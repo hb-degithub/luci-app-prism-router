@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# traffic-statsd — 流量统计采集守护进程
+USE_PROCD=1
+START=95
+STOP=10
+
+start_service() {
+	procd_open_instance "main"
+	procd_set_param command /usr/bin/ucode /usr/share/traffic-stats/traffic-statsd.uc
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param nice -5
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}

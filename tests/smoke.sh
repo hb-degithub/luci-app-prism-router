@@ -35,10 +35,12 @@ for m in status get_state; do
   case "$OUT" in *'"'*) ok "ubus $m 有返回" ;; *) bad "ubus $m: $(echo "$OUT" | head -1)" ;; esac
 done
 
-echo "=== 5. LuCI 页面 ==="
+echo "=== 5. LuCI 页面（带会话）==="
+RSH 'PW="${LUCI_PW:-}"; rm -f /tmp/ck.txt; [ -n "$PW" ] && curl -sk -c /tmp/ck.txt -o /dev/null --data-urlencode "luci_username=root" --data-urlencode "luci_password=$PW" "https://127.0.0.1/cgi-bin/luci/"' >/dev/null 2>&1
 for p in overview devices apps settings; do
-  CODE=$(RSH "curl -s -o /dev/null -w '%{http_code}' -k https://127.0.0.1/cgi-bin/luci/admin/services/traffic-stats/$p" 2>/dev/null | tr -d '\r')
-  case "$CODE" in 200|302) ok "页面 $p HTTP $CODE" ;; *) bad "页面 $p HTTP ${CODE:-无响应}" ;; esac
+  CODE=$(RSH "curl -sk -b /tmp/ck.txt -o /dev/null -w '%{http_code}' https://127.0.0.1/cgi-bin/luci/admin/services/traffic-stats/$p" 2>/dev/null | tr -d '\r')
+  JS=$(RSH "curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1/luci-static/resources/view/traffic-stats/$p.js" 2>/dev/null | tr -d '\r')
+  case "$CODE:$JS" in 200:200) ok "页面 $p（html=200 js=200）" ;; *:200) ok "页面 $p（js 可取，html=$CODE 未登录）" ;; *) bad "页面 $p html=$CODE js=$JS" ;; esac
 done
 
 echo "=== 6. 资源占用 ==="

@@ -16,6 +16,10 @@
 //   ucode feishu.uc retry [--now]          # 处理重试队列（--now 忽略到期时间）
 //   ucode feishu.uc status                 # 查看配置/队列状态
 //
+// 定时调用（cron 示例，避开整点/半点以降低 11232 概率）：
+//   32 8 * * * ucode /usr/bin/feishu.uc daily
+//   3,13,23,33,43,53 * * * * ucode /usr/bin/feishu.uc alerts
+//
 // 常用参数：--base DIR（默认 /tmp/traffic-stats）、--state FILE、--history FILE、
 //           --webhook URL、--secret SECRET（后两个仅用于测试，不写 UCI）、
 //           --force（忽略 feishu.enabled=0）
@@ -27,7 +31,7 @@
 //   traffic-stats.feishu.daily_time          日报时间，仅展示用（调度由调用方决定）
 //   traffic-stats.feishu.alert_enabled       告警总开关，默认 1
 //   traffic-stats.feishu.alert_new_device    新设备上线告警，默认 1
-//   traffic-stats.feishu.device_daily_limit  单设备日流量阈值，如 40G；不设=关闭
+//   traffic-stats.feishu.device_daily_limit  单设备日流量阈值，如 40G/512M；纯数字按 GB；不设=关闭
 //   traffic-stats.feishu.alert_cooldown      冷却秒数，默认 1800（30 分钟）
 //
 // 签名算法（官方）：key = timestamp + "\n" + secret，HMAC-SHA256 签空字节串，Base64。
@@ -61,13 +65,14 @@ const SIGN_VECTOR = {
 };
 
 let BASE = DEFAULT_BASE;
+let LIMIT = LIMIT_BODY;            // 实际生效上限（测试可用 --limit 调整）
 let _pid = 0;
 let _seq = 0;
 let _uci_cursor = null;
 let _uci_broken = false;
 
 // ucode 在函数定义处绑定标识符：先统一声明，再赋值为函数表达式。
-let nowstr, today, run, shq, ensure_dir, getpid, read_json, write_atomic, log, jstr, jminify, num, intv, gb, fmt_bytes, cut, parse_size, tz_offset, hmac_sign, uci_get, bool_opt, load_cfg, send_allowed, device_key, device_label, device_bytes, top_nodes, collect, chart_points, overview_text, chart_element, table_element, footnote_element, build_card, prepare_daily, signed_body, code_help, http_post, parse_result, deliver, queue_dir, enqueue, process_retries, script_path, spawn_worker, retry_worker, alert_state_path, read_alert_state, save_alert_state, allow_send, check_degraded, alert_text, send_text, cmd_alerts, gather_tags, check_card_json, cmd_daily, cmd_card, cmd_check, cmd_test, cmd_retry, cmd_status, cmd_selftest, cmd_sign, usage, parse_args;
+let nowstr, today, run, shq, ensure_dir, getpid, read_json, write_atomic, log, jstr, jminify, num, intv, gb, fmt_bytes, cut, parse_size, tz_offset, hmac_sign, uci_get, bool_opt, load_cfg, send_allowed, device_key, device_label, device_bytes, top_nodes, collect, chart_points, overview_text, chart_element, table_element, footnote_element, build_card, prepare_daily, signed_body, code_help, http_post, parse_result, deliver, queue_dir, queue_count, enqueue, process_retries, script_path, spawn_worker, retry_worker, alert_state_path, read_alert_state, save_alert_state, allow_send, check_degraded, alert_text, send_text, cmd_alerts, gather_tags, check_card_json, cmd_daily, cmd_card, cmd_check, cmd_test, cmd_retry, cmd_status, cmd_selftest, cmd_sign, usage, parse_args;
 
 // ───────────────────────────── 基础工具 ─────────────────────────────
 
@@ -373,6 +378,8 @@ load_cfg = function(opts) {
             c.webhook = trim(opts.webhook);
         if (opts.secret != null)
             c.secret = trim(opts.secret);
+        if (opts.device_limit != null)
+            c.device_limit = parse_size(opts.device_limit);
     }
     return c;
 };
@@ -459,6 +466,7 @@ collect = function(state, hist, now) {
         hist_day: "",
         now: now,
         has_state: false,
+        has_totals: false,
         has_hours: false,
         has_data: false,
         state_age: -1,
@@ -519,7 +527,9 @@ collect = function(state, hist, now) {
         if (ts > 0)
             ctx.state_age = now - ts;
 
-        let t = (type(state.totals) == "object") ? state.totals : {};
+        let has_totals = (type(state.totals) == "object");
+        ctx.has_totals = has_totals;
+        let t = has_totals ? state.totals : {};
         ctx.direct = num(t.direct_rx) + num(t.direct_tx);
         ctx.proxy = num(t.proxy_rx) + num(t.proxy_tx);
         ctx.total = ctx.direct + ctx.proxy;
@@ -580,7 +590,7 @@ collect = function(state, hist, now) {
     }
 
     // totals 缺失时按设备汇总兜底
-    if (ctx.total <= 0 && length(ctx.devices)) {
+    if (!ctx.has_totals && length(ctx.devices)) {
         let dsum = 0, psum = 0;
         for (let d in ctx.devices) {
             dsum += d.direct;
@@ -761,7 +771,7 @@ prepare_daily = function(ctx, cfg) {
         let card = build_card(ctx, tops[i], 1);
         let body = signed_body(cfg, { "msg_type": "interactive", "card": card }, ts, sign);
         let bytes = length(body);
-        if (bytes < LIMIT_BODY)
+        if (bytes < LIMIT)
             return { card: card, body: body, bytes: bytes, top: tops[i], step: 1, ts: ts, sign: sign };
         push(tried, sprintf("top=%d/step=1:%dB", tops[i], bytes));
     }
@@ -769,7 +779,7 @@ prepare_daily = function(ctx, cfg) {
         let card = build_card(ctx, 5, steps[i]);
         let body = signed_body(cfg, { "msg_type": "interactive", "card": card }, ts, sign);
         let bytes = length(body);
-        if (bytes < LIMIT_BODY)
+        if (bytes < LIMIT)
             return { card: card, body: body, bytes: bytes, top: 5, step: steps[i], ts: ts, sign: sign };
         push(tried, sprintf("top=5/step=%dh:%dB", steps[i], bytes));
     }
@@ -889,8 +899,8 @@ deliver = function(cfg, req) {
         return { ok: false, retryable: false, code: -3, http: 0, msg: "签名计算失败（openssl 不可用？）", bytes: 0 };
     let body = signed_body(cfg, req, ts, sign);
     let bytes = length(body);
-    if (bytes >= LIMIT_BODY)
-        return { ok: false, retryable: false, code: -4, http: 0, msg: sprintf("请求体 %d 字节超过 20 KB", bytes), bytes: bytes };
+    if (bytes >= LIMIT)
+        return { ok: false, retryable: false, code: -4, http: 0, msg: sprintf("请求体 %d 字节超过 %d 上限", bytes, LIMIT), bytes: bytes };
     let res = parse_result(http_post(cfg.webhook, body));
     res.bytes = bytes;
     return res;
@@ -957,7 +967,7 @@ process_retries = function(cfg, force) {
         } else {
             log("WARN", sprintf("重试失败（第 %d 次尝试）：http=%s code=%s %s（%s）",
                 attempts + 1, res.http, res.code, res.msg, code_help(res.code)));
-            if (res.retryable && attempts < MAX_RETRIES + 1) {
+            if (res.retryable && attempts < MAX_RETRIES) {
                 e.attempts = attempts + 1;
                 e.next_at = time() + RETRY_DELAYS[e.attempts - 1];
                 if (write_atomic(p, jstr(e)))
@@ -1004,6 +1014,8 @@ spawn_worker = function() {
     }
     let lock = BASE + "/feishu-retry.lock";
     let inner = sprintf("flock -n %s ucode %s _retry-worker", shq(lock), shq(self));
+    if (BASE != DEFAULT_BASE)
+        inner += sprintf(" --base %s", shq(BASE));
     system(sprintf("setsid /bin/sh -c %s </dev/null >/dev/null 2>&1 &", shq(inner)));
     log("INFO", "已启动后台重试进程");
     return true;
@@ -1014,6 +1026,10 @@ retry_worker = function() {
     log("INFO", "后台重试进程启动");
     while (time() <= deadline) {
         let cfg = load_cfg({});
+        if (!length(cfg.webhook) || !length(cfg.secret)) {
+            log("WARN", "重试进程：webhook/secret 未配置，退出");
+            break;
+        }
         let pending = process_retries(cfg, false);
         if (pending <= 0)
             break;
@@ -1113,6 +1129,10 @@ send_text = function(cfg, text, desc) {
 
 cmd_alerts = function(opts) {
     let cfg = load_cfg(opts);
+    if (!cfg.enabled && !cfg.force) {
+        log("INFO", "feishu.enabled=0，跳过告警（可用 --force 强制）");
+        return 0;
+    }
     if (!cfg.alert_enabled) {
         log("INFO", "告警未启用（alert_enabled=0），跳过");
         return 0;
@@ -1213,6 +1233,8 @@ cmd_alerts = function(opts) {
         log("ERROR", "写告警状态失败：" + alert_state_path());
 
     log("INFO", sprintf("告警检查完成：发送 %d 条，冷却跳过 %d 条，清理陈旧设备 %d 台", sent, skipped, pruned));
+    if (opts.webhook == null && queue_count() > 0)
+        spawn_worker();
     return 0;
 };
 
@@ -1401,11 +1423,12 @@ cmd_daily = function(opts) {
         log("INFO", "feishu.enabled=0，跳过日报");
         return 0;
     }
-    if (!send_allowed(cfg))
-        return 0;
-
-    if (!opts.dry_run)
+    // --dry-run 只生成卡片，不需要 webhook/secret，也不处理重试队列
+    if (!opts.dry_run) {
+        if (!send_allowed(cfg))
+            return 0;
         process_retries(cfg, false);
+    }
 
     let state_path = opts.state || (BASE + "/state.json");
     let hist_path = opts.history || (BASE + "/history.json");
@@ -1421,8 +1444,8 @@ cmd_daily = function(opts) {
 
     let prep = prepare_daily(ctx, cfg);
     if (prep == null) {
-        log("ERROR", "日报卡片无法压到 20 KB，放弃发送");
-        print("feishu daily: 卡片超过 20 KB 且无法压缩，已放弃\n");
+        log("ERROR", sprintf("日报卡片无法压到 %d 字节，放弃发送", LIMIT));
+        print(sprintf("feishu daily: 卡片超过 %d 字节上限且无法压缩，已放弃\n", LIMIT));
         return 1;
     }
     if (prep.top < 10 || prep.step > 1)
@@ -1438,7 +1461,7 @@ cmd_daily = function(opts) {
             log("ERROR", "写卡片文件失败：" + out);
             return 1;
         }
-        print(sprintf("feishu daily: dry-run 已写入 %s（%d 字节 / 上限 %d）\n", out, prep.bytes, LIMIT_BODY));
+        print(sprintf("feishu daily: dry-run 已写入 %s（%d 字节 / 上限 %d）\n", out, prep.bytes, LIMIT));
         return 0;
     }
 
@@ -1452,7 +1475,8 @@ cmd_daily = function(opts) {
         print(sprintf("feishu daily: 发送失败 code=%s（%s）\n", res.code, code_help(res.code)));
         if (res.retryable) {
             if (length(enqueue({ "msg_type": "interactive", "card": prep.card }, "daily/" + ctx.day)))
-                spawn_worker();
+                if (opts.webhook == null)
+                    spawn_worker();
         } else {
             log("WARN", "该错误不可重试（配置或内容问题），未入队");
         }
@@ -1467,11 +1491,11 @@ cmd_card = function(opts) {
     let ctx = collect(read_json(state_path), read_json(hist_path), time());
     if (!ctx.has_data) {
         print("feishu card: 无数据，未生成卡片\n");
-        return 1;
+        return 0;
     }
     let prep = prepare_daily(ctx, cfg);
     if (prep == null) {
-        print("feishu card: 卡片超过 20 KB 且无法压缩\n");
+        print(sprintf("feishu card: 卡片超过 %d 字节上限且无法压缩\n", LIMIT));
         return 1;
     }
     let out = opts.card_out || "/tmp/card.json";
@@ -1483,7 +1507,7 @@ cmd_card = function(opts) {
         return 1;
     }
     print(sprintf("feishu card: %s => %d 字节（上限 %d，占 %.1f%%），Top=%d，图表步长 %dh\n",
-        out, prep.bytes, LIMIT_BODY, prep.bytes * 100.0 / LIMIT_BODY, prep.top, prep.step));
+        out, prep.bytes, LIMIT, prep.bytes * 100.0 / LIMIT, prep.top, prep.step));
     if (prep.top < 10 || prep.step > 1)
         print(sprintf("  已截断：Top %d，图表 %d 小时/点\n", prep.top, prep.step));
     return 0;
@@ -1561,7 +1585,7 @@ cmd_status = function(opts) {
     }
     print(sprintf("  queue     : %d 条待重试（%s）\n", q, queue_dir()));
     let st = read_json(opts.state || (BASE + "/state.json"));
-    if (st != null && type(st) == "object")
+    if (st != null && type(st) == "object" && intv(st.ts) > 0)
         print(sprintf("  state.json: 存在（%d 秒前更新）\n", time() - intv(st.ts)));
     else
         print("  state.json: 缺失\n");
@@ -1687,6 +1711,8 @@ parse_args = function(argv) {
         state: "",
         history: "",
         card_out: "/tmp/card.json",
+        limit: LIMIT_BODY,
+        device_limit: null,
         webhook: null,
         secret: null,
         text: "",
@@ -1713,6 +1739,10 @@ parse_args = function(argv) {
             o.history = argv[++i];
         } else if ((a == "--out" || a == "--card-out") && i + 1 < length(argv)) {
             o.card_out = argv[++i];
+        } else if (a == "--limit" && i + 1 < length(argv)) {
+            o.limit = intv(argv[++i]);
+        } else if (a == "--device-limit" && i + 1 < length(argv)) {
+            o.device_limit = argv[++i];
         } else if (a == "--webhook" && i + 1 < length(argv)) {
             o.webhook = argv[++i];
         } else if (a == "--secret" && i + 1 < length(argv)) {
@@ -1738,6 +1768,8 @@ parse_args = function(argv) {
 let opts = parse_args(ARGV);
 if (length(opts.base) && match(opts.base, /^\/[A-Za-z0-9._\/-]+$/))
     BASE = opts.base;
+if (opts.limit >= 1024)
+    LIMIT = opts.limit;
 
 let rc = 0;
 if (opts.cmd == "daily")

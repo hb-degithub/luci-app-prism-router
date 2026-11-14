@@ -99,8 +99,9 @@ config feishu 'feishu'
 ```
 
 - `rx` = 下载方向（到设备），`tx` = 上传方向。**统一按"设备视角"**。
-- `apps` 每设备保留 **Top 30**（按 rx 排序），其余合并为 `__other__`。
-- `devices` 按 `proxy_rx + direct_rx` 降序，最多 200 个。
+- `apps` 每设备保留 **Top 15**（按 rx 排序），其余合并为 `__other__`。
+- `devices` 按 `proxy_rx + direct_rx` 降序，**最多 40 个**；全局 `apps` 最多 40 条。
+- **硬限制（实测）**：ubus 单条消息上限 **262144 字节**，超过会报 `Operation not supported`。所以 state.json 必须控制在 ~180KB 以内——40 设备 × 15 应用实测约 8–12KB，安全。
 
 ## 4. history.json（当日 5 分钟桶）
 

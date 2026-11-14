@@ -66,8 +66,13 @@ function text(value, fallback) {
 }
 
 function integer(value, fallback) {
+	if (value == null)
+		return fallback;
+
 	const n = int(value);
-	return (value == null || (n == 0 && `${value}` != '0')) ? fallback : n;
+
+	/* int() 对非数字返回 NaN；NaN != NaN，用它判定可避免依赖 ucode-mod-math。 */
+	return (n != n) ? fallback : n;
 }
 
 function clamp(n, lo, hi) {
@@ -325,6 +330,11 @@ function build_state(raw, running) {
 	devices = sort(devices, (a, b) => device_total(b) - device_total(a));
 	apps = sort(apps, (a, b) => app_total(b) - app_total(a));
 
+	/* 半截 / null 条目直接丢掉，别让前端出现空白行。 */
+	devices = filter(devices, dev =>
+		type(dev) == 'object' && (length(text(dev?.ip, '')) || length(text(dev?.mac, ''))));
+	apps = filter(apps, app => type(app) == 'object' && length(text(app?.host, '')));
+
 	for (let shape in STATE_SHAPES) {
 		const max_devices = shape[0], max_apps = shape[1], max_top = shape[2];
 
@@ -511,8 +521,10 @@ function set_config(request) {
 	if (type(options) != 'object')
 		return { ok: false, error: 'invalid options' };
 
-	/* 先确认 section 存在；不存在就建一个同名 section（uci set cfg.name=type）。 */
-	if (system([ UCI_BIN, '-q', 'get', `${UCI_CONFIG}.${section}` ]) != 0) {
+	/* 先确认 section 存在；不存在就建一个同名 section（uci set cfg.name=type）。
+	   uci 会把命中的 section 类型打到 stdout，这里用 sh 重定向掉，别污染 rpcd。 */
+	if (system([ 'sh', '-c', sprintf('%s -q get %s >/dev/null 2>&1',
+			UCI_BIN, shellquote(`${UCI_CONFIG}.${section}`)) ]) != 0) {
 		if (!uci_run([ 'set', `${UCI_CONFIG}.${section}=${section}` ]))
 			return { ok: false, error: `无法创建 section ${section}` };
 	}
@@ -525,7 +537,8 @@ function set_config(request) {
 
 		let value = options[key];
 
-		if (type(value) == 'boolean')
+		/* ucode 的 type() 对布尔返回 'bool'，UCI 里统一写成 '1' / '0'。 */
+		if (type(value) == 'bool')
 			value = value ? '1' : '0';
 		else if (value == null)
 			continue;

@@ -32,11 +32,11 @@ const CONNTRACK_FILE = '/proc/net/nf_conntrack';
 
 /* 资源上限：家庭网关上远达不到，仅用于保证长时间运行内存有界（SPEC §8.7） */
 const MAX_TRACK_DEVICES = 256;    /* 内部跟踪的设备数上限 */
-const MAX_OUT_DEVICES = 200;      /* state.json 输出上限（SPEC §3） */
+const MAX_OUT_DEVICES = 40;      /* state.json 输出上限（SPEC §3） */
 const MAX_DEV_APPS = 96;          /* 每设备跟踪的 host 数上限 */
-const MAX_DEV_APPS_OUT = 30;      /* 每设备输出 Top N（SPEC §3） */
+const MAX_DEV_APPS_OUT = 15;      /* 每设备输出 Top N（SPEC §3） */
 const MAX_GLOBAL_APPS = 512;      /* 全局跟踪的 host 数上限 */
-const MAX_OUT_APPS = 50;          /* apps 数组输出条数 */
+const MAX_OUT_APPS = 40;          /* apps 数组输出条数 */
 const MAX_DAY_APPS = 512;         /* 当日应用累计上限 */
 const MAX_BUCKET_APPS = 256;      /* 单个 5 分钟桶内的应用数上限 */
 const BUCKET_SECONDS = 300;       /* 5 分钟桶（SPEC §4） */

@@ -1,0 +1,17 @@
+{
+	"luci-app-traffic-stats": {
+		"description": "流量统计 —— 查看状态与配置",
+		"read": {
+			"ubus": {
+				"traffic-stats": [ "status", "get_state", "get_history", "get_daily" ]
+			},
+			"uci": [ "traffic-stats" ]
+		},
+		"write": {
+			"ubus": {
+				"traffic-stats": [ "test_feishu", "set_config", "restart" ]
+			},
+			"uci": [ "traffic-stats" ]
+		}
+	}
+}
