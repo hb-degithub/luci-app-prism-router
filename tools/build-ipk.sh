@@ -8,22 +8,20 @@ W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 
 pack() { # $1=dir $2=basename（不带扩展名）
   local d="$1" base="$2"
-  # 关键：必须强制 root:root 且目录 755。
-  # 否则 opkg 会把包里的目录条目（./etc/、./usr/、./www/）套用到真实系统目录上，
-  # 这正是 2026-11-14 把 /etc /usr /www 改成 uid1000/700、导致 ubus 与网络全挂的原因。
+  # 关键：强制 root:root + 目录 755，避免 2026-11-14 那种把 /etc /usr /www 改成 1000/700 的事故
   find "$d/data" -type d -exec chmod 755 {} +
   find "$d/data" -type f -exec chmod 644 {} +
   chmod 755 "$d/data/usr/bin/traffic-statsd" "$d/data/etc/init.d/traffic-statsd" "$d/data/usr/share/traffic-stats/feishu-test.sh" 2>/dev/null || true
   local TO="--owner=0 --group=0 --numeric-owner"
-  ( cd "$d/data" && tar $TO -czf ../data.tar.gz . )
+  ( cd "$d/data"    && tar $TO -czf ../data.tar.gz . )
   ( cd "$d/control" && tar $TO -czf ../control.tar.gz . )
   printf '2.0\n' > "$d/debian-binary"
-  # 标准 OpenWrt / Debian 风格：ar 容器
-  ( cd "$d" && ar rc "$OUT/${base}.ipk" debian-binary control.tar.gz data.tar.gz )
-  # iStoreOS 定制 opkg（abpkg 标志）只认 tar 容器
-  ( cd "$d" && tar -czf "$OUT/${base}.istore.ipk" debian-binary control.tar.gz data.tar.gz )
-  echo "  ✓ dist/${base}.ipk        $(stat -c%s "$OUT/${base}.ipk") B (ar, 标准 OpenWrt)"
-  echo "  ✓ dist/${base}.istore.ipk $(stat -c%s "$OUT/${base}.istore.ipk") B (tar, iStoreOS)"
+  # OpenWrt 24.10+ 的 ipk 外层就是 tar.gz（不是 ar！）
+  ( cd "$d" && tar $TO -czf "$OUT/${base}.ipk" ./debian-binary ./data.tar.gz ./control.tar.gz )
+  # 23.05 及更早用 ar 容器，留一份备用
+  ( cd "$d" && ar rc "$OUT/${base}.legacy.ipk" debian-binary control.tar.gz data.tar.gz )
+  echo "  ✓ dist/${base}.ipk         $(stat -c%s "$OUT/${base}.ipk") B (tar.gz, 24.10+)"
+  echo "  ✓ dist/${base}.legacy.ipk  $(stat -c%s "$OUT/${base}.legacy.ipk") B (ar, ≤23.05)"
 }
 ctl() { # $1=dir  $2=pkgname  $3=section  $4=depends  $5=desc
   printf 'Package: %s\nVersion: %s-%s\nArchitecture: all\nMaintainer: traffic-stats\nSection: %s\nPriority: optional\nDepends: %s\nDescription: %s\n' \
