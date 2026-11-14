@@ -369,6 +369,14 @@ function is_root(request) {
 	return (user == null || user == 'root');
 }
 
+function curl_binary() {
+	for (let path in [ CURL_BIN, '/usr/sbin/curl', '/bin/curl' ])
+		if (access(path))
+			return path;
+
+	return null;
+}
+
 function feishu_sign(timestamp, secret) {
 	const key = `${timestamp}\n${secret}`;
 	const bin = access(OPENSSL_BIN) ? OPENSSL_BIN : 'openssl';
@@ -442,8 +450,12 @@ function test_feishu() {
 	if (length(secret) && !access(OPENSSL_BIN) && !access('/usr/sbin/openssl'))
 		return { ok: false, code: -1, msg: '缺少 openssl，无法生成签名' };
 
+	const curl = curl_binary();
+
+	if (curl == null)
+		return { ok: false, code: -1, msg: '缺少 curl，无法发送（opkg install curl）' };
+
 	const payload = feishu_payload(secret);
-	const curl = access(CURL_BIN) ? CURL_BIN : 'curl';
 	const cmd = sprintf('%s -sS -m 15 -H %s -d %s %s',
 		curl,
 		shellquote('Content-Type: application/json'),

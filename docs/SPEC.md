@@ -109,6 +109,15 @@ config feishu 'feishu'
 - `devices` 按 `proxy_rx + direct_rx` 降序，**最多 40 个**；全局 `apps` 最多 40 条。
 - **硬限制（实测）**：ubus 单条消息上限 **262144 字节**，超过会报 `Operation not supported`。所以 state.json 必须控制在 ~180KB 以内——40 设备 × 15 应用实测约 8–12KB，安全。
 
+
+### 3.1 语义补充（实现中发现的歧义，以此为准）
+
+- **`totals` = 进程启动以来累计**（进程重启归零），与 `uptime` 配套；"今日/历史"口径看 `history.json` 与 `/etc/traffic-stats/daily/`。UI 必须在卡片上标明这一点，不能把 `totals` 当"今日"展示。
+- **`accounting_confidence` 枚举固定为** `exact | degraded | unavailable`，不得新增其它值。
+- **`__other__` 桶固定为** `{ rx, tx, chain: "MIXED" }`；前端按 `chain` 过滤时必须把 `MIXED` 当作"混合"而不是节点名。
+- **历史精度现实**：`history.json` 在 tmpfs，重启即丢 → "近 7 天折线"实际是「当天 5 分钟精度 + 往日日粒度」，前端要么两段拼接，要么只画当日。SPEC 不承诺跨天 5 分钟数据。
+- **已知漏计**：完全落在两次轮询之间的短连接（clash 从未见过它、conntrack 又因 fake-ip 去重被跳过）会两边都不计。这是当前架构的固有盲区，需在文档中如实说明；缓解手段是缩短 `poll_interval`。
+
 ## 4. history.json（当日 5 分钟桶）
 
 ```json
