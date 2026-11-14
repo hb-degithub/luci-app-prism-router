@@ -1,0 +1,82 @@
+#
+# traffic-stats —— OpenWrt 流量统计守护进程
+#
+# 安装内容（全部是脚本，无需编译）：
+#   /usr/bin/traffic-statsd          <- files/traffic-statsd.uc
+#   /etc/init.d/traffic-statsd       <- files/traffic-statsd.init
+#   /etc/config/traffic-stats        <- files/traffic-stats.config  (conffile)
+#   /etc/traffic-stats/daily/        每日汇总落盘目录
+#
+# 契约：docs/SPEC.md
+#
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=traffic-stats
+PKG_VERSION:=1.0.0
+PKG_RELEASE:=1
+
+PKG_LICENSE:=GPL-2.0-only
+PKG_MAINTAINER:=traffic-stats
+
+PKGARCH:=all
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/traffic-stats
+  SECTION:=net
+  CATEGORY:=Network
+  SUBMENU:=Traffic Control
+  TITLE:=Traffic statistics daemon (OpenClash API + conntrack)
+  DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-uloop +curl
+  PKGARCH:=all
+endef
+
+define Package/traffic-stats/description
+  按设备 / 应用 / 出口链路统计流量：clash /connections 负责被接管的流量，
+  /proc/net/nf_conntrack 负责未接管的直连流量（fake-ip 段自动去重，不重复计数）。
+  结果原子写入 /tmp/traffic-stats/state.json，供 LuCI 读取。
+  飞书日报需要 openssl-util（可选，默认关闭）。
+endef
+
+define Package/traffic-stats/conffiles
+/etc/config/traffic-stats
+endef
+
+define Build/Compile
+endef
+
+define Package/traffic-stats/install
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) ./files/traffic-statsd.uc $(1)/usr/bin/traffic-statsd
+
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/traffic-statsd.init $(1)/etc/init.d/traffic-statsd
+
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./files/traffic-stats.config $(1)/etc/config/traffic-stats
+
+	$(INSTALL_DIR) $(1)/etc/traffic-stats/daily
+
+	$(INSTALL_DIR) $(1)/usr/share/traffic-stats
+	$(if $(wildcard ./files/feishu.uc),$(INSTALL_DATA) ./files/feishu.uc $(1)/usr/share/traffic-stats/feishu.uc)
+endef
+
+define Package/traffic-stats/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || {
+	/etc/init.d/traffic-statsd enable
+	/etc/init.d/traffic-statsd restart
+}
+exit 0
+endef
+
+define Package/traffic-stats/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] || {
+	/etc/init.d/traffic-statsd stop
+	/etc/init.d/traffic-statsd disable
+}
+exit 0
+endef
+
+$(eval $(call BuildPackage,traffic-stats))

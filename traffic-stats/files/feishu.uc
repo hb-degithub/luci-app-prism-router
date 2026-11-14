@@ -5,7 +5,7 @@
 // 依赖：ucode（fs/uci/json 内建）、curl、openssl（openssl-util）
 // 环境：iStoreOS 24.10（x86_64/musl）；没有 python3 / jq / node，也不使用它们。
 //
-// 用法（安装后 feishu.uc 放在 /usr/bin/feishu.uc 或 /usr/lib/traffic-stats/feishu.uc）：
+// 用法（安装后位于 /usr/share/traffic-stats/feishu.uc，见 traffic-stats/Makefile）：
 //   ucode feishu.uc daily                  # 生成并发送日报
 //   ucode feishu.uc daily --dry-run        # 只生成，写到 /tmp/card.json，不联网
 //   ucode feishu.uc card [--out FILE]      # 同上（只生成卡片）
@@ -17,8 +17,8 @@
 //   ucode feishu.uc status                 # 查看配置/队列状态
 //
 // 定时调用（cron 示例，避开整点/半点以降低 11232 概率）：
-//   32 8 * * * ucode /usr/bin/feishu.uc daily
-//   3,13,23,33,43,53 * * * * ucode /usr/bin/feishu.uc alerts
+//   32 8 * * * ucode /usr/share/traffic-stats/feishu.uc daily
+//   3,13,23,33,43,53 * * * * ucode /usr/share/traffic-stats/feishu.uc alerts
 //
 // 常用参数：--base DIR（默认 /tmp/traffic-stats）、--state FILE、--history FILE、
 //           --webhook URL、--secret SECRET（后两个仅用于测试，不写 UCI）、
@@ -72,7 +72,7 @@ let _uci_cursor = null;
 let _uci_broken = false;
 
 // ucode 在函数定义处绑定标识符：先统一声明，再赋值为函数表达式。
-let nowstr, today, run, shq, ensure_dir, getpid, read_json, write_atomic, log, jstr, jminify, num, intv, gb, fmt_bytes, cut, parse_size, tz_offset, hmac_sign, uci_get, bool_opt, load_cfg, send_allowed, device_key, device_label, device_bytes, top_nodes, collect, chart_points, overview_text, chart_element, table_element, footnote_element, build_card, prepare_daily, signed_body, code_help, http_post, parse_result, deliver, queue_dir, queue_count, enqueue, process_retries, script_path, spawn_worker, retry_worker, alert_state_path, read_alert_state, save_alert_state, allow_send, check_degraded, alert_text, send_text, cmd_alerts, gather_tags, check_card_json, cmd_daily, cmd_card, cmd_check, cmd_test, cmd_retry, cmd_status, cmd_selftest, cmd_sign, usage, parse_args;
+let nowstr, today, run, shq, ensure_dir, getpid, read_json, write_atomic, log, jstr, jminify, num, intv, gb, fmt_bytes, cut, parse_size, tz_offset, hmac_sign, uci_get, bool_opt, load_cfg, send_allowed, device_key, device_label, device_bytes, top_nodes, collect, chart_points, overview_text, chart_element, table_element, footnote_element, build_card, prepare_daily, signed_body, code_help, http_post, parse_result, deliver, queue_dir, queue_count, enqueue, process_retries, script_path, spawn_worker, retry_worker, alert_state_path, read_alert_state, save_alert_state, allow_send, check_degraded, alert_text, send_text, cmd_alerts, gather_tags, check_card_json, cmd_daily, cmd_card, cmd_check, cmd_test, cmd_retry, cmd_status, cmd_selftest, cmd_sign, app_http, app_token, deliver_app, cmd_chats, usage, parse_args;
 
 // ───────────────────────────── 基础工具 ─────────────────────────────
 
@@ -360,6 +360,10 @@ load_cfg = function(opts) {
     let c = {
         enabled: bool_opt(uci_get("traffic-stats.feishu.enabled"), true),
         webhook: trim(uci_get("traffic-stats.feishu.webhook")),
+        app_id: trim(uci_get("traffic-stats.feishu.app_id")),
+        app_secret: trim(uci_get("traffic-stats.feishu.app_secret")),
+        chat_id: trim(uci_get("traffic-stats.feishu.chat_id")),
+        card_wrapper: trim(uci_get("traffic-stats.feishu.card_wrapper")),
         secret: trim(uci_get("traffic-stats.feishu.secret")),
         daily_time: trim(uci_get("traffic-stats.feishu.daily_time")),
         alert_enabled: bool_opt(uci_get("traffic-stats.feishu.alert_enabled"), true),
@@ -370,6 +374,8 @@ load_cfg = function(opts) {
     };
     if (!length(c.daily_time))
         c.daily_time = "08:30";
+    if (!length(c.card_wrapper))
+        c.card_wrapper = "card";
     let cd = intv(trim(uci_get("traffic-stats.feishu.alert_cooldown")));
     if (cd >= 60)
         c.cooldown = cd;
@@ -892,7 +898,123 @@ parse_result = function(r) {
     return { ok: ok, code: code, http: r.http, msg: msg, retryable: retryable, curl: r.curl, bytes: 0 };
 };
 
+/* ============================================================
+ * 自建应用路线（app_id / app_secret / chat_id）
+ *   机器人用二维码加进群，发消息走 tenant_access_token
+ *   - token: POST /open-apis/auth/v3/tenant_access_token/internal（缓存到 BASE/tmp）
+ *   - 发送: POST /open-apis/im/v1/messages?receive_id_type=chat_id
+ *   - 群列表: GET /open-apis/im/v1/chats
+ * ============================================================ */
+app_http = function(method, url, bearer, body) {
+    let dir = BASE + "/tmp";
+    if (!ensure_dir(dir))
+        return { http: 0, curl: -1, body: "", err: "无法创建临时目录 " + dir };
+    let tag = sprintf("%d-%d-%d", time(), getpid(), _seq++);
+    let bf = sprintf("%s/abody-%s.json", dir, tag);
+    let rf = sprintf("%s/aresp-%s.json", dir, tag);
+    let cf = sprintf("%s/acurl-%s.conf", dir, tag);
+    let conf = sprintf("url = \"%s\"\nrequest = \"%s\"\n", url, method);
+    if (length(bearer))
+        conf += sprintf("header = \"Authorization: Bearer %s\"\n", bearer);
+    if (length(body))
+        conf += sprintf("header = \"Content-Type: application/json\"\ndata-binary = \"@%s\"\n", bf);
+    conf += sprintf("silent\nshow-error\nconnect-timeout = 8\nmax-time = 25\noutput = \"%s\"\nwrite-out = \"%%{http_code}\"\n", rf);
+    try {
+        if (length(body)) fs.writefile(bf, body);
+        fs.writefile(cf, conf);
+    } catch (e) {
+        return { http: 0, curl: -1, body: "", err: "写临时文件失败：" + e };
+    }
+    let r = run(sprintf("curl -sS -K %s 2>/dev/null", shq(cf)));
+    let http = intv(trim(r.out));
+    let resp = "";
+    try { if (fs.access(rf)) resp = fs.readfile(rf); } catch (e) { }
+    try { fs.unlink(bf); fs.unlink(cf); fs.unlink(rf); } catch (e) { }
+    return { http: http, curl: r.code, body: resp, err: "" };
+};
+
+app_token = function(cfg, force) {
+    let cp = BASE + "/tmp/feishu-token.json";
+    let now = time();
+    if (!force) {
+        let c = read_json(cp);
+        if (c != null && type(c) == "object" && c.app_id == cfg.app_id &&
+            intv(c.expire) > now + 120 && length(c.token))
+            return c.token;
+    }
+    let body = sprintf('%J', { app_id: cfg.app_id, app_secret: cfg.app_secret });
+    let r = app_http("POST", "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", "", body);
+    let j = null;
+    try { if (length(r.body)) j = json(r.body); } catch (e) { j = null; }
+    let tok = (j != null && type(j) == "object" && j.tenant_access_token != null) ? j.tenant_access_token : "";
+    let exp = (j != null && type(j) == "object" && j.expire != null) ? intv(j.expire) : 7200;
+    if (!length(tok)) {
+        log("ERROR", sprintf("tenant_access_token 获取失败 http=%d body=%s", r.http, cut(r.body, 200)));
+        return "";
+    }
+    write_atomic(cp, sprintf('%J', { app_id: cfg.app_id, token: tok, expire: now + exp }));
+    return tok;
+};
+
+deliver_app = function(cfg, req) {
+    if (!length(cfg.app_id) || !length(cfg.app_secret))
+        return { ok: false, retryable: false, code: -6, http: 0, msg: "未配置 app_id/app_secret", bytes: 0 };
+    if (!length(cfg.chat_id))
+        return { ok: false, retryable: false, code: -7, http: 0, msg: "未配置 chat_id（先跑 feishu.uc chats 列群）", bytes: 0 };
+    let tok = app_token(cfg);
+    if (!length(tok))
+        return { ok: false, retryable: true, code: -5, http: 0, msg: "tenant_access_token 获取失败", bytes: 0 };
+    let content;
+    if (req.msg_type == "interactive")
+        content = (cfg.card_wrapper == "bare") ? req.card : { type: "card", data: req.card };
+    else
+        content = req.content;
+    let body = sprintf('%J', {
+        receive_id: cfg.chat_id,
+        msg_type: req.msg_type,
+        content: sprintf('%J', content)
+    });
+    let bytes = length(body);
+    if (bytes >= LIMIT)
+        return { ok: false, retryable: false, code: -4, http: 0, msg: sprintf("请求体 %d 字节超过 %d 上限", bytes, LIMIT), bytes: bytes };
+    let res = parse_result(app_http("POST",
+        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", tok, body));
+    res.bytes = bytes;
+    return res;
+};
+
+cmd_chats = function(opts) {
+    let cfg = load_cfg(opts);
+    if (!length(cfg.app_id) || !length(cfg.app_secret)) {
+        print("请先配置 app_id / app_secret：\n  uci set traffic-stats.feishu.app_id=cli_xxx\n  uci set traffic-stats.feishu.app_secret=xxx\n  uci commit traffic-stats\n");
+        return 2;
+    }
+    let tok = app_token(cfg);
+    if (!length(tok)) {
+        print("tenant_access_token 获取失败：检查 app_id/app_secret 与出网\n");
+        return 2;
+    }
+    let r = app_http("GET", "https://open.feishu.cn/open-apis/im/v1/chats?page_size=50", tok, "");
+    let j = null;
+    try { j = json(r.body); } catch (e) { j = null; }
+    if (j == null || type(j) != "object" || intv(j.code) != 0) {
+        print(sprintf("查询群列表失败：HTTP %d %s\n", r.http, cut(r.body, 200)));
+        return 2;
+    }
+    let items = (j.data != null && j.data.items != null) ? j.data.items : [];
+    if (!length(items)) {
+        print("机器人还没有被加入任何群。请先把机器人拉进群（扫码或搜索应用名）。\n");
+        return 3;
+    }
+    for (let it in items)
+        printf("%s\t%s\n", it.chat_id, it.name);
+    return 0;
+};
+
 deliver = function(cfg, req) {
+    /* 配了自建应用三件套就走 API，否则回落到群机器人 webhook */
+    if (length(cfg.app_id) && length(cfg.app_secret) && length(cfg.chat_id))
+        return deliver_app(cfg, req);
     let ts = sprintf("%d", time());
     let sign = length(cfg.secret) ? hmac_sign(ts, cfg.secret) : "";
     if (length(cfg.secret) && !length(sign))
@@ -939,6 +1061,23 @@ process_retries = function(cfg, force) {
     let dir = queue_dir();
     if (!fs.access(dir))
         return 0;
+
+    // 回收崩溃/被杀进程留下的 .processing 条目（10 分钟后仍无人处理就放回队列）
+    let stale = fs.lsdir(dir);
+    if (type(stale) == "array") {
+        for (let f in stale) {
+            if (!match(f, /^q-.*\.json\.processing$/))
+                continue;
+            let cp = dir + "/" + f;
+            let st = fs.stat(cp);
+            if (st && time() - st.mtime > 600) {
+                let back = substr(cp, 0, length(cp) - length(".processing"));
+                if (fs.rename(cp, back))
+                    log("WARN", "回收超时的重试条目：" + back);
+            }
+        }
+    }
+
     let files = fs.lsdir(dir);
     if (type(files) != "array")
         return 0;
@@ -951,6 +1090,8 @@ process_retries = function(cfg, force) {
         let p = dir + "/" + f;
         let e = read_json(p);
         if (e == null || type(e) != "object" || type(e.req) != "object") {
+            if (!fs.access(p))
+                continue;               // 已被其他进程认领，不是损坏
             log("WARN", "丢弃损坏的重试条目：" + p);
             try { fs.unlink(p); } catch (x) { }
             continue;
@@ -959,10 +1100,21 @@ process_retries = function(cfg, force) {
             pending++;
             continue;
         }
+
+        // 先改名认领，避免 daily 与后台 worker 同时处理同一条
+        let claim = p + ".processing";
+        if (!fs.rename(p, claim))
+            continue;
+        e = read_json(claim);
+        if (e == null || type(e) != "object" || type(e.req) != "object") {
+            try { fs.unlink(claim); } catch (x) { }
+            continue;
+        }
+
         let attempts = intv(e.attempts);
         let res = deliver(cfg, e.req);
         if (res.ok) {
-            try { fs.unlink(p); } catch (x) { }
+            try { fs.unlink(claim); } catch (x) { }
             log("INFO", sprintf("重试成功（第 %d 次尝试，%d 字节）：%s", attempts + 1, res.bytes, e.desc));
         } else {
             log("WARN", sprintf("重试失败（第 %d 次尝试）：http=%s code=%s %s（%s）",
@@ -970,12 +1122,14 @@ process_retries = function(cfg, force) {
             if (res.retryable && attempts < MAX_RETRIES) {
                 e.attempts = attempts + 1;
                 e.next_at = time() + RETRY_DELAYS[e.attempts - 1];
-                if (write_atomic(p, jstr(e)))
+                if (write_atomic(claim, jstr(e)) && fs.rename(claim, p)) {
                     pending++;
-                else
-                    log("ERROR", "更新重试队列失败：" + p);
+                } else {
+                    log("ERROR", "回写重试条目失败，保留为 " + claim);
+                    pending++;
+                }
             } else {
-                try { fs.unlink(p); } catch (x) { }
+                try { fs.unlink(claim); } catch (x) { }
                 log("ERROR", sprintf("放弃重试（%s）：%s",
                     res.retryable ? "重试次数用尽" : "错误不可重试：" + code_help(res.code), e.desc));
             }
@@ -1790,6 +1944,8 @@ else if (opts.cmd == "status")
     rc = cmd_status(opts);
 else if (opts.cmd == "sign")
     rc = cmd_sign(opts);
+else if (opts.cmd == "chats")
+    rc = cmd_chats(opts);
 else if (opts.cmd == "_retry-worker")
     rc = retry_worker();
 else if (opts.cmd == "help" || opts.cmd == "--help")

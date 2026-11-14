@@ -482,7 +482,7 @@ return view.extend({
 				this.setStatus(_('服务已重启'), false);
 			else
 				this.setStatus(_('重启失败：') + ((res != null && res.error != null) ? res.error : _('未知原因')), true);
-		}).catch(function(e) {
+		}.bind(this)).catch(function(e) {
 			this.setStatus(_('重启失败：') + ((e != null && e.message) ? e.message : ('' + e)), true);
 		}.bind(this));
 	},

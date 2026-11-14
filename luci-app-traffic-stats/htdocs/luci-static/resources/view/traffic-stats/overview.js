@@ -78,24 +78,6 @@ function pad2(n) {
 	return (n < 10 ? '0' : '') + n;
 }
 
-function fmtTime(ts) {
-	var t = num(ts);
-
-	if (!t) return '—';
-
-	var diff = Math.floor(Date.now() / 1000) - t;
-
-	if (diff < 0) diff = 0;
-	if (diff < 5) return _('刚刚');
-	if (diff < 60) return diff + ' ' + _('秒前');
-	if (diff < 3600) return Math.floor(diff / 60) + ' ' + _('分钟前');
-
-	var d = new Date(t * 1000);
-
-	return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
-		' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
-}
-
 function fmtClock(ts) {
 	var t = num(ts);
 
@@ -112,6 +94,17 @@ function shorten(text, max) {
 	if (s.length <= max) return s;
 
 	return s.substring(0, max - 1) + '…';
+}
+
+function healthLook(confidence) {
+	var conf = '' + (confidence == null ? 'unknown' : confidence);
+
+	if (conf == 'exact')
+		return { color: '#2e7d32', bg: 'rgba(76,175,80,.12)', label: _('记账精确') };
+	if (conf == 'degraded')
+		return { color: '#e65100', bg: 'rgba(255,152,0,.14)', label: _('记账降级') };
+
+	return { color: '#c62828', bg: 'rgba(198,40,40,.12)', label: _('记账状态未知') };
 }
 
 function deviceName(dev) {
@@ -211,111 +204,127 @@ return view.extend({
 
 	renderStatusLine: function(state) {
 		var running = (state != null) && (state.running === true);
-		var ts = state != null ? state.ts : 0;
 
 		this.updatedNode = E('span', {}, '');
+		this.runningBadge = E('span', {
+			'class': 'label',
+			style: 'display:inline-block;padding:1px 8px;border-radius:4px;margin-right:8px;color:#fff;background:' +
+				(running ? '#4caf50' : '#c62828')
+		}, running ? _('服务运行中') : _('服务未运行'));
+		this.dataTimeNode = E('span', {}, '');
 
 		return E('p', { style: 'margin:0 0 10px 0;font-size:12px;opacity:.85' }, [
-			E('span', {
-				'class': 'label',
-				style: 'display:inline-block;padding:1px 8px;border-radius:4px;margin-right:8px;color:#fff;background:' +
-					(running ? '#4caf50' : '#c62828')
-			}, running ? _('服务运行中') : _('服务未运行')),
+			this.runningBadge,
 			this.updatedNode,
 			' · ',
-			E('span', {}, _('数据时间') + ' ' + fmtClock(ts))
+			this.dataTimeNode
 		]);
+	},
+
+	updateStatusLine: function(state) {
+		var running = (state != null) && (state.running === true);
+
+		if (this.runningBadge != null) {
+			this.runningBadge.textContent = running ? _('服务运行中') : _('服务未运行');
+			this.runningBadge.style.background = running ? '#4caf50' : '#c62828';
+		}
+
+		if (this.dataTimeNode != null)
+			this.dataTimeNode.textContent = _('数据时间') + ' ' + fmtClock(state != null ? state.ts : 0);
 	},
 
 	renderHealth: function(state, health) {
 		var h = health || {};
-		var conf = ('' + (h.accounting_confidence || 'unknown'));
-		var reasons = Array.isArray(h.reasons) ? h.reasons : [];
-		var styles = {
-			exact: { color: '#2e7d32', bg: 'rgba(76,175,80,.12)', label: _('记账精确') },
-			degraded: { color: '#e65100', bg: 'rgba(255,152,0,.14)', label: _('记账降级') },
-			unknown: { color: '#c62828', bg: 'rgba(198,40,40,.12)', label: _('记账状态未知') }
-		};
-		var look = styles[conf] || styles.unknown;
+		var look = healthLook(h.accounting_confidence);
 		var source = (state != null && state.source && typeof state.source == 'object') ? state.source : {};
 
-		var bits = [
-			_('数据源') + ' clash=' + (source.clash || 'unknown') + ', conntrack=' + (source.conntrack || 'unknown'),
-			_('conntrack 条目') + ' ' + num(h.conntrack_count),
-			_('clash 连接') + ' ' + num(h.clash_connections),
-			_('clash 轮询') + ' ' + num(h.clash_poll_ms) + ' ms'
-		];
-
-		return E('div', {
+		this.healthBox = E('div', {
 			style: 'padding:10px 14px;margin-bottom:16px;border-left:4px solid ' + look.color +
 				';border-radius:6px;background:' + look.bg
 		}, [
 			E('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, [
-				E('strong', { style: 'color:' + look.color }, look.label),
-				E('span', { style: 'font-size:12px;opacity:.8' }, bits.join(' · '))
+				this.healthLabel = E('strong', { style: 'color:' + look.color }, look.label),
+				this.healthBits = E('span', { style: 'font-size:12px;opacity:.8' }, '')
 			]),
-			reasons.length ? E('ul', {
-				style: 'margin:8px 0 0 0;padding-left:20px;font-size:12px'
-			}, reasons.map(function(reason) {
-				return E('li', {}, '' + reason);
-			})) : ''
+			this.healthReasons = E('ul', { style: 'margin:8px 0 0 0;padding-left:20px;font-size:12px' }, '')
 		]);
+
+		return this.healthBox;
+	},
+
+	updateHealth: function(state) {
+		var h = (state != null && state.health) ? state.health : {};
+		var source = (state != null && state.source && typeof state.source == 'object') ? state.source : {};
+		var look = healthLook(h.accounting_confidence);
+		var reasons = Array.isArray(h.reasons) ? h.reasons : [];
+
+		if (this.healthBox == null || this.healthLabel == null) return;
+
+		this.healthBox.style.borderLeftColor = look.color;
+		this.healthBox.style.background = look.bg;
+		this.healthLabel.style.color = look.color;
+		this.healthLabel.textContent = look.label;
+		this.healthBits.textContent = [
+			_('数据源') + ' clash=' + (source.clash || 'unknown') + ', conntrack=' + (source.conntrack || 'unknown'),
+			_('conntrack 条目') + ' ' + num(h.conntrack_count),
+			_('clash 连接') + ' ' + num(h.clash_connections),
+			_('clash 轮询') + ' ' + num(h.clash_poll_ms) + ' ms'
+		].join(' · ');
+
+		dom.content(this.healthReasons, reasons.map(function(reason) {
+			return E('li', {}, '' + reason);
+		}));
 	},
 
 	renderCards: function(state) {
-		var totals = state.totals || {};
 		var self = this;
 
-		function rxTx(rx, tx) {
+		/* 副行统一用 cell()，这样 5s 刷新时数字会跟着动 */
+		function fromTotals(render) {
 			return E('div', { style: 'font-size:12px;opacity:.75' }, [
-				'↓ ', self.cell(function() { return fmtBytes(rx); }),
-				' · ↑ ', self.cell(function() { return fmtBytes(tx); })
+				self.cell(function(s) { return render(s.totals || {}); })
 			]);
 		}
 
-		function card(title, valueRender, subRender, title2) {
-			var valueNode = self.cell(valueRender, { style: 'display:block;font-size:21px;font-weight:600;line-height:1.35' });
+		function rxTx(field) {
+			return E('div', { style: 'font-size:12px;opacity:.75' }, [
+				'↓ ', self.cell(function(s) { return fmtBytes(num((s.totals || {})[field + '_rx'])); }),
+				' · ↑ ', self.cell(function(s) { return fmtBytes(num((s.totals || {})[field + '_tx'])); })
+			]);
+		}
 
+		function card(title, valueRender, subNode, title2) {
 			return E('div', {
 				style: 'flex:1 1 200px;min-width:170px;padding:12px 14px;border-radius:8px;' +
 					'background:rgba(127,127,127,.08);border:1px solid rgba(127,127,127,.18)'
 			}, [
 				E('div', { style: 'font-size:12px;opacity:.75', title: title2 || null }, title),
-				valueNode,
-				subRender()
+				E('div', { style: 'font-size:21px;font-weight:600;line-height:1.35' }, self.cell(valueRender)),
+				subNode
 			]);
 		}
 
 		return E('div', { style: 'display:flex;gap:12px;flex-wrap:wrap;margin-bottom:18px' }, [
 			card(_('总流量'),
 				function(s) { return fmtBytes(totalOf(s.totals)); },
-				function() {
-					return E('div', { style: 'font-size:12px;opacity:.75' }, [
-						'↓ ', self.cell(function(s) {
-							return fmtBytes(num((s.totals || {}).proxy_rx) + num((s.totals || {}).direct_rx));
-						}),
-						' · ↑ ', self.cell(function(s) {
-							return fmtBytes(num((s.totals || {}).proxy_tx) + num((s.totals || {}).direct_tx));
-						})
-					]);
-				}),
+				fromTotals(function(t) {
+					return '↓ ' + fmtBytes(num(t.proxy_rx) + num(t.direct_rx)) +
+						' · ↑ ' + fmtBytes(num(t.proxy_tx) + num(t.direct_tx));
+				})),
 			card(_('代理流量'),
 				function(s) { return fmtBytes(num((s.totals || {}).proxy_rx) + num((s.totals || {}).proxy_tx)); },
-				function() { return rxTx(num(totals.proxy_rx), num(totals.proxy_tx)); }),
+				rxTx('proxy')),
 			card(_('直连流量'),
 				function(s) { return fmtBytes(num((s.totals || {}).direct_rx) + num((s.totals || {}).direct_tx)); },
-				function() { return rxTx(num(totals.direct_rx), num(totals.direct_tx)); }),
-			card(_('实时速率'), function(s) {
-				return fmtRateBits(num((s.totals || {}).rx_rate));
-			}, function() {
-				return E('div', { style: 'font-size:12px;opacity:.75' }, [
+				rxTx('direct')),
+			card(_('实时速率'),
+				function(s) { return fmtRateBits(num((s.totals || {}).rx_rate)); },
+				E('div', { style: 'font-size:12px;opacity:.75' }, [
 					'↑ ', self.cell(function(s) { return fmtRateBits(num((s.totals || {}).tx_rate)); }),
 					' · ',
-					self.cell(function(s) {
-						return '↓ ' + fmtRateBytes(num((s.totals || {}).rx_rate));
-					})
-				]);
-			}, _('速率按 Mb/s（bits）；括号/下方是十进制 MB/s'))
+					self.cell(function(s) { return '↓ ' + fmtRateBytes(num((s.totals || {}).rx_rate)); })
+				]),
+				_('速率按 Mb/s（bits）；同一行的 MB/s 是十进制字节速率'))
 		]);
 	},
 
@@ -426,7 +435,6 @@ return view.extend({
 	},
 
 	renderTopApps: function(state, apps, total) {
-		var self = this;
 		var top = apps.slice().sort(function(a, b) {
 			return (num(b.rx) + num(b.tx)) - (num(a.rx) + num(a.tx));
 		}).slice(0, 5);
@@ -472,7 +480,6 @@ return view.extend({
 	},
 
 	renderTopDevices: function(state, devices) {
-		var self = this;
 		var top = devices.slice().sort(function(a, b) {
 			return (num(b.direct_rx) + num(b.direct_tx) + num(b.proxy_rx) + num(b.proxy_tx)) -
 				(num(a.direct_rx) + num(a.direct_tx) + num(a.proxy_rx) + num(a.proxy_tx));
@@ -519,8 +526,8 @@ return view.extend({
 	// ------------------------------------------------------------ 增量刷新
 
 	/* 记录所有需要随刷新更新的文本节点 */
-	cell: function(render) {
-		var node = E('span', {}, '—');
+	cell: function(render, attrs) {
+		var node = E('span', attrs || {}, '—');
 
 		this.cells.push({ node: node, render: render });
 
@@ -537,6 +544,9 @@ return view.extend({
 
 		if (this.updatedNode != null)
 			this.updatedNode.textContent = _('更新于') + ' ' + fmtClock(Date.now() / 1000);
+
+		this.updateStatusLine(state);
+		this.updateHealth(state);
 	},
 
 	startRefresh: function() {

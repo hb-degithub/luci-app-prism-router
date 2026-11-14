@@ -17,6 +17,8 @@
  *   TRAFFIC_STATS_STATE_DIR  覆盖 /tmp/traffic-stats
  *   TRAFFIC_STATS_DAILY_DIR  覆盖 /etc/traffic-stats/daily
  *   TRAFFIC_STATS_ONCE=1     只跑一轮、写完文件后退出（用于冒烟测试）
+ *   TRAFFIC_STATS_CONNTRACK_FILE  覆盖 /proc/net/nf_conntrack（合成数据自测用）
+ *   TRAFFIC_STATS_CLASH_API  覆盖 clash_api（自测用）
  *   TRAFFIC_STATS_DEBUG=1    详细日志输出到 stderr
  */
 
@@ -32,15 +34,28 @@ const CONNTRACK_FILE = '/proc/net/nf_conntrack';
 
 /* 资源上限：家庭网关上远达不到，仅用于保证长时间运行内存有界（SPEC §8.7） */
 const MAX_TRACK_DEVICES = 256;    /* 内部跟踪的设备数上限 */
-const MAX_OUT_DEVICES = 40;      /* state.json 输出上限（SPEC §3） */
+const MAX_OUT_DEVICES = 200;      /* state.json 输出上限（SPEC §3） */
 const MAX_DEV_APPS = 96;          /* 每设备跟踪的 host 数上限 */
-const MAX_DEV_APPS_OUT = 15;      /* 每设备输出 Top N（SPEC §3） */
+const MAX_DEV_APPS_OUT = 30;      /* 每设备输出 Top N（SPEC §3） */
 const MAX_GLOBAL_APPS = 512;      /* 全局跟踪的 host 数上限 */
-const MAX_OUT_APPS = 40;          /* apps 数组输出条数 */
+const MAX_OUT_APPS = 50;          /* apps 数组输出条数 */
 const MAX_DAY_APPS = 512;         /* 当日应用累计上限 */
 const MAX_BUCKET_APPS = 256;      /* 单个 5 分钟桶内的应用数上限 */
 const BUCKET_SECONDS = 300;       /* 5 分钟桶（SPEC §4） */
 const TOP_PER_BUCKET = 10;
+const HISTORY_FLUSH_SECONDS = 60; /* history.json 最少刷新间隔 */
+const DAILY_RETRY_SECONDS = 600;  /* daily 目录写失败后的重试间隔 */
+const DAILY_WRITE_SECONDS = 300;  /* daily 文件最短落盘间隔：/etc 在闪存上，别每轮都写 */
+
+/*
+ * ucode 不做函数提升：被调用者必须先于调用者定义。
+ * 下面这些函数在源码里是后置定义的，先用 let 建好绑定，避免编译期解析不到。
+ */
+let store_evict, evict_device, elapsed_ms, node_add, day_dev_add, poll_dev_add;
+
+/* ------------------------------------------------------------------ *
+ * 基础工具
+ * ------------------------------------------------------------------ */
 
 function str(v) {
 	if (v == null) return '';
@@ -57,10 +72,20 @@ function to_int(v, dflt) {
 	return n;
 }
 
+/** 去掉首尾空白，让 health.reasons 干净可读 */
+function trim(s) {
+	s = str(s);
+	let a = 0, b = length(s);
+	while (a < b && index(" \t\r\n", substr(s, a, 1)) >= 0) a++;
+	while (b > a && index(" \t\r\n", substr(s, b - 1, 1)) >= 0) b--;
+	return substr(s, a, b - a);
+}
+
 function clamp(v, lo, hi) {
 	return v < lo ? lo : (v > hi ? hi : v);
 }
 
+/** 按空白切分并丢弃空 token（conntrack / dhcp.leases 都需要） */
 function split_ws(s) {
 	let out = [];
 	for (let t in split(s, ' ')) {
@@ -69,6 +94,7 @@ function split_ws(s) {
 	return out;
 }
 
+/** 按空格或逗号切分（配置里的 CIDR 列表） */
 function split_list(s) {
 	let out = [];
 	for (let t in split(replace(str(s), ',', ' '), ' ')) {
@@ -77,6 +103,7 @@ function split_list(s) {
 	return out;
 }
 
+/** URI 清洗：去掉 shell 元字符与引号，防止拼进命令行时被注入 */
 function sanitize_uri(s) {
 	let bad = " \t\n\r\"'\\`$;&|<>(){}*?!";
 	let out = '';
@@ -88,6 +115,7 @@ function sanitize_uri(s) {
 	return out;
 }
 
+/** curl 配置文件里的值：只去掉会破坏 "header = \\"...\\"" 的字符 */
 function sanitize_secret(s) {
 	let out = '';
 	for (let i = 0; i < length(s); i++) {
@@ -106,24 +134,15 @@ function new_store() {
 	return { rx: 0, tx: 0, chain: '', chain_rx: {}, devs: {} };
 }
 
-function store_evict(store) {
-	let worst = null, worst_v = null;
-	for (let k in store) {
-		let v = store[k].rx + store[k].tx;
-		if (worst_v == null || v < worst_v) {
-			worst_v = v;
-			worst = k;
-		}
-	}
-	if (worst != null) delete store[worst];
-}
-
+/** 记录一条 host 流量；chain 取 rx 最大的那条链路 */
 function store_add(store, host, chain, rx, tx, ip, cap) {
 	let a = store[host];
 	if (a == null) {
 		a = new_store();
 		a.chain = chain;
 		store[host] = a;
+		/* 只在新建条目时检查容量：length() 是 O(n)，不能放在每条流的热路径上 */
+		if (cap > 0 && length(store) > cap) store_evict(store);
 	}
 	a.rx += rx;
 	a.tx += tx;
@@ -137,9 +156,25 @@ function store_add(store, host, chain, rx, tx, ip, cap) {
 	}
 	a.chain = best;
 	if (ip != null && ip != '') a.devs[ip] = 1;
-	if (cap > 0 && length(store) > cap) store_evict(store);
 	return a;
 }
+
+/** 超过上限时淘汰流量最小的一条，避免长时间运行无限增长 */
+store_evict = function(store) {
+	let worst = null, worst_v = null;
+	for (let k in store) {
+		let v = store[k].rx + store[k].tx;
+		if (worst_v == null || v < worst_v) {
+			worst_v = v;
+			worst = k;
+		}
+	}
+	if (worst != null) delete store[worst];
+};
+
+/* ------------------------------------------------------------------ *
+ * 文件系统
+ * ------------------------------------------------------------------ */
 
 function mkpath(dir) {
 	if (dir == null || dir == '' || dir == '/') return true;
@@ -150,6 +185,7 @@ function mkpath(dir) {
 	return fs.stat(dir) != null;
 }
 
+/** 原子写：同目录临时文件 + rename（SPEC §8.7 不允许半截文件） */
 function atomic_write(path, text) {
 	let tmp = path + '.tmp';
 	let n = fs.writefile(tmp, text);
@@ -184,6 +220,10 @@ function unlink_quiet(list) {
 		}
 	}
 }
+
+/* ------------------------------------------------------------------ *
+ * JSON 编码（ucode 的 %J 带空格，这里输出紧凑格式，与契约示例一致）
+ * ------------------------------------------------------------------ */
 
 function jstr(s) {
 	let out = '"';
@@ -229,6 +269,10 @@ function jenc(v) {
 	}
 	return 'null';
 }
+
+/* ------------------------------------------------------------------ *
+ * IPv4 / CIDR
+ * ------------------------------------------------------------------ */
 
 function ipv4_int(s) {
 	let p = split(str(s), '.');
@@ -277,6 +321,7 @@ function cidr_match(cidrs, ip) {
 	return false;
 }
 
+/** "192.168.100.1" + "255.255.255.0" -> "192.168.100.0/24" */
 function cidr_from_ip_mask(ip, mask) {
 	let n = ipv4_int(ip);
 	if (n == null) return null;
@@ -289,6 +334,10 @@ function cidr_from_ip_mask(ip, mask) {
 		int(net / 256) % 256,
 		net % 256, bits);
 }
+
+/* ------------------------------------------------------------------ *
+ * 配置（UCI: /etc/config/traffic-stats，缺省时全部走默认值）
+ * ------------------------------------------------------------------ */
 
 function cfg_str(cur, pkg, sec, opt, dflt) {
 	let v = null;
@@ -317,16 +366,15 @@ function load_config(cur) {
 		c.clash_secret = cfg_str(cur, 'openclash', 'config', 'dashboard_password', '');
 	}
 
-	c.feishu_enabled = to_int(cfg_str(cur, 'traffic-stats', 'feishu', 'enabled', '0'), 0) != 0;
-	c.feishu_webhook = cfg_str(cur, 'traffic-stats', 'feishu', 'webhook', '');
-	c.feishu_secret = cfg_str(cur, 'traffic-stats', 'feishu', 'secret', '');
-	c.feishu_daily_time = cfg_str(cur, 'traffic-stats', 'feishu', 'daily_time', '08:30');
-	c.feishu_chat_enabled = to_int(cfg_str(cur, 'traffic-stats', 'feishu', 'report_chat_enabled', '1'), 1) != 0;
 
 	let sd = getenv('TRAFFIC_STATS_STATE_DIR');
 	c.state_dir = (sd != null && sd != '') ? sd : STATE_DIR_DEFAULT;
 	let dd = getenv('TRAFFIC_STATS_DAILY_DIR');
 	c.daily_dir = (dd != null && dd != '') ? dd : DAILY_DIR_DEFAULT;
+	let cf = getenv('TRAFFIC_STATS_CONNTRACK_FILE');
+	c.conntrack_file = (cf != null && cf != '') ? cf : CONNTRACK_FILE;
+	let ca = getenv('TRAFFIC_STATS_CLASH_API');
+	if (ca != null && ca != '') c.clash_api = ca;
 	c.debug = getenv('TRAFFIC_STATS_DEBUG') != null;
 	c.once = (getenv('TRAFFIC_STATS_ONCE') != null);
 
@@ -346,6 +394,11 @@ function dbg(ctx, msg) {
 	if (ctx != null && ctx.cfg != null && ctx.cfg.debug) warn('traffic-statsd: ' + msg + '\n');
 }
 
+/* ------------------------------------------------------------------ *
+ * LAN / fake-ip 网段识别
+ * ------------------------------------------------------------------ */
+
+/** 解析 `ip -4 -o addr show` -> { ifname: [ "a.b.c.d/len", ... ] } */
 function read_if_addrs() {
 	let out = {};
 	let txt = null;
@@ -369,6 +422,7 @@ function read_if_addrs() {
 	return out;
 }
 
+/** LAN 网段：优先 config 里的 lan_ranges，其次 firewall lan zone 的网络，最后兜底 */
 function detect_lan_cidrs(cur, cfg) {
 	let raw = [];
 	if (length(cfg.lan_ranges) > 0) {
@@ -434,6 +488,10 @@ function detect_lan_cidrs(cur, cfg) {
 	return out;
 }
 
+/* ------------------------------------------------------------------ *
+ * 设备身份：/tmp/dhcp.leases -> { ip: { mac, hostname } }
+ * ------------------------------------------------------------------ */
+
 function load_leases(ctx) {
 	let now = time();
 	if (now - ctx.leases_ts < 30) return;
@@ -462,17 +520,9 @@ function dev_identity(ctx, ip) {
 	return l;
 }
 
-function evict_device(ctx) {
-	let worst = null, worst_v = null;
-	for (let ip in ctx.devices) {
-		let v = ctx.devices[ip].last_seen;
-		if (worst_v == null || v < worst_v) {
-			worst_v = v;
-			worst = ip;
-		}
-	}
-	if (worst != null) delete ctx.devices[worst];
-}
+/* ------------------------------------------------------------------ *
+ * 设备记录
+ * ------------------------------------------------------------------ */
 
 function dev_slot(ctx, ip) {
 	let d = ctx.devices[ip];
@@ -492,17 +542,29 @@ function dev_slot(ctx, ip) {
 	return d;
 }
 
+evict_device = function(ctx) {
+	let worst = null, worst_v = null;
+	for (let ip in ctx.devices) {
+		let v = ctx.devices[ip].last_seen;
+		if (worst_v == null || v < worst_v) {
+			worst_v = v;
+			worst = ip;
+		}
+	}
+	if (worst != null) delete ctx.devices[worst];
+};
+
+/* ------------------------------------------------------------------ *
+ * clash /connections 采集
+ * ------------------------------------------------------------------ */
+
 function clash_url(ctx) {
 	let api = sanitize_uri(ctx.cfg.clash_api);
 	if (index(api, '://') < 0) api = 'http://' + api;
 	return api + '/connections';
 }
 
-function elapsed_ms(t0) {
-	let t1 = clock();
-	return int(((t1[0] - t0[0]) * 1000000000 + (t1[1] - t0[1])) / 1000000);
-}
-
+/** 取一次 /connections；返回 { ok, conns, n, ms, reason } */
 function fetch_clash(ctx) {
 	let t0 = clock();
 	let body = ctx.cfg.state_dir + '/.clash.body';
@@ -539,7 +601,7 @@ function fetch_clash(ctx) {
 	}
 
 	if (http != 200) {
-		let errtext = str(fs.readfile(errf));
+		let errtext = trim(str(fs.readfile(errf)));
 		if (http == 0) {
 			res.reason = 'clash: 无法连接 ' + ctx.cfg.clash_api
 				+ (errtext != '' ? '（' + substr(replace(errtext, '\n', ' '), 0, 90) + '）' : '');
@@ -575,36 +637,22 @@ function fetch_clash(ctx) {
 	return res;
 }
 
-function day_dev_add(ctx, ip, rx, tx) {
-	let d = ctx.day_devices[ip];
-	if (d == null) {
-		d = { rx: 0, tx: 0 };
-		ctx.day_devices[ip] = d;
-	}
-	d.rx += rx;
-	d.tx += tx;
+elapsed_ms = function(t0) {
+	let t1 = clock();
+	return int(((t1[0] - t0[0]) * 1000000000 + (t1[1] - t0[1])) / 1000000);
+};
+
+function ms_between(a, b) {
+	return int(((b[0] - a[0]) * 1000000000 + (b[1] - a[1])) / 1000000);
 }
 
-function node_add(store, node, rx, tx) {
-	let n = store[node];
-	if (n == null) {
-		n = { rx: 0, tx: 0 };
-		store[node] = n;
-	}
-	n.rx += rx;
-	n.tx += tx;
-}
-
-function poll_dev_add(ctx, ip, rx, tx) {
-	let d = ctx.poll_devs[ip];
-	if (d == null) {
-		d = { rx: 0, tx: 0 };
-		ctx.poll_devs[ip] = d;
-	}
-	d.rx += rx;
-	d.tx += tx;
-}
-
+/**
+ * clash 侧增量累计
+ *  - id 是稳定键，用上轮快照做差；连接消失时删除快照（最后一次已知值即已计入）
+ *  - chains[0] == "DIRECT" -> 直连；否则代理，节点名 = chains[0]
+ *  - 域名取 metadata.host，空则用 destinationIP:destinationPort
+ *  - 设备用 metadata.sourceIP
+ */
 function accumulate_clash(ctx, conns) {
 	let seen = {};
 	for (let c in conns) {
@@ -692,20 +740,60 @@ function accumulate_clash(ctx, conns) {
 	}
 }
 
+node_add = function(store, node, rx, tx) {
+	let n = store[node];
+	if (n == null) {
+		n = { rx: 0, tx: 0 };
+		store[node] = n;
+	}
+	n.rx += rx;
+	n.tx += tx;
+};
+
+day_dev_add = function(ctx, ip, rx, tx) {
+	let d = ctx.day_devices[ip];
+	if (d == null) {
+		d = { rx: 0, tx: 0 };
+		ctx.day_devices[ip] = d;
+	}
+	d.rx += rx;
+	d.tx += tx;
+};
+
+poll_dev_add = function(ctx, ip, rx, tx) {
+	let d = ctx.poll_devs[ip];
+	if (d == null) {
+		d = { rx: 0, tx: 0 };
+		ctx.poll_devs[ip] = d;
+	}
+	d.rx += rx;
+	d.tx += tx;
+};
+
+/* ------------------------------------------------------------------ *
+ * conntrack 采集
+ * ------------------------------------------------------------------ */
+
 function fetch_conntrack(ctx) {
 	let txt = null;
 	try {
-		txt = fs.readfile(CONNTRACK_FILE);
+		txt = fs.readfile(ctx.cfg.conntrack_file);
 	} catch (e) {
 		txt = null;
 	}
 	if (txt == null) {
 		return { ok: false, text: null,
-			reason: 'conntrack: 无法读取 ' + CONNTRACK_FILE + '（模块未加载或无权限），直连流量无法统计' };
+			reason: 'conntrack: 无法读取 ' + ctx.cfg.conntrack_file + '（模块未加载或无权限），直连流量无法统计' };
 	}
 	return { ok: true, text: txt, reason: '' };
 }
 
+/**
+ * 解析单行 conntrack。
+ * 一行里有两组 "src=.. dst=.. sport=.. dport=.. packets=.. bytes=.."，
+ * 第一组是原始方向，第二组是应答方向。
+ * 为了性能这里不对 token 做 split(tok,"=")，只按前缀取需要的字段。
+ */
 function parse_ct_line(line) {
 	let toks = split_ws(line);
 	if (length(toks) < 8) return null;
@@ -716,20 +804,23 @@ function parse_ct_line(line) {
 	let groups = [];
 	let cur = null;
 	for (let tk in toks) {
-		if (substr(tk, 0, 4) == 'src=') {
-			cur = {};
-			push(groups, cur);
+		let c0 = substr(tk, 0, 1);
+		if (c0 == 's') {
+			if (substr(tk, 0, 4) == 'src=') {
+				cur = { src: substr(tk, 4) };
+				push(groups, cur);
+			} else if (cur != null && substr(tk, 0, 6) == 'sport=') {
+				cur.sport = substr(tk, 6);
+			}
+		} else if (c0 == 'd') {
+			if (cur == null) continue;
+			if (substr(tk, 0, 4) == 'dst=') cur.dst = substr(tk, 4);
+			else if (substr(tk, 0, 6) == 'dport=') cur.dport = substr(tk, 6);
+		} else if (c0 == 'b') {
+			if (cur != null && substr(tk, 0, 6) == 'bytes=') cur.bytes = to_int(substr(tk, 6), 0);
+		} else if (c0 == 'p') {
+			if (cur != null && substr(tk, 0, 8) == 'packets=') cur.packets = to_int(substr(tk, 8), 0);
 		}
-		if (cur == null) continue;
-		let kv = split(tk, '=');
-		if (length(kv) != 2) continue;
-		let k = kv[0];
-		if (k == 'src') cur.src = kv[1];
-		else if (k == 'dst') cur.dst = kv[1];
-		else if (k == 'sport') cur.sport = kv[1];
-		else if (k == 'dport') cur.dport = kv[1];
-		else if (k == 'packets') cur.packets = to_int(kv[1], 0);
-		else if (k == 'bytes') cur.bytes = to_int(kv[1], 0);
 	}
 	if (length(groups) == 0) return null;
 	let orig = groups[0];
@@ -740,6 +831,12 @@ function parse_ct_line(line) {
 	return { family: family, proto: proto, orig: orig, reply: reply };
 }
 
+/**
+ * conntrack 侧增量累计（只处理直连流量）
+ *
+ * 方向统一按“设备视角”：orig 是设备发出的 -> tx，reply 是设备收到的 -> rx；
+ * 若设备是 orig.dst（外网主动连入），则反过来。
+ */
 function accumulate_conntrack(ctx, text) {
 	let seen = {};
 	let total = 0;
@@ -747,6 +844,12 @@ function accumulate_conntrack(ctx, text) {
 	for (let line in split(text, '\n')) {
 		if (line == '') continue;
 		total++;
+		/* 粗筛：orig 里必须出现 LAN 网段前缀才值得解析，能省掉一大半 tokenize */
+		let maybe = false;
+		for (let pfx in ctx.lan_prefixes) {
+			if (index(line, pfx) >= 0) { maybe = true; break; }
+		}
+		if (!maybe) continue;
 		let flow = parse_ct_line(line);
 		if (flow == null) continue;
 
@@ -773,6 +876,9 @@ function accumulate_conntrack(ctx, text) {
 
 		/* LAN 内部互访不计入设备直连，避免把内网流量当外网用量 */
 		if (dir == 1 && odst != null && cidr_match(ctx.lan_cidrs, odst)) continue;
+
+		/* 组播/广播不是外网用量（mDNS、SSDP 之类） */
+		if (odst != null && (odst >= 0xe0000000 || odst == 0xffffffff)) continue;
 
 		let key = flow.proto + '|' + o.src + '|' + str(o.sport) + '|' + o.dst + '|' + str(o.dport);
 		seen[key] = 1;
@@ -827,6 +933,10 @@ function accumulate_conntrack(ctx, text) {
 		if (seen[key] == null) delete ctx.ct_prev[key];
 	}
 }
+
+/* ------------------------------------------------------------------ *
+ * 5 分钟桶 / history.json（SPEC §4）
+ * ------------------------------------------------------------------ */
 
 function local_day_str(ts) {
 	let t = localtime(ts);
@@ -914,6 +1024,10 @@ function history_flush(ctx, force) {
 	if (!ok) dbg(ctx, 'write history.json failed: ' + str(fs.error()));
 }
 
+/* ------------------------------------------------------------------ *
+ * 每日汇总（/etc/traffic-stats/daily/YYYY-MM-DD.json）
+ * ------------------------------------------------------------------ */
+
 function day_summary(ctx) {
 	let devices = [];
 	for (let ip in ctx.day_devices) {
@@ -952,7 +1066,10 @@ function day_summary(ctx) {
 }
 
 function daily_write(ctx, force) {
-	if (!force && ctx.daily_fail_ts > 0 && ctx.now - ctx.daily_fail_ts < DAILY_RETRY_SECONDS) return;
+	if (!force) {
+		if (ctx.daily_fail_ts > 0 && ctx.now - ctx.daily_fail_ts < DAILY_RETRY_SECONDS) return;
+		if (ctx.last_daily_write > 0 && ctx.now - ctx.last_daily_write < DAILY_WRITE_SECONDS) return;
+	}
 	if (!mkpath(ctx.cfg.daily_dir)) {
 		ctx.daily_fail_ts = ctx.now;
 		return;
@@ -962,6 +1079,7 @@ function daily_write(ctx, force) {
 		return;
 	}
 	ctx.daily_fail_ts = 0;
+	ctx.last_daily_write = ctx.now;
 }
 
 function daily_prune(ctx) {
@@ -1006,6 +1124,10 @@ function day_rollover_check(ctx) {
 	ctx.last_history_flush = 0;
 	daily_prune(ctx);
 }
+
+/* ------------------------------------------------------------------ *
+ * state.json 组装（SPEC §3）
+ * ------------------------------------------------------------------ */
 
 function device_apps_out(apps) {
 	let list = [];
@@ -1098,136 +1220,9 @@ function build_state(ctx) {
 	};
 }
 
-function fmt_bytes(n) {
-	n = to_int(n, 0);
-	if (n < 1024) return n + ' B';
-	if (n < 1048576) return sprintf('%d.%d KB', int(n / 1024), int(n % 1024 / 102));
-	if (n < 1073741824) return sprintf('%d.%d MB', int(n / 1048576), int(n % 1048576 / 104858));
-	return sprintf('%d.%d GB', int(n / 1073741824), int(n % 1073741824 / 107374183));
-}
-
-function feishu_payload(ctx) {
-	let sum = day_summary(ctx);
-	let top_devs = slice(sum.devices, 0, 10);
-	let rows = [];
-	for (let d in top_devs) {
-		let name = d.hostname != '' ? d.hostname : (d.ip != '' ? d.ip : d.mac);
-		push(rows, [name, fmt_bytes(d.rx), fmt_bytes(d.tx), fmt_bytes(d.rx + d.tx)]);
-	}
-
-	let total_rx = sum.totals.rx, total_tx = sum.totals.tx;
-	let bytes = [];
-	let n = 0;
-	for (let b in ctx.buckets) {
-		if (n >= 24) break;
-		push(bytes, fmt_bytes(b.proxy_rx + b.direct_rx + b.proxy_tx + b.direct_tx));
-		n++;
-	}
-	let recent = length(bytes) > 0 ? join(' / ', bytes) : '（暂无数据）';
-
-	return {
-		schema: '2.0',
-		config: { wide_screen_mode: true },
-		header: {
-			template: 'blue',
-			title: { tag: 'plain_text', content: '流量日报 ' + sum.day }
-		},
-		body: {
-			elements: [
-				{ tag: 'div', text: { tag: 'lark_md',
-					content: '**总流量（下行 / 上行）**：' + fmt_bytes(total_rx) + ' / ' + fmt_bytes(total_tx)
-						+ '\n**代理流量**：' + fmt_bytes(sum.totals.proxy_rx + sum.totals.proxy_tx)
-						+ '\n**直连流量**：' + fmt_bytes(sum.totals.direct_rx + sum.totals.direct_tx)
-						+ '\n**在线设备数**：' + length(sum.devices) } },
-				{ tag: 'div', text: { tag: 'lark_md',
-					content: '**近 24 小时每 5 分钟总流量**：\n' + recent } },
-				{ tag: 'table', page_size: 10, row_height: 'low',
-					header_style: { text_align: 'left', text_size: 'normal', background_style: 'grey' },
-					columns: [
-						{ name: 'device', display_name: '设备', data_type: 'text', width: 'auto' },
-						{ name: 'direct', display_name: '直连', data_type: 'text', width: 'auto' },
-						{ name: 'proxy', display_name: '代理', data_type: 'text', width: 'auto' },
-						{ name: 'total', display_name: '合计', data_type: 'text', width: 'auto' }
-					],
-					rows: rows },
-				{ tag: 'div', text: { tag: 'plain_text',
-					content: '由 traffic-statsd ' + DAEMON_VERSION + ' 生成 · ' + local_day_str(ctx.now) } }
-			]
-		}
-	};
-}
-
-function hmac_sign_b64(ts, secret) {
-	/* key = timestamp + "\n" + secret，对空串做 HMAC-SHA256，再 Base64 */
-	let key = str(ts) + '\n' + secret;
-	let cmd = "printf '%s' '' | openssl dgst -sha256 -hmac " + shell_quote(key)
-		+ ' -binary | openssl base64 -A';
-	let res = null;
-	try {
-		let p = fs.popen(cmd, 'r');
-		res = p.read('all');
-		p.close();
-	} catch (e) {
-		return null;
-	}
-	if (res == null) return null;
-	res = replace(res, '\n', '');
-	return res == '' ? null : res;
-}
-
-function feishu_send(ctx) {
-	if (ctx.cfg.feishu_webhook == '') return { ok: false, code: -1, msg: '未配置 webhook' };
-	let ts = ctx.now > 0 ? ctx.now : time();
-	let sign = hmac_sign_b64(ts, ctx.cfg.feishu_secret);
-	let doc = {
-		timestamp: str(ts),
-		sign: sign != null ? sign : '',
-		msg_type: 'interactive',
-		card: feishu_payload(ctx)
-	};
-	mkpath(ctx.cfg.state_dir);
-	let file = ctx.cfg.state_dir + '/.feishu.json';
-	let respf = ctx.cfg.state_dir + '/.feishu.resp';
-	if (type(fs.writefile(file, jenc(doc))) != 'int')
-		return { ok: false, code: -1, msg: '无法写临时请求体' };
-
-	let cmd = "curl -sS -m 10 -X POST -H 'Content-Type: application/json' --data-binary @"
-		+ shell_quote(file) + ' -o ' + shell_quote(respf)
-		+ " -w '%{http_code}' " + shell_quote(ctx.cfg.feishu_webhook);
-	let http = 0;
-	try {
-		let p = fs.popen(cmd, 'r');
-		http = to_int(str(p.read('all')), 0);
-		p.close();
-	} catch (e) {
-		http = 0;
-	}
-	let text = fs.readfile(respf);
-	unlink_quiet([file, respf]);
-	if (text == null) return { ok: false, code: http, msg: '无响应（HTTP ' + http + '）' };
-	let o = null;
-	try {
-		o = json(text);
-	} catch (e) {
-		o = null;
-	}
-	if (type(o) != 'object') return { ok: false, code: http, msg: '响应非 JSON: ' + substr(text, 0, 90) };
-	let code = to_int(o.code, -1);
-	return { ok: code == 0, code: code, msg: str(o.msg) };
-}
-
-function feishu_maybe_send(ctx) {
-	if (!ctx.cfg.feishu_enabled) return;
-	if (ctx.cfg.feishu_webhook == '') return;
-	let t = localtime(ctx.now);
-	let hhmm = sprintf('%02d:%02d', t.hour, t.min);
-	let day = local_day_str(ctx.now);
-	if (ctx.feishu_sent_day == day) return;
-	if (hhmm != ctx.cfg.feishu_daily_time) return;
-	ctx.feishu_sent_day = day;
-	let r = feishu_send(ctx);
-	if (!r.ok) dbg(ctx, 'feishu send failed: code=' + r.code + ' msg=' + r.msg);
-}
+/* ------------------------------------------------------------------ *
+ * 一轮采集
+ * ------------------------------------------------------------------ */
 
 function poll(ctx) {
 	let t0 = clock();
@@ -1266,6 +1261,7 @@ function poll(ctx) {
 
 	let reasons = [];
 
+	let t_clash0 = clock();
 	let clash = fetch_clash(ctx);
 	ctx.clash_ms = clash.ms;
 	if (clash.ok) {
@@ -1278,6 +1274,7 @@ function poll(ctx) {
 		push(reasons, clash.reason);
 	}
 
+	let t_clash1 = clock();
 	let ct = fetch_conntrack(ctx);
 	if (ct.ok) {
 		ctx.source.conntrack = 'ok';
@@ -1298,18 +1295,62 @@ function poll(ctx) {
 
 	ctx.reasons = reasons;
 	ctx.poll_ms = elapsed_ms(t0);
+	let t_ct1 = clock();
 
 	let st = build_state(ctx);
 	mkpath(ctx.cfg.state_dir);
 	if (!atomic_write(ctx.cfg.state_dir + '/state.json', jenc(st)))
 		dbg(ctx, 'write state.json failed: ' + str(fs.error()));
 
+	let t_build1 = clock();
+	if (ctx.cfg.debug)
+		dbg(ctx, sprintf('timings clash=%dms ct=%dms build_write=%dms total=%dms',
+			ms_between(t_clash0, t_clash1), ms_between(t_clash1, t_ct1),
+			ms_between(t_ct1, t_build1), ctx.poll_ms));
+
 	history_flush(ctx, false);
 	daily_write(ctx, false);
-	feishu_maybe_send(ctx);
 
 	return st;
 }
+
+/* ------------------------------------------------------------------ *
+ * 飞书日报（SPEC §7；默认 enabled=0）
+ * ------------------------------------------------------------------ */
+
+function hmac_sign_b64(ts, secret) {
+	/* key = timestamp + "\n" + secret，对空串做 HMAC-SHA256，再 Base64 */
+	let key = str(ts) + '\n' + secret;
+	let cmd = "printf '%s' '' | openssl dgst -sha256 -hmac " + shell_quote(key)
+		+ ' -binary | openssl base64 -A';
+	let res = null;
+	try {
+		let p = fs.popen(cmd, 'r');
+		res = p.read('all');
+		p.close();
+	} catch (e) {
+		return null;
+	}
+	if (res == null) return null;
+	res = replace(res, '\n', '');
+	return res == '' ? null : res;
+}
+
+function fmt_bytes(n) {
+	n = to_int(n, 0);
+	if (n < 1024) return n + ' B';
+	if (n < 1048576) return sprintf('%d.%d KB', int(n / 1024), int(n % 1024 / 102));
+	if (n < 1073741824) return sprintf('%d.%d MB', int(n / 1048576), int(n % 1048576 / 104858));
+	return sprintf('%d.%d GB', int(n / 1073741824), int(n % 1073741824 / 107374183));
+}
+
+
+/** 发送日报/测试消息；返回 { ok, code, msg } */
+
+
+/* ------------------------------------------------------------------ *
+ * 初始化 / 主循环
+ * ------------------------------------------------------------------ */
 
 function new_ctx() {
 	let now = time();
@@ -1344,14 +1385,30 @@ function new_ctx() {
 		leases: {},
 		leases_ts: 0,
 		lan_cidrs: [],
+		lan_prefixes: [],
 		fake_cidrs: [],
 		poll_apps: {},
 		poll_devs: {},
 		last_history_flush: 0,
 		daily_fail_ts: 0,
-		feishu_sent_day: '',
+		last_daily_write: 0,
 		stopping: false
 	};
+}
+
+/** 由 LAN 网段推出用于粗筛的字符串前缀（/24 及以上精度才用） */
+function lan_prefixes_of(cidrs) {
+	let out = [];
+	for (let c in cidrs) {
+		if (c.bits < 8) continue;
+		let base = sprintf('%d.%d.%d.%d', int(c.base / 16777216) % 256,
+			int(c.base / 65536) % 256, int(c.base / 256) % 256, c.base % 256);
+		let p = split(base, '.');
+		if (c.bits >= 24) push(out, p[0] + '.' + p[1] + '.' + p[2] + '.');
+		else if (c.bits >= 16) push(out, p[0] + '.' + p[1] + '.');
+		else push(out, p[0] + '.');
+	}
+	return out;
 }
 
 function lan_txt_of(ctx) {
@@ -1383,6 +1440,7 @@ function boot() {
 		if (c != null) push(ctx.fake_cidrs, c);
 	}
 	ctx.lan_cidrs = detect_lan_cidrs(cur, ctx.cfg);
+	ctx.lan_prefixes = lan_prefixes_of(ctx.lan_cidrs);
 
 	dbg(ctx, 'lan=' + join(',', lan_txt_of(ctx)) + '  fake=' + join(',', ctx.cfg.fake_ip_ranges)
 		+ '  interval=' + ctx.cfg.poll_interval + 's  api=' + ctx.cfg.clash_api);
@@ -1452,168 +1510,5 @@ function main() {
 	flush_all(ctx, 'exit');
 	dbg(ctx, 'stopped');
 }
-
-const HISTORY_FLUSH_SECONDS = 60; /* history.json 最少刷新间隔 */
-const DAILY_RETRY_SECONDS = 600;  /* daily 目录写失败后的重试间隔 */
-
-/* ------------------------------------------------------------------ *
- * 基础工具
- * ------------------------------------------------------------------ */
-
-
-
-
-/** 按空白切分并丢弃空 token（conntrack / dhcp.leases 都需要） */
-
-/** 按空格或逗号切分（配置里的 CIDR 列表） */
-
-/** URI 清洗：去掉 shell 元字符与引号，防止拼进命令行时被注入 */
-
-/** curl 配置文件里的值：只去掉会破坏 "header = \\"...\\"" 的字符 */
-
-
-
-/** 记录一条 host 流量；chain 取 rx 最大的那条链路 */
-
-/** 超过上限时淘汰流量最小的一条，避免长时间运行无限增长 */
-
-/* ------------------------------------------------------------------ *
- * 文件系统
- * ------------------------------------------------------------------ */
-
-
-/** 原子写：同目录临时文件 + rename（SPEC §8.7 不允许半截文件） */
-
-
-
-/* ------------------------------------------------------------------ *
- * JSON 编码（ucode 的 %J 带空格，这里输出紧凑格式，与契约示例一致）
- * ------------------------------------------------------------------ */
-
-
-
-
-/* ------------------------------------------------------------------ *
- * IPv4 / CIDR
- * ------------------------------------------------------------------ */
-
-
-
-
-
-
-/** "192.168.100.1" + "255.255.255.0" -> "192.168.100.0/24" */
-
-/* ------------------------------------------------------------------ *
- * 配置（UCI: /etc/config/traffic-stats，缺省时全部走默认值）
- * ------------------------------------------------------------------ */
-
-
-
-
-/* ------------------------------------------------------------------ *
- * LAN / fake-ip 网段识别
- * ------------------------------------------------------------------ */
-
-/** 解析 `ip -4 -o addr show` -> { ifname: [ "a.b.c.d/len", ... ] } */
-
-/** LAN 网段：优先 config 里的 lan_ranges，其次 firewall lan zone 的网络，最后兜底 */
-
-/* ------------------------------------------------------------------ *
- * 设备身份：/tmp/dhcp.leases -> { ip: { mac, hostname } }
- * ------------------------------------------------------------------ */
-
-
-
-/* ------------------------------------------------------------------ *
- * 设备记录
- * ------------------------------------------------------------------ */
-
-
-
-/* ------------------------------------------------------------------ *
- * clash /connections 采集
- * ------------------------------------------------------------------ */
-
-
-/** 取一次 /connections；返回 { ok, conns, n, ms, reason } */
-
-
-/**
- * clash 侧增量累计
- *  - id 是稳定键，用上轮快照做差；连接消失时删除快照（最后一次已知值即已计入）
- *  - chains[0] == "DIRECT" -> 直连；否则代理，节点名 = chains[0]
- *  - 域名取 metadata.host，空则用 destinationIP:destinationPort
- *  - 设备用 metadata.sourceIP
- */
-
-
-
-
-/* ------------------------------------------------------------------ *
- * conntrack 采集
- * ------------------------------------------------------------------ */
-
-
-/**
- * 解析单行 conntrack。
- * 一行里有两组 "src=.. dst=.. sport=.. dport=.. packets=.. bytes=.."，
- * 第一组是原始方向，第二组是应答方向。
- */
-
-/**
- * conntrack 侧增量累计（只处理直连流量）
- *
- * 方向统一按“设备视角”：orig 是设备发出的 -> tx，reply 是设备收到的 -> rx；
- * 若设备是 orig.dst（外网主动连入），则反过来。
- */
-
-/* ------------------------------------------------------------------ *
- * 5 分钟桶 / history.json（SPEC §4）
- * ------------------------------------------------------------------ */
-
-
-
-
-
-
-
-/* ------------------------------------------------------------------ *
- * 每日汇总（/etc/traffic-stats/daily/YYYY-MM-DD.json）
- * ------------------------------------------------------------------ */
-
-
-
-
-
-/* ------------------------------------------------------------------ *
- * state.json 组装（SPEC §3）
- * ------------------------------------------------------------------ */
-
-
-
-/* ------------------------------------------------------------------ *
- * 一轮采集
- * ------------------------------------------------------------------ */
-
-
-/* ------------------------------------------------------------------ *
- * 飞书日报（SPEC §7；默认 enabled=0）
- * ------------------------------------------------------------------ */
-
-
-
-
-/** 发送日报/测试消息；返回 { ok, code, msg } */
-
-
-/* ------------------------------------------------------------------ *
- * 初始化 / 主循环
- * ------------------------------------------------------------------ */
-
-
-
-
-
 
 main();

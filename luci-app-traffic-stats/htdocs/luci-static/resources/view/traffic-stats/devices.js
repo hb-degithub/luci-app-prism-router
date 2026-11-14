@@ -92,6 +92,14 @@ function deviceTotal(dev) {
 	return num(dev.direct_rx) + num(dev.direct_tx) + num(dev.proxy_rx) + num(dev.proxy_tx);
 }
 
+function appLabel(host) {
+	var name = (host == null) ? '' : ('' + host);
+
+	if (name == '__other__') return _('其他（合并）');
+
+	return name;
+}
+
 function shorten(text, max) {
 	var s = '' + (text == null ? '' : text);
 
@@ -137,10 +145,10 @@ return view.extend({
 		var rows = [];
 
 		for (var i = 0; i < devices.length; i++)
-			rows.push(this.renderDeviceRow(devices[i], i));
+			rows.push(this.renderDeviceRow(devices[i]));
 
 		var summary = E('p', { style: 'margin:0 0 12px 0;font-size:12px;opacity:.85' }, [
-			_('共 %d 台设备').format(devices.length),
+			_('共') + ' ' + devices.length + ' ' + _('台设备'),
 			state.truncated === true ? ' · ' + _('数据过大，后端已裁剪（仅显示使用量最高的部分）') : '',
 			' · ',
 			_('点击任意一行展开该设备的应用分布')
@@ -174,7 +182,7 @@ return view.extend({
 			message = _('暂时读不到设备列表：rpcd 对象 traffic-stats 不可用，或者后端尚未安装。');
 		}
 		else if (state.running !== true) {
-			message = _('traffic-statsd 未运行，因此还没有设备数据。');
+			message = _('暂无数据：traffic-statsd 未运行，因此还没有设备记录。');
 		}
 		else {
 			message = _('暂无数据：traffic-statsd 正在运行，但还没采到任何设备流量。');
@@ -191,7 +199,7 @@ return view.extend({
 		]);
 	},
 
-	renderDeviceRow: function(dev, index) {
+	renderDeviceRow: function(dev) {
 		var direct = num(dev.direct_rx) + num(dev.direct_tx);
 		var proxy = num(dev.proxy_rx) + num(dev.proxy_tx);
 		var total = direct + proxy;
@@ -281,7 +289,7 @@ return view.extend({
 			var percent = (sum > 0) ? (total * 100 / sum) : 0;
 
 			return E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td', title: app.host }, shorten(app.host, 48)),
+				E('td', { 'class': 'td', title: app.host }, shorten(appLabel(app.host), 48)),
 				E('td', { 'class': 'td' }, chainBadge(app.chain)),
 				E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(app.rx)),
 				E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(app.tx)),

@@ -116,7 +116,7 @@ return view.extend({
 		var root = E('div', {}, [
 			E('h2', {}, _('流量统计 · 应用')),
 			E('p', { style: 'margin:0 0 12px 0;font-size:12px;opacity:.85' }, [
-				_('共 %d 个域名').format(this.apps.length),
+				_('共') + ' ' + this.apps.length + ' ' + _('个域名'),
 				' · ',
 				_('按合计流量排序'),
 				state.truncated === true ? ' · ' + _('数据过大，后端已裁剪') : ''
@@ -303,7 +303,7 @@ return view.extend({
 
 		return E('div', {}, [
 			E('div', { style: 'font-size:12px;opacity:.85;margin-bottom:6px' },
-				_('下钻：%s 分布在 %d 台设备上').format(shortHost(host, 60), matched.length)),
+				_('下钻：') + shortHost(host, 60) + ' ' + _('分布在') + ' ' + matched.length + ' ' + _('台设备上')),
 			E('table', { 'class': 'table' }, [
 				E('tr', { 'class': 'tr table-titles' }, [
 					E('th', { 'class': 'th' }, _('设备')),
@@ -326,7 +326,7 @@ return view.extend({
 		if (state == null)
 			message = _('暂时读不到应用列表：rpcd 对象 traffic-stats 不可用，或者后端尚未安装。');
 		else if (state.running !== true)
-			message = _('traffic-statsd 未运行，因此还没有域名数据。');
+			message = _('暂无数据：traffic-statsd 未运行，因此还没有域名记录。');
 		else
 			message = _('暂无数据：traffic-statsd 正在运行，但还没采到任何域名。');
 
