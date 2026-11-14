@@ -392,6 +392,15 @@ load_cfg = function(opts) {
 
 // 空 webhook/secret -> 静默跳过（只记日志，不报错、不重试）
 send_allowed = function(cfg, ignore_enabled) {
+    /* 自建应用路线：只要三件套齐全就放行，不要求 webhook/secret */
+    let app_mode = length(cfg.app_id) && length(cfg.app_secret) && length(cfg.chat_id);
+    if (app_mode) {
+        if (!ignore_enabled && !cfg.enabled && !cfg.force) {
+            log("INFO", "traffic-stats.feishu.enabled=0，跳过发送（可用 --force 强制）");
+            return false;
+        }
+        return true;
+    }
     if (!length(cfg.webhook)) {
         log("INFO", "traffic-stats.feishu.webhook 未配置，跳过发送");
         return false;
@@ -818,6 +827,9 @@ code_help = function(code) {
     if (code == 230020) return "触发频率限制";
     if (code == 230025) return "消息体超长";
     if (code == 230099) return "卡片内容非法（子码见响应）";
+    if (code == -5) return "tenant_access_token 获取失败（检查 app_id/app_secret）";
+    if (code == -6) return "未配置 app_id/app_secret";
+    if (code == -7) return "未配置 chat_id（先运行 chats 列群）";
     return "未知错误";
 };
 
@@ -912,25 +924,27 @@ app_http = function(method, url, bearer, body) {
     let tag = sprintf("%d-%d-%d", time(), getpid(), _seq++);
     let bf = sprintf("%s/abody-%s.json", dir, tag);
     let rf = sprintf("%s/aresp-%s.json", dir, tag);
-    let cf = sprintf("%s/acurl-%s.conf", dir, tag);
-    let conf = sprintf("url = \"%s\"\nrequest = \"%s\"\n", url, method);
+
+    let cmd = sprintf("curl -sS -X %s", method);
     if (length(bearer))
-        conf += sprintf("header = \"Authorization: Bearer %s\"\n", bearer);
-    if (length(body))
-        conf += sprintf("header = \"Content-Type: application/json\"\ndata-binary = \"@%s\"\n", bf);
-    conf += sprintf("silent\nshow-error\nconnect-timeout = 8\nmax-time = 25\noutput = \"%s\"\nwrite-out = \"%%{http_code}\"\n", rf);
-    try {
-        if (length(body)) fs.writefile(bf, body);
-        fs.writefile(cf, conf);
-    } catch (e) {
-        return { http: 0, curl: -1, body: "", err: "写临时文件失败：" + e };
+        cmd += sprintf(" -H %s", shq("Authorization: Bearer " + bearer));
+    if (length(body)) {
+        try { fs.writefile(bf, body); } catch (e) {
+            return { http: 0, curl: -1, body: "", err: "写请求体失败：" + e };
+        }
+        cmd += sprintf(" -H %s", shq("Content-Type: application/json"));
+        cmd += sprintf(" --data-binary %s", shq("@" + bf));
     }
-    let r = run(sprintf("curl -sS -K %s 2>/dev/null", shq(cf)));
+    cmd += sprintf(" -o %s -w '%%{http_code}' --connect-timeout 8 --max-time 25 %s 2>/dev/null",
+                   shq(rf), shq(url));
+
+    let r = run(cmd);
     let http = intv(trim(r.out));
     let resp = "";
     try { if (fs.access(rf)) resp = fs.readfile(rf); } catch (e) { }
-    try { fs.unlink(bf); fs.unlink(cf); fs.unlink(rf); } catch (e) { }
-    return { http: http, curl: r.code, body: resp, err: "" };
+    try { fs.unlink(bf); } catch (e) { }
+    try { fs.unlink(rf); } catch (e) { }
+    return { http: http, curl: r.code, body: resp, err: length(resp) ? "" : "curl exit " + r.code };
 };
 
 app_token = function(cfg, force) {
@@ -1619,7 +1633,7 @@ cmd_daily = function(opts) {
         return 0;
     }
 
-    let res = parse_result(http_post(cfg.webhook, prep.body));
+    let res = deliver(cfg, { "msg_type": "interactive", "card": prep.card });
     res.bytes = prep.bytes;
     if (res.ok) {
         log("INFO", sprintf("日报发送成功：http=%s code=0 bytes=%d", res.http, res.bytes));

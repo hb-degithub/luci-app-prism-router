@@ -373,9 +373,16 @@ return view.extend({
 				src: L.resource('nlbw.chart.min.js'),
 				load: function() { self.drawChart(canvas); },
 				error: function() {
-					dom.content(canvas.parentNode, E('div', {
-						'class': 'alert-message warning'
-					}, _('图表库未安装（luci-lib-chartjs），环形图无法显示。')));
+					var parent = canvas.parentNode;
+					var note = E('p', {
+						'class': 'alert-message warning',
+						style: 'max-width:260px'
+					}, _('图表库未安装（luci-lib-chartjs），环形图无法显示。'));
+
+					if (parent != null) {
+						parent.removeChild(canvas);
+						parent.appendChild(note);
+					}
 				}
 			});
 		}

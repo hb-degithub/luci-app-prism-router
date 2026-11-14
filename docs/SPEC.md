@@ -47,8 +47,14 @@ config settings 'settings'
     option history_days '7'
 config feishu 'feishu'
     option enabled '0'
+    # 路线一：群自定义机器人（复制 webhook，无二维码流程）
     option webhook ''
     option secret ''
+    # 路线二：自建应用机器人（二维码/搜索加群），三件套齐全时优先于 webhook
+    option app_id ''
+    option app_secret ''
+    option chat_id ''
+    option card_wrapper 'card'      # card={"type":"card","data":card} | bare
     option daily_time '08:30'
     option report_chat_enabled '1'
 ```
