@@ -1,0 +1,4 @@
+.research*
+*.log
+dist/
+__pycache__/
