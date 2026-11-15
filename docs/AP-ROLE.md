@@ -59,3 +59,28 @@ AP 无 apk 源，无法 `apk add`；有 ucode/curl，所以：
 
 目标里写的"在 AP 上部署"**按方案 A 暂缓**：部署上去只会制造重复计数。
 若需要无线信号维度，再按方案 B 实现。
+
+---
+
+## 六、实际部署记录（2026-11-15）
+
+按方案 B（只报无线元数据、**不报任何字节**）部署完毕。
+
+| 位置 | 改动 |
+|---|---|
+| AP `192.168.100.3` | `/usr/share/traffic-stats/stations.uc`（root:root 644）、`/etc/config/traffic-stats`（600）、crontab 一行每分钟 |
+| 母节点 `192.168.100.1` | `stations_enabled=1` + `stations_token`，接收端与界面此前已随包部署 |
+
+验证结果：
+```
+AP 上报：站点=3 请求体=418 字节  exit=0
+母节点：/etc/traffic-stats/stations/ap-1.json (root:root 644)
+get_stations：node ap-1「客厅 AP」，3 个站点（signal -48/-40 dBm、rx/tx 速率、连接时长）
+设备页：信号列已显示（-xx dBm），接入列 无线/有线 与流量统计无关地独立呈现
+AP 权限：/etc /usr /www /usr/share/traffic-stats 全部 root:root 755 未变
+WiFi：3 个 BSS 正常
+```
+
+**干扰数据如何避免**：AP 侧只采集 `iw station dump` 的 6 个字段（mac/iface/signal/rx_rate/tx_rate/connected_sec），
+母节点再按白名单过滤一次；即使 AP 端被改坏、塞入 `rx_bytes`，也不会落盘（门禁 93 项含此用例）。
+因此主路由的字节统计仍是唯一权威来源，不会出现双计。
