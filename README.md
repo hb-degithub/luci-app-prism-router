@@ -53,6 +53,7 @@ uci set traffic-stats.feishu.chat_id='oc_xxx'
 uci set traffic-stats.feishu.webhook='https://open.feishu.cn/open-apis/bot/v2/hook/xxx'
 uci set traffic-stats.feishu.secret='xxx'
 
+uci set traffic-stats.feishu.enabled='1'            # 总开关（默认已是 1；设 0 可静音）
 uci commit traffic-stats
 ucode /usr/share/traffic-stats/feishu.uc test       # 连通性测试
 ```
