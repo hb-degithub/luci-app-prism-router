@@ -1293,6 +1293,10 @@ function poll(ctx) {
 	};
 	bucket_add(ctx, deltas);
 
+	/* 自适应轮询：连续空闲则降频，见 tick()。空闲判定=本轮四个方向增量全为 0。 */
+	let activity = deltas.direct_rx + deltas.direct_tx + deltas.proxy_rx + deltas.proxy_tx;
+	ctx.idle_rounds = (activity == 0) ? ((ctx.idle_rounds || 0) + 1) : 0;
+
 	ctx.reasons = reasons;
 	ctx.poll_ms = elapsed_ms(t0);
 	let t_ct1 = clock();
@@ -1496,7 +1500,17 @@ function main() {
 		} catch (e) {
 			warn('traffic-statsd: poll error: ' + str(e) + '\n');
 		}
-		if (!ctx.stopping && tmr != null) tmr.set(ctx.cfg.poll_interval * 1000);
+		if (!ctx.stopping && tmr != null) {
+			/* 空闲 >=2 轮后降到 3 倍间隔（上限 30s），有流量立即恢复。
+			   速率由 poll 内部按实际 dt 计算，降频不影响速率正确性。 */
+			let base = ctx.cfg.poll_interval;
+			let iv = ((ctx.idle_rounds || 0) >= 2) ? clamp(base * 3, base, 30) : base;
+			if (iv != ctx.cur_interval) {
+				ctx.cur_interval = iv;
+				dbg(ctx, 'adaptive interval -> ' + iv + 's (idle_rounds=' + (ctx.idle_rounds || 0) + ')');
+			}
+			tmr.set(iv * 1000);
+		}
 	};
 
 	printf('traffic-statsd %s started (interval=%ds, lan=%s)\n',
