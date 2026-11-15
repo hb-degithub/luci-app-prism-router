@@ -55,3 +55,15 @@ ubus / netifd / dnsmasq / firewall 出现异常时：
 - 宿主机没有 gcc / 交叉工具链，构建靠 docker（Alpine 静态编译）。
 - OpenWrt 验证用 rootfs 容器；容器内无法复现真实 conntrack/PPE 行为，这类验证仍需真机只读观察。
 - 真机只读观察 ≠ 部署，不受本流程第 3 步限制，但仍不得写任何系统路径。
+
+## 六、界面验证（无头浏览器）
+
+`tests/ui/run.sh` 用 puppeteer 容器真实登录 LuCI，逐页检查渲染与 console 报错。
+最近一次结果（2026-11-15）：登录 OK，overview/devices/apps/nodes/settings **全部 OK，0 报错**。
+
+```sh
+LUCI_PASS='<root 密码>' ./tests/ui/run.sh
+```
+
+注意：容器内 puppeteer 位于 `/home/pptruser/node_modules`；挂载目录必须是 755，
+否则容器内用户看不到脚本（表现为 `Cannot find module '/w/test.js'`）。

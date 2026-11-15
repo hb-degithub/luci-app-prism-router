@@ -27,7 +27,7 @@ define Package/traffic-stats
   CATEGORY:=Network
   SUBMENU:=Traffic Control
   TITLE:=Traffic statistics daemon (OpenClash API + conntrack)
-  DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-uloop +curl
+  DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-uloop +curl +openssl-util
   PKGARCH:=all
 endef
 
@@ -59,6 +59,12 @@ define Package/traffic-stats/install
 
 	$(INSTALL_DIR) $(1)/usr/share/traffic-stats
 	$(if $(wildcard ./files/feishu.uc),$(INSTALL_DATA) ./files/feishu.uc $(1)/usr/share/traffic-stats/feishu.uc)
+	$(if $(wildcard ./files/feishu-test.sh),$(INSTALL_BIN) ./files/feishu-test.sh $(1)/usr/share/traffic-stats/feishu-test.sh)
+	# 子母多节点：子节点推送脚本
+	$(if $(wildcard ./files/push.uc),$(INSTALL_DATA) ./files/push.uc $(1)/usr/share/traffic-stats/push.uc)
+	# 子母多节点：母节点接收 CGI（必须可执行）
+	$(INSTALL_DIR) $(1)/www/cgi-bin
+	$(if $(wildcard ./files/ingest.uc),$(INSTALL_BIN) ./files/ingest.uc $(1)/www/cgi-bin/traffic-stats-ingest)
 endef
 
 define Package/traffic-stats/postinst
