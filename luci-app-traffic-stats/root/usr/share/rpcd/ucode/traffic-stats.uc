@@ -1127,6 +1127,50 @@ const methods = {
 					push(out, { day: today, buckets: [], summary: data });
 			}
 
+			/* ubus 单条消息上限 262144B：满一天 288 桶 × 每桶 top 列表会到 ~318 KiB，
+			   整次调用会直接失败（前端只能降级成"暂无历史数据"）。按预算逐级瘦身：
+			   ① 去掉桶内的 top_apps / top_devices（趋势图只需要 totals）
+			   ② 仍超则只保留每个 day 最近的 200 个桶 */
+			let slim_buckets = function(list) {
+				for (let d in list) {
+					let nb = [];
+
+					for (let b in d.buckets) {
+						let o = {};
+
+						for (let k in b)
+							if (k != 'top_apps' && k != 'top_devices')
+								o[k] = b[k];
+
+						push(nb, o);
+					}
+
+					d.buckets = nb;
+				}
+
+				return list;
+			};
+
+			let enc = sprintf('%J', { days: out });
+
+			if (length(enc) > 200000)
+				slim_buckets(out);
+
+			enc = sprintf('%J', { days: out });
+
+			if (length(enc) > 200000) {
+				for (let d in out) {
+					if (length(d.buckets) > 200) {
+						let keep = [];
+
+						for (let i = length(d.buckets) - 200; i < length(d.buckets); i++)
+							push(keep, d.buckets[i]);
+
+						d.buckets = keep;
+					}
+				}
+			}
+
 			return { days: out };
 		}
 	},

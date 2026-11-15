@@ -219,7 +219,9 @@ return view.extend({
 		var rows = [];
 
 		for (var i = 0; i < devices.length; i++)
-			rows.push(this.renderDeviceRow(devices[i]));
+			/* renderDeviceRow 返回 [主行, 详情行]，必须 concat 展开；push 会变成嵌套数组，
+			   被 E() 当成字符串渲染成 [object HTMLTableRowElement]。 */
+			rows = rows.concat(this.renderDeviceRow(devices[i]));
 
 		var summary = E('p', { style: 'margin:0 0 12px 0;font-size:12px;opacity:.85' }, [
 			_('共') + ' ' + devices.length + ' ' + _('台设备'),

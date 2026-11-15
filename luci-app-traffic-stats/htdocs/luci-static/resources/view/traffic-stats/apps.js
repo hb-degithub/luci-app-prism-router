@@ -177,7 +177,8 @@ return view.extend({
 			var app = this.apps[i];
 
 			if (this.matchChain(app.chain))
-				rows.push(this.renderAppRow(app));
+				/* 同 devices.js：renderAppRow 返回 [主行, 详情行]，必须 concat 展开 */
+				rows = rows.concat(this.renderAppRow(app));
 		}
 
 		if (rows.length == 0)
