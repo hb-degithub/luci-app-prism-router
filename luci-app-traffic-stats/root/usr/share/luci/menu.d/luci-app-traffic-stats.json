@@ -20,6 +20,11 @@
 		"order": 30,
 		"action": { "type": "view", "path": "traffic-stats/apps" }
 	},
+	"admin/services/traffic-stats/nodes": {
+		"title": "节点",
+		"order": 35,
+		"action": { "type": "view", "path": "traffic-stats/nodes" }
+	},
 	"admin/services/traffic-stats/settings": {
 		"title": "设置",
 		"order": 40,

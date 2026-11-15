@@ -7,6 +7,7 @@
 //   * /tmp/traffic-stats/state.json    由 traffic-statsd 每 5s 原子写入
 //   * /tmp/traffic-stats/history.json  当日 5 分钟桶
 //   * /etc/traffic-stats/daily/*.json  每日汇总
+//   * /etc/traffic-stats/nodes/*.json  子节点快照（子母多节点汇总，由 CGI 写入）
 //
 // 两条硬约束（真机实测，见 docs/SPEC.md 的 rpcd 约定）：
 //   1. 任何文件缺失 / JSON 半截 / UCI 缺失都必须返回空结构，不能让 ubus 调用报错；
@@ -34,6 +35,7 @@ const CONFIG_FILE  = '/etc/config/traffic-stats';
 const STATE_FILE   = '/tmp/traffic-stats/state.json';
 const HISTORY_FILE = '/tmp/traffic-stats/history.json';
 const DAILY_DIR    = '/etc/traffic-stats/daily';
+const NODES_DIR    = '/etc/traffic-stats/nodes';
 const INIT_SCRIPT  = '/etc/init.d/traffic-statsd';
 const VERSION      = '1.0.0';
 
@@ -53,9 +55,22 @@ const STATE_SHAPES = [
 	[   8,  0,   8 ]
 ];
 
+/* get_nodes 的裁剪档位：[节点数, 每节点设备数, 每节点应用数]。 */
+const NODE_SHAPES = [
+	[ 50, 20, 20 ],
+	[ 24, 20, 20 ],
+	[ 12, 10, 10 ],
+	[  6,  5,  5 ],
+	[  6,  0,  0 ]
+];
+
 /* 允许前端写入的 UCI 字段白名单（不开放任意 UCI 写）。 */
 const UCI_FIELDS = {
-	settings: [ 'enabled', 'poll_interval', 'clash_api', 'clash_secret', 'fake_ip_ranges', 'history_days' ],
+	settings: [
+		'enabled', 'poll_interval', 'clash_api', 'clash_secret', 'fake_ip_ranges', 'history_days',
+		/* 子母多节点汇总（settings 页暂未提供输入框，先开放给后续页面/脚本复用） */
+		'node_id', 'node_name', 'mother_url', 'mother_secret', 'mother_enabled'
+	],
 	feishu:   [ 'enabled', 'webhook', 'secret', 'daily_time', 'report_chat_enabled' ]
 };
 
@@ -362,6 +377,174 @@ function build_state(raw, running) {
 	return out;
 }
 
+// ---------------------------------------------------------------- 多节点快照
+
+/* 子节点快照由 /www/cgi-bin/traffic-stats-ingest 写入，字段见 traffic-stats/files/ingest.uc。
+   这里只做"读 + 归一化"：文件坏掉、字段缺失、类型不对都退回空结构，绝不抛错。 */
+
+function node_totals(raw) {
+	const out = {
+		direct_rx: 0, direct_tx: 0,
+		proxy_rx: 0, proxy_tx: 0,
+		rx_rate: 0, tx_rate: 0
+	};
+
+	if (type(raw) == 'object')
+		for (let key in keys(out))
+			out[key] = integer(raw[key], 0);
+
+	return out;
+}
+
+function node_nodes(raw) {
+	const out = {};
+
+	if (type(raw) != 'object')
+		return out;
+
+	for (let name, value in raw) {
+		if (type(value) != 'object')
+			continue;
+
+		const label = text(name, '');
+
+		if (length(label) == 0)
+			continue;
+
+		out[label] = { rx: integer(value.rx, 0), tx: integer(value.tx, 0) };
+	}
+
+	return out;
+}
+
+function node_devices(raw, max) {
+	const out = [];
+
+	if (type(raw) != 'array' || max <= 0)
+		return out;
+
+	for (let i = 0; i < length(raw) && i < max; i++) {
+		const dev = raw[i];
+
+		if (type(dev) != 'object')
+			continue;
+
+		push(out, {
+			ip: text(dev.ip, ''),
+			mac: text(dev.mac, ''),
+			hostname: text(dev.hostname, ''),
+			direct_rx: integer(dev.direct_rx, 0),
+			direct_tx: integer(dev.direct_tx, 0),
+			proxy_rx: integer(dev.proxy_rx, 0),
+			proxy_tx: integer(dev.proxy_tx, 0),
+			rx_rate: integer(dev.rx_rate, 0),
+			tx_rate: integer(dev.tx_rate, 0),
+			last_seen: integer(dev.last_seen, 0)
+		});
+	}
+
+	return out;
+}
+
+function node_apps(raw, max) {
+	const out = [];
+
+	if (type(raw) != 'array' || max <= 0)
+		return out;
+
+	for (let i = 0; i < length(raw) && i < max; i++) {
+		const app = raw[i];
+
+		if (type(app) != 'object')
+			continue;
+
+		push(out, {
+			host: text(app.host, ''),
+			rx: integer(app.rx, 0),
+			tx: integer(app.tx, 0),
+			chain: text(app.chain, ''),
+			devices: integer(app.devices, 0)
+		});
+	}
+
+	return out;
+}
+
+function read_node(file) {
+	const data = read_json(file);
+
+	if (data == null || type(data) != 'object')
+		return null;
+
+	const node_id = text(data.node_id, replace(basename(file), /\.json$/, ''));
+
+	if (length(node_id) == 0)
+		return null;
+
+	const ts = integer(data.ts, 0);
+	const now = time();
+
+	return {
+		node_id: node_id,
+		name: text(data.name, node_id),
+		ts: ts,
+		/* age_sec = -1 表示快照里没有可信时间戳（前端显示"—"并按过期处理）。 */
+		age_sec: (ts > 0) ? max(0, now - ts) : -1,
+		totals: node_totals(data.totals),
+		nodes: node_nodes(data.nodes),
+		devices: (type(data.devices) == 'array') ? data.devices : [],
+		apps: (type(data.apps) == 'array') ? data.apps : []
+	};
+}
+
+function build_nodes() {
+	let files = glob(`${NODES_DIR}/*.json`) ?? [];
+
+	files = sort(files ?? [], (a, b) => (a > b) ? -1 : ((a < b) ? 1 : 0));
+
+	let list = [];
+
+	for (let file in files) {
+		const node = read_node(file);
+
+		if (node != null)
+			push(list, node);
+	}
+
+	list = sort(list, (a, b) => b.ts - a.ts);
+
+	const out = { nodes: [] };
+
+	/* 按预算逐级裁剪：ubus 单条消息 262144 字节，超了整个调用直接失败。 */
+	for (let shape in NODE_SHAPES) {
+		const max_nodes = shape[0], max_devices = shape[1], max_apps = shape[2];
+
+		out.nodes = [];
+
+		for (let i = 0; i < length(list) && i < max_nodes; i++) {
+			const node = list[i];
+
+			push(out.nodes, {
+				node_id: node.node_id,
+				name: node.name,
+				ts: node.ts,
+				age_sec: node.age_sec,
+				latest: {
+					totals: node.totals,
+					nodes: node.nodes,
+					devices: node_devices(node.devices, max_devices),
+					apps: node_apps(node.apps, max_apps)
+				}
+			});
+		}
+
+		if (length(sprintf('%J', out)) <= STATE_BUDGET)
+			return out;
+	}
+
+	return out;
+}
+
 // ---------------------------------------------------------------- 动作
 
 function is_root(request) {
@@ -602,6 +785,18 @@ const methods = {
 			const poll = poll_interval();
 
 			return build_state(raw, daemon_running(raw, poll));
+		}
+	},
+
+	get_nodes: {
+		call: function(request) {
+			try {
+				return build_nodes();
+			}
+			catch (e) {
+				/* 多节点页面挂了也不能影响概览/设备页：异常一律退回空结构。 */
+				return { nodes: [] };
+			}
 		}
 	},
 
