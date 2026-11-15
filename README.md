@@ -16,7 +16,7 @@
 ## 安装
 
 ```sh
-# 24.10+（iStoreOS 等）用 tar.gz 格式；≤23.05 用 .legacy.ipk
+# 23.05 / 24.10 都用 .ipk（tar.gz 格式）；.legacy.ipk 仅极旧版本备用且未验证
 opkg install traffic-stats_1.0.0-1_all.ipk
 opkg install luci-app-traffic-stats_1.0.0-1_all.ipk
 /etc/init.d/traffic-statsd enable

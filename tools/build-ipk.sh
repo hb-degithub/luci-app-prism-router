@@ -24,7 +24,7 @@ pack() { # $1=dir $2=basename（不带扩展名）
   # 23.05 及更早用 ar 容器，留一份备用
   ( cd "$d" && ar rc "$OUT/${base}.legacy.ipk" debian-binary control.tar.gz data.tar.gz )
   echo "  ✓ dist/${base}.ipk         $(stat -c%s "$OUT/${base}.ipk") B (tar.gz, 24.10+)"
-  echo "  ✓ dist/${base}.legacy.ipk  $(stat -c%s "$OUT/${base}.legacy.ipk") B (ar, ≤23.05)"
+  echo "  ✓ dist/${base}.legacy.ipk  $(stat -c%s "$OUT/${base}.legacy.ipk") B (ar, 极旧版本, 未验证)"
 }
 ctl() { # $1=dir  $2=pkgname  $3=section  $4=depends  $5=desc
   printf 'Package: %s\nVersion: %s-%s\nArchitecture: all\nMaintainer: traffic-stats\nSection: %s\nPriority: optional\nDepends: %s\nDescription: %s\n' \
