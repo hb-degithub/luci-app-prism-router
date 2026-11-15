@@ -117,6 +117,10 @@ Station aa:bb:cc:dd:ee:ff (on phy0.0-ap1)
 Station 02:00:00:00:00:01 (on phy0.0-ap1)
 	signal:  	5 dBm
 	connected time:	2 seconds
+
+Station 02:00:00:00:00:02 (on phy0.0-ap1)
+	rx bitrate:	866.7 MBit/s VHT-MCS 9
+	connected time:	40 seconds
 EOF
 	;;
 br-lan)
@@ -178,20 +182,22 @@ check /etc/traffic-stats/stations/ap-1.json "root:root -rw-r--r--"
 
 R=$(F=/etc/traffic-stats/stations/ap-1.json ucode -e '
   let fs = require("fs"); let d = json(fs.readfile(getenv("F")));
-  let s1 = null, s4 = null, s5 = null;
+  let s1 = null, s4 = null, s5 = null, s6 = null;
   for (let s in d.stations) {
     if (s.mac == "22:77:08:69:a9:1f") s1 = s;
     if (s.mac == "aa:bb:cc:dd:ee:ff") s4 = s;
     if (s.mac == "02:00:00:00:00:01") s5 = s;
+    if (s.mac == "02:00:00:00:00:02") s6 = s;
   }
-  print(sprintf("%s|%d|%d|%s|%s|%s|%s|%s|%s|%s|%s",
+  print(sprintf("%s|%d|%d|%s|%s|%s|%s|%s|%s|%s|%s|%s",
     d.node_id, d.count, length(d.stations), d.name,
     s1.signal, s1.rx_rate, s1.tx_rate, s1.connected_sec, s1.iface,
-    (type(s4.rx_rate) == "null" ? "absent" : s4.rx_rate),
-    (type(s5.signal) == "null" ? "absent" : s5.signal)));')
+    (s4.rx_rate == null ? "absent" : s4.rx_rate),
+    (s5.signal == null ? "absent" : s5.signal),
+    s6.rx_rate));')
 OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
 [ "$1" = "ap-1" ] && ok "快照 node_id=ap-1" || bad "node_id=$1"
-[ "$2" = "5" ] && [ "$3" = "5" ] && ok "5 个站点全部落盘（count=$2）" || bad "站点数异常：count=$2 len=$3"
+[ "$2" = "6" ] && [ "$3" = "6" ] && ok "6 个站点全部落盘（count=$2）" || bad "站点数异常：count=$2 len=$3"
 [ "$4" = "客厅 AP" ] && ok "name=客厅 AP（UTF-8 正常）" || bad "name=[$4]"
 [ "$5" = "-53" ] && ok "signal=-53（从 '-53 [-57, -55] dBm' 取首个整数）" || bad "signal=$5"
 [ "$6" = "866600" ] && ok "rx_rate=866600 kbit/s（866.6 MBit/s 换算）" || bad "rx_rate=$6"
@@ -200,10 +206,40 @@ OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
 [ "$9" = "phy0.1-ap0" ] && ok "iface=phy0.1-ap0（从 '(on ...)' 取）" || bad "iface=$9"
 [ "${10}" = "absent" ] && ok "rx bitrate=unknown → 跳过该字段（不崩）" || bad "rx_rate 应为 absent，实际 ${10}"
 [ "${11}" = "absent" ] && ok "signal=5 dBm 越界 → 不写该字段" || bad "越界 signal 被写入：${11}"
+[ "${12}" = "866700" ] && ok "rx_rate=866700（866.7 MBit/s 进位正确）" || bad "866.7→${12} 期望 866700"
 grep -q 'bytes' /etc/traffic-stats/stations/ap-1.json && bad "快照里出现 bytes（违反'绝不报字节'）" \
   || ok "快照里没有 bytes 字段（只报元数据）"
-grep -q 'br-lan' /tmp/traffic-stats/stations.log && bad "扫了非 AP 接口 br-lan" \
-  || ok "auto/enumerated 接口里没有误扫 br-lan"
+echo "=== 9.5 自动枚举（station_ifaces 留空 → 只挑 type AP 的 BSS）==="
+UCI set traffic-stats.settings.station_ifaces=''; UCI commit traffic-stats
+BEFORE=$(logsize)
+PATH=/tmp/fakebin:$PATH ucode /usr/share/traffic-stats/stations.uc; RC=$?
+AFTER=$(logsize)
+[ "$RC" = "0" ] && ok "留空 station_ifaces → 自动枚举并上报，exit 0" || bad "自动枚举时 rc=$RC"
+NEWLOG=$(tail -n +$((BEFORE+1)) /tmp/traffic-stats/stations.log 2>/dev/null | grep -c 'br-lan')
+[ "$NEWLOG" = "0" ] && ok "自动枚举没有把 br-lan（type AP/VLAN）当成 BSS 去 dump" \
+  || bad "br-lan 被当成 AP 接口扫了（type AP/VLAN 解析错误）"
+CNT=$(F=/etc/traffic-stats/stations/ap-1.json ucode -e 'let fs=require("fs"); print(json(fs.readfile(getenv("F"))).count);')
+[ "$CNT" = "6" ] && ok "自动枚举后快照仍是 6 个站点（$CNT）" || bad "自动枚举后 count=$CNT"
+UCI set traffic-stats.settings.station_ifaces='phy0.1-ap0,phy0.0-ap1'; UCI commit traffic-stats
+grep -q 'br-lan' /tmp/traffic-stats/stations.log && bad "日志里出现 br-lan（扫了非 AP 接口）" \
+  || ok "全程没有扫过 br-lan"
+
+echo "=== 9.6 node_id 未配置时自动推导（不写回 UCI，不抢 push.uc 的活）==="
+UCI delete traffic-stats.settings.node_id; UCI commit traffic-stats
+UCI delete traffic-stats.settings.node_name; UCI commit traffic-stats
+PATH=/tmp/fakebin:$PATH TRAFFIC_STATS_STATIONS_DRY=1 ucode /usr/share/traffic-stats/stations.uc > /tmp/nid.json
+R=$(F=/tmp/nid.json ucode -e '
+  let fs = require("fs"); let d = json(fs.readfile(getenv("F"))); let b = json(d.body);
+  print(sprintf("%s|%s|%s|%s", b.node_id, b.name, d.headers["X-Node-Id"],
+    (match(b.node_id, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/) ? "ok" : "bad")));')
+OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
+[ "$4" = "ok" ] && ok "自动推导 node_id=$1（符合母节点白名单正则）" || bad "自动 node_id 非法：$1"
+[ "$2" = "$1" ] && ok "name 缺省时回退为 node_id" || bad "name=$2 应为 node_id"
+[ "$3" = "$1" ] && ok "请求头 X-Node-Id 与 body 一致" || bad "头/体 node_id 不一致：$3 vs $1"
+[ "$(CGET traffic-stats.settings.node_id)" = "" ] && ok "没有回写 UCI（push.uc 负责写，避免抢写）" \
+  || bad "stations.uc 改写了 node_id"
+UCI set traffic-stats.settings.node_id='ap-1'
+UCI set traffic-stats.settings.node_name='客厅 AP'; UCI commit traffic-stats
 
 echo "=== 10. get_stations 有数据（脚本入口 / ubus / ACL）==="
 TRAFFIC_STATS_METHOD=get_stations ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc > /tmp/s1.json 2>/tmp/s1.err
@@ -211,7 +247,7 @@ R=$(F=/tmp/s1.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv
   let hit=null; for (let s in d.stations) if (s.mac == "22:77:08:69:a9:1f") hit=s;
   print(sprintf("%d|%s|%s|%s|%s|%s", d.count, d.nodes[0].node_id, hit.signal, hit.rx_rate, hit.iface, (type(hit.signal)=="int" ? "int" : type(hit.signal))));')
 OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
-[ "$1" = "5" ] && ok "get_stations 返回 5 条站点" || { bad "get_stations 条数=$1"; cat /tmp/s1.err; }
+[ "$1" = "6" ] && ok "get_stations 返回 6 条站点" || { bad "get_stations 条数=$1"; cat /tmp/s1.err; }
 [ "$2" = "ap-1" ] && ok "nodes[0].node_id=ap-1" || bad "nodes[0].node_id=$2"
 [ "$3" = "-53" ] && [ "$4" = "866600" ] && ok "按 MAC 能查到 signal/-53 与 rx_rate/866600" || bad "站点字段异常：$3/$4"
 [ "$5" = "phy0.1-ap0" ] && ok "站点带 iface（前端 tooltip 用）" || bad "iface=$5"
@@ -220,7 +256,7 @@ OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
 B=$(ubus call traffic-stats get_stations 2>/tmp/ubus.err)
 echo "$B" > /tmp/s2.json
 N=$(F=/tmp/s2.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F"))); print(length(d.stations ?? []));')
-[ "$N" = "5" ] && ok "ubus call traffic-stats get_stations → 5 条" || { bad "ubus 条数=$N"; cat /tmp/ubus.err; }
+[ "$N" = "6" ] && ok "ubus call traffic-stats get_stations → 6 条" || { bad "ubus 条数=$N"; cat /tmp/ubus.err; }
 
 LOGIN=$(curl -sS -m 5 -X POST http://127.0.0.1:8080/ubus -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}')
@@ -329,7 +365,7 @@ AFTER=$(F=/etc/traffic-stats/stations/ap-1.json ucode -e 'let fs=require("fs"); 
 grep -q 'X-Token' /tmp/dry.json && grep -q '"body"' /tmp/dry.json \
   && ok "dry-run 打印了 url/headers/body" || { bad "dry-run 输出不完整"; head -c 200 /tmp/dry.json; }
 DRYCOUNT=$(F=/tmp/dry.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F"))); print(length(json(d.body).stations));')
-[ "$DRYCOUNT" = "5" ] && ok "dry-run body 含 5 个站点" || bad "dry-run body 站点数=$DRYCOUNT"
+[ "$DRYCOUNT" = "6" ] && ok "dry-run body 含 6 个站点" || bad "dry-run body 站点数=$DRYCOUNT"
 
 echo "=== 14. 静默退出（cron 友好，绝不刷屏）==="
 # 14a. 开关关闭：退出 0 且不写日志
@@ -355,7 +391,8 @@ BEFORE=$(logsize)
 TRAFFIC_STATS_IW=/nonexistent/iw ucode /usr/share/traffic-stats/stations.uc; RC=$?
 AFTER=$(logsize)
 [ "$RC" = "0" ] && ok "iw 缺失 → exit 0（不因 cron 报错）" || bad "iw 缺失时 rc=$RC"
-tail -1 /tmp/traffic-stats/stations.log | grep -q 'station dump 失败' && ok "iw 缺失记 WARN" || bad "iw 缺失没有 WARN 日志"
+tail -n +$((BEFORE+1)) /tmp/traffic-stats/stations.log | grep -q 'station dump 失败' \
+  && ok "iw 缺失记 WARN（$BEFORE -> $AFTER 行）" || bad "iw 缺失没有 WARN 日志"
 
 UCI set traffic-stats.settings.station_ifaces='phy0.1-ap0,phy0.0-ap1'; UCI commit traffic-stats
 

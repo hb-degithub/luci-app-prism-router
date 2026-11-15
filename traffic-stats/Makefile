@@ -65,6 +65,9 @@ define Package/traffic-stats/install
 	# 子母多节点：母节点接收 CGI（必须可执行）
 	$(INSTALL_DIR) $(1)/www/cgi-bin
 	$(if $(wildcard ./files/ingest.uc),$(INSTALL_BIN) ./files/ingest.uc $(1)/www/cgi-bin/traffic-stats-ingest)
+	# 哑桥 AP 无线站点元数据（只报信号/速率，不报字节，避免与主路由双计）
+	$(if $(wildcard ./files/stations.uc),$(INSTALL_DATA) ./files/stations.uc $(1)/usr/share/traffic-stats/stations.uc)
+	$(if $(wildcard ./files/ingest-stations.uc),$(INSTALL_BIN) ./files/ingest-stations.uc $(1)/www/cgi-bin/traffic-stats-stations)
 endef
 
 define Package/traffic-stats/postinst

@@ -263,8 +263,8 @@ function log(level, msg) {
     }
 
     if (level == 'ERROR' || level == 'WARN') {
-        /* 文件里每行都有（会轮转），syslog 5 分钟一条，cron 每分钟跑也不刷屏。 */
-        if (level != 'ERROR' || throttle('syslog', 300))
+        /* 文件里每行都有（会轮转）；syslog 按级别 5 分钟一条，cron 每分钟跑也不刷屏。 */
+        if (throttle(sprintf('syslog-%s', lc(level)), 300))
             system([ 'logger', '-t', 'traffic-stats-stations', '-p',
                 (level == 'ERROR' ? 'daemon.err' : 'daemon.warn'), cut(one_line(msg), 200) ]);
     }
@@ -548,7 +548,9 @@ function parse_dump(raw, iface) {
     return out;
 }
 
-/* `iw dev` 输出 → AP 接口名列表。优先看 type（AP），名字再兜一层 phy*-ap*。 */
+/* `iw dev` 输出 → AP 接口名列表。优先看 type（必须正好是 AP），名字再兜一层 phy*-ap*。
+   注意 `type AP/VLAN` 是 VLAN 接口（例如 br-lan），**不是** BSS，不能被当成 AP ——
+   否则会去 dump 一个没有 station 的接口，白干活还刷日志。 */
 function is_ap_iface(name, kind) {
     if (kind == 'ap')
         return true;
@@ -577,7 +579,8 @@ function parse_iw_dev(raw) {
             continue;
         }
 
-        const type = match(t, /^type[ \t]+([A-Za-z]+)/);
+        /* 取整个 token：'AP' 才是 BSS，'AP/VLAN' 不是（用 [A-Za-z]+ 会截成 AP）。 */
+        const type = match(t, /^type[ \t]+(\S+)/);
 
         if (type != null) {
             kind = lc(type[1]);
@@ -983,13 +986,13 @@ function main() {
 
     if (!res.ok) {
         /* 网络 / 非 200 / code != 0 都不算脚本故障：记日志，下个周期再试。 */
-        log('ERROR', sprintf('上报失败：code=%s %s（%d 个站点，%d 字节）',
+        log('ERROR', sprintf('上报失败：code=%s %s（站点 %d，请求体 %d 字节）',
             res.code, cut(res.msg, 160), length(got.list), length(body)));
         return 0;
     }
 
     if (throttle('ok', 600))
-        log('INFO', sprintf('上报成功：%s 站点=%d bytes=%d ts=%s',
+        log('INFO', sprintf('上报成功：%s 站点=%d 请求体=%d 字节 ts=%s',
             url, length(got.list), length(body), ts));
 
     return 0;
