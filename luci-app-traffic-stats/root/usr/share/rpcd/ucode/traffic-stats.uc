@@ -76,6 +76,8 @@ const STATION_SHAPES = [ 400, 200, 100, 50, 0 ];
 const UCI_FIELDS = {
 	settings: [
 		'enabled', 'poll_interval', 'clash_api', 'clash_secret', 'fake_ip_ranges', 'history_days',
+		/* 接入方式（无线 / 有线）判定：桥名 + 无线上联端口 + AP 的 LAN MAC + FDB 刷新间隔 */
+		'lan_bridge', 'wireless_ports', 'ap_macs', 'link_refresh',
 		/* 子母多节点汇总（settings 页暂未提供输入框，先开放给后续页面/脚本复用） */
 		'node_id', 'node_name', 'mother_url', 'mother_secret', 'mother_enabled',
 		/* 哑桥 AP 无线站点元数据上报（stations.uc 读，母节点 ingest-stations.uc 校验） */
@@ -109,6 +111,31 @@ function member(list, value) {
 		if (item == value)
 			return true;
 	return false;
+}
+
+/* 接入方式枚举固定 wifi|wired|unknown；缺字段/脏值 -> ''（前端显示 "-"）。 */
+function link_kind(value) {
+	const v = text(value, '');
+	return member([ 'wifi', 'wired', 'unknown' ], v) ? v : '';
+}
+
+/* 无线上联端口列表：只收 0..65535 的整数，去重并截断（防止脏 state 撑爆 ubus 消息）。 */
+function link_ports(value) {
+	const out = [];
+
+	if (type(value) != 'array')
+		return out;
+
+	for (let i = 0; i < length(value) && i < 32; i++) {
+		const p = integer(value[i], -1);
+
+		if (p < 0 || p > 65535 || member(out, p))
+			continue;
+
+		push(out, p);
+	}
+
+	return out;
 }
 
 function shellquote(s) {
@@ -205,6 +232,9 @@ function empty_summary() {
 		totals: {
 			direct_rx: 0, direct_tx: 0,
 			proxy_rx: 0, proxy_tx: 0,
+			wifi_rx: 0, wifi_tx: 0,
+			wired_rx: 0, wired_tx: 0,
+			unknown_rx: 0, unknown_tx: 0,
 			rx_rate: 0, tx_rate: 0
 		},
 		nodes: {},
@@ -213,7 +243,14 @@ function empty_summary() {
 			reasons: [],
 			conntrack_count: 0,
 			clash_connections: 0,
-			clash_poll_ms: 0
+			clash_poll_ms: 0,
+			link_source: 'none',
+			link_bridge: '',
+			link_ports: [],
+			link_ports_from: 'none',
+			link_entries: 0,
+			link_refresh: 0,
+			link_error: ''
 		}
 	};
 }
@@ -259,6 +296,15 @@ function state_summary(raw) {
 		out.health.clash_connections = integer(h.clash_connections, 0);
 		out.health.clash_poll_ms = integer(h.clash_poll_ms, 0);
 
+		/* 接入方式（与 direct/proxy 正交）：状态透传给前端，缺字段时保持默认值。 */
+		out.health.link_source = (text(h.link_source, 'none') == 'brctl') ? 'brctl' : 'none';
+		out.health.link_bridge = text(h.link_bridge, '');
+		out.health.link_ports = link_ports(h.link_ports);
+		out.health.link_ports_from = text(h.link_ports_from, 'none');
+		out.health.link_entries = integer(h.link_entries, 0);
+		out.health.link_refresh = integer(h.link_refresh, 0);
+		out.health.link_error = text(h.link_error, '');
+
 		const reasons = [];
 
 		if (type(h.reasons) == 'array')
@@ -286,6 +332,7 @@ function project_device(dev, max_apps) {
 		ip: text(dev?.ip, ''),
 		mac: text(dev?.mac, ''),
 		hostname: text(dev?.hostname, ''),
+		link: link_kind(dev?.link),
 		direct_rx: integer(dev?.direct_rx, 0),
 		direct_tx: integer(dev?.direct_tx, 0),
 		proxy_rx: integer(dev?.proxy_rx, 0),
@@ -926,6 +973,11 @@ const methods = {
 					clash: summary.source.clash,
 					conntrack: summary.source.conntrack
 				},
+				/* 接入方式判定状态（设置页/概览页用来提示"FDB 读不到"或"未配置端口"） */
+				link_source: summary.health.link_source,
+				link_bridge: summary.health.link_bridge,
+				link_ports: summary.health.link_ports,
+				link_ports_from: summary.health.link_ports_from,
 				version: VERSION
 			};
 		}

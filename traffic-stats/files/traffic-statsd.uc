@@ -11,6 +11,17 @@
  * 去重（硬性）：conntrack 中 orig.dst 落在 fake_ip_ranges 的流一律跳过，
  * 这部分流量由 clash 侧统计，绝不能两边都算。
  *
+ * 接入方式（无线 / 有线，与"代理 / 直连"是两个正交维度）：
+ *   主路由 br-lan 是软件桥，哑桥 AP 挂在其中一个桥端口上；无线客户端和 AP 自己的
+ *   br-lan MAC 都学在**同一个桥端口**上。所以每 link_refresh 秒跑一次
+ *
+ *       brctl showmacs <lan_bridge>          # 注意：这台机器上没有 bridge 命令
+ *
+ *   解析 "port mac is-local" 得到 mac -> port，再用 ap_macs 反查 AP 上联端口
+ *   （优先），没配 ap_macs 就用显式的 wireless_ports。设备的 MAC 落在无线上联端口
+ *   -> wifi，落在其它端口 -> wired，FDB 里没有 -> unknown。新增的 totals.wifi_* 、
+ *   wired_* 与 unknown_* 三桶与 direct/proxy 严格互斥且完备（相加恒等）。
+ *
  * 契约：docs/SPEC.md —— 字段名 / 文件路径以契约为准，不得改动。
  *
  * 仅测试用的环境变量（生产环境不要设置）：
@@ -19,6 +30,7 @@
  *   TRAFFIC_STATS_ONCE=1     只跑一轮、写完文件后退出（用于冒烟测试）
  *   TRAFFIC_STATS_CONNTRACK_FILE  覆盖 /proc/net/nf_conntrack（合成数据自测用）
  *   TRAFFIC_STATS_CLASH_API  覆盖 clash_api（自测用）
+ *   TRAFFIC_STATS_BRCTL      覆盖 brctl 路径（自测用：指向假 brctl / 不存在路径）
  *   TRAFFIC_STATS_DEBUG=1    详细日志输出到 stderr
  */
 
@@ -57,6 +69,20 @@ let store_evict, evict_device, elapsed_ms, node_add, day_dev_add, poll_dev_add;
  * 基础工具
  * ------------------------------------------------------------------ */
 
+/** MAC 校验：不能依赖 match()（本 build 的 match() 恒返回 nil，见 docs/INCIDENT 附录） */
+function is_mac(m) {
+	if (length(m) != 17) return false;
+	for (let i = 0; i < 17; i++) {
+		let ch = substr(m, i, 1);
+		if (i % 3 == 2) {
+			if (ch != ':') return false;
+		} else if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+			return false;
+		}
+	}
+	return true;
+}
+
 function str(v) {
 	if (v == null) return '';
 	return '' + v;
@@ -87,8 +113,10 @@ function clamp(v, lo, hi) {
 
 /** 按空白切分并丢弃空 token（conntrack / dhcp.leases 都需要） */
 function split_ws(s) {
+	/* 注意：brctl showmacs 的输出是**制表符分隔**，只按空格切会把整行当成一个 token。
+	   这里先把 TAB 归一成空格再切（conntrack 行本来就是空格分隔，不受影响）。 */
 	let out = [];
-	for (let t in split(s, ' ')) {
+	for (let t in split(replace(str(s), '\t', ' '), ' ')) {
 		if (t != '') push(out, t);
 	}
 	return out;
@@ -99,6 +127,36 @@ function split_list(s) {
 	let out = [];
 	for (let t in split(replace(str(s), ',', ' '), ' ')) {
 		if (t != '') push(out, t);
+	}
+	return out;
+}
+
+/** 桥端口号列表："3" / "3,5" -> [3, 5]；非法项丢弃并去重 */
+function parse_port_list(s) {
+	let out = [];
+	for (let t in split_list(s)) {
+		let p = to_int(t, -1);
+		if (p < 0 || p > 65535) continue;
+		let dup = false;
+		for (let q in out) {
+			if (q == p) { dup = true; break; }
+		}
+		if (!dup) push(out, p);
+	}
+	return out;
+}
+
+/** MAC 列表：统一小写、`-` 归一成 `:`，非法项丢弃（brctl 输出的 MAC 是小写冒号格式） */
+function parse_mac_list(s) {
+	let out = [];
+	for (let t in split_list(s)) {
+		let m = lc(replace(t, '-', ':'));
+		if (!is_mac(m)) continue;
+		let dup = false;
+		for (let q in out) {
+			if (q == m) { dup = true; break; }
+		}
+		if (!dup) push(out, m);
 	}
 	return out;
 }
@@ -361,6 +419,12 @@ function load_config(cur) {
 	c.lan_ranges = split_list(cfg_str(cur, 'traffic-stats', 'settings', 'lan_ranges', ''));
 	c.history_days = clamp(to_int(cfg_str(cur, 'traffic-stats', 'settings', 'history_days', '7'), 7), 1, 90);
 
+	/* 接入方式（无线 / 有线）判定：桥名 + 无线上联端口 + AP 的 LAN MAC */
+	c.lan_bridge = cfg_str(cur, 'traffic-stats', 'settings', 'lan_bridge', 'br-lan');
+	c.wireless_ports = parse_port_list(cfg_str(cur, 'traffic-stats', 'settings', 'wireless_ports', ''));
+	c.ap_macs = parse_mac_list(cfg_str(cur, 'traffic-stats', 'settings', 'ap_macs', ''));
+	c.link_refresh = clamp(to_int(cfg_str(cur, 'traffic-stats', 'settings', 'link_refresh', '30'), 30), 1, 3600);
+
 	/* clash_secret 留空 -> 自动读 openclash 的控制器密码（契约 §2） */
 	if (c.clash_secret == '') {
 		c.clash_secret = cfg_str(cur, 'openclash', 'config', 'dashboard_password', '');
@@ -518,6 +582,216 @@ function dev_identity(ctx, ip) {
 	let l = ctx.leases[ip];
 	if (l == null) return { mac: '', hostname: '' };
 	return l;
+}
+
+/* ------------------------------------------------------------------ *
+ * 接入方式（无线 / 有线）：brctl showmacs FDB -> mac 所在桥端口
+ * ------------------------------------------------------------------ *
+ * 这台机器上**没有 bridge 命令**，只有 /usr/sbin/brctl（busybox）。
+ * 判定链：设备 MAC --(FDB)--> 桥端口 --(无线上联端口集合)--> wifi / wired。
+ *   - 无线上联端口 = ap_macs 反查结果（优先），否则就用 wireless_ports
+ *   - FDB 里查不到设备 MAC（静态 IP / 未学到）-> unknown
+ * 分类必须与字节累加同步：conntrack 与 clash 两侧每笔增量都进且只进一个桶，
+ * 保证 wifi + wired + unknown == direct + proxy（见 build_state）。
+ */
+
+/** 定位 brctl：env 覆盖 > PATH（测试注入假 brctl 走这里）> 固定路径 > 裸名字 */
+function resolve_brctl() {
+	let env = getenv('TRAFFIC_STATS_BRCTL');
+	if (env != null && env != '') return env;
+
+	let found = '';
+	try {
+		let p = fs.popen('command -v brctl 2>/dev/null', 'r');
+		found = trim(p.read('all'));
+		p.close();
+	} catch (e) {
+		found = '';
+	}
+	if (found != '') return found;
+
+	for (let c in [ '/usr/sbin/brctl', '/sbin/brctl', '/usr/bin/brctl', '/bin/brctl' ]) {
+		if (fs.stat(c) != null) return c;
+	}
+	return 'brctl';
+}
+
+/** 端口集合的文本形式（health / 日志用） */
+function ports_txt(list) {
+	let out = [];
+	for (let p in list) push(out, sprintf('%d', p));
+	return join(',', out);
+}
+
+/** 解析 `brctl showmacs <bridge>`：每行 "port mac is-local?"，返回 {map, lines, parsed} */
+function parse_fdb(text) {
+	let map = {}, lines = 0, parsed = 0;
+	for (let line in split(text, '\n')) {
+		let l = trim(line);
+		if (l == '') continue;
+		lines++;
+		let t = split_ws(l);
+		if (length(t) < 2) continue;
+		let port = to_int(t[0], -1);
+		if (port < 0) continue;
+		let mac = lc(t[1]);
+		if (!is_mac(mac)) continue;
+		map[mac] = port;
+		parsed++;
+	}
+	return { map: map, lines: lines, parsed: parsed };
+}
+
+/** 用 ap_macs 反查无线上联端口；查不到时保持 wireless_ports 原值并返回原因 */
+function resolve_link_ports(ctx) {
+	ctx.link_ap_ports = [];
+	ctx.link_ports = ctx.cfg.wireless_ports;
+
+	if (length(ctx.cfg.ap_macs) == 0) return '';
+
+	let ports = [], missing = [];
+	for (let m in ctx.cfg.ap_macs) {
+		let p = ctx.link_fdb[m];
+		if (p == null) {
+			push(missing, m);
+			continue;
+		}
+		let dup = false;
+		for (let q in ports) {
+			if (q == p) { dup = true; break; }
+		}
+		if (!dup) push(ports, p);
+	}
+
+	if (length(ports) > 0) {
+		ctx.link_ports = sort(ports, function(a, b) { return a - b; });
+		ctx.link_ap_ports = ctx.link_ports;
+		ctx.link_ports_from = 'ap_macs';
+		return '';
+	}
+
+	ctx.link_ports_from = (length(ctx.link_ports) > 0) ? 'wireless_ports' : 'none';
+	return 'link: ap_macs 未在 ' + ctx.cfg.lan_bridge + ' 的 FDB 中找到（' + join(',', missing)
+		+ '），保持 wireless_ports=' + (length(ctx.link_ports) > 0 ? ports_txt(ctx.link_ports) : '空');
+}
+
+/**
+ * 读一次 FDB。成功 -> health.link_source="brctl"；失败/输出无法解析 -> "none" + link_error。
+ * 任何失败都只影响接入方式分类，绝不影响 direct/proxy 的统计。
+ */
+function fdb_refresh(ctx) {
+	ctx.link_last = (ctx.now > 0) ? ctx.now : time();
+	ctx.link_cache = {};
+	ctx.link_fdb = {};
+	ctx.link_entries = 0;
+	ctx.link_error = '';
+	ctx.link_source = 'none';
+
+	let out = ctx.cfg.state_dir + '/.fdb.out';
+	let err = ctx.cfg.state_dir + '/.fdb.err';
+	unlink_quiet([ out, err ]);
+
+	let cmd = shell_quote(ctx.link_brctl) + ' showmacs ' + shell_quote(ctx.cfg.lan_bridge)
+		+ ' > ' + shell_quote(out) + ' 2> ' + shell_quote(err);
+	let rc = -1;
+	try {
+		rc = system([ 'sh', '-c', cmd ]);
+	} catch (e) {
+		rc = -1;
+	}
+
+	let text = null;
+	try {
+		text = fs.readfile(out);
+	} catch (e) {
+		text = null;
+	}
+	let errtext = substr(replace(trim(str(fs.readfile(err))), '\n', ' '), 0, 100);
+	unlink_quiet([ out, err ]);
+
+	if (rc != 0) {
+		ctx.link_error = 'link: brctl showmacs ' + ctx.cfg.lan_bridge + ' 失败（rc=' + rc
+			+ (errtext != '' ? '，' + errtext : '') + '），接入方式无法判定';
+		resolve_link_ports(ctx);
+		return;
+	}
+
+	let p = parse_fdb(str(text));
+	if (p.lines > 0 && p.parsed == 0) {
+		ctx.link_error = 'link: brctl showmacs ' + ctx.cfg.lan_bridge + ' 输出无法解析（'
+			+ p.lines + ' 行），接入方式无法判定';
+		resolve_link_ports(ctx);
+		return;
+	}
+
+	ctx.link_source = 'brctl';
+	ctx.link_fdb = p.map;
+	ctx.link_entries = p.parsed;
+
+	let reason = resolve_link_ports(ctx);
+	if (reason != '') ctx.link_error = reason;
+}
+
+/** 到了 link_refresh 才重新读 FDB；首轮（link_last=0）必定读一次 */
+function link_maybe_refresh(ctx) {
+	let now = (ctx.now > 0) ? ctx.now : time();
+	if (ctx.link_last > 0 && now - ctx.link_last < ctx.cfg.link_refresh) return;
+	fdb_refresh(ctx);
+}
+
+/** 是否配置了接入方式判定（只在配置过时才把 link 失败写进 health.reasons） */
+function link_configured(ctx) {
+	return (length(ctx.cfg.ap_macs) > 0) || (length(ctx.cfg.wireless_ports) > 0);
+}
+
+/** MAC -> wifi | wired | unknown */
+function link_of_mac(ctx, mac) {
+	let m = lc(str(mac));
+	if (m == '') return 'unknown';
+	let port = ctx.link_fdb[m];
+	if (port != null) {
+		/* 配了接入判定但端口暂时解析不出（例如 AP 自己的 MAC 刚好从 FDB 老化掉）时，
+		   不要武断判成 wired——那会覆盖正确记忆、把无线设备永久算成有线。
+		   完全没配置时按契约走原有行为（FDB 里学到的设备归 wired）。 */
+		if (length(ctx.link_ports) == 0 && link_configured(ctx)) return 'unknown';
+		let v = 'wired';
+		for (let p in ctx.link_ports) {
+			if (p == port) { v = 'wifi'; break; }
+		}
+		/* 记住判定结果：桥 FDB 老化时间只有 30 秒，空闲设备会从表里消失，
+		   若每次都重新判定，睡眠中的手机/音箱会被错算进 unknown 桶。 */
+		if (ctx.link_mem == null) ctx.link_mem = {};
+		ctx.link_mem[m] = v;
+		return v;
+	}
+	/* FDB 里暂时没有（空闲老化）→ 沿用上次判定 */
+	if (ctx.link_mem != null && ctx.link_mem[m] != null) return ctx.link_mem[m];
+	return 'unknown';
+}
+
+/** 设备 IP -> wifi | wired | unknown（每轮缓存：一条流查一次就够） */
+function dev_link(ctx, ip) {
+	if (ip == null || ip == '') return 'unknown';
+	let cached = ctx.link_cache[ip];
+	if (cached != null) return cached;
+	let link = link_of_mac(ctx, dev_identity(ctx, ip).mac);
+	ctx.link_cache[ip] = link;
+	return link;
+}
+
+/** 把增量同步累加到对应接入桶（必须与 direct/proxy 的累加一一对应） */
+function link_add(ctx, link, rx, tx) {
+	let t = ctx.totals;
+	if (link == 'wifi') {
+		t.wifi_rx += rx;
+		t.wifi_tx += tx;
+	} else if (link == 'wired') {
+		t.wired_rx += rx;
+		t.wired_tx += tx;
+	} else {
+		t.unknown_rx += rx;
+		t.unknown_tx += tx;
+	}
 }
 
 /* ------------------------------------------------------------------ *
@@ -694,6 +968,9 @@ function accumulate_clash(ctx, conns) {
 			host = (dip != '' ? dip : 'unknown') + (dport != '' ? ':' + dport : '');
 		}
 		let ip = str(md.sourceIP);
+
+		/* 接入方式与代理/直连正交：同一笔增量同时进一个 link 桶（不会重复计总量） */
+		link_add(ctx, dev_link(ctx, ip), ddl, dul);
 
 		if (is_direct) {
 			ctx.totals.direct_rx += ddl;
@@ -899,6 +1176,8 @@ function accumulate_conntrack(ctx, text) {
 		}
 		ctx.ct_prev[key] = { rx: cur_rx, tx: cur_tx };
 		if (d_rx == 0 && d_tx == 0) continue;
+
+		link_add(ctx, dev_link(ctx, ip), d_rx, d_tx);
 
 		ctx.totals.direct_rx += d_rx;
 		ctx.totals.direct_tx += d_tx;
@@ -1160,10 +1439,12 @@ function build_state(ctx) {
 	let devices = [];
 	for (let ip in ctx.devices) {
 		let d = ctx.devices[ip];
+		let mac = (d.mac != '') ? d.mac : dev_identity(ctx, ip).mac;
 		push(devices, {
 			ip: d.ip,
 			mac: d.mac,
 			hostname: d.hostname,
+			link: link_of_mac(ctx, mac),
 			direct_rx: d.direct_rx,
 			direct_tx: d.direct_tx,
 			proxy_rx: d.proxy_rx,
@@ -1204,6 +1485,9 @@ function build_state(ctx) {
 		totals: {
 			direct_rx: ctx.totals.direct_rx, direct_tx: ctx.totals.direct_tx,
 			proxy_rx: ctx.totals.proxy_rx, proxy_tx: ctx.totals.proxy_tx,
+			wifi_rx: ctx.totals.wifi_rx, wifi_tx: ctx.totals.wifi_tx,
+			wired_rx: ctx.totals.wired_rx, wired_tx: ctx.totals.wired_tx,
+			unknown_rx: ctx.totals.unknown_rx, unknown_tx: ctx.totals.unknown_tx,
 			rx_rate: ctx.totals.rx_rate, tx_rate: ctx.totals.tx_rate
 		},
 		nodes: nodes,
@@ -1215,7 +1499,15 @@ function build_state(ctx) {
 			conntrack_count: ctx.ct_count,
 			clash_connections: ctx.clash_count,
 			clash_poll_ms: ctx.clash_ms,
-			poll_ms: ctx.poll_ms
+			poll_ms: ctx.poll_ms,
+			/* 接入方式判定的来源与状态（与 direct/proxy 完全独立） */
+			link_source: ctx.link_source,
+			link_bridge: ctx.cfg.lan_bridge,
+			link_ports: ctx.link_ports,
+			link_ports_from: ctx.link_ports_from,
+			link_entries: ctx.link_entries,
+			link_refresh: ctx.cfg.link_refresh,
+			link_error: ctx.link_error
 		}
 	};
 }
@@ -1245,6 +1537,10 @@ function poll(ctx) {
 
 	load_leases(ctx);
 
+	/* 接入方式：到了 link_refresh 才重新读 FDB；失败只影响 link，不影响 direct/proxy */
+	ctx.link_cache = {};
+	link_maybe_refresh(ctx);
+
 	/* 本轮增量累加器 */
 	for (let ip in ctx.devices) {
 		ctx.devices[ip].rx_rate = 0;
@@ -1260,6 +1556,9 @@ function poll(ctx) {
 	let before_proxy_tx = ctx.totals.proxy_tx;
 
 	let reasons = [];
+
+	/* 只有真的配置了接入方式判定，FDB 读取失败才进 health.reasons（否则只是 link_source=none） */
+	if (ctx.link_error != '' && link_configured(ctx)) push(reasons, ctx.link_error);
 
 	let t_clash0 = clock();
 	let clash = fetch_clash(ctx);
@@ -1371,7 +1670,13 @@ function new_ctx() {
 		fakeip_skipped: 0,
 		source: { clash: 'ok', conntrack: 'ok' },
 		reasons: [],
-		totals: { direct_rx: 0, direct_tx: 0, proxy_rx: 0, proxy_tx: 0, rx_rate: 0, tx_rate: 0 },
+		totals: {
+			direct_rx: 0, direct_tx: 0, proxy_rx: 0, proxy_tx: 0,
+			wifi_rx: 0, wifi_tx: 0,
+			wired_rx: 0, wired_tx: 0,
+			unknown_rx: 0, unknown_tx: 0,
+			rx_rate: 0, tx_rate: 0
+		},
 		prev_total_rx: 0,
 		prev_total_tx: 0,
 		nodes: {},
@@ -1391,6 +1696,18 @@ function new_ctx() {
 		lan_cidrs: [],
 		lan_prefixes: [],
 		fake_cidrs: [],
+		/* 接入方式（FDB）状态 */
+		link_brctl: 'brctl',
+		link_source: 'none',
+		link_ports: [],
+		link_ports_cfg: [],
+		link_ap_ports: [],
+		link_ports_from: 'none',
+		link_fdb: {},
+		link_cache: {},
+		link_entries: 0,
+		link_error: '',
+		link_last: 0,
 		poll_apps: {},
 		poll_devs: {},
 		last_history_flush: 0,
@@ -1446,8 +1763,18 @@ function boot() {
 	ctx.lan_cidrs = detect_lan_cidrs(cur, ctx.cfg);
 	ctx.lan_prefixes = lan_prefixes_of(ctx.lan_cidrs);
 
+	/* 接入方式：brctl 可执行文件与无线上联端口（ap_macs 反查在每轮 fdb_refresh 里做） */
+	ctx.link_brctl = resolve_brctl();
+	ctx.link_ports_cfg = ctx.cfg.wireless_ports;
+	ctx.link_ports = ctx.cfg.wireless_ports;
+	ctx.link_ports_from = (length(ctx.cfg.wireless_ports) > 0) ? 'wireless_ports' : 'none';
+
 	dbg(ctx, 'lan=' + join(',', lan_txt_of(ctx)) + '  fake=' + join(',', ctx.cfg.fake_ip_ranges)
 		+ '  interval=' + ctx.cfg.poll_interval + 's  api=' + ctx.cfg.clash_api);
+	dbg(ctx, 'link: brctl=' + ctx.link_brctl + ' bridge=' + ctx.cfg.lan_bridge
+		+ ' ports=' + (length(ctx.cfg.wireless_ports) > 0 ? ports_txt(ctx.cfg.wireless_ports) : '空')
+		+ ' ap_macs=' + (length(ctx.cfg.ap_macs) > 0 ? join(',', ctx.cfg.ap_macs) : '空')
+		+ ' refresh=' + ctx.cfg.link_refresh + 's');
 
 	if (length(ctx.lan_cidrs) == 0)
 		push(ctx.reasons, 'lan: 未能识别 LAN 网段，conntrack 直连流量将统计不到');
@@ -1476,9 +1803,10 @@ function main() {
 		flush_all(ctx, 'once');
 		let st = load_json(ctx.cfg.state_dir + '/state.json');
 		if (st != null)
-			printf('once: devices=%d proxy_rx=%d direct_rx=%d apps=%d reasons=%d\n',
+			printf('once: devices=%d proxy_rx=%d direct_rx=%d apps=%d reasons=%d link=%s ports=%s entries=%d\n',
 				length(st.devices), st.totals.proxy_rx, st.totals.direct_rx,
-				length(st.apps), length(st.health.reasons));
+				length(st.apps), length(st.health.reasons), st.health.link_source,
+				ports_txt(st.health.link_ports), st.health.link_entries);
 		exit(0);
 	}
 

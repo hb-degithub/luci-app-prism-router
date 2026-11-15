@@ -46,7 +46,11 @@ var DEFAULTS = {
 		clash_api: '127.0.0.1:9090',
 		clash_secret: '',
 		fake_ip_ranges: '198.18.0.0/16',
-		history_days: '7'
+		history_days: '7',
+		lan_bridge: 'br-lan',
+		wireless_ports: '',
+		ap_macs: '',
+		link_refresh: '30'
 	},
 	feishu: {
 		enabled: '0',
@@ -144,6 +148,14 @@ return view.extend({
 				bits.push('conntrack=' + (status.sources.conntrack || '?'));
 			}
 
+			if (status.link_source != null) {
+				var ports = Array.isArray(status.link_ports) ? status.link_ports : [];
+
+				bits.push(_('接入判定') + ': ' + ((status.link_source == 'brctl')
+					? ('brctl' + (ports.length ? ' (' + ports.join(',') + ')' : ''))
+					: _('不可用')));
+			}
+
 			if (status.version)
 				bits.push('v' + status.version);
 		}
@@ -237,7 +249,11 @@ return view.extend({
 			[ 'settings', 'clash_api', _('Clash API 地址'), _('mihomo / OpenClash 的 external-controller，例如 127.0.0.1:9090。'), 'text', null ],
 			[ 'settings', 'clash_secret', _('Clash secret'), _('留空 = 自动读取 OpenClash 的 dashboard 密码。'), 'password', { placeholder: _('留空自动获取') } ],
 			[ 'settings', 'fake_ip_ranges', _('fake-ip 网段'), _('逗号分隔；命中这些网段的 conntrack 流不计入直连，避免与代理重复计数。'), 'text', { wide: true } ],
-			[ 'settings', 'history_days', _('历史保留天数'), _('1–90，默认 7。'), 'number', null ]
+			[ 'settings', 'history_days', _('历史保留天数'), _('1–90，默认 7。'), 'number', null ],
+			[ 'settings', 'lan_bridge', _('LAN 网桥'), _('brctl showmacs 的目标网桥；x86 多网卡桥接一般是 br-lan。'), 'text', { placeholder: 'br-lan' } ],
+			[ 'settings', 'wireless_ports', _('无线上联端口'), _('桥端口号，逗号分隔（例如 3 或 3,5）：AP 上联的那个口上的 MAC 记为无线。留空 = 不区分。'), 'text', { placeholder: '3' } ],
+			[ 'settings', 'ap_macs', _('AP 的 LAN MAC'), _('逗号分隔。配了它就用 FDB 反查 AP 上联端口，优先于「无线上联端口」。'), 'text', { wide: true, placeholder: '00:58:28:d7:63:60' } ],
+			[ 'settings', 'link_refresh', _('接入方式刷新间隔（秒）'), _('重新读取 FDB 的间隔，默认 30。'), 'number', null ]
 		];
 
 		var fields = defs.map(function(def) {
@@ -325,6 +341,10 @@ return view.extend({
 		settings.clash_secret = this.inputValue('settings', 'clash_secret');
 		settings.fake_ip_ranges = this.inputValue('settings', 'fake_ip_ranges');
 		settings.history_days = this.inputValue('settings', 'history_days');
+		settings.lan_bridge = this.inputValue('settings', 'lan_bridge');
+		settings.wireless_ports = this.inputValue('settings', 'wireless_ports');
+		settings.ap_macs = this.inputValue('settings', 'ap_macs');
+		settings.link_refresh = this.inputValue('settings', 'link_refresh');
 
 		feishu.enabled = this.inputChecked('feishu', 'enabled') ? '1' : '0';
 		feishu.webhook = this.inputValue('feishu', 'webhook');
@@ -356,6 +376,32 @@ return view.extend({
 
 			if (!/^[0-9a-fA-F:.]+\/[0-9]{1,3}$/.test(ranges[i]))
 				return _('fake-ip 网段要以 CIDR 形式填写，例如 198.18.0.0/16');
+		}
+
+		var refresh = cfg.settings.link_refresh;
+
+		if (!/^[0-9]+$/.test(refresh) || parseInt(refresh, 10) < 1 || parseInt(refresh, 10) > 3600)
+			return _('接入方式刷新间隔必须是 1–3600 之间的整数');
+
+		if (cfg.settings.lan_bridge.length > 0 && !/^[A-Za-z0-9._-]{1,15}$/.test(cfg.settings.lan_bridge))
+			return _('LAN 网桥名不合法（1–15 个字母/数字/._-，例如 br-lan）');
+
+		var ports = cfg.settings.wireless_ports.split(/[\s,]+/);
+
+		for (var j = 0; j < ports.length; j++) {
+			if (ports[j].length == 0) continue;
+
+			if (!/^[0-9]{1,5}$/.test(ports[j]))
+				return _('无线上联端口必须是桥端口号（数字），例如 3 或 3,5');
+		}
+
+		var apMacs = cfg.settings.ap_macs.split(/[\s,]+/);
+
+		for (var k = 0; k < apMacs.length; k++) {
+			if (apMacs[k].length == 0) continue;
+
+			if (!/^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$/.test(apMacs[k]))
+				return _('AP 的 LAN MAC 必须是 MAC 形式，例如 00:58:28:d7:63:60');
 		}
 
 		if (cfg.feishu.webhook.length > 0 && !/^https?:\/\/[^\s]+$/.test(cfg.feishu.webhook))

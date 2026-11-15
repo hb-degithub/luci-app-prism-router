@@ -25,6 +25,10 @@ var callState = rpc.declare({
 var REFRESH_MS = 5000;
 var COLOR_PROXY = '#2b7de9';
 var COLOR_DIRECT = '#4caf50';
+/* 接入方式（无线 / 有线 / 未知）——和上面的代理/直连是两套颜色、两个维度 */
+var COLOR_WIFI = '#7b1fa2';
+var COLOR_WIRED = '#00838f';
+var COLOR_LINK_UNKNOWN = '#9e9e9e';
 
 // ---------------------------------------------------------------- 格式化
 
@@ -122,6 +126,27 @@ function totalOf(totals) {
 	return num(t.direct_rx) + num(t.direct_tx) + num(t.proxy_rx) + num(t.proxy_tx);
 }
 
+/*
+ * 接入方式三个桶（互斥且完备：wifi + wired + unknown == direct + proxy）。
+ * 注意这是**另一个维度**：同一字节既可能是"无线接入"也可能是"走代理"，
+ * 所以这里的数绝不能再和代理/直连相加。
+ */
+function linkTotals(totals) {
+	var t = totals || {};
+
+	return {
+		wifi: num(t.wifi_rx) + num(t.wifi_tx),
+		wired: num(t.wired_rx) + num(t.wired_tx),
+		unknown: num(t.unknown_rx) + num(t.unknown_tx)
+	};
+}
+
+function linkRxTx(totals, prefix) {
+	var t = totals || {};
+
+	return { rx: num(t[prefix + '_rx']), tx: num(t[prefix + '_tx']) };
+}
+
 // ---------------------------------------------------------------- 视图
 
 return view.extend({
@@ -161,6 +186,7 @@ return view.extend({
 			empty ? this.renderEmpty(health) : '',
 			this.renderCards(state),
 			this.renderChart(state),
+			this.renderLinkSection(state),
 			this.renderTopApps(state, apps, total),
 			this.renderTopDevices(state, devices)
 		]);
@@ -257,6 +283,10 @@ return view.extend({
 		var source = (state != null && state.source && typeof state.source == 'object') ? state.source : {};
 		var look = healthLook(h.accounting_confidence);
 		var reasons = Array.isArray(h.reasons) ? h.reasons : [];
+		var ports = Array.isArray(h.link_ports) ? h.link_ports : [];
+		var linkText = ('' + (h.link_source || 'none')) == 'brctl'
+			? ('brctl' + (ports.length ? ' (' + ports.join(',') + ')' : ''))
+			: ('none' + (h.link_error ? ' · ' + h.link_error : ''));
 
 		if (this.healthBox == null || this.healthLabel == null) return;
 
@@ -268,7 +298,8 @@ return view.extend({
 			_('数据源') + ' clash=' + (source.clash || 'unknown') + ', conntrack=' + (source.conntrack || 'unknown'),
 			_('conntrack 条目') + ' ' + num(h.conntrack_count),
 			_('clash 连接') + ' ' + num(h.clash_connections),
-			_('clash 轮询') + ' ' + num(h.clash_poll_ms) + ' ms'
+			_('clash 轮询') + ' ' + num(h.clash_poll_ms) + ' ms',
+			_('接入判定') + ' ' + linkText
 		].join(' · ');
 
 		dom.content(this.healthReasons, reasons.map(function(reason) {
@@ -438,6 +469,157 @@ return view.extend({
 		catch (e) {
 			/* 图表失败不影响页面其它部分 */
 			if (window.console) console.warn('traffic-stats: 环形图绘制失败', e);
+		}
+	},
+
+	/*
+	 * 接入方式（无线 / 有线）——与代理/直连**正交**的另一个维度。
+	 * 两个卡片 + 一张三段环形图（含"未知"：FDB 未命中/未配置端口），
+	 * 绝不和上面的代理/直连合并成"总计"，否则同一个字节会被算两次。
+	 */
+	renderLinkSection: function(state) {
+		var self = this;
+		var health = (state != null && state.health) ? state.health : {};
+		var link = linkTotals(state != null ? state.totals : null);
+		var sum = link.wifi + link.wired + link.unknown;
+		var ports = Array.isArray(health.link_ports) ? health.link_ports : [];
+		var source = '' + (health.link_source || 'none');
+		var bridge = ('' + (health.link_bridge || 'br-lan'));
+
+		var canvas = E('canvas', { width: 200, height: 200, style: 'width:200px;height:200px' });
+
+		this.linkChartData = link;
+
+		function card(title, prefix, valueOf) {
+			return E('div', {
+				style: 'flex:1 1 200px;min-width:170px;padding:12px 14px;border-radius:8px;' +
+					'background:rgba(127,127,127,.08);border:1px solid rgba(127,127,127,.18)'
+			}, [
+				E('div', { style: 'font-size:12px;opacity:.75' }, title),
+				E('div', { style: 'font-size:21px;font-weight:600;line-height:1.35' },
+					self.cell(valueOf)),
+				E('div', { style: 'font-size:12px;opacity:.75' }, [
+					'↓ ', self.cell(function(s) { return fmtBytes(linkRxTx(s.totals, prefix).rx); }),
+					' · ↑ ', self.cell(function(s) { return fmtBytes(linkRxTx(s.totals, prefix).tx); }),
+					' · ', self.cell(function(s) {
+						var l = linkTotals(s.totals);
+						return fmtPercent(l[prefix], l.wifi + l.wired + l.unknown);
+					})
+				])
+			]);
+		}
+
+		function legendRow(color, label, value) {
+			return E('li', { style: 'margin:5px 0;list-style:none' }, [
+				E('span', {
+					style: 'display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:8px;background:' + color
+				}),
+				E('strong', {}, label),
+				' ',
+				E('span', {}, fmtBytes(value)),
+				E('span', { style: 'opacity:.7' }, ' (' + fmtPercent(value, sum) + ')')
+			]);
+		}
+
+		var hint;
+
+		if (source != 'brctl')
+			hint = _('读不到桥 FDB（brctl 不可用），接入方式一律显示为未知；现有代理/直连统计不受影响。');
+		else if (ports.length == 0)
+			hint = _('尚未指定无线上联端口：配置 wireless_ports 或 ap_macs 后，FDB 里学到的设备才能区分无线/有线（当前一律归为有线）。');
+		else
+			hint = _('判据：') + 'brctl showmacs ' + bridge + ' · ' + _('无线上联端口') + ' '
+				+ ports.join(', ') + ' · ' + _('每') + ' ' + num(health.link_refresh) + ' ' + _('秒刷新');
+
+		var chart = E('div', { style: 'display:flex;gap:24px;align-items:center;flex-wrap:wrap' }, [
+			canvas,
+			E('ul', { style: 'margin:0;padding:0;min-width:230px' }, [
+				legendRow(COLOR_WIFI, _('无线'), link.wifi),
+				legendRow(COLOR_WIRED, _('有线'), link.wired),
+				legendRow(COLOR_LINK_UNKNOWN, _('未知'), link.unknown),
+				E('li', { style: 'margin-top:10px;font-size:12px;opacity:.7;list-style:none' },
+					_('累计字节（rx+tx）。与上方的代理/直连是两个维度，不能相加。'))
+			])
+		]);
+
+		var script = null;
+
+		if (typeof window.Chart == 'function') {
+			window.setTimeout(function() { self.drawLinkChart(canvas); }, 0);
+		}
+		else {
+			script = E('script', {
+				type: 'text/javascript',
+				src: L.resource('nlbw.chart.min.js'),
+				load: function() { self.drawLinkChart(canvas); },
+				error: function() {
+					var parent = canvas.parentNode;
+
+					if (parent != null) {
+						parent.removeChild(canvas);
+						parent.appendChild(E('p', { 'class': 'alert-message warning', style: 'max-width:260px' },
+							_('图表库未安装（luci-lib-chartjs），接入方式环形图无法显示。')));
+					}
+				}
+			});
+		}
+
+		return E('div', { 'class': 'cbi-section', style: 'margin-bottom:18px' }, [
+			E('h3', {}, _('接入方式（无线 / 有线）')),
+			E('p', { style: 'margin:0 0 10px 0;font-size:12px;opacity:.75' }, hint),
+			E('div', { style: 'display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px' }, [
+				card(_('无线接入'), 'wifi', function(s) {
+					var l = linkTotals(s.totals);
+					return fmtBytes(l.wifi);
+				}),
+				card(_('有线接入'), 'wired', function(s) {
+					var l = linkTotals(s.totals);
+					return fmtBytes(l.wired);
+				})
+			]),
+			chart,
+			script || ''
+		]);
+	},
+
+	drawLinkChart: function(canvas) {
+		var ChartLib = window.Chart;
+
+		if (typeof ChartLib != 'function' || !canvas || !canvas.getContext) return;
+
+		var ctx = canvas.getContext('2d');
+
+		if (!ctx) return;
+
+		var data = this.linkChartData || { wifi: 0, wired: 0, unknown: 0 };
+		var sum = data.wifi + data.wired + data.unknown;
+
+		if (ChartLib.defaults && ChartLib.defaults.global) {
+			ChartLib.defaults.global.customTooltips = null;
+			ChartLib.defaults.global.showTooltips = true;
+			ChartLib.defaults.global.tooltipTemplate = function(item) {
+				return '' + item.label + ': ' + fmtBytes(item.value);
+			};
+			ChartLib.defaults.global.multiTooltipTemplate = ChartLib.defaults.global.tooltipTemplate;
+		}
+
+		var segments = (sum > 0) ? [
+			{ value: data.wifi, color: COLOR_WIFI, highlight: '#9c4dcc', label: _('无线') },
+			{ value: data.wired, color: COLOR_WIRED, highlight: '#26a4ad', label: _('有线') },
+			{ value: data.unknown, color: COLOR_LINK_UNKNOWN, highlight: '#bdbdbd', label: _('未知') }
+		] : [
+			{ value: 1, color: 'rgba(127,127,127,.25)', highlight: 'rgba(127,127,127,.25)', label: _('暂无数据') }
+		];
+
+		try {
+			this.linkChart = new ChartLib(ctx).Doughnut(segments, {
+				segmentStrokeWidth: 2,
+				percentageInnerCutout: 62,
+				animation: false
+			});
+		}
+		catch (e) {
+			if (window.console) console.warn('traffic-stats: 接入方式环形图绘制失败', e);
 		}
 	},
 

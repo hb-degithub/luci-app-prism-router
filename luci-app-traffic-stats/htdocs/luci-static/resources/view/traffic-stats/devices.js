@@ -129,6 +129,23 @@ function chainBadge(chain) {
 	}, name);
 }
 
+/* ---- 接入方式（无线 / 有线 / 未知，来自主路由的桥 FDB，与代理/直连无关）---- */
+
+var LINK_STYLE = {
+	wifi: { label: '无线', color: '#7b1fa2', bg: 'rgba(123,31,162,.16)' },
+	wired: { label: '有线', color: '#00838f', bg: 'rgba(0,131,143,.16)' },
+	unknown: { label: '未知', color: '#9e9e9e', bg: 'rgba(158,158,158,.2)' }
+};
+
+/* 后端每次都会给 link；字段缺失（老 state.json）时返回 ''，表格里显示 "-"。 */
+function linkOf(dev) {
+	if (dev == null || typeof dev.link != 'string') return '';
+
+	var v = dev.link.toLowerCase();
+
+	return (v == 'wifi' || v == 'wired' || v == 'unknown') ? v : '';
+}
+
 /* ---- 无线信号（来自哑桥 AP 的元数据，按 MAC 索引）---- */
 
 function indexStations(payload) {
@@ -208,6 +225,7 @@ return view.extend({
 			_('共') + ' ' + devices.length + ' ' + _('台设备'),
 			state.truncated === true ? ' · ' + _('数据过大，后端已裁剪（仅显示使用量最高的部分）') : '',
 			' · ',
+			this.linkSummary(state),
 			_('点击任意一行展开该设备的应用分布')
 		]);
 
@@ -219,6 +237,10 @@ return view.extend({
 					E('th', { 'class': 'th' }, _('主机名')),
 					E('th', { 'class': 'th' }, _('MAC')),
 					E('th', { 'class': 'th' }, _('IP')),
+					E('th', {
+						'class': 'th',
+						title: _('接入方式：主路由桥 FDB 里该设备 MAC 学在哪个端口（无线/有线），与代理/直连无关')
+					}, _('接入')),
 					E('th', { 'class': 'th', style: 'text-align:right' }, _('直连')),
 					E('th', { 'class': 'th', style: 'text-align:right' }, _('代理')),
 					E('th', { 'class': 'th', style: 'text-align:right' }, _('合计')),
@@ -232,6 +254,21 @@ return view.extend({
 				])
 			].concat(rows))
 		]);
+	},
+
+	/* 接入方式的数据来源提示：FDB 读不到或没配端口时，本列会大面积显示"未知/有线"，先把原因说清楚。 */
+	linkSummary: function(state) {
+		var h = (state != null && state.health) ? state.health : {};
+		var ports = Array.isArray(h.link_ports) ? h.link_ports : [];
+		var source = '' + (h.link_source || 'none');
+
+		if (source != 'brctl')
+			return _('接入判定不可用（读不到桥 FDB）') + ' · ';
+
+		if (ports.length == 0)
+			return _('未配置无线上联端口，接入列一律按有线归类') + ' · ';
+
+		return _('接入判定') + ' brctl:' + ports.join(',') + ' · ';
 	},
 
 	renderEmpty: function() {
@@ -273,7 +310,7 @@ return view.extend({
 
 		var cell = E('td', {
 			'class': 'td',
-			colspan: 9,
+			colspan: 10,
 			style: 'padding:10px 12px;background:rgba(127,127,127,.06)'
 		}, E('em', {}, _('展开后加载…')));
 
@@ -293,6 +330,7 @@ return view.extend({
 			E('td', { 'class': 'td' }, [ marker, ' ', E('strong', {}, shorten(name, 30)) ]),
 			E('td', { 'class': 'td' }, E('code', {}, dev.mac ? '' + dev.mac : '—')),
 			E('td', { 'class': 'td' }, E('code', {}, dev.ip ? '' + dev.ip : '—')),
+			this.renderLink(dev),
 			E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(direct)),
 			E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(proxy)),
 			E('td', { 'class': 'td', style: 'text-align:right' }, E('strong', {}, fmtBytes(total))),
@@ -320,6 +358,21 @@ return view.extend({
 		}.bind(this));
 
 		return [ row, detailRow ];
+	},
+
+	/* 接入列：无线 / 有线 / 未知；字段缺失（老后端）显示 "-"。
+	   数据来自主路由的桥 FDB（见守护进程 brctl showmacs），与字节来源无关。 */
+	renderLink: function(dev) {
+		var kind = linkOf(dev);
+		var style = LINK_STYLE[kind];
+
+		if (style == null)
+			return E('td', { 'class': 'td' }, '-');
+
+		return E('td', { 'class': 'td' }, E('span', {
+			style: 'font-size:11px;padding:1px 6px;border-radius:4px;white-space:nowrap;color:' +
+				style.color + ';background:' + style.bg
+		}, _(style.label)));
 	},
 
 	/* 信号列：有数据就显示 "-53 dBm" 并分级着色；没有该设备的数据就显示 "-"。
@@ -400,6 +453,8 @@ return view.extend({
 				_('设备') + ' ' + deviceName(dev),
 				dev.mac ? ' · ' + dev.mac : '',
 				dev.ip ? ' · ' + dev.ip : '',
+				' · ',
+				_('接入') + ' ' + (LINK_STYLE[linkOf(dev)] != null ? _(LINK_STYLE[linkOf(dev)].label) : '-'),
 				' · ',
 				_('应用明细') + ' ' + list.length + ' ' + _('项')
 			]),
