@@ -110,10 +110,11 @@ function history(boost) {
 	let buckets = [];
 	for (let i = 0; i < 96; i++) {
 		let per = 1048576;                       /* 1 MB / 5min -> 12 MB/h */
-		if (boost && i >= 84)                    /* 最近 1 小时的桶放大到 400 MB */
-			per = 400 * 1048576;
+		if (boost && i >= 84)                    /* 最近 1 小时的桶放大到 200 MB（rx+tx=400MB） */
+			per = 200 * 1048576;
 		push(buckets, {
-			ts: now - (96 - i) * 300,
+			/* 最新一个桶正好落在「现在」，保证任意分钟都能命中当前小时（用例不随时钟漂移） */
+			ts: now - (95 - i) * 300,
 			direct_rx: per, direct_tx: 1024,
 			proxy_rx: per, proxy_tx: 2048
 		});
@@ -355,6 +356,8 @@ sched "window=10 不覆盖 08:41"              0 --at "$TODAY 08:41" --mode dail
 ucode "$FEISHU" scheduled --base "$BASE" --secret demo --dry-run --at "$MON 08:30" \
   --mode weekly --time 08:30 --weekday 1 --out "$WORK/c-weekly.json" >/dev/null 2>&1
 has "流量周报" "$WORK/c-weekly.json" "weekly 到点生成「流量周报」标题"
+ucode "$FEISHU" check "$WORK/c-weekly.json" >/dev/null 2>&1
+rc_is 0 $? "周报卡片 check 通过（title 允许「流量周报」）"
 ucode "$FEISHU" scheduled --base "$BASE" --secret demo --dry-run --at "$TUE 08:30" \
   --mode both --time 08:30 --weekday 1 --out "$WORK/c-both-tue.json" >/dev/null 2>&1
 has "流量日报" "$WORK/c-both-tue.json" "both 且非周报日 -> 「流量日报」标题"
@@ -397,6 +400,11 @@ alerts --offline-min 10 >/dev/null
 fire offline "离线 10 分钟：device-12 离线 60 分钟触发"
 alerts --offline-min 120 >/dev/null
 nofire offline "离线 120 分钟：不触发"
+# state.json 缺失时无法判断离线 -> 静默跳过（采集异常另有告警，避免刷屏）
+STATE="$BASE/no-such-state.json"
+rc_is 0 "$(alerts --offline-min 10)" "state.json 缺失：离线判定退出 0"
+nofire offline "state.json 缺失：离线告警静默跳过"
+STATE=""
 alerts --cpu 90 >/dev/null
 fire sys_cpu "CPU 阈值 90%：95% 触发"
 alerts --cpu 99 >/dev/null

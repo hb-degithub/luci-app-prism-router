@@ -131,6 +131,18 @@ function fmtRate(v) {
 	return Math.round(n) + ' b/s';
 }
 
+/* KPI 主值用的紧凑写法：去掉无意义的 .00，窄卡片里不折行 */
+function fmtRateShort(v) {
+	var n = num(v) * 8;
+	var trim = function (s) { return s.replace(/\.0+$/, '').replace(/(\.\d)0$/, '$1'); };
+
+	if (n >= 1e9) return trim((n / 1e9).toFixed(2)) + ' Gb/s';
+	if (n >= 1e6) return trim((n / 1e6).toFixed(2)) + ' Mb/s';
+	if (n >= 1e3) return trim((n / 1e3).toFixed(1)) + ' kb/s';
+
+	return Math.round(n) + ' b/s';
+}
+
 function pad2(n) {
 	return (n < 10 ? '0' : '') + n;
 }
@@ -265,7 +277,10 @@ function kpi(key, label, value, sub, color) {
 			'border-radius:10px;padding:14px 16px;min-width:0'
 	}, [
 		E('div', { style: 'font-size:12px;opacity:.65;margin-bottom:6px' }, label),
-		E('div', { style: 'font-size:24px;font-weight:600;line-height:1.15;color:' + (color || 'inherit') }, value),
+		E('div', {
+			style: 'font-size:24px;font-weight:600;line-height:1.15;color:' + (color || 'inherit') +
+				';white-space:nowrap;overflow:hidden;text-overflow:ellipsis'
+		}, value),
 		E('div', { style: 'font-size:11px;opacity:.6;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis' }, sub || '')
 	]);
 }
@@ -308,8 +323,9 @@ function table(head, rows, emptyText) {
 
 	var titles = head.map(function (h) {
 		var attrs = { 'class': 'th' };
-		var style = h.right ? 'text-align:right' : '';
+		var style = 'white-space:nowrap' + (h.right ? ';text-align:right' : '');
 
+		if (h.width) style += ';width:' + h.width;
 		if (h.click) style += (style ? ';' : '') + 'cursor:pointer;user-select:none';
 		if (h.title) attrs.title = h.title;
 		if (h.sortKey) attrs['data-sort'] = h.sortKey;
@@ -628,7 +644,7 @@ function tsRenderLine(host, data, opts) {
 
 	var W = Math.max(320, Math.round(opts.width || host.clientWidth || 900));
 	var H = Math.max(120, Math.round(opts.height || host.clientHeight || 240));
-	var PL = 68, PR = 14, PT = 10, PB = 24;
+	var PL = 68, PR = 14, PT = 10, PB = 26;
 	var ticks = Math.max(1, Math.round(opts.yTicks || 4));
 
 	var max = 0;
@@ -662,7 +678,7 @@ function tsRenderLine(host, data, opts) {
 	var step = Math.max(1, Math.ceil(n / 8));
 
 	for (var i = 0; i < n; i += step)
-		out.push('<text x="' + x(i).toFixed(1) + '" y="' + (H - 6) +
+		out.push('<text x="' + x(i).toFixed(1) + '" y="' + (H - 8) +
 			'" font-size="10" fill="rgba(127,127,127,.85)" text-anchor="middle">' + labels[i] + '</text>');
 
 	var legend = (opts.legend === false) ? '' : sets.map(function (s) {
@@ -1027,13 +1043,13 @@ return view.extend({
 
 			/* KPI 行：6 张卡，口径写在标签/副标题上（totals 是"进程启动以来累计"） */
 			E('div', {
-				style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px'
+				style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:14px'
 			}, [
 				kpi('total', _('总流量（累计）'),
 					hasTotals ? fmtBytes(totalAll) : '—',
 					hasTotals ? (_('下载') + ' ' + fmtBytes(num(totals.direct_rx) + num(totals.proxy_rx)) + ' · ' + _('上传') + ' ' + fmtBytes(num(totals.direct_tx) + num(totals.proxy_tx))) : _('暂无数据')),
 				kpi('rate', _('实时速率'),
-					hasTotals ? fmtRate(num(totals.rx_rate)) : '—',
+					hasTotals ? fmtRateShort(num(totals.rx_rate)) : '—',
 					hasTotals ? ('↓ ' + fmtRate(num(totals.rx_rate)) + '   ↑ ' + fmtRate(num(totals.tx_rate))) : _('暂无数据')),
 				kpi('proxy', _('代理流量'),
 					hasTotals ? fmtBytes(proxyAll) : '—',
@@ -1052,7 +1068,7 @@ return view.extend({
 			/* 趋势 + 比例 */
 			E('div', {
 				'class': 'ts-grid-split',
-				style: 'grid-template-columns:minmax(0,2fr) minmax(0,1fr);margin-bottom:14px'
+				style: 'display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:12px;margin-bottom:14px'
 			}, [
 				card(_('流量趋势（近 24 小时 · 5 分钟桶）'), this.ovChartHost,
 					E('span', { style: 'font-size:12px;opacity:.6' }, _('总 / 代理 / 直连'))),
@@ -1074,7 +1090,7 @@ return view.extend({
 			/* Top 10 设备 / Top 10 应用 */
 			E('div', {
 				'class': 'ts-grid-split',
-				style: 'grid-template-columns:minmax(0,1fr) minmax(0,1fr)'
+				style: 'display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px'
 			}, [
 				card(_('Top 10 设备'), this.renderTopDevices()),
 				card(_('Top 10 应用 / 域名'), this.renderTopApps())
@@ -1096,15 +1112,17 @@ return view.extend({
 				E('td', { 'class': 'td', style: 'max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' },
 					E('strong', {}, shortText(name, 26))),
 				E('td', { 'class': 'td' }, badge(m.label, m.color, m.bg)),
-				E('td', { 'class': 'td', style: 'text-align:right;color:#1a73e8' }, fmtBytes(num(d.proxy_rx) + num(d.proxy_tx))),
-				E('td', { 'class': 'td', style: 'text-align:right;color:#34a853' }, fmtBytes(num(d.direct_rx) + num(d.direct_tx))),
-				E('td', { 'class': 'td', style: 'text-align:right' }, E('strong', {}, fmtBytes(deviceTotal(d))))
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap;color:#1a73e8' }, fmtBytes(num(d.proxy_rx) + num(d.proxy_tx))),
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap;color:#34a853' }, fmtBytes(num(d.direct_rx) + num(d.direct_tx))),
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, E('strong', {}, fmtBytes(deviceTotal(d))))
 			]);
 		});
 
 		return table([
-			{ label: _('设备') }, { label: _('接入') },
-			{ label: _('代理'), right: true }, { label: _('直连'), right: true }, { label: _('合计'), right: true }
+			{ label: _('设备') }, { label: _('接入'), width: '90px' },
+			{ label: _('代理'), right: true, width: '110px' },
+			{ label: _('直连'), right: true, width: '110px' },
+			{ label: _('合计'), right: true, width: '110px' }
 		], rows, _('暂无设备数据'));
 	},
 
@@ -1119,14 +1137,15 @@ return view.extend({
 				E('td', { 'class': 'td', style: 'max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', title: '' + (a.host || '') },
 					shortText(appLabel(a.host), 40)),
 				E('td', { 'class': 'td' }, chainBadge(a.chain)),
-				E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(appTotal(a))),
-				E('td', { 'class': 'td', style: 'text-align:right;opacity:.7' }, '' + num(a.devices))
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtBytes(appTotal(a))),
+				E('td', { 'class': 'td', style: 'text-align:right;opacity:.7;white-space:nowrap' }, '' + num(a.devices))
 			]);
 		});
 
 		return table([
-			{ label: _('域名 / 应用') }, { label: _('出口') },
-			{ label: _('流量'), right: true }, { label: _('设备数'), right: true }
+			{ label: _('域名 / 应用') }, { label: _('出口'), width: '150px' },
+			{ label: _('流量'), right: true, width: '110px' },
+			{ label: _('设备数'), right: true, width: '80px' }
 		], rows, _('暂无应用数据'));
 	},
 
@@ -1411,7 +1430,7 @@ return view.extend({
 		});
 
 		this.devSummaryNode = E('span', { style: 'font-size:12px;opacity:.85' }, '');
-		this.devTableHost = E('div', {}, this.renderDeviceTableBody());
+		this.devTableHost = E('div', { style: 'overflow-x:auto' }, this.renderDeviceTableBody());
 
 		this.updateDeviceSummary();
 
@@ -1446,21 +1465,22 @@ return view.extend({
 		var self = this;
 
 		var cols = [
-			{ label: _('主机名'), sortKey: 'host' },
-			{ label: _('IP'), sortKey: 'ip' },
-			{ label: _('MAC'), sortKey: 'mac' },
-			{ label: _('接入'), sortKey: 'link' },
-			{ label: _('直连'), right: true, sortKey: 'direct' },
-			{ label: _('代理'), right: true, sortKey: 'proxy' },
-			{ label: _('合计'), right: true, sortKey: 'total' },
-			{ label: _('速率'), right: true, sortKey: 'rate', title: _('下载 + 上传，bit/s') },
-			{ label: _('最后在线'), right: true, sortKey: 'last_seen' },
-			{ label: _('信号'), right: true, sortKey: 'signal', title: _('来自哑桥 AP 的无线信号（若有）') }
+			{ label: _('主机名'), sortKey: 'host', width: '22%' },
+			{ label: _('IP'), sortKey: 'ip', width: '130px' },
+			{ label: _('MAC'), sortKey: 'mac', width: '160px' },
+			{ label: _('接入'), sortKey: 'link', width: '78px' },
+			{ label: _('直连'), right: true, sortKey: 'direct', width: '104px' },
+			{ label: _('代理'), right: true, sortKey: 'proxy', width: '104px' },
+			{ label: _('合计'), right: true, sortKey: 'total', width: '104px' },
+			{ label: _('速率'), right: true, sortKey: 'rate', width: '104px', title: _('下载 + 上传，bit/s') },
+			{ label: _('最后在线'), right: true, sortKey: 'last_seen', width: '104px' },
+			{ label: _('信号'), right: true, sortKey: 'signal', width: '88px', title: _('来自哑桥 AP 的无线信号（若有）') }
 		];
 
 		return cols.map(function (c) {
 			var o = {
 				label: c.label,
+				width: c.width,
 				right: c.right,
 				title: c.title,
 				sortKey: c.sortKey,
@@ -1534,14 +1554,14 @@ return view.extend({
 			E('td', { 'class': 'td' }, E('code', {}, d.ip ? '' + d.ip : '—')),
 			E('td', { 'class': 'td' }, E('code', {}, d.mac ? '' + d.mac : '—')),
 			E('td', { 'class': 'td' }, linkBadge(d)),
-			E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(direct)),
-			E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(proxy)),
-			E('td', { 'class': 'td', style: 'text-align:right' }, E('strong', {}, fmtBytes(deviceTotal(d)))),
-			E('td', { 'class': 'td', style: 'text-align:right', title: fmtRate(deviceRate(d)) }, fmtRate(deviceRate(d))),
-			E('td', { 'class': 'td', style: 'text-align:right' }, fmtAgo(d.last_seen)),
+			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtBytes(direct)),
+			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtBytes(proxy)),
+			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, E('strong', {}, fmtBytes(deviceTotal(d)))),
+			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap', title: fmtRate(deviceRate(d)) }, fmtRate(deviceRate(d))),
+			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtAgo(d.last_seen)),
 			E('td', {
 				'class': 'td',
-				style: 'text-align:right;color:' + (sig == null ? 'inherit' : signalColor(sig)),
+				style: 'text-align:right;white-space:nowrap;color:' + (sig == null ? 'inherit' : signalColor(sig)),
 				title: (sig == null) ? _('没有无线站点元数据（需要 AP 侧上报）') : ''
 			}, (sig == null) ? '—' : (sig + ' dBm'))
 		]);
@@ -1601,7 +1621,7 @@ return view.extend({
 				E('td', { 'class': 'td', style: 'max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' },
 					shortText(appLabel(a.host), 48)),
 				E('td', { 'class': 'td' }, chainBadge(a.chain)),
-				E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(a.rx + a.tx))
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtBytes(a.rx + a.tx))
 			]);
 		});
 
@@ -1615,8 +1635,8 @@ return view.extend({
 			E('table', { 'class': 'table', style: 'width:100%;font-size:12px' }, [
 				E('tr', { 'class': 'tr table-titles' }, [
 					E('th', { 'class': 'th' }, _('应用 / 域名')),
-					E('th', { 'class': 'th' }, _('出口')),
-					E('th', { 'class': 'th', style: 'text-align:right' }, _('流量'))
+					E('th', { 'class': 'th', style: 'width:150px' }, _('出口')),
+					E('th', { 'class': 'th', style: 'text-align:right;width:110px' }, _('流量'))
 				])
 			].concat(rows))
 		]);
@@ -1723,7 +1743,7 @@ return view.extend({
 		}));
 
 		this.appSelect.value = this.appChain;
-		this.appTableHost = E('div', {}, this.renderAppTableBody());
+		this.appTableHost = E('div', { style: 'overflow-x:auto' }, this.renderAppTableBody());
 
 		return E('div', { 'data-page': 'apps' }, [
 			this.renderStateBanner(),
@@ -1760,9 +1780,9 @@ return view.extend({
 
 		return table([
 			{ label: _('域名 / 应用') },
-			{ label: _('出口') },
-			{ label: _('流量'), right: true },
-			{ label: _('设备数'), right: true }
+			{ label: _('出口'), width: '190px' },
+			{ label: _('流量'), right: true, width: '120px' },
+			{ label: _('设备数'), right: true, width: '90px' }
 		], rows, _('暂无应用数据'));
 	},
 
@@ -1783,8 +1803,8 @@ return view.extend({
 				E('strong', {}, shortText(appLabel(host), 48))
 			]),
 			E('td', { 'class': 'td' }, chainBadge(a.chain)),
-			E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(appTotal(a))),
-			E('td', { 'class': 'td', style: 'text-align:right' }, '' + num(a.devices))
+			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtBytes(appTotal(a))),
+			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, '' + num(a.devices))
 		]);
 
 		row.addEventListener('click', function () {
@@ -1905,9 +1925,9 @@ return view.extend({
 			return E('tr', { 'class': 'tr' }, [
 				E('td', { 'class': 'td', style: 'max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' },
 					E('strong', {}, shortText(d.name || d.ip || _('未知设备'), 40))),
-				E('td', { 'class': 'td' }, E('code', {}, d.ip || '—')),
-				E('td', { 'class': 'td' }, m ? badge(m.label, m.color, m.bg) : '—'),
-				E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(d.rx + d.tx))
+				E('td', { 'class': 'td', style: 'white-space:nowrap' }, E('code', {}, d.ip || '—')),
+				E('td', { 'class': 'td', style: 'white-space:nowrap' }, m ? badge(m.label, m.color, m.bg) : '—'),
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtBytes(d.rx + d.tx))
 			]);
 		});
 
@@ -1924,9 +1944,9 @@ return view.extend({
 			E('table', { 'class': 'table', style: 'width:100%;font-size:12px' }, [
 				E('tr', { 'class': 'tr table-titles' }, [
 					E('th', { 'class': 'th' }, _('设备')),
-					E('th', { 'class': 'th' }, _('IP')),
-					E('th', { 'class': 'th' }, _('接入')),
-					E('th', { 'class': 'th', style: 'text-align:right' }, _('该应用流量'))
+					E('th', { 'class': 'th', style: 'width:140px' }, _('IP')),
+					E('th', { 'class': 'th', style: 'width:80px' }, _('接入')),
+					E('th', { 'class': 'th', style: 'text-align:right;width:120px' }, _('该应用流量'))
 				])
 			].concat(rows))
 		]);
@@ -2016,10 +2036,10 @@ return view.extend({
 					fmtAgeSec(age),
 					E('div', { style: 'font-size:11px;opacity:.6' }, fmtClock(n && n.ts))
 				]),
-				E('td', { 'class': 'td', style: 'text-align:right' }, E('strong', {}, fmtBytes(t.total))),
-				E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(t.proxy)),
-				E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(t.direct)),
-				E('td', { 'class': 'td', style: 'text-align:right' }, '' + self.nodeDeviceCount(n))
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, E('strong', {}, fmtBytes(t.total))),
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtBytes(t.proxy)),
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtBytes(t.direct)),
+				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, '' + self.nodeDeviceCount(n))
 			]);
 		});
 
@@ -2034,11 +2054,11 @@ return view.extend({
 				_('读取节点列表失败：') + this.nodesError) : '',
 			table([
 				{ label: _('节点') },
-				{ label: _('最后上报'), right: true },
-				{ label: _('总流量'), right: true },
-				{ label: _('代理'), right: true },
-				{ label: _('直连'), right: true },
-				{ label: _('设备数'), right: true }
+				{ label: _('最后上报'), right: true, width: '170px' },
+				{ label: _('总流量'), right: true, width: '120px' },
+				{ label: _('代理'), right: true, width: '110px' },
+				{ label: _('直连'), right: true, width: '110px' },
+				{ label: _('设备数'), right: true, width: '84px' }
 			], rows, _('暂无节点（多节点未启用或尚未上报）'))
 		]);
 	},
@@ -2138,12 +2158,10 @@ return view.extend({
 			wanTx = numOrNull(sys.wan_tx_rate);
 
 			if (wanRx != null || wanTx != null) {
-				var wanText = [];
-
-				if (wanRx != null) wanText.push('↓ ' + fmtRate(wanRx));
-				if (wanTx != null) wanText.push('↑ ' + fmtRate(wanTx));
-
-				cards.push(metricCard('wan', _('WAN 实时速率'), wanText.join('   '), _('按 WAN 接口两轮字节差计算')));
+				cards.push(metricCard('wan', _('WAN 实时速率'), E('div', {}, [
+					wanRx != null ? E('div', { style: 'font-size:18px;line-height:1.35;white-space:nowrap' }, '↓ ' + fmtRate(wanRx)) : '',
+					wanTx != null ? E('div', { style: 'font-size:18px;line-height:1.35;white-space:nowrap' }, '↑ ' + fmtRate(wanTx)) : ''
+				]), _('按 WAN 接口两轮字节差计算')));
 			}
 		}
 
@@ -2193,12 +2211,14 @@ return view.extend({
 		if (value == null) return null;
 
 		return E('div', {
-			style: 'display:flex;gap:12px;align-items:baseline;padding:6px 0;' +
-				'border-bottom:1px dashed rgba(127,127,127,.18);font-size:13px'
+			style: 'display:grid;grid-template-columns:120px minmax(0,1fr);gap:2px 12px;' +
+				'align-items:baseline;padding:7px 0;border-bottom:1px dashed rgba(127,127,127,.18);font-size:13px'
 		}, [
-			E('span', { style: 'min-width:150px;opacity:.7;flex-shrink:0' }, label),
-			E('span', { style: 'flex:1;min-width:0;word-break:break-all' }, value),
-			hint ? E('span', { style: 'font-size:11px;opacity:.55;white-space:nowrap' }, hint) : ''
+			E('span', { style: 'opacity:.7' }, label),
+			E('div', { style: 'min-width:0;word-break:break-all' }, [
+				value,
+				hint ? E('div', { style: 'font-size:11px;opacity:.55;margin-top:2px' }, hint) : ''
+			])
 		]);
 	},
 
@@ -2257,7 +2277,7 @@ return view.extend({
 		v = this.cfgWithDefault('settings', 'clash_api');
 		if (v.value != null) rows.push(s(_('Clash 控制器'), v.value, defaultHint(v)));
 
-		rows.push(s(_('Clash 密钥'), this.maskSet(this.cfg('settings', 'clash_secret')), _('留空时自动读 OpenClash')));
+		rows.push(s(_('Clash 密钥'), this.maskSet(this.cfg('settings', 'clash_secret'))));
 
 		v = this.cfgWithDefault('settings', 'fake_ip_ranges');
 		if (v.value != null)
@@ -2304,7 +2324,8 @@ return view.extend({
 
 		rows.push(s(_('群机器人 Webhook'), this.maskSet(this.cfg('feishu', 'webhook'))));
 		rows.push(s(_('应用机器人'), (this.cfg('feishu', 'app_id') != null || this.cfg('feishu', 'chat_id') != null)
-			? _('已配置（app_id / chat_id 已设置）') : _('未配置')));
+			? _('已配置') : _('未配置'),
+			(this.cfg('feishu', 'app_id') != null || this.cfg('feishu', 'chat_id') != null) ? _('app_id / chat_id 已设置') : ''));
 
 		if (rows.length) cards.push(card(_('飞书日报'), E('div', {}, rows)));
 

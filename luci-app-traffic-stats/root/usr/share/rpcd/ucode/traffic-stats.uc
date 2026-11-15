@@ -86,7 +86,11 @@ const UCI_FIELDS = {
 		'system_enabled', 'wan_iface'
 	],
 	feishu:   [ 'enabled', 'webhook', 'secret', 'daily_time', 'report_chat_enabled',
-	             'app_id', 'app_secret', 'chat_id', 'card_wrapper' ]
+	             'app_id', 'app_secret', 'chat_id', 'card_wrapper',
+	             /* 内容 / 时间 / 条件可配（feishu.uc 1.1.0） */
+	             'report_items', 'report_mode', 'report_time', 'report_weekday',
+	             'alert_app_daily_limit', 'alert_spike_ratio', 'alert_offline_min',
+	             'alert_cpu_pct', 'alert_mem_pct', 'alert_disk_pct', 'alert_quiet_hours' ]
 };
 
 // ---------------------------------------------------------------- 小工具

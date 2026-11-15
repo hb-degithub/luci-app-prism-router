@@ -1453,7 +1453,8 @@ build_card = function(ctx, cfg, top_n, step, trimmed) {
 
 // 生成日报：先按 Top 10/8/5 截断，再降图表密度，最后去掉表格；整个请求体必须 < 20 KB
 prepare_daily = function(ctx, cfg) {
-    let ts = sprintf("%d", now_ts());
+    /* 签名时间戳必须用真实时间（飞书只接受 1 小时内），--at/--epoch 只影响「日期/到点」判定 */
+    let ts = sprintf("%d", time());
     let sign = length(cfg.secret) ? hmac_sign(ts, cfg.secret) : "";
     let ladder = [
         { top: 10, step: 1 }, { top: 8, step: 1 }, { top: 5, step: 1 },
@@ -1982,6 +1983,8 @@ alert_emit = function(cfg, o, now, key, kind, title, lines, dry) {
         return { fired: false, skipped: true };
     if (dry) {
         print(sprintf("DRYRUN kind=%s key=%s %s\n", kind, key, title));
+        for (let l in lines)
+            print("        " + sprintf("%s", l) + "\n");
         return { fired: true, skipped: false };
     }
     let ok = send_text(cfg, alert_text(title, lines), "alert/" + kind + "/" + key).ok;
@@ -2196,13 +2199,13 @@ cmd_alerts = function(opts) {
     }
 
     // 6) 设备离线超过 N 分钟（以告警状态里记录的最后在线时间为准）
-    if (cfg.offline_min > 0) {
+    //    注意：state.json 缺失/无设备时无从判断「离线」，直接跳过（采集异常另有告警，避免刷屏）
+    if (cfg.offline_min > 0 && state != null && type(state) == "object" &&
+        type(state.devices) == "array") {
         let labels = {};
-        if (state != null && type(state) == "object" && type(state.devices) == "array") {
-            for (let d in state.devices) {
-                if (type(d) == "object")
-                    labels[device_key(d)] = device_label(d);
-            }
+        for (let d in state.devices) {
+            if (type(d) == "object")
+                labels[device_key(d)] = device_label(d);
         }
         let limit = cfg.offline_min * 60;
         for (let k in keys(o.devices)) {
