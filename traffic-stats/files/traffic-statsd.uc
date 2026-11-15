@@ -22,15 +22,28 @@
  *   -> wifi，落在其它端口 -> wired，FDB 里没有 -> unknown。新增的 totals.wifi_* 、
  *   wired_* 与 unknown_* 三桶与 direct/proxy 严格互斥且完备（相加恒等）。
  *
+ * 软路由自身性能指标（system，SPEC §3.3）：
+ *   每轮 poll 读 /proc（uptime / loadavg / stat / cpuinfo / meminfo / net/dev / net/route）
+ *   与 sysfs（thermal_zone0），全部只读、成本极低；cpu_pct 用两次 /proc/stat 采样差值，
+ *   disk 每 60 秒最多跑一次 `df -k /` 并缓存。任何一项读不到只是省略字段，
+ *   **绝不**影响 direct/proxy/link 统计，也不进 health.reasons。
+ *
  * 契约：docs/SPEC.md —— 字段名 / 文件路径以契约为准，不得改动。
  *
  * 仅测试用的环境变量（生产环境不要设置）：
  *   TRAFFIC_STATS_STATE_DIR  覆盖 /tmp/traffic-stats
  *   TRAFFIC_STATS_DAILY_DIR  覆盖 /etc/traffic-stats/daily
  *   TRAFFIC_STATS_ONCE=1     只跑一轮、写完文件后退出（用于冒烟测试）
+ *   TRAFFIC_STATS_ONCE_POLLS=N  仅 --once 时连续跑 N 轮（自测：cpu/wan 需要两次采样）
  *   TRAFFIC_STATS_CONNTRACK_FILE  覆盖 /proc/net/nf_conntrack（合成数据自测用）
  *   TRAFFIC_STATS_CLASH_API  覆盖 clash_api（自测用）
  *   TRAFFIC_STATS_BRCTL      覆盖 brctl 路径（自测用：指向假 brctl / 不存在路径）
+ *   TRAFFIC_STATS_PROC_DIR   覆盖 /proc 基目录（自测：指向固定内容 / FIFO）
+ *   TRAFFIC_STATS_PROC_STAT / _MEMINFO / _LOADAVG / _UPTIME / _CPUINFO
+ *   TRAFFIC_STATS_PROC_NET_DEV / _NET_ROUTE  单独覆盖对应 /proc 文件
+ *   TRAFFIC_STATS_THERMAL    覆盖 /sys/class/thermal/thermal_zone0/temp
+ *   TRAFFIC_STATS_DF         覆盖 df 命令（自测：假 df 统计调用次数）
+ *   TRAFFIC_STATS_ROOTFS     覆盖 df 的目标（默认 /）
  *   TRAFFIC_STATS_DEBUG=1    详细日志输出到 stderr
  */
 
@@ -58,6 +71,7 @@ const TOP_PER_BUCKET = 10;
 const HISTORY_FLUSH_SECONDS = 60; /* history.json 最少刷新间隔 */
 const DAILY_RETRY_SECONDS = 600;  /* daily 目录写失败后的重试间隔 */
 const DAILY_WRITE_SECONDS = 300;  /* daily 文件最短落盘间隔：/etc 在闪存上，别每轮都写 */
+const SYSTEM_DISK_SECONDS = 60;   /* `df -k /` 最短间隔：磁盘容量变化慢，别每轮 fork */
 
 /*
  * ucode 不做函数提升：被调用者必须先于调用者定义。
@@ -302,10 +316,9 @@ function jstr(s) {
 function jnum(v) {
 	let t = type(v);
 	if (t == 'int') return sprintf('%d', v);
-	if (t == 'double') {
-		let n = int(v);
-		if (type(n) == 'int') return sprintf('%d', n);
-	}
+	/* 现有 state/history/daily 全是整数；system 段的小数统一保留 1 位，
+	   且 sprintf 是定点格式，不会出现科学计数法。 */
+	if (t == 'double') return sprintf('%.1f', v);
 	return '0';
 }
 
@@ -408,6 +421,12 @@ function cfg_str(cur, pkg, sec, opt, dflt) {
 	return str(v);
 }
 
+/** 环境变量覆盖（仅测试用）；空串视为未设置 */
+function env_path(name, dflt) {
+	let v = getenv(name);
+	return (v != null && v != '') ? v : dflt;
+}
+
 function load_config(cur) {
 	let c = {};
 
@@ -425,6 +444,10 @@ function load_config(cur) {
 	c.ap_macs = parse_mac_list(cfg_str(cur, 'traffic-stats', 'settings', 'ap_macs', ''));
 	c.link_refresh = clamp(to_int(cfg_str(cur, 'traffic-stats', 'settings', 'link_refresh', '30'), 30), 1, 3600);
 
+	/* 软路由自身性能指标（SPEC §3.3）：辅助信息，读不到只省略字段 */
+	c.system_enabled = to_int(cfg_str(cur, 'traffic-stats', 'settings', 'system_enabled', '1'), 1) != 0;
+	c.wan_iface = cfg_str(cur, 'traffic-stats', 'settings', 'wan_iface', '');
+
 	/* clash_secret 留空 -> 自动读 openclash 的控制器密码（契约 §2） */
 	if (c.clash_secret == '') {
 		c.clash_secret = cfg_str(cur, 'openclash', 'config', 'dashboard_password', '');
@@ -441,6 +464,20 @@ function load_config(cur) {
 	if (ca != null && ca != '') c.clash_api = ca;
 	c.debug = getenv('TRAFFIC_STATS_DEBUG') != null;
 	c.once = (getenv('TRAFFIC_STATS_ONCE') != null);
+	c.once_polls = clamp(to_int(getenv('TRAFFIC_STATS_ONCE_POLLS'), 1), 1, 1000);
+
+	/* /proc 与 sysfs 读取路径：默认走真实内核接口，测试用环境变量指向固定内容 */
+	let pd = env_path('TRAFFIC_STATS_PROC_DIR', '/proc');
+	c.proc_stat = env_path('TRAFFIC_STATS_PROC_STAT', pd + '/stat');
+	c.proc_meminfo = env_path('TRAFFIC_STATS_PROC_MEMINFO', pd + '/meminfo');
+	c.proc_loadavg = env_path('TRAFFIC_STATS_PROC_LOADAVG', pd + '/loadavg');
+	c.proc_uptime = env_path('TRAFFIC_STATS_PROC_UPTIME', pd + '/uptime');
+	c.proc_cpuinfo = env_path('TRAFFIC_STATS_PROC_CPUINFO', pd + '/cpuinfo');
+	c.proc_net_dev = env_path('TRAFFIC_STATS_PROC_NET_DEV', pd + '/net/dev');
+	c.proc_net_route = env_path('TRAFFIC_STATS_PROC_NET_ROUTE', pd + '/net/route');
+	c.thermal_file = env_path('TRAFFIC_STATS_THERMAL', '/sys/class/thermal/thermal_zone0/temp');
+	c.df_bin = env_path('TRAFFIC_STATS_DF', 'df');
+	c.rootfs = env_path('TRAFFIC_STATS_ROOTFS', '/');
 
 	for (let a in ARGV) {
 		if (a == '--once') c.once = true;
@@ -1426,6 +1463,267 @@ function device_apps_out(apps) {
 	return out;
 }
 
+/* ------------------------------------------------------------------ *
+ * 软路由自身性能指标（system，SPEC §3.3）
+ *
+ * 全部只读 /proc 或 sysfs；任何一项读不到只是省略字段，绝不 push reasons，
+ * 也绝不参与 direct / proxy / link 的任何计算。数值统一整数或 1 位小数。
+ * ------------------------------------------------------------------ */
+
+function read_sys_text(path) {
+	if (path == null || path == '') return null;
+	try {
+		let t = fs.readfile(path);
+		if (type(t) != 'string' || t == '') return null;
+		return t;
+	} catch (e) {
+		return null;
+	}
+}
+
+/** 把 "0.15" / "2" 这类十进制串按**字符串**四舍五入到 0.1，返回十分位整数。
+    不走浮点，避免 2.95*10 = 29.4999… 这类边界误差。 */
+function tenths_of(s) {
+	s = trim(str(s));
+	if (s == '') return null;
+	let neg = false;
+	if (substr(s, 0, 1) == '-') { neg = true; s = substr(s, 1); }
+	let dot = index(s, '.');
+	let ipart = (dot < 0) ? s : substr(s, 0, dot);
+	let fpart = (dot < 0) ? '' : substr(s, dot + 1);
+	let ip = int(ipart);
+	if (type(ip) != 'int' || ip < 0) return null;
+	let d1 = (length(fpart) >= 1) ? int(substr(fpart, 0, 1)) : 0;
+	let d2 = (length(fpart) >= 2) ? int(substr(fpart, 1, 1)) : 0;
+	if (type(d1) != 'int' || d1 < 0 || d1 > 9) d1 = 0;
+	if (type(d2) != 'int' || d2 < 0 || d2 > 9) d2 = 0;
+	let t = ip * 10 + d1 + ((d2 >= 5) ? 1 : 0);
+	return neg ? -t : t;
+}
+
+/** busy/total 的百分比四舍五入到 0.1，返回十分位整数（0..1000），纯整数运算 */
+function pct_tenths(busy, total) {
+	if (total <= 0) return 0;
+	if (busy < 0) busy = 0;
+	if (busy > total) busy = total;
+	let t = int((2000 * busy + total) / (2 * total));
+	if (t < 0) t = 0;
+	if (t > 1000) t = 1000;
+	return t;
+}
+
+function sys_collect_uptime(ctx, sys) {
+	let txt = read_sys_text(ctx.cfg.proc_uptime);
+	if (txt == null) return;
+	let t = split_ws(txt);
+	if (length(t) < 1) return;
+	let tenths = tenths_of(t[0]);
+	if (tenths == null) return;
+	sys.uptime = int(tenths / 10);
+}
+
+function sys_collect_load(ctx, sys) {
+	let txt = read_sys_text(ctx.cfg.proc_loadavg);
+	if (txt == null) return;
+	let t = split_ws(txt);
+	if (length(t) < 3) return;
+	let a = tenths_of(t[0]), b = tenths_of(t[1]), c = tenths_of(t[2]);
+	if (a != null) sys.load1 = a / 10.0;
+	if (b != null) sys.load5 = b / 10.0;
+	if (c != null) sys.load15 = c / 10.0;
+}
+
+/** /proc/stat 首行 -> { total, idle }（idle 含 iowait，口径同 top） */
+function sys_cpu_sample(txt) {
+	if (txt == null) return null;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		if (length(t) < 5) continue;
+		if (t[0] != 'cpu') continue;
+		let total = 0;
+		let maxf = (length(t) - 1 > 8) ? 8 : (length(t) - 1);
+		for (let i = 1; i <= maxf; i++) {
+			let v = to_int(t[i], null);
+			if (v == null) return null;
+			total += v;
+		}
+		let idle = to_int(t[4], 0) + to_int(t[5], 0);
+		return { total: total, idle: idle };
+	}
+	return null;
+}
+
+function sys_collect_cpu(ctx, sys) {
+	let s = sys_cpu_sample(read_sys_text(ctx.cfg.proc_stat));
+	if (s == null) return;
+	let prev = ctx.sys_cpu_prev;
+	ctx.sys_cpu_prev = s;
+	if (prev == null) return;  /* 第一次采样没有差值，省略 cpu_pct */
+	let dt = s.total - prev.total;
+	let didle = s.idle - prev.idle;
+	if (dt <= 0) return;
+	let busy = dt - didle;
+	if (busy < 0) busy = 0;
+	if (busy > dt) busy = dt;
+	sys.cpu_pct = pct_tenths(busy, dt) / 10.0;
+}
+
+/** /proc/cpuinfo 里 processor 行数：只成功读一次，缓存 */
+function sys_cpu_cores(ctx) {
+	if (ctx.sys_cpu_cores > 0) return ctx.sys_cpu_cores;
+	let txt = read_sys_text(ctx.cfg.proc_cpuinfo);
+	if (txt == null) return 0;
+	let n = 0;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		/* 真实内核输出是 "processor\t: 0"（冒号前有空格），归一后可能是 "processor" 或 "processor:" */
+		if (length(t) >= 1 && (t[0] == 'processor' || t[0] == 'processor:')) n++;
+	}
+	if (n > 0) ctx.sys_cpu_cores = n;
+	return n;
+}
+
+function sys_collect_mem(ctx, sys) {
+	let txt = read_sys_text(ctx.cfg.proc_meminfo);
+	if (txt == null) return;
+	let mt = null, ma = null, st = null, sf = null;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		if (length(t) < 2) continue;
+		let v = to_int(t[1], null);
+		if (v == null) continue;
+		if (t[0] == 'MemTotal:') mt = v * 1024;
+		else if (t[0] == 'MemAvailable:') ma = v * 1024;
+		else if (t[0] == 'SwapTotal:') st = v * 1024;
+		else if (t[0] == 'SwapFree:') sf = v * 1024;
+	}
+	if (mt != null && mt > 0) {
+		sys.mem_total = mt;
+		if (ma != null) {
+			sys.mem_avail = ma;
+			sys.mem_pct = pct_tenths(mt - ma, mt) / 10.0;
+		}
+	}
+	if (st != null) sys.swap_total = st;
+	if (sf != null) sys.swap_free = sf;
+}
+
+function sys_collect_temp(ctx, sys) {
+	let txt = read_sys_text(ctx.cfg.thermal_file);
+	if (txt == null) return;
+	let v = to_int(trim(txt), null);
+	if (v == null || v < 0) return;  /* 没有 thermal_zone0（x86 常见）就省略 */
+	sys.temp_c = int((v + 50) / 100) / 10.0;
+}
+
+/** `df -k <rootfs>` -> { total, used, pct }（字节）；失败返回 null */
+function sys_disk_read(ctx) {
+	let cmd = shell_quote(ctx.cfg.df_bin) + ' -k ' + shell_quote(ctx.cfg.rootfs) + ' 2>/dev/null';
+	let txt = null;
+	try {
+		let p = fs.popen(cmd, 'r');
+		txt = p.read('all');
+		p.close();
+	} catch (e) {
+		txt = null;
+	}
+	if (txt == null) return null;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		let n = length(t);
+		/* 从行尾取数字：兼容设备名里有空格、以及 GNU df 把长设备名换行拆开
+		   （拆开后数字行只有 5 个 token）。表头行数字解析失败会被跳过。 */
+		if (n < 5) continue;
+		let total = to_int(t[n - 5], null);
+		let used = to_int(t[n - 4], null);
+		let avail = to_int(t[n - 3], null);
+		if (total == null || used == null || avail == null) continue;
+		if (total <= 0 || used < 0 || avail < 0) continue;
+		let out = { total: total * 1024, used: used * 1024 };
+		if (used + avail > 0) out.pct = pct_tenths(used, used + avail) / 10.0;
+		return out;
+	}
+	return null;
+}
+
+/** 磁盘容量变化慢：最多每 SYSTEM_DISK_SECONDS 秒跑一次 df（不每轮 fork） */
+function sys_collect_disk(ctx, sys) {
+	if (ctx.sys_disk == null || (ctx.now - ctx.sys_disk_ts) >= SYSTEM_DISK_SECONDS) {
+		ctx.sys_disk = sys_disk_read(ctx);
+		ctx.sys_disk_ts = ctx.now;
+	}
+	let d = ctx.sys_disk;
+	if (d == null) return;
+	sys.disk_total = d.total;
+	sys.disk_used = d.used;
+	if (d.pct != null) sys.disk_pct = d.pct;
+}
+
+/** 未配置 wan_iface 时从 /proc/net/route 取默认路由（metric 最小）所在接口 */
+function sys_default_iface(ctx) {
+	let txt = read_sys_text(ctx.cfg.proc_net_route);
+	if (txt == null) return '';
+	let best = '', best_metric = null;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		if (length(t) < 8) continue;
+		if (t[1] != '00000000') continue;
+		let m = to_int(t[6], 0);
+		if (best == '' || m < best_metric) {
+			best = t[0];
+			best_metric = m;
+		}
+	}
+	return best;
+}
+
+/** /proc/net/dev 中某接口的累计字节 rx/tx */
+function sys_dev_counters(txt, iface) {
+	if (txt == null || iface == '') return null;
+	for (let line in split(txt, '\n')) {
+		let c = index(line, ':');
+		if (c < 0) continue;
+		if (trim(substr(line, 0, c)) != iface) continue;
+		let t = split_ws(substr(line, c + 1));
+		if (length(t) < 9) return null;
+		let rx = to_int(t[0], null);
+		let tx = to_int(t[8], null);
+		if (rx == null || tx == null) return null;
+		return { rx: rx, tx: tx };
+	}
+	return null;
+}
+
+function sys_collect_wan(ctx, sys) {
+	let iface = ctx.cfg.wan_iface;
+	if (iface == '') iface = sys_default_iface(ctx);
+	if (iface == '') return;
+	let c = sys_dev_counters(read_sys_text(ctx.cfg.proc_net_dev), iface);
+	if (c == null) return;
+	let prev = ctx.sys_wan_prev;
+	ctx.sys_wan_prev = { iface: iface, rx: c.rx, tx: c.tx, ts: ctx.now };
+	if (prev == null || prev.iface != iface) return;  /* 首次采样没有速率 */
+	let dt = ctx.now - prev.ts;
+	if (dt <= 0) dt = 1;
+	/* 计数器回绕时不猜速率，直接省略（下一轮就有正常差值） */
+	if (c.rx >= prev.rx) sys.wan_rx_rate = int((c.rx - prev.rx) / dt);
+	if (c.tx >= prev.tx) sys.wan_tx_rate = int((c.tx - prev.tx) / dt);
+}
+
+function build_system(ctx) {
+	let sys = {};
+	sys_collect_uptime(ctx, sys);
+	sys_collect_load(ctx, sys);
+	sys_collect_cpu(ctx, sys);
+	let cores = sys_cpu_cores(ctx);
+	if (cores > 0) sys.cpu_cores = cores;
+	sys_collect_mem(ctx, sys);
+	sys_collect_temp(ctx, sys);
+	sys_collect_disk(ctx, sys);
+	sys_collect_wan(ctx, sys);
+	return sys;
+}
+
 function build_state(ctx) {
 	let dt = ctx.poll_dt > 0 ? ctx.poll_dt : 1;
 
@@ -1478,7 +1776,7 @@ function build_state(ctx) {
 			? 'unavailable' : 'degraded';
 	}
 
-	return {
+	let st = {
 		ts: ctx.now,
 		uptime: ctx.now - ctx.started,
 		source: { clash: ctx.source.clash, conntrack: ctx.source.conntrack },
@@ -1492,24 +1790,29 @@ function build_state(ctx) {
 		},
 		nodes: nodes,
 		devices: devices,
-		apps: apps,
-		health: {
-			accounting_confidence: conf,
-			reasons: reasons,
-			conntrack_count: ctx.ct_count,
-			clash_connections: ctx.clash_count,
-			clash_poll_ms: ctx.clash_ms,
-			poll_ms: ctx.poll_ms,
-			/* 接入方式判定的来源与状态（与 direct/proxy 完全独立） */
-			link_source: ctx.link_source,
-			link_bridge: ctx.cfg.lan_bridge,
-			link_ports: ctx.link_ports,
-			link_ports_from: ctx.link_ports_from,
-			link_entries: ctx.link_entries,
-			link_refresh: ctx.cfg.link_refresh,
-			link_error: ctx.link_error
-		}
+		apps: apps
 	};
+
+	/* 新增顶层字段：关闭开关时整段不出现，老消费方完全无感（SPEC §3.3） */
+	if (ctx.cfg.system_enabled) st.system = ctx.system;
+
+	st.health = {
+		accounting_confidence: conf,
+		reasons: reasons,
+		conntrack_count: ctx.ct_count,
+		clash_connections: ctx.clash_count,
+		clash_poll_ms: ctx.clash_ms,
+		poll_ms: ctx.poll_ms,
+		/* 接入方式判定的来源与状态（与 direct/proxy 完全独立） */
+		link_source: ctx.link_source,
+		link_bridge: ctx.cfg.lan_bridge,
+		link_ports: ctx.link_ports,
+		link_ports_from: ctx.link_ports_from,
+		link_entries: ctx.link_entries,
+		link_refresh: ctx.cfg.link_refresh,
+		link_error: ctx.link_error
+	};
+	return st;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1596,6 +1899,21 @@ function poll(ctx) {
 	let activity = deltas.direct_rx + deltas.direct_tx + deltas.proxy_rx + deltas.proxy_tx;
 	ctx.idle_rounds = (activity == 0) ? ((ctx.idle_rounds || 0) + 1) : 0;
 
+	/* 软路由自身指标：辅助信息。任何读取失败只省略字段，绝不进 reasons，
+	   也绝不影响上面已经算好的 direct/proxy/link。 */
+	let t_sys0 = clock();
+	if (ctx.cfg.system_enabled) {
+		try {
+			ctx.system = build_system(ctx);
+		} catch (e) {
+			ctx.system = {};
+			dbg(ctx, 'system metrics failed: ' + str(e));
+		}
+	} else {
+		ctx.system = {};
+	}
+	let t_sys1 = clock();
+
 	ctx.reasons = reasons;
 	ctx.poll_ms = elapsed_ms(t0);
 	let t_ct1 = clock();
@@ -1607,8 +1925,9 @@ function poll(ctx) {
 
 	let t_build1 = clock();
 	if (ctx.cfg.debug)
-		dbg(ctx, sprintf('timings clash=%dms ct=%dms build_write=%dms total=%dms',
+		dbg(ctx, sprintf('timings clash=%dms ct=%dms sys=%dms build_write=%dms total=%dms',
 			ms_between(t_clash0, t_clash1), ms_between(t_clash1, t_ct1),
+			ms_between(t_sys0, t_sys1),
 			ms_between(t_ct1, t_build1), ctx.poll_ms));
 
 	history_flush(ctx, false);
@@ -1708,6 +2027,13 @@ function new_ctx() {
 		link_entries: 0,
 		link_error: '',
 		link_last: 0,
+		/* 软路由自身指标（SPEC §3.3）：辅助信息，与主统计完全隔离 */
+		system: {},
+		sys_cpu_prev: null,
+		sys_cpu_cores: 0,
+		sys_disk: null,
+		sys_disk_ts: 0,
+		sys_wan_prev: null,
 		poll_apps: {},
 		poll_devs: {},
 		last_history_flush: 0,
@@ -1799,14 +2125,16 @@ function main() {
 	let ctx = boot();
 
 	if (ctx.cfg.once) {
-		poll(ctx);
+		/* 默认只跑一轮；TRAFFIC_STATS_ONCE_POLLS=N 供自测连续采样（cpu/wan 差值） */
+		for (let i = 0; i < ctx.cfg.once_polls; i++) poll(ctx);
 		flush_all(ctx, 'once');
 		let st = load_json(ctx.cfg.state_dir + '/state.json');
 		if (st != null)
-			printf('once: devices=%d proxy_rx=%d direct_rx=%d apps=%d reasons=%d link=%s ports=%s entries=%d\n',
+			printf('once: devices=%d proxy_rx=%d direct_rx=%d apps=%d reasons=%d link=%s ports=%s entries=%d system=%d\n',
 				length(st.devices), st.totals.proxy_rx, st.totals.direct_rx,
 				length(st.apps), length(st.health.reasons), st.health.link_source,
-				ports_txt(st.health.link_ports), st.health.link_entries);
+				ports_txt(st.health.link_ports), st.health.link_entries,
+				(st.system != null) ? length(st.system) : -1);
 		exit(0);
 	}
 

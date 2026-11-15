@@ -81,7 +81,9 @@ const UCI_FIELDS = {
 		/* 子母多节点汇总（settings 页暂未提供输入框，先开放给后续页面/脚本复用） */
 		'node_id', 'node_name', 'mother_url', 'mother_secret', 'mother_enabled',
 		/* 哑桥 AP 无线站点元数据上报（stations.uc 读，母节点 ingest-stations.uc 校验） */
-		'stations_enabled', 'stations_token', 'station_ifaces'
+		'stations_enabled', 'stations_token', 'station_ifaces',
+		/* 软路由自身性能指标：是否采集 + 用哪个接口算 WAN 速率 */
+		'system_enabled', 'wan_iface'
 	],
 	feishu:   [ 'enabled', 'webhook', 'secret', 'daily_time', 'report_chat_enabled',
 	             'app_id', 'app_secret', 'chat_id', 'card_wrapper' ]
@@ -239,6 +241,8 @@ function empty_summary() {
 			rx_rate: 0, tx_rate: 0
 		},
 		nodes: {},
+		/* 软路由自身性能指标；守护进程不写时为空对象，前端按缺字段处理 */
+		system: {},
 		health: {
 			accounting_confidence: 'unknown',
 			reasons: [],
@@ -274,6 +278,26 @@ function state_summary(raw) {
 	if (type(raw.totals) == 'object')
 		for (let key in keys(out.totals))
 			out.totals[key] = integer(raw.totals[key], 0);
+
+	/* 软路由性能指标：按"只放标量、最多 32 键"透传，未知结构一律丢弃，避免前端拿到脏数据
+	   或把 ubus 报文撑大。字段集合由守护进程决定，这里不做枚举，新增指标无需再改本文件。 */
+	if (type(raw.system) == 'object') {
+		const sys = {};
+		let n = 0;
+
+		for (let k in raw.system) {
+			if (n++ >= 32)
+				break;
+
+			const v = raw.system[k];
+			const t = type(v);
+
+			if (t == 'int' || t == 'double' || t == 'string' || t == 'bool')
+				sys[k] = v;
+		}
+
+		out.system = sys;
+	}
 
 	if (type(raw.nodes) == 'object') {
 		const nodes = {};
