@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"traffic-stats": [ "test_feishu", "set_config", "restart" ]
+				"traffic-stats": [ "test_feishu", "feishu_chats", "set_config", "restart" ]
 			},
 			"uci": [ "traffic-stats" ]
 		}

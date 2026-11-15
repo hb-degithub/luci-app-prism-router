@@ -33,6 +33,12 @@ var callTestFeishu = rpc.declare({
 	expect: {}
 });
 
+var callFeishuChats = rpc.declare({
+	object: 'traffic-stats',
+	method: 'feishu_chats',
+	expect: {}
+});
+
 var callRestart = rpc.declare({
 	object: 'traffic-stats',
 	method: 'restart',
@@ -272,6 +278,9 @@ return view.extend({
 			[ 'feishu', 'enabled', _('启用飞书报表'), _('开启后按报表时间推送日报卡片。'), 'bool', null ],
 			[ 'feishu', 'webhook', _('Webhook 地址'), _('群自定义机器人的地址，https://open.feishu.cn/open-apis/bot/v2/hook/…'), 'text', { wide: true } ],
 			[ 'feishu', 'secret', _('签名校验 secret'), _('机器人开启"签名校验"时填写；留空则不加签。'), 'password', { placeholder: _('留空则不签名') } ],
+			[ 'feishu', 'app_id', _('App ID（扫码加群的自建应用）'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。填了 App ID/Secret 就优先走应用 API，不再用 webhook。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
+			[ 'feishu', 'app_secret', _('App Secret'), _('与 App ID 配套；仅保存在本机 /etc/config/traffic-stats。'), 'password', null ],
+			[ 'feishu', 'chat_id', _('群 chat_id'), _('点下方「列出机器人所在的群」自动获取；形如 oc_xxxxx。'), 'text', { wide: true, placeholder: 'oc_xxxxx' } ],
 			[ 'feishu', 'daily_time', _('报表时间'), _('24 小时制 HH:MM，例如 08:30。'), 'text', { placeholder: '08:30' } ],
 			[ 'feishu', 'report_chat_enabled', _('群聊报表'), _('关掉后只推送给私聊/其它通道（按后端实现）。'), 'bool', null ]
 		];
@@ -281,6 +290,7 @@ return view.extend({
 		});
 
 		this.testNode = E('span', { style: 'font-size:12px;opacity:.85' }, '');
+		this.chatNode = E('div', { style: 'font-size:12px;margin-top:8px' }, '');
 
 		return E('div', { 'class': 'cbi-section', style: 'margin-bottom:18px' }, [
 			E('h3', {}, _('飞书报表')),
@@ -290,8 +300,13 @@ return view.extend({
 					'class': 'cbi-button cbi-button-action',
 					click: ui.createHandlerFn(this, this.testFeishu)
 				}, _('测试发送')),
+				E('button', {
+					'class': 'cbi-button',
+					click: ui.createHandlerFn(this, this.listFeishuChats)
+				}, _('列出机器人所在的群')),
 				this.testNode
-			])
+			]),
+			this.chatNode
 		]);
 	},
 
@@ -351,6 +366,9 @@ return view.extend({
 		feishu.secret = this.inputValue('feishu', 'secret');
 		feishu.daily_time = this.inputValue('feishu', 'daily_time');
 		feishu.report_chat_enabled = this.inputChecked('feishu', 'report_chat_enabled') ? '1' : '0';
+		feishu.app_id = this.inputValue('feishu', 'app_id');
+		feishu.app_secret = this.inputValue('feishu', 'app_secret');
+		feishu.chat_id = this.inputValue('feishu', 'chat_id');
 
 		return { settings: settings, feishu: feishu };
 	},
@@ -483,6 +501,46 @@ return view.extend({
 
 	saveApply: function(ev) {
 		return this.save(true);
+	},
+
+	/* 二维码加群的自建应用：列出机器人所在的群，点一下就把 chat_id 填进输入框 */
+	listFeishuChats: function() {
+		var self = this;
+
+		this.chatNode.innerHTML = '';
+		this.chatNode.appendChild(E('em', {}, _('查询中…（用已保存的 App ID/Secret 换 token）')));
+
+		return callFeishuChats().then(function(res) {
+			self.chatNode.innerHTML = '';
+
+			if (res == null || res.ok !== true) {
+				self.chatNode.appendChild(E('span', { style: 'color:#c62828' },
+					_('获取失败：') + ((res && res.msg) || _('未知错误'))));
+				return;
+			}
+
+			var chats = res.chats || [];
+
+			if (chats.length === 0) {
+				self.chatNode.appendChild(E('span', {}, _('机器人还没有被加入任何群。请先在飞书里把它扫码拉进群。')));
+				return;
+			}
+
+			self.chatNode.appendChild(E('div', {}, _('点击一项填入 chat_id：')));
+
+			chats.forEach(function(c) {
+				self.chatNode.appendChild(E('div', {
+					style: 'padding:4px 0;cursor:pointer',
+					click: function() {
+						var node = self.inputs['feishu.chat_id'];
+						if (node != null) node.value = c.chat_id;
+					}
+				}, [ E('code', {}, c.chat_id), E('span', { style: 'margin-left:8px' }, c.name || '') ]));
+			});
+		}).catch(function(e) {
+			self.chatNode.innerHTML = '';
+			self.chatNode.appendChild(E('span', { style: 'color:#c62828' }, _('获取失败：') + e));
+		});
 	},
 
 	testFeishu: function(ev) {

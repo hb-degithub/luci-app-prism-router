@@ -83,7 +83,8 @@ const UCI_FIELDS = {
 		/* 哑桥 AP 无线站点元数据上报（stations.uc 读，母节点 ingest-stations.uc 校验） */
 		'stations_enabled', 'stations_token', 'station_ifaces'
 	],
-	feishu:   [ 'enabled', 'webhook', 'secret', 'daily_time', 'report_chat_enabled' ]
+	feishu:   [ 'enabled', 'webhook', 'secret', 'daily_time', 'report_chat_enabled',
+	             'app_id', 'app_secret', 'chat_id', 'card_wrapper' ]
 };
 
 // ---------------------------------------------------------------- 小工具
@@ -819,6 +820,58 @@ function feishu_payload(secret) {
 	return payload;
 }
 
+/* 二维码加群的机器人：列出它所在的群，供设置页选择 chat_id。
+   直接复用 feishu.uc 的 chats 子命令，避免在 rpcd 里重复实现 Feishu API。 */
+function feishu_chats() {
+	const app_id = trim(text(uci_get('feishu', 'app_id', ''), ''));
+	const app_secret = trim(text(uci_get('feishu', 'app_secret', ''), ''));
+
+	if (!length(app_id) || !length(app_secret))
+		return { ok: false, code: -1, msg: '请先填写 App ID / App Secret 并保存' };
+
+	const script = '/usr/share/traffic-stats/feishu.uc';
+
+	if (!access(script))
+		return { ok: false, code: -1, msg: 'feishu.uc 未安装（重装 traffic-stats 包）' };
+
+	let fd = null;
+
+	try {
+		fd = popen(sprintf('/usr/bin/ucode %s chats 2>&1', shellquote(script)));
+	}
+	catch (e) {
+		return { ok: false, code: -1, msg: `执行失败：${e}` };
+	}
+
+	if (fd == null)
+		return { ok: false, code: -1, msg: '执行失败' };
+
+	const out = fd.read('all');
+	fd.close();
+
+	let list = [];
+	let raw = trim(text(out, ''));
+
+	for (let line in split(raw, '\n')) {
+		let l = trim(line);
+		let tab = index(l, '\t');
+
+		if (tab <= 0)
+			continue;
+
+		let id = trim(substr(l, 0, tab));
+		let name = trim(substr(l, tab + 1));
+
+		if (length(id))
+			push(list, { chat_id: id, name: name });
+	}
+
+	if (!length(list))
+		return { ok: false, code: -1, msg: raw || '未获取到群列表（机器人是否已加群？）', raw: raw };
+
+	return { ok: true, chats: list, raw: raw };
+}
+
 function test_feishu() {
 	const webhook = trim(text(uci_get('feishu', 'webhook', ''), ''));
 	const secret = trim(text(uci_get('feishu', 'secret', ''), ''));
@@ -1113,6 +1166,20 @@ const methods = {
 			}
 
 			return {};
+		}
+	},
+
+	feishu_chats: {
+		call: function(request) {
+			if (!is_root(request))
+				return { ok: false, code: -1, msg: 'permission denied' };
+
+			try {
+				return feishu_chats();
+			}
+			catch (e) {
+				return { ok: false, code: -1, msg: `${e}` };
+			}
 		}
 	},
 

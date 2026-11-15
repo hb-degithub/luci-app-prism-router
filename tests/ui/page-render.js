@@ -20,8 +20,8 @@ const PASS = process.env.LUCI_PASS || '';
     ]);
   }
   console.log('LOGIN:', (await page.$('input[type=password]')) ? 'FAIL' : 'OK');
-  const pages = ['overview','devices','apps','nodes','settings'];
-  const expect = { overview:['流量','代理','直连'], devices:['设备'], apps:['应用'], nodes:['节点'], settings:['飞书'] };
+  const pages = ['overview','devices','apps','nodes','settings','mobile'];
+  const expect = { overview:['流量','代理','直连'], devices:['设备'], apps:['应用'], nodes:['节点'], settings:['飞书'], mobile:['流量'] };
   let bad = 0;
   for (const p of pages) {
     errors.length = 0;

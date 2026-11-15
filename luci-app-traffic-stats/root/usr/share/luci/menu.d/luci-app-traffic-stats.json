@@ -29,5 +29,10 @@
 		"title": "设置",
 		"order": 40,
 		"action": { "type": "view", "path": "traffic-stats/settings" }
+	},
+	"admin/services/traffic-stats/mobile": {
+		"title": "手机版",
+		"order": 50,
+		"action": { "type": "view", "path": "traffic-stats/mobile" }
 	}
 }
