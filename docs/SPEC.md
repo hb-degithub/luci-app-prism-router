@@ -30,6 +30,11 @@
 /tmp/traffic-stats/state.json      # 守护进程每 5s 原子写入（rename）
 /tmp/traffic-stats/history.json    # 当日 5 分钟桶
 /etc/traffic-stats/daily/          # 每日汇总（JSON，一天一个文件，很小）
+/etc/traffic-stats/nodes/          # 子节点快照 <node_id>.json / 采样 <node_id>.jsonl（§9 清理）
+/etc/traffic-stats/stations/       # 哑桥 AP 站点元数据 <node_id>.json（§9 清理）
+/tmp/traffic-stats/*.log           # 各模块日志（§9 按天删 + 超限截断）
+/tmp/traffic-stats/feishu-queue/   # 飞书重试队列（§9 总量上限）
+/usr/share/traffic-stats/retention.uc     # 数据/日志保留与清理脚本（cron 调用，见 §9）
 /usr/share/rpcd/ucode/traffic-stats.uc   # rpcd 后端，读 state/history 返回 JSON
 /usr/share/rpcd/acl.d/luci-app-traffic-stats.json
 /usr/share/luci/menu.d/luci-app-traffic-stats.json
@@ -81,6 +86,10 @@ config feishu 'feishu'
     option alert_disk_pct ''
     option alert_quiet_hours ''     # 免打扰，如 23:00-07:00；只抑制告警
 ```
+
+> 另有 `config retention 'retention'` 段（数据 / 日志保留与清理，8 个阈值 + 总开关，
+> 默认值与语义见 **§9**）。新装的默认配置末尾带这一段；**老配置升级不会被覆盖**
+> （`/etc/config/traffic-stats` 是 conffile），需要手动追加或重装配置才会出现。
 
 ---
 
@@ -407,3 +416,181 @@ cron（用户自己加；`scheduled` 才按配置判定）：
    两次采样时 `cpu_pct`/`mem_pct`/load 与构造值一致；`temp` 缺失时字段省略；
    `df` 在 60 秒内只执行一次；`/proc` 读不到时 `system` 为空对象、`direct/proxy` 与
    关闭 `system_enabled` 时**逐字节一致**且 `reasons` 不增加。
+
+---
+
+## 9. 数据 / 日志保留与清理（retention）
+
+模块：`/usr/share/traffic-stats/retention.uc`（ucode，只用 `fs`/`uci` 内建，不需要 curl/openssl）。
+**cron 由用户自己加**，脚本不改 crontab；`retention.enabled=0` 或整段删掉即回到旧行为。
+
+### 9.1 清理范围（白名单硬编码）
+
+| 目录（硬编码） | 匹配 | 年龄依据 | 配置项 |
+|---|---|---|---|
+| `/etc/traffic-stats/daily/` | `*.json`（一天一个） | **文件名日期** | `daily_days` |
+| `/etc/traffic-stats/nodes/` | `*.json` / `*.jsonl` | 文件名日期，没有就 mtime | `nodes_days` |
+| `/etc/traffic-stats/stations/` | `*.json` | 同上 | `stations_days` |
+| `/tmp/traffic-stats/` | `*.log` | mtime | `log_days` |
+| `/tmp/traffic-stats/` | `*.log` | 大小 | `log_max_kb`（超限截断） |
+| `/tmp/traffic-stats/feishu-queue/` | 目录内全部普通文件 | 总量 | `spool_max_kb`（从最旧删） |
+
+配置段**只有阈值，没有任何路径项**，所以清理范围不可能被配置改到系统目录。
+只处理上表目录的**直接子文件**，不递归。
+
+### 9.2 配置（UCI `traffic-stats`，section `retention`）
+
+```
+config retention 'retention'
+    option enabled '1'
+    option daily_days '400'
+    option nodes_days '30'
+    option stations_days '7'
+    option log_days '7'
+    option log_max_kb '512'
+    option spool_max_kb '2048'
+    option dry_run '0'
+```
+
+| 选项 | 默认 | 取值范围 | 语义 |
+|---|---|---|---|
+| `enabled` | `1` | 0/1 | `0` = 本次运行什么都不删、不截断（等于回到旧行为） |
+| `daily_days` | `400` | 0–36500 | `/etc/traffic-stats/daily/*.json` 保留天数 |
+| `nodes_days` | `30` | 0–36500 | `/etc/traffic-stats/nodes/*` 保留天数 |
+| `stations_days` | `7` | 0–36500 | `/etc/traffic-stats/stations/*` 保留天数 |
+| `log_days` | `7` | 0–36500 | `/tmp/traffic-stats/*.log` 按 mtime 的保留天数 |
+| `log_max_kb` | `512` | 0–16777216 | 单个日志超过就截断，只留尾部一半（KB） |
+| `spool_max_kb` | `2048` | 0–16777216 | `feishu-queue` 目录总量上限（KB） |
+| `dry_run` | `0` | 0/1 | `1` = 只打印将要删除/截断的清单，不动任何文件 |
+
+规则：
+
+- **`0` 一律表示关闭该项**（`days=0` 关闭该目录的按天清理，`*_kb=0` 关闭截断/上限）。
+  这是安全阀：配置写错成 `0` 不会把数据删空。
+- 选项缺失（老配置根本没有 `retention` 段）、非整数、越界 → 用默认值并记一条 WARN，
+  **绝不猜测一个会删数据的值**。
+- 整段缺失等价于默认值（`enabled=1` + 上面 7 个默认阈值）；但只有加了 cron 才会真正执行。
+
+### 9.3 按天删除的判定
+
+- **文件名日期优先**：`^YYYY-MM-DD[.后缀]$`（如 `2026-11-15.json`、`2026-11-15.jsonl`）。
+  四位年 + 两位月 + 两位日，并用公历往返校验（`2026-02-30` 这类非法日期不算），
+  所以 `node-a.json`、`q-1794700000-1-0.json` 不会被误认成日期。
+  日期按**本地时区**解释（与 `daily/` 文件名口径一致）。
+- **否则按 mtime**：`年龄 = int((now - mtime) / 86400)`；mtime 在未来按 0 天前算（保留）。
+- **年龄 > 保留天数才删**：恰好等于保留天数的不删。所以 `daily_days=400` 实际保留 401 个日历日的文件。
+- 删除时记一行清单：`retention: 删除 <路径>（<N> 天前）`。
+
+### 9.4 日志截断
+
+- 只处理 `/tmp/traffic-stats/*.log`，`size > log_max_kb*1024`（严格大于）才截断。
+- 保留**尾部** `size/2` 字节；若起点切在半行上，丢掉这半行（最多丢一行），保证新文件从整行开始。
+- 「同目录临时文件 + `rename`」原子替换，保持原文件权限（通常 0644），不会出现半截日志。
+- 脚本自己的 `/tmp/traffic-stats/retention.log` 也在范围内，会被自己一起截断，不会无限增长。
+
+### 9.5 飞书重试队列上限
+
+- 总量 = 目录下所有**普通文件** `st_size` 之和（不算目录开销）。
+- 超过 `spool_max_kb` → 按 **mtime 从最旧**开始删，边删边算，直到不超上限。
+- `*.processing`（`feishu.uc` 正在投递的条目）**跳过不删**；删完仍超限只记 WARN
+  （剩下的都是处理中的条目，等 `feishu.uc` 自己收尾/回收）。
+
+### 9.6 安全约束（硬性）
+
+- 只删上表白名单目录里的**普通文件**；目录本身、子目录、符号链接、设备文件一律跳过。
+- 删除前 `realpath` 复核：真实路径必须**正好等于** `<root>/<name>`，且仍在白名单根之下。
+- 白名单根**不能是符号链接**：`realpath(root)` 必须等于 `realpath(parent) + 相对路径`；
+  目录不存在则静默跳过（还没产生数据），不是普通目录则 WARN 后跳过。
+- 不跟随符号链接：符号链接条目本身不删、其目标也不会被删。
+- 调试用的目录覆盖（`--daily-dir` 等）必须落在 `/etc/traffic-stats/` 或 `/tmp/traffic-stats/` 之下，
+  路径里不允许 `.` / `..` 段，字符限于 `[A-Za-z0-9._/-]`；被拒绝时只 WARN 并跳过该目录，
+  **绝不回退到默认目录**（否则等于绕过白名单）。
+- 不使用 `rm -rf`、不 fork 删除命令：只用 `fs.unlink` / `fs.rename`。
+- 依赖自检：`ucode-mod-fs` 缺少 `fs.realpath`/`fs.lstat`/`fs.lsdir` 时**拒绝执行**
+  （fail closed，只 WARN + 全 0 摘要），绝不退化成「不做校验就删」。
+
+### 9.7 输出契约（机器可读）
+
+- 每个动作一行，全部以 `retention: ` 开头；dry-run 时动词前多一个「将」：
+  - `retention: 删除 <路径>（<N> 天前）` / `retention: 将删除 …`
+  - `retention: 截断 <路径>（<旧> KB → <新> KB，保留尾部）` / `retention: 将截断 …`
+  - `retention: 删除 <队列条目>（队列 <总量> KB > <上限> KB）`
+- WARN 也走 **stdout**（前缀 `retention: WARN `），这样 `2>&1` 下顺序确定；
+  同时写 `/tmp/traffic-stats/retention.log` 与 syslog（`logger -t traffic-stats-retention -p daemon.warn`）。
+- dry-run 额外一行计划汇总：
+  `retention: dry-run：计划删除 P 个文件、截断 T 个日志，共 B 字节（未改动任何文件）`
+- **stdout 最后一行永远是摘要**：
+
+  ```
+  retention: files_deleted=N bytes_freed=M logs_truncated=K
+  ```
+
+  `files_deleted` = 实际删除的文件数（含飞书队列条目）；`bytes_freed` = 释放字节数
+  （删除 + 截断）；`logs_truncated` = 被截断的日志个数。
+  **dry-run 下三个值都是 0**（确实没动文件），计划量看上面那行。
+- **一律 `exit 0`**：没有东西可删、单个文件失败、甚至未预期异常（外层 try/catch）都是 0，
+  cron 不会因此发邮件；失败信号是 WARN 行 + `retention.log` + syslog。
+- 单个文件失败（删不掉/截断失败）只记 WARN 并继续下一个。
+
+### 9.8 与守护进程的分工（关键）
+
+`daily/` 的清理只能有**一个**负责人，否则 `daily_days=400` 会被老逻辑悄悄删掉：
+
+- `retention` 段**存在**且 `enabled != 0` → `traffic-statsd` **不再执行** `daily_prune`
+  （原来按 `settings.history_days` 做「只留 N 个文件」的计数裁剪）；`daily/` 的清理
+  完全由 `retention.uc` 按 `daily_days` 的**日期**语义负责。
+- `retention` 段**不存在**（老配置升级、conffile 未被覆盖）或 `enabled=0` → 行为与从前
+  完全一致（守护进程按 `history_days` 计数裁剪）。
+- 结论：升级后想用新策略，必须**手动追加** `retention` 段（或重装配置）并加 cron；
+  只装脚本不配段 = 老行为不变。
+- 门禁用的测试钩子：`TRAFFIC_STATS_PRUNE_NOW=1` 让守护进程启动时立刻跑一次清理判定
+  （正常只在跨天时跑），生产环境不要设置。
+
+### 9.9 cron（用户自己加，包不改 crontab）
+
+```sh
+# 每天 03:30 清理一次；stdout 是给人的清单，cron 里丢掉即可
+30 3 * * * /usr/bin/ucode /usr/share/traffic-stats/retention.uc >/dev/null 2>&1
+
+# 首次启用建议先看清单（只打印、不动文件），再上正式 cron：
+ucode /usr/share/traffic-stats/retention.uc --dry-run
+```
+
+### 9.10 调试参数（不写 UCI）
+
+`--dry-run`、`--epoch N`（注入「现在」，秒）、`--daily-days/--nodes-days/--stations-days/--log-days/--log-max-kb/--spool-max-kb`、
+`--daily-dir/--nodes-dir/--stations-dir/--log-dir/--queue-dir`（受 §9.6 约束）、`--selftest`、`--help`。
+
+`--selftest` 是纯函数自检（公历换算、文件名日期解析、白名单/路径判定、KB 显示），
+不读写任何数据目录，容器门禁会跑它。
+
+### 9.11 容器门禁
+
+`tests/container-validate-retention.sh`（隔离容器、`--network none`）覆盖：
+
+- 安装后 `/etc /usr /www` 权限不变；`retention.uc` 落位 0644 root:root；config 三个 section 结构完好
+- `retention` 段 8 个默认值齐全
+- 5 个日期的 daily（含 500 天前）→ 只删 500 天前那个，其余一个不动
+- `nodes_days` / `stations_days` 各自生效（同为 10 天前：node 保留、station 删除）
+- 文件名日期优先于 mtime（mtime 是新文件但名字是 `2020-01-01.json` → 删）
+- 日志 > `log_max_kb` → 截断为约一半、内容确实是尾部、无 `.tmp` 残留、权限不变
+- `feishu-queue` 超上限 → 从最旧删到不超，最新保留
+- `--dry-run` 与 UCI `dry_run=1`：只打印，前后条目数/大小完全一致
+- 越权保护：`/etc/escape.json`、父目录里的 `escape.json`、指向白名单外的符号链接、
+  以超期日期命名的**子目录**全部不动；`--daily-dir /etc`、含 `..` 的路径被拒绝且不回落默认目录；
+  白名单根本身换成符号链接时整目录跳过
+- 摘要行格式正确；空目录 / `enabled=0` 也 `exit 0`
+- 安全阀：`daily_days=0` / `log_max_kb=0` 关闭对应动作；非法值回落默认并 WARN
+- 守护进程：`retention` 段存在时不裁剪 daily，`enabled=0` 时回到 `history_days` 计数裁剪
+
+### 9.12 已知不足
+
+- `/tmp` 是 tmpfs：日志与队列重启即丢，`log_days` 只对「本次开机期间」有意义；
+  真正长期留存的是 `/etc/traffic-stats/` 下的 daily/nodes/stations。
+- 队列按 **mtime** 排序（不是条目里的 `created`/`next_at`）；人工 `touch` 过会改变顺序。
+- `*.processing` 不删，卡住的条目要等 `feishu.uc` 的 10 分钟回收逻辑放回队列后才会被清理。
+- 目录大小按文件 `st_size` 求和，不含目录项/块对齐开销（与 `du` 有少许差异）。
+- 只做「删除 / 截断」，不做压缩归档、不做跨目录配额统计。
+- 日期判定跟随本机时区（`/etc/TZ`）；容器里通常是 UTC，与真机本地时区结论可能差一天，
+  门禁用相对天数（`date -d @epoch`）构造，不受影响。
+

@@ -10,19 +10,24 @@
  * 形态：从概览页「详细面板」按钮新窗口打开（admin/services/traffic-stats/panel），
  * 所以本页隐藏 LuCI 侧栏与页头，让内容铺满整个视口（applyFullscreen，沿用原逻辑）。
  *
- * 七个标签，共用同一份 state，切标签不重新请求后端：
- *   概览 / 趋势 / 设备 / 应用 / 节点 / 系统 / 设置
+ * 六个标签，共用同一份 state，切标签不重新请求后端：
+ *   历史 / 设备 / 应用 / 节点 / 系统 / 设置
+ *
+ * 这里**没有**「概览」：那只是把 LuCI 概览页放大一遍（6 张 KPI + 趋势 + 比例条 + Top10），
+ * 用户明确不要。健康状况改由顶部一行紧凑状态摘要表达（运行状态 / confidence /
+ * 更新时间 / 在线设备数），不放 KPI 大卡、不放排行榜。
  *
  * 数据来源只有四个（不新增任何后端方法）：
  *   traffic-stats.get_state   —— totals / devices / apps / nodes / system / health
- *   traffic-stats.get_history —— 今日 5 分钟桶（days=1）；趋势页切「近 7 天」时才请求 days=7
+ *   traffic-stats.get_history —— 今日 5 分钟桶（days=1）；历史页切到「近 7 / 30 天」时才请求
  *   traffic-stats.get_nodes   —— 子节点快照（只在节点页 / 节点页刷新时拉取）
  *   uci('traffic-stats')      —— 设置页只读展示
  *
  * 降级约定（硬要求）：
  *   - 任何字段缺失都走文案，不显示 0 / NaN / undefined，也不白屏；
  *   - 每个标签的渲染都套 try/catch，单页出错只影响该页，其它标签照常；
- *   - 15s 自动刷新只重绘当前标签，切标签不打断定时器，也不重新请求 history；
+ *   - 15s 自动刷新只重绘当前标签，切标签不打断定时器，也不重复请求没变化的 history；
+ *   - get_history 有 ubus 单条消息上限：近 30 天失败时自动降级到近 7 天/今日并提示；
  *   - 不引外部库：趋势图用文件内的零依赖 SVG 渲染器（tsRenderLine）。
  */
 
@@ -33,7 +38,7 @@ var callState = rpc.declare({
 	reject: true
 });
 
-/* 只有「趋势」页切到近 7 天时才会用 days=7 再请求一次；失败降级为 days=1。 */
+/* 只有历史页切到近 7 / 30 天时才会多请求一次；失败降级并提示。 */
 var callHistory = rpc.declare({
 	object: 'traffic-stats',
 	method: 'get_history',
@@ -50,20 +55,25 @@ var callNodes = rpc.declare({
 });
 
 var REFRESH_MS = 15000;
-var STALE_SEC = 300;             /* 节点超过 5 分钟未上报标黄 */
-var HISTORY_TIMEOUT_MS = 12000;  /* 近 7 天可能撑爆 ubus，给一个明确的超时降级点 */
-var OVERVIEW_CHART_H = 240;
+var STALE_SEC = 300;             /* 节点超过 5 分钟未上报标黄；设备在线判定也用这个阈值 */
+var HISTORY_TIMEOUT_MS = 12000;  /* get_history 可能撑爆 ubus，给一个明确的超时降级点 */
+var HISTORY_REFRESH_LONG_MS = 300000; /* 近 30 天报文大，自动刷新降到 5 分钟一次 */
 var TREND_CHART_H = 360;         /* 大图高度下限，需求要求 ≥ 340px */
 var PANEL_MAX_W = 1680;
 
 var TAB_DEFS = [
-	{ id: 'overview', label: '概览' },
-	{ id: 'trend',    label: '趋势' },
+	{ id: 'history',  label: '历史' },
 	{ id: 'devices',  label: '设备' },
 	{ id: 'apps',     label: '应用' },
 	{ id: 'nodes',    label: '节点' },
 	{ id: 'system',   label: '系统' },
 	{ id: 'settings', label: '设置' }
+];
+
+var RANGE_DEFS = [
+	{ days: 1,  label: '今日' },
+	{ days: 7,  label: '近 7 天' },
+	{ days: 30, label: '近 30 天' }
 ];
 
 var SERIES_DEFS = [
@@ -127,18 +137,6 @@ function fmtRate(v) {
 	if (n >= 1e9) return (n / 1e9).toFixed(2) + ' Gb/s';
 	if (n >= 1e6) return (n / 1e6).toFixed(2) + ' Mb/s';
 	if (n >= 1e3) return (n / 1e3).toFixed(0) + ' kb/s';
-
-	return Math.round(n) + ' b/s';
-}
-
-/* KPI 主值用的紧凑写法：去掉无意义的 .00，窄卡片里不折行 */
-function fmtRateShort(v) {
-	var n = num(v) * 8;
-	var trim = function (s) { return s.replace(/\.0+$/, '').replace(/(\.\d)0$/, '$1'); };
-
-	if (n >= 1e9) return trim((n / 1e9).toFixed(2)) + ' Gb/s';
-	if (n >= 1e6) return trim((n / 1e6).toFixed(2)) + ' Mb/s';
-	if (n >= 1e3) return trim((n / 1e3).toFixed(1)) + ' kb/s';
 
 	return Math.round(n) + ' b/s';
 }
@@ -268,47 +266,6 @@ function card(title, body, extra) {
 		]),
 		body
 	]);
-}
-
-function kpi(key, label, value, sub, color) {
-	return E('div', {
-		'data-kpi': key,
-		style: 'background:var(--background-color-high,#fff);border:1px solid var(--border-color,#e5e7eb);' +
-			'border-radius:10px;padding:14px 16px;min-width:0'
-	}, [
-		E('div', { style: 'font-size:12px;opacity:.65;margin-bottom:6px' }, label),
-		E('div', {
-			style: 'font-size:24px;font-weight:600;line-height:1.15;color:' + (color || 'inherit') +
-				';white-space:nowrap;overflow:hidden;text-overflow:ellipsis'
-		}, value),
-		E('div', { style: 'font-size:11px;opacity:.6;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis' }, sub || '')
-	]);
-}
-
-/* 细堆叠条：比环形图省 10 倍空间，同样表达比例 */
-function splitBar(parts) {
-	var total = parts.reduce(function (s, p) { return s + num(p.value); }, 0);
-	var bar = E('div', {
-		style: 'display:flex;height:10px;border-radius:5px;overflow:hidden;background:#e5e7eb'
-	}, parts.map(function (p) {
-		var pct = total > 0 ? (num(p.value) / total * 100) : 0;
-
-		return E('div', { style: 'width:' + pct.toFixed(2) + '%;background:' + p.color, title: p.label + ' ' + pct.toFixed(1) + '%' }, '');
-	}));
-
-	var legend = E('div', { style: 'display:flex;flex-wrap:wrap;gap:14px;margin-top:10px;font-size:12px' },
-		parts.map(function (p) {
-			var pct = total > 0 ? (num(p.value) / total * 100) : 0;
-
-			return E('span', { style: 'display:inline-flex;align-items:center;gap:6px' }, [
-				E('i', { style: 'width:9px;height:9px;border-radius:2px;background:' + p.color + ';display:inline-block' }, ''),
-				E('span', {}, p.label),
-				E('strong', {}, pct.toFixed(1) + '%'),
-				E('span', { style: 'opacity:.6' }, fmtBytes(p.value))
-			]);
-		}));
-
-	return E('div', {}, [ bar, legend ]);
 }
 
 /*
@@ -500,7 +457,7 @@ function buildTrend(range, payload) {
 	var has = { wifi: false, wired: false };
 	var i, j;
 
-	if (range !== 7) {
+	if (range === 1) {
 		var buckets = [];
 
 		for (i = 0; i < days.length; i++)
@@ -622,6 +579,76 @@ function chartDataFromTrend(trend, enabled) {
 	return { labels: labels, datasets: datasets };
 }
 
+/*
+ * 每日汇总：把 get_history 的 days[] 拍平成「一天一行」。
+ *
+ * 和 buildTrend 的区别：buildTrend 是给折线用的（近 7/30 天每天一个点），这里给表格用，
+ * 更关心「哪些列真的采集到了」——wifi/wired 在每日汇总文件里通常没有（守护进程只写
+ * direct/proxy），那就留 null，界面上显示「—」，绝不补 0 冒充"当天没有无线流量"。
+ */
+function dailyRowOf(d) {
+	var day = (d != null && d.day != null) ? ('' + d.day) : '';
+	var buckets = (d != null && Array.isArray(d.buckets)) ? d.buckets : [];
+	var row = { day: day, total: null, proxy: null, direct: null, wifi: null, wired: null };
+	var i, b;
+
+	if (buckets.length) {
+		var direct = 0, proxy = 0, wifi = 0, wired = 0;
+		var anyWifi = false, anyWired = false;
+
+		for (i = 0; i < buckets.length; i++) {
+			b = buckets[i] || {};
+
+			direct += num(b.direct_rx) + num(b.direct_tx);
+			proxy += num(b.proxy_rx) + num(b.proxy_tx);
+
+			if (numOrNull(b.wifi_rx) != null || numOrNull(b.wifi_tx) != null) {
+				anyWifi = true;
+				wifi += num(b.wifi_rx) + num(b.wifi_tx);
+			}
+
+			if (numOrNull(b.wired_rx) != null || numOrNull(b.wired_tx) != null) {
+				anyWired = true;
+				wired += num(b.wired_rx) + num(b.wired_tx);
+			}
+		}
+
+		row.direct = direct;
+		row.proxy = proxy;
+		row.total = direct + proxy;
+		row.wifi = anyWifi ? wifi : null;
+		row.wired = anyWired ? wired : null;
+	}
+	else if (d != null && d.summary != null && typeof d.summary === 'object' &&
+		d.summary.totals != null && typeof d.summary.totals === 'object') {
+		var t = d.summary.totals;
+		var directB = num(t.direct_rx) + num(t.direct_tx);
+		var proxyB = num(t.proxy_rx) + num(t.proxy_tx);
+
+		row.direct = directB;
+		row.proxy = proxyB;
+		row.total = (numOrNull(t.rx) != null && numOrNull(t.tx) != null)
+			? num(t.rx) + num(t.tx)
+			: directB + proxyB;
+		row.wifi = (numOrNull(t.wifi_rx) != null || numOrNull(t.wifi_tx) != null)
+			? num(t.wifi_rx) + num(t.wifi_tx) : null;
+		row.wired = (numOrNull(t.wired_rx) != null || numOrNull(t.wired_tx) != null)
+			? num(t.wired_rx) + num(t.wired_tx) : null;
+	}
+
+	return row;
+}
+
+function dailyRowsOf(payload) {
+	var days = historyDays(payload);
+	var out = [];
+
+	for (var i = 0; i < days.length; i++)
+		out.push(dailyRowOf(days[i]));
+
+	return out;
+}
+
 /* ------------------------------------------------------------------ *
  * 零依赖 SVG 折线渲染器
  *
@@ -737,8 +764,10 @@ return view.extend({
 
 		this.state = null;
 		this.stateError = null;
-		this.history = null;
-		this.history7 = null;
+		this.hist = {};        /* days → get_history 返回体（只有请求过的范围才有 key） */
+		this.histErr = {};     /* days → 失败原因 */
+		this.histAt = {};      /* days → 最近一次成功请求的时间（ms），决定自动刷新频率 */
+		this.histPending = {}; /* days → 该范围的请求是否进行中 */
 		this.nodes = [];
 		this.nodesError = null;
 		this.uciOk = true;
@@ -759,11 +788,14 @@ return view.extend({
 				self.stateError = errText(err);
 			}),
 
-			/* 首屏就要 history=1：概览的 240px 小图和趋势页的「今日」共用这份数据 */
+			/* 首屏先拿 days=1：历史页默认「今日」，切 7 / 30 天时再按需请求 */
 			attempt(function () { return callHistory(1); }).then(function (h) {
-				self.history = (h != null && typeof h === 'object') ? h : null;
-			}).catch(function () {
-				self.history = null;
+				self.hist[1] = (h != null && typeof h === 'object') ? h : { days: [] };
+				self.histAt[1] = Date.now();
+				self.histErr[1] = '';
+			}).catch(function (err) {
+				self.hist[1] = null;
+				self.histErr[1] = errText(err);
 			}),
 
 			/* 节点快照很轻（只有子节点上报的几个文件），但老后端可能没有这个方法 */
@@ -802,21 +834,19 @@ return view.extend({
 			'  padding:0 0 10px 0;border-bottom:1px solid rgba(127,127,127,.22)}',
 			'#ts-panel-tabs button:hover{opacity:.88}',
 			'#ts-panel .table .th,#ts-panel .table .td{padding:6px 8px}',
-			'#ts-panel .ts-grid-split{display:grid;gap:12px}',
-			'@media (max-width:900px){#ts-panel .ts-grid-split{grid-template-columns:1fr!important}}'
+			'#ts-panel-status strong{font-weight:600}'
 		].join('\n');
 
 		document.head.appendChild(E('style', { id: 'ts-panel-fs' }, css));
 	},
 
 	render: function () {
-		var self = this;
-
 		this.applyFullscreen();
 
-		this.tab = this.tab || 'overview';
-		this.range = this.range || 1;
+		this.tab = this.tab || 'history';
+		this.range = (this.range === 7 || this.range === 30) ? this.range : 1;
 		this.series = this.series || { total: true, proxy: true, direct: true, wifi: false, wired: false };
+		this.dailySort = this.dailySort || { key: 'day', dir: -1 };
 		this.devSort = this.devSort || { key: 'total', dir: -1 };
 		this.devLink = this.devLink || 'all';
 		this.devQuery = this.devQuery || '';
@@ -825,19 +855,23 @@ return view.extend({
 		this.expandedApps = this.expandedApps || {};
 		this.refreshError = null;
 		this.busy = false;
-		this.trendLoading = false;
-		this.trendNotice = '';
+		this.histNotice = '';
+		this.hist = this.hist || {};
+		this.histErr = this.histErr || {};
+		this.histAt = this.histAt || {};
+		this.histPending = this.histPending || {};
 
 		this.header = this.buildHeader();
+		this.statusLine = this.buildStatus();
 		this.tabBar = this.buildTabs();
 		this.sectionHost = E('div', { id: 'ts-panel-section' }, '');
 
 		this.root = E('div', {
 			id: 'ts-panel',
 			style: 'max-width:' + PANEL_MAX_W + 'px;margin:0 auto'
-		}, [ this.header, this.tabBar, this.sectionHost ]);
+		}, [ this.header, this.statusLine, this.tabBar, this.sectionHost ]);
 
-		this.updateHeader();
+		this.updateStatus();
 		this.renderSection();
 		this.scheduleRefresh();
 
@@ -849,21 +883,16 @@ return view.extend({
 	buildHeader: function () {
 		var self = this;
 
-		this.confNode = E('span', { style: 'font-size:12px;padding:2px 8px;border-radius:10px' }, '');
-		this.updatedNode = E('span', { style: 'font-size:12px;opacity:.6' }, '');
-
 		return E('div', {
 			id: 'ts-panel-header',
 			style: 'display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap'
 		}, [
 			E('h2', { style: 'margin:0;font-size:20px' }, _('流量详细面板')),
-			this.confNode,
-			this.updatedNode,
 			E('span', { style: 'flex:1' }, ''),
 			E('button', {
 				'class': 'cbi-button',
 				type: 'button',
-				title: _('立即刷新当前标签的数据（不会重新请求 history）'),
+				title: _('立即刷新当前标签的数据（不会重新请求没变化的 history）'),
 				click: function () { self.refreshNow(); }
 			}, _('刷新')),
 			E('button', {
@@ -874,25 +903,85 @@ return view.extend({
 		]);
 	},
 
-	updateHeader: function () {
-		if (this.confNode) {
-			var look = confLook(((this.state || {}).health || {}).accounting_confidence);
+	/*
+	 * 紧凑状态摘要：运行状态 / confidence / 更新时间 / 在线设备数。
+	 * 它是"这一屏能不能信"的最小信息，不是概览——所以没有 KPI 大卡、没有 Top 榜。
+	 */
+	buildStatus: function () {
+		this.statusDot = E('span', {
+			style: 'display:inline-block;width:8px;height:8px;border-radius:50%;background:#9e9e9e;flex:none'
+		}, '');
+		this.statusRun = E('strong', {}, _('状态未知'));
+		this.statusConf = E('span', {}, '');
+		this.statusUpdated = E('span', { style: 'opacity:.8' }, '');
+		this.statusDevices = E('span', { style: 'opacity:.8' }, '');
+		this.statusWarn = E('span', { style: 'color:#b26a00' }, '');
 
-			this.confNode.textContent = look.text;
-			this.confNode.setAttribute('style',
-				'font-size:12px;padding:2px 8px;border-radius:10px;color:' + look.color + ';background:' + look.bg);
+		return E('div', {
+			id: 'ts-panel-status',
+			style: 'display:flex;align-items:center;gap:9px;flex-wrap:wrap;font-size:12px;' +
+				'padding:7px 12px;margin:0 0 12px;border:1px solid rgba(127,127,127,.22);' +
+				'border-radius:8px;background:rgba(127,127,127,.06)'
+		}, [
+			E('span', { style: 'display:inline-flex;align-items:center;gap:6px' }, [ this.statusDot, this.statusRun ]),
+			E('span', { style: 'opacity:.3' }, '|'),
+			this.statusConf,
+			E('span', { style: 'opacity:.3' }, '|'),
+			this.statusUpdated,
+			E('span', { style: 'opacity:.3' }, '|'),
+			this.statusDevices,
+			this.statusWarn
+		]);
+	},
+
+	updateStatus: function () {
+		if (this.statusRun == null) return;
+
+		var st = this.state;
+		var look = confLook(((st || {}).health || {}).accounting_confidence);
+		var devices = (st != null && Array.isArray(st.devices)) ? st.devices : [];
+		var nowSec = Math.floor(Date.now() / 1000);
+		var online = 0;
+
+		for (var i = 0; i < devices.length; i++) {
+			var seen = num(devices[i] && devices[i].last_seen);
+
+			if (seen > 0 && (nowSec - seen) <= STALE_SEC) online++;
 		}
 
-		if (this.updatedNode) {
-			if (this.refreshError)
-				this.updatedNode.textContent = _('刷新失败，显示上次数据');
-			else if (this.state == null)
-				this.updatedNode.textContent = _('暂无数据');
-			else if (num((this.state || {}).ts) > 0)
-				this.updatedNode.textContent = _('更新于') + ' ' + fmtClock(this.state.ts);
-			else
-				this.updatedNode.textContent = _('暂无数据');
-		}
+		var running = (st != null) ? st.running : null;
+		var color = (st == null) ? '#9e9e9e' : ((running === false) ? '#d93025' : '#1e8e3e');
+
+		this.statusDot.style.background = color;
+
+		if (st == null)
+			this.statusRun.textContent = _('读不到运行状态');
+		else if (running === true)
+			this.statusRun.textContent = _('运行中');
+		else if (running === false)
+			this.statusRun.textContent = _('已停止');
+		else
+			this.statusRun.textContent = _('运行状态未知');
+
+		this.statusRun.style.color = color;
+
+		this.statusConf.textContent = look.text;
+		this.statusConf.style.color = look.color;
+
+		if (this.refreshError)
+			this.statusUpdated.textContent = _('更新失败，显示上次数据');
+		else if (st == null)
+			this.statusUpdated.textContent = _('暂无数据');
+		else if (num(st.ts) > 0)
+			this.statusUpdated.textContent = _('更新于') + ' ' + fmtClock(st.ts);
+		else
+			this.statusUpdated.textContent = _('暂无数据');
+
+		this.statusDevices.textContent = (st == null)
+			? _('在线设备 —')
+			: (_('在线设备') + ' ' + online + ' / ' + devices.length);
+
+		this.statusWarn.textContent = (st != null && st.truncated === true) ? _('· 数据已裁剪') : '';
 	},
 
 	/* ------------------------------------------------------------ 标签栏 */
@@ -960,13 +1049,13 @@ return view.extend({
 		var node = null;
 
 		try {
-			if (this.tab === 'trend') node = this.renderTrend();
+			if (this.tab === 'history') node = this.renderHistory();
 			else if (this.tab === 'devices') node = this.renderDevices();
 			else if (this.tab === 'apps') node = this.renderApps();
 			else if (this.tab === 'nodes') node = this.renderNodes();
 			else if (this.tab === 'system') node = this.renderSystem();
 			else if (this.tab === 'settings') node = this.renderSettings();
-			else node = this.renderOverview();
+			else node = this.renderHistory();
 		}
 		catch (e) {
 			/* 单页渲染异常不能白屏：只把这一页换成错误说明，其它标签仍可用 */
@@ -976,7 +1065,7 @@ return view.extend({
 		try {
 			dom.content(this.sectionHost, node);
 			this.updateTabs();
-			this.updateHeader();
+			this.updateStatus();
 			this.drawCurrentChart();
 		}
 		catch (e2) {
@@ -1003,15 +1092,14 @@ return view.extend({
 
 	drawCurrentChart: function () {
 		try {
-			if (this.tab === 'overview') this.drawOverviewChart();
-			else if (this.tab === 'trend') this.drawTrendChart();
+			if (this.tab === 'history') this.drawHistoryChart();
 		}
 		catch (e) {
 			/* 图表失败不影响其它内容；下面各 draw* 自己也兜底 */
 		}
 	},
 
-	/* ------------------------------------------------------------ 概览 */
+	/* ------------------------------------------------------------ 状态横幅 */
 
 	renderStateBanner: function () {
 		if (this.state != null) return '';
@@ -1023,188 +1111,52 @@ return view.extend({
 		]);
 	},
 
-	renderOverview: function () {
-		var st = this.state || {};
-		var totals = st.totals || {};
-		var hasTotals = !!(this.state && st.totals);
+	/* ------------------------------------------------------------ 历史 */
 
-		var directAll = num(totals.direct_rx) + num(totals.direct_tx);
-		var proxyAll = num(totals.proxy_rx) + num(totals.proxy_tx);
-		var wifiKnown = (numOrNull(totals.wifi_rx) != null || numOrNull(totals.wifi_tx) != null);
-		var wiredKnown = (numOrNull(totals.wired_rx) != null || numOrNull(totals.wired_tx) != null);
-		var totalAll = directAll + proxyAll;
+	rangeLabel: function (n) {
+		if (n === 7) return _('近 7 天');
+		if (n === 30) return _('近 30 天');
 
-		this.ovChartHost = E('div', {
-			style: 'height:' + OVERVIEW_CHART_H + 'px;position:relative;min-width:0'
-		}, '');
-
-		return E('div', { 'data-page': 'overview' }, [
-			this.renderStateBanner(),
-
-			/* KPI 行：6 张卡，口径写在标签/副标题上（totals 是"进程启动以来累计"） */
-			E('div', {
-				style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:14px'
-			}, [
-				kpi('total', _('总流量（累计）'),
-					hasTotals ? fmtBytes(totalAll) : '—',
-					hasTotals ? (_('下载') + ' ' + fmtBytes(num(totals.direct_rx) + num(totals.proxy_rx)) + ' · ' + _('上传') + ' ' + fmtBytes(num(totals.direct_tx) + num(totals.proxy_tx))) : _('暂无数据')),
-				kpi('rate', _('实时速率'),
-					hasTotals ? fmtRateShort(num(totals.rx_rate)) : '—',
-					hasTotals ? ('↓ ' + fmtRate(num(totals.rx_rate)) + '   ↑ ' + fmtRate(num(totals.tx_rate))) : _('暂无数据')),
-				kpi('proxy', _('代理流量'),
-					hasTotals ? fmtBytes(proxyAll) : '—',
-					hasTotals ? ('↓ ' + fmtBytes(num(totals.proxy_rx)) + '  ↑ ' + fmtBytes(num(totals.proxy_tx))) : _('暂无数据'), '#1a73e8'),
-				kpi('direct', _('直连流量'),
-					hasTotals ? fmtBytes(directAll) : '—',
-					hasTotals ? ('↓ ' + fmtBytes(num(totals.direct_rx)) + '  ↑ ' + fmtBytes(num(totals.direct_tx))) : _('暂无数据'), '#34a853'),
-				kpi('wifi', _('无线接入'),
-					wifiKnown ? fmtBytes(num(totals.wifi_rx) + num(totals.wifi_tx)) : '—',
-					wifiKnown ? ('↓ ' + fmtBytes(num(totals.wifi_rx)) + '  ↑ ' + fmtBytes(num(totals.wifi_tx))) : _('未采集'), '#a142f4'),
-				kpi('wired', _('有线接入'),
-					wiredKnown ? fmtBytes(num(totals.wired_rx) + num(totals.wired_tx)) : '—',
-					wiredKnown ? ('↓ ' + fmtBytes(num(totals.wired_rx)) + '  ↑ ' + fmtBytes(num(totals.wired_tx))) : _('未采集'), '#f9ab00')
-			]),
-
-			/* 趋势 + 比例 */
-			E('div', {
-				'class': 'ts-grid-split',
-				style: 'display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:12px;margin-bottom:14px'
-			}, [
-				card(_('流量趋势（近 24 小时 · 5 分钟桶）'), this.ovChartHost,
-					E('span', { style: 'font-size:12px;opacity:.6' }, _('总 / 代理 / 直连'))),
-				card(_('构成比例'), E('div', {}, [
-					E('div', { style: 'font-size:12px;opacity:.65;margin-bottom:8px' }, _('代理 vs 直连')),
-					splitBar([
-						{ label: _('代理'), value: proxyAll, color: '#1a73e8' },
-						{ label: _('直连'), value: directAll, color: '#34a853' }
-					]),
-					E('div', { style: 'font-size:12px;opacity:.65;margin:16px 0 8px' }, _('无线 vs 有线')),
-					wifiKnown ? splitBar([
-						{ label: _('无线'), value: num(totals.wifi_rx) + num(totals.wifi_tx), color: '#a142f4' },
-						{ label: _('有线'), value: num(totals.wired_rx) + num(totals.wired_tx), color: '#f9ab00' },
-						{ label: _('未知'), value: num(totals.unknown_rx) + num(totals.unknown_tx), color: '#9aa0a6' }
-					]) : E('div', { style: 'opacity:.55;font-size:12px' }, _('未启用接入方式判定'))
-				]))
-			]),
-
-			/* Top 10 设备 / Top 10 应用 */
-			E('div', {
-				'class': 'ts-grid-split',
-				style: 'display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px'
-			}, [
-				card(_('Top 10 设备'), this.renderTopDevices()),
-				card(_('Top 10 应用 / 域名'), this.renderTopApps())
-			])
-		]);
+		return _('今日');
 	},
 
-	renderTopDevices: function () {
-		var st = this.state || {};
-		var list = (Array.isArray(st.devices) ? st.devices.slice() : [])
-			.sort(function (a, b) { return deviceTotal(b) - deviceTotal(a); })
-			.slice(0, 10);
-
-		var rows = list.map(function (d) {
-			var name = deviceName(d);
-			var m = linkMeta(d);
-
-			return E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td', style: 'max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' },
-					E('strong', {}, shortText(name, 26))),
-				E('td', { 'class': 'td' }, badge(m.label, m.color, m.bg)),
-				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap;color:#1a73e8' }, fmtBytes(num(d.proxy_rx) + num(d.proxy_tx))),
-				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap;color:#34a853' }, fmtBytes(num(d.direct_rx) + num(d.direct_tx))),
-				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, E('strong', {}, fmtBytes(deviceTotal(d))))
-			]);
-		});
-
-		return table([
-			{ label: _('设备') }, { label: _('接入'), width: '90px' },
-			{ label: _('代理'), right: true, width: '110px' },
-			{ label: _('直连'), right: true, width: '110px' },
-			{ label: _('合计'), right: true, width: '110px' }
-		], rows, _('暂无设备数据'));
+	/* 当前范围的数据：只有请求成功过的范围才有值，失败 / 未请求一律 null */
+	histPayload: function () {
+		return Object.prototype.hasOwnProperty.call(this.hist || {}, this.range) ? this.hist[this.range] : null;
 	},
 
-	renderTopApps: function () {
-		var st = this.state || {};
-		var list = (Array.isArray(st.apps) ? st.apps.slice() : [])
-			.sort(function (a, b) { return appTotal(b) - appTotal(a); })
-			.slice(0, 10);
-
-		var rows = list.map(function (a) {
-			return E('tr', { 'class': 'tr' }, [
-				E('td', { 'class': 'td', style: 'max-width:230px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap', title: '' + (a.host || '') },
-					shortText(appLabel(a.host), 40)),
-				E('td', { 'class': 'td' }, chainBadge(a.chain)),
-				E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtBytes(appTotal(a))),
-				E('td', { 'class': 'td', style: 'text-align:right;opacity:.7;white-space:nowrap' }, '' + num(a.devices))
-			]);
-		});
-
-		return table([
-			{ label: _('域名 / 应用') }, { label: _('出口'), width: '150px' },
-			{ label: _('流量'), right: true, width: '110px' },
-			{ label: _('设备数'), right: true, width: '80px' }
-		], rows, _('暂无应用数据'));
-	},
-
-	/* 概览的小图：固定用今日（days=1），与趋势页的当前选择互不影响 */
-	drawOverviewChart: function () {
-		var host = this.ovChartHost;
-
-		if (host == null) return;
-
-		try {
-			var trend = buildTrend(1, this.history);
-
-			if (!trend.points.length) {
-				dom.content(host, centerBox(_('暂无历史数据（history.json 为空，或守护进程刚启动）')));
-				return;
-			}
-
-			var data = chartDataFromTrend(trend, { total: true, proxy: true, direct: true });
-
-			if (!data.datasets.length) {
-				dom.content(host, centerBox(_('暂无可绘制的曲线')));
-				return;
-			}
-
-			tsRenderLine(host, data, {
-				height: OVERVIEW_CHART_H,
-				fmtY: function (v) { return fmtBytes(v); }
-			});
-		}
-		catch (e) {
-			dom.content(host, centerBox(_('趋势图绘制失败：') + errText(e)));
-		}
-	},
-
-	/* ------------------------------------------------------------ 趋势 */
-
-	renderTrend: function () {
+	renderHistory: function () {
 		var self = this;
-		var payload = (this.range === 7) ? this.history7 : this.history;
+		var payload = this.histPayload();
 		var trend = buildTrend(this.range, payload);
 		var available = {
 			total: true, proxy: true, direct: true,
 			wifi: !!trend.has.wifi, wired: !!trend.has.wired
 		};
+		var pending = (this.histPending || {})[this.range] === true;
 
-		this.trendChartHost = E('div', {
+		this.histChartHost = E('div', {
 			style: 'height:' + TREND_CHART_H + 'px;position:relative;min-width:0'
 		}, '');
 
 		var rangeRow = E('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' }, [
-			E('span', { style: 'font-size:12px;opacity:.7;margin-right:2px' }, _('时间范围')),
-			chip(_('今日'), this.range === 1, '#1a73e8', function () { self.setRange(1); }),
-			chip(_('近 7 天'), this.range === 7, '#1a73e8', function () { self.setRange(7); })
-		]);
+			E('span', { style: 'font-size:12px;opacity:.7;margin-right:2px' }, _('时间范围'))
+		].concat(RANGE_DEFS.map(function (r) {
+			return chip(_(r.label), self.range === r.days, '#1a73e8', function () { self.setRange(r.days); });
+		})));
 
-		var seriesChips = SERIES_DEFS.filter(function (s) {
-			return !!(available[s.key]);
-		}).map(function (s) {
-			return chip(_(s.label), !!self.series[s.key], s.color, function () { self.toggleSeries(s.key); });
+		/* 五个指标都摆出来；本范围没有采集到的（无线 / 有线）置灰并说明，避免点开一条假 0 线 */
+		var seriesChips = SERIES_DEFS.map(function (s) {
+			var usable = !!available[s.key];
+			var btn = chip(_(s.label), usable && !!self.series[s.key], s.color,
+				function () { self.toggleSeries(s.key); });
+
+			if (!usable) {
+				btn.setAttribute('style', chipStyle(false, s.color) + ';opacity:.4;cursor:default');
+				btn.setAttribute('title', _('该时间范围没有') + _(s.label) + _('数据'));
+			}
+
+			return btn;
 		});
 
 		var seriesRow = E('div', {
@@ -1213,84 +1165,219 @@ return view.extend({
 
 		var notice = '';
 
-		if (this.trendLoading)
-			notice = E('div', { style: 'margin-top:10px;font-size:12px;opacity:.7' }, _('正在加载近 7 天数据…'));
-		else if (this.trendNotice)
-			notice = E('div', { 'class': 'alert-message warning', style: 'padding:10px 14px;margin-top:10px' }, this.trendNotice);
+		if (pending)
+			notice = E('div', { style: 'margin-top:10px;font-size:12px;opacity:.7' },
+				_('正在加载') + this.rangeLabel(this.range) + _('数据…'));
+		else if (this.histNotice)
+			notice = E('div', { 'class': 'alert-message warning', style: 'padding:10px 14px;margin-top:10px' }, this.histNotice);
+		else if (payload == null && (this.histErr || {})[this.range])
+			notice = E('div', { 'class': 'alert-message warning', style: 'padding:10px 14px;margin-top:10px' },
+				_('历史数据读取失败：') + this.histErr[this.range]);
 
 		var caveat = (this.range === 1)
 			? _('今日：5 分钟桶，最多 288 个点（history.json 在 tmpfs，重启即丢）。')
-			: _('近 7 天：每天一个点——今天由 5 分钟桶求和，往日取每日汇总（日粒度）。SPEC §3.1 不承诺跨天 5 分钟数据。');
+			: ((this.range === 7)
+				? _('近 7 天：每天一个点——今天由 5 分钟桶求和，往日取每日汇总（日粒度）。SPEC §3.1 不承诺跨天 5 分钟数据。')
+				: _('近 30 天：日粒度，报文更大；超过 ubus 单条消息上限会失败，并自动降级回近 7 天 / 今日，原因见上方提示。'));
 
-		return E('div', { 'data-page': 'trend' }, [
+		return E('div', { 'data-page': 'history' }, [
 			this.renderStateBanner(),
 			E('div', {
 				style: 'background:var(--background-color-high,#fff);border:1px solid var(--border-color,#e5e7eb);' +
 					'border-radius:10px;padding:12px 14px;margin-bottom:12px'
 			}, [ rangeRow, seriesRow ]),
-			card(_('流量趋势'), this.trendChartHost,
+			card(_('流量趋势'), this.histChartHost,
 				E('span', { style: 'font-size:12px;opacity:.6' },
-					this.range === 1 ? _('今日 · 5 分钟桶') : _('近 7 天 · 日粒度'))),
+					this.range === 1 ? _('今日 · 5 分钟桶') : (this.rangeLabel(this.range) + ' · ' + _('日粒度')))),
 			notice,
-			E('p', { style: 'margin:10px 0 0;font-size:12px;opacity:.7' }, caveat)
+			E('p', { style: 'margin:10px 0 14px;font-size:12px;opacity:.7' }, caveat),
+			this.renderDailyTable()
 		]);
 	},
 
-	/* 切到近 7 天：只有这里会额外请求 history；超过 ubus 上限/超时就降级回今日 */
+	/* 每日汇总表：一天一行，点表头排序 */
+	renderDailyTable: function () {
+		var host = E('div', { style: 'overflow-x:auto' }, this.renderDailyBody());
+
+		this.dailyHost = host;
+
+		return card(_('每日汇总'), E('div', {}, [
+			E('p', { style: 'margin:0 0 10px;font-size:12px;opacity:.65' },
+				_('每天一行，来自 get_history 的 days 数组；无线 / 有线未采集的日子显示「—」。点表头可排序。')),
+			host
+		]), E('span', { style: 'font-size:12px;opacity:.6' }, _('按日汇总')));
+	},
+
+	renderDailyBody: function () {
+		var rows = this.sortedDailyRows();
+
+		if (!rows.length)
+			return emptyBox(_('暂无每日汇总'), _('get_history 没有返回任何一天的数据'));
+
+		var cell = function (value, color) {
+			return E('td', {
+				'class': 'td',
+				style: 'text-align:right;white-space:nowrap' + (color ? ';color:' + color : '')
+			}, (value == null) ? '—' : E('strong', {}, fmtBytes(value)));
+		};
+
+		var cells = rows.map(function (r) {
+			return E('tr', { 'class': 'tr', 'data-row': 'daily' }, [
+				E('td', { 'class': 'td', style: 'white-space:nowrap' }, E('code', {}, r.day || '—')),
+				cell(r.total),
+				cell(r.proxy, '#1a73e8'),
+				cell(r.direct, '#188038'),
+				cell(r.wifi, '#a142f4'),
+				cell(r.wired, '#b26a00')
+			]);
+		});
+
+		return table(this.dailyHead(), cells, _('暂无每日汇总'));
+	},
+
+	dailyHead: function () {
+		var self = this;
+
+		var cols = [
+			{ key: 'day', label: _('日期') },
+			{ key: 'total', label: _('总流量'), right: true },
+			{ key: 'proxy', label: _('代理'), right: true },
+			{ key: 'direct', label: _('直连'), right: true },
+			{ key: 'wifi', label: _('无线'), right: true },
+			{ key: 'wired', label: _('有线'), right: true }
+		];
+
+		var sort = this.dailySort || { key: 'day', dir: -1 };
+
+		return cols.map(function (c) {
+			var o = {
+				label: c.label,
+				right: c.right,
+				sortKey: c.key,
+				click: function () { self.setDailySort(c.key); }
+			};
+
+			if (sort.key === c.key)
+				o.mark = (sort.dir < 0) ? '▼' : '▲';
+
+			return o;
+		});
+	},
+
+	dailySortValue: function (row, key) {
+		if (key === 'day') return row.day || '';
+
+		return (row[key] == null) ? null : num(row[key]);
+	},
+
+	sortedDailyRows: function () {
+		var self = this;
+		var rows = dailyRowsOf(this.histPayload());
+		var sort = this.dailySort || { key: 'day', dir: -1 };
+		var key = sort.key;
+		var dir = (sort.dir < 0) ? -1 : 1;
+
+		rows.sort(function (a, b) {
+			var va = self.dailySortValue(a, key);
+			var vb = self.dailySortValue(b, key);
+
+			/* 空值（无线 / 有线未采集）永远排最后，不随升降序来回跳 */
+			if (va == null && vb == null) return 0;
+			if (va == null) return 1;
+			if (vb == null) return -1;
+
+			var r;
+
+			if (typeof va === 'number' && typeof vb === 'number')
+				r = va - vb;
+			else if (va < vb)
+				r = -1;
+			else if (va > vb)
+				r = 1;
+			else
+				r = 0;
+
+			return r * dir;
+		});
+
+		return rows;
+	},
+
+	setDailySort: function (key) {
+		if (!key) return;
+
+		if (this.dailySort && this.dailySort.key === key)
+			this.dailySort.dir = (this.dailySort.dir < 0) ? 1 : -1;
+		else
+			this.dailySort = { key: key, dir: -1 };
+
+		if (this.dailyHost)
+			dom.content(this.dailyHost, this.renderDailyBody());
+	},
+
+	/*
+	 * 切时间范围：只有第一次切到某个范围才真的请求。
+	 * get_history 受 ubus 单条消息上限约束（后端按 200000 字符瘦身，仍可能失败），
+	 * 所以失败一律降级：30 天 → 近 7 天（有缓存时）→ 今日，并把原因写在历史页顶部。
+	 */
 	setRange: function (n) {
 		var self = this;
 
-		n = (n === 7) ? 7 : 1;
+		n = (n === 7 || n === 30) ? n : 1;
 
-		if (n === 1) {
-			this.range = 1;
-			this.trendLoading = false;
-			this.trendNotice = '';
+		this.hist = this.hist || {};
+		this.histPending = this.histPending || {};
+		this.histErr = this.histErr || {};
+		this.histAt = this.histAt || {};
+
+		if (this.histPending[n]) return;
+
+		if (Object.prototype.hasOwnProperty.call(this.hist, n) && this.hist[n] != null) {
+			this.range = n;
+			this.histNotice = '';
 			this.renderSection();
 			return;
 		}
 
-		this.range = 7;
-		this.trendNotice = '';
-
-		if (this.history7) {
-			this.trendLoading = false;
-			this.renderSection();
-			return;
-		}
-
-		if (this.trendPending) return;
-
-		this.trendLoading = true;
-		this.trendPending = true;
+		this.range = n;
+		this.histNotice = '';
+		this.histPending[n] = true;
 		this.renderSection();
 
 		var timeout = new Promise(function (resolve, reject) {
-			setTimeout(function () { reject(new Error('timeout')); }, HISTORY_TIMEOUT_MS);
+			setTimeout(function () { reject(new Error(_('请求超时'))); }, HISTORY_TIMEOUT_MS);
 		});
 
-		Promise.race([ Promise.resolve().then(function () { return callHistory(7); }), timeout ])
-			.then(function (data) {
-				self.history7 = (data != null && typeof data === 'object') ? data : { days: [] };
-				self.trendLoading = false;
-				self.trendPending = false;
-				self.renderSection();
-			})
-			.catch(function () {
-				/* 降级：回到 days=1，并把原因写在趋势页顶部 */
-				self.trendLoading = false;
-				self.trendPending = false;
-				self.range = 1;
-				self.trendNotice = _('近 7 天数据读取失败（可能超过 ubus 单条消息上限，或后端超时），已降级为「今日」。');
+		Promise.race([
+			Promise.resolve().then(function () { return callHistory(n); }),
+			timeout
+		]).then(function (data) {
+			self.hist[n] = (data != null && typeof data === 'object') ? data : { days: [] };
+			self.histAt[n] = Date.now();
+			self.histErr[n] = '';
+			delete self.histPending[n];
 
-				return Promise.resolve().then(function () { return callHistory(1); })
-					.then(function (d) {
-						if (d != null && typeof d === 'object') self.history = d;
-					})
-					.catch(function () { })
-					.then(function () { self.renderSection(); });
-			})
-			.catch(function () { /* 兜底：渲染失败也不能冒出未处理的 Promise 拒绝 */ });
+			if (self.range === n) {
+				self.histNotice = '';
+				self.renderSection();
+			}
+		}).catch(function (err) {
+			delete self.histPending[n];
+			self.hist[n] = null;
+			self.histErr[n] = errText(err);
+
+			/* 用户已经切到别的范围了：只记下这次失败，不要把他拽回来 */
+			if (self.range !== n) return;
+
+			var fb = (n === 30 && self.hist[7] != null) ? 7 : 1;
+			var reason = self.histErr[n] || _('未知错误');
+
+			self.range = fb;
+			self.histNotice = self.rangeLabel(n) + _('读取失败') +
+				'（' + _('可能超过 ubus 单条消息上限，或后端超时') + '）。' +
+				_('已降级为') + '「' + self.rangeLabel(fb) + '」：' + reason;
+			self.renderSection();
+		});
 	},
 
 	toggleSeries: function (key) {
@@ -1300,19 +1387,18 @@ return view.extend({
 		this.renderSection();
 	},
 
-	drawTrendChart: function () {
-		var host = this.trendChartHost;
+	drawHistoryChart: function () {
+		var host = this.histChartHost;
 
 		if (host == null) return;
 
 		try {
-			if (this.range === 7 && this.trendLoading) {
-				dom.content(host, centerBox(_('正在加载近 7 天数据…')));
+			if ((this.histPending || {})[this.range] === true && this.histPayload() == null) {
+				dom.content(host, centerBox(_('正在加载') + this.rangeLabel(this.range) + _('数据…')));
 				return;
 			}
 
-			var payload = (this.range === 7) ? this.history7 : this.history;
-			var trend = buildTrend(this.range, payload);
+			var trend = buildTrend(this.range, this.histPayload());
 
 			if (!trend.points.length) {
 				dom.content(host, centerBox(_('暂无历史数据（history.json 为空，或守护进程刚启动）')));
@@ -2329,24 +2415,40 @@ return view.extend({
 
 		if (rows.length) cards.push(card(_('飞书日报'), E('div', {}, rows)));
 
-		/* ---- 保留策略（字段可能还没实现：没有就不显示） ---- */
+		/* ---- 保留策略 ----
+		 * history_days 属于 settings（守护进程自己用）；
+		 * 其余来自 retention 段（retention.uc 读取）。该段可能还没写进 /etc/config，
+		 * 没有的字段直接不显示，绝不补 0 / 默认值冒充"已配置"。
+		 */
 		rows = [];
 
 		v = this.cfgWithDefault('settings', 'history_days');
 		if (v.value != null) {
-			var keepHint = _('history.json + 每日汇总');
+			var keepHint = _('history.json 保留天数');
 
 			if (defaultHint(v)) keepHint = defaultHint(v) + ' · ' + keepHint;
 
-			rows.push(s(_('历史保留'), v.value + ' ' + _('天'), keepHint));
+			rows.push(s(_('历史文件保留'), v.value + ' ' + _('天'), keepHint));
 		}
 
-		var extraKeys = [ 'retention_days', 'keep_days', 'daily_keep' ];
+		v = this.cfg('retention', 'enabled');
+		if (v != null)
+			rows.push(s(_('清理任务'), flagOn(v, '1') ? badge(_('已启用'), '#137333', 'rgba(52,168,83,.15)') : badge(_('已关闭'), '#5f6368', 'rgba(95,99,104,.15)')));
 
-		for (var i = 0; i < extraKeys.length; i++) {
-			v = this.cfg('settings', extraKeys[i]);
+		var retentionDefs = [
+			[ 'daily_days',   _('每日汇总保留'), _('天') ],
+			[ 'nodes_days',   _('子节点快照保留'), _('天') ],
+			[ 'stations_days', _('AP 站点快照保留'), _('天') ],
+			[ 'log_days',     _('日志保留'), _('天') ],
+			[ 'log_max_kb',   _('单个日志上限'), 'KB' ],
+			[ 'spool_max_kb', _('飞书重试队列上限'), 'KB' ]
+		];
 
-			if (v != null) rows.push(s(extraKeys[i], v));
+		for (var i = 0; i < retentionDefs.length; i++) {
+			var rv = this.cfg('retention', retentionDefs[i][0]);
+
+			if (rv != null)
+				rows.push(s(retentionDefs[i][1], rv + ' ' + retentionDefs[i][2]));
 		}
 
 		if (rows.length) cards.push(card(_('保留策略'), E('div', {}, rows)));
@@ -2399,8 +2501,8 @@ return view.extend({
 
 	/* ------------------------------------------------------------ 刷新 */
 
-	/* 15s 自动刷新：只重绘当前标签；只有节点页会额外重拉 get_nodes。
-	   history 不在这里请求——只有趋势页切「近 7 天」才会请求。 */
+	/* 15s 自动刷新：只重绘当前标签；节点页额外重拉 get_nodes。
+	   历史页跟着刷新当前范围，但近 30 天报文大，降到 5 分钟一次，避免折腾 ubus 与闪存。 */
 	refreshNow: function () {
 		var self = this;
 
@@ -2435,14 +2537,38 @@ return view.extend({
 				}));
 		}
 
+		if (this.tab === 'history' && !this.histPending[this.range] && this.historyRefreshDue()) {
+			tasks.push(Promise.resolve().then(function () { return callHistory(self.range); })
+				.then(function (d) {
+					if (d != null && typeof d === 'object') {
+						self.hist[self.range] = d;
+						self.histAt[self.range] = Date.now();
+						self.histErr[self.range] = '';
+					}
+				})
+				.catch(function () {
+					/* 后台刷新失败保持沉默：旧图继续用，别把用户的视线拉到一条瞬时错误上 */
+				}));
+		}
+
 		return Promise.all(tasks).then(function () {
 			self.busy = false;
 			self.renderSection();
 		}).catch(function () {
 			self.busy = false;
 			self.refreshError = _('刷新失败');
-			self.updateHeader();
+			self.updateStatus();
 		});
+	},
+
+	/* 历史数据是否到了该刷新的时间：今日/近 7 天跟 15s 节奏，近 30 天 5 分钟一次 */
+	historyRefreshDue: function () {
+		var last = num((this.histAt || {})[this.range]);
+		var maxAge = (this.range === 30) ? HISTORY_REFRESH_LONG_MS : REFRESH_MS;
+
+		if (!last) return true;
+
+		return (Date.now() - last) >= maxAge;
 	},
 
 	scheduleRefresh: function () {

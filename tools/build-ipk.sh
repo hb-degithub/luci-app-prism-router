@@ -40,6 +40,8 @@ D="$W/ts"; mkdir -p "$D/data/usr/bin" "$D/data/usr/share/traffic-stats" \
 cp "$ROOT/traffic-stats/files/traffic-statsd.uc"  "$D/data/usr/bin/traffic-statsd"; chmod 755 "$D/data/usr/bin/traffic-statsd"
 cp "$ROOT/traffic-stats/files/feishu.uc"          "$D/data/usr/share/traffic-stats/feishu.uc"; chmod 644 "$D/data/usr/share/traffic-stats/feishu.uc"
 cp "$ROOT/traffic-stats/files/feishu-test.sh"     "$D/data/usr/share/traffic-stats/feishu-test.sh"; chmod 755 "$D/data/usr/share/traffic-stats/feishu-test.sh"
+# 数据 / 日志保留与清理（用户 cron 调用；只动白名单目录，见 docs/SPEC.md §9）
+cp "$ROOT/traffic-stats/files/retention.uc"       "$D/data/usr/share/traffic-stats/retention.uc"; chmod 644 "$D/data/usr/share/traffic-stats/retention.uc"
 # 子节点推送脚本（cron 调用；不进 PATH，避免和守护进程抢名字）
 cp "$ROOT/traffic-stats/files/push.uc"            "$D/data/usr/share/traffic-stats/push.uc"; chmod 644 "$D/data/usr/share/traffic-stats/push.uc"
 # 母节点接收端：CGI，必须可执行（uhttpd -c /cgi-bin 直接 exec）

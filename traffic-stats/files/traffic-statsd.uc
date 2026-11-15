@@ -44,6 +44,7 @@
  *   TRAFFIC_STATS_THERMAL    覆盖 /sys/class/thermal/thermal_zone0/temp
  *   TRAFFIC_STATS_DF         覆盖 df 命令（自测：假 df 统计调用次数）
  *   TRAFFIC_STATS_ROOTFS     覆盖 df 的目标（默认 /）
+ *   TRAFFIC_STATS_PRUNE_NOW=1  启动时立刻跑一次 daily 清理判定（自测：验证 daily 清理归属）
  *   TRAFFIC_STATS_DEBUG=1    详细日志输出到 stderr
  */
 
@@ -447,6 +448,21 @@ function load_config(cur) {
 	/* 软路由自身性能指标（SPEC §3.3）：辅助信息，读不到只省略字段 */
 	c.system_enabled = to_int(cfg_str(cur, 'traffic-stats', 'settings', 'system_enabled', '1'), 1) != 0;
 	c.wan_iface = cfg_str(cur, 'traffic-stats', 'settings', 'wan_iface', '');
+
+	/* 保留策略归属（SPEC §9）：retention 段存在且 enabled != 0 时，daily 的清理
+	 * 交给 /usr/share/traffic-stats/retention.uc 按 retention.daily_days 做（按日期）；
+	 * 本进程不再按 history_days 做「只留 N 个文件」的计数裁剪，否则 daily_days=400
+	 * 会被 7 天的计数逻辑悄悄删掉。老配置（没有 retention 段）行为完全不变。
+	 * 注意 uci cursor 的 get(pkg, section) 返回的是 section 的 type 字符串（不存在时 null），
+	 * 选项值仍然用 cfg_str(cur, pkg, section, opt, dflt) 读。 */
+	let rsec = null;
+	try {
+		rsec = cur.get('traffic-stats', 'retention');
+	} catch (e) {
+		rsec = null;
+	}
+	c.retention_owns_daily = (rsec != null)
+		&& (to_int(cfg_str(cur, 'traffic-stats', 'retention', 'enabled', '1'), 1) != 0);
 
 	/* clash_secret 留空 -> 自动读 openclash 的控制器密码（契约 §2） */
 	if (c.clash_secret == '') {
@@ -1399,6 +1415,11 @@ function daily_write(ctx, force) {
 }
 
 function daily_prune(ctx) {
+	/* 保留策略由 retention.uc 接管时（新默认配置带 retention 段）不再按 history_days
+	 * 计数裁剪，否则 retention.daily_days=400 会被「只留 7 个文件」悄悄删掉。
+	 * 老配置没有 retention 段 -> retention_owns_daily 为 false -> 行为与从前完全一致。 */
+	if (ctx.cfg.retention_owns_daily) return;
+
 	let names = null;
 	try {
 		names = fs.lsdir(ctx.cfg.daily_dir);
@@ -2108,6 +2129,13 @@ function boot() {
 		push(ctx.reasons, 'fake_ip: fake_ip_ranges 无效，无法去重，可能重复计数');
 
 	mkpath(ctx.cfg.state_dir);
+
+	/* 测试钩子（生产环境不要设置）：启动时立刻跑一次 daily 清理判定。
+	 * 正常流程只在跨天（day_rollover_check）才清理，容器门禁等不到零点，
+	 * 所以给 tests/container-retention-inner.sh 一个入口来验证「谁负责清理 daily」。 */
+	if (getenv('TRAFFIC_STATS_PRUNE_NOW') != null)
+		daily_prune(ctx);
+
 	return ctx;
 }
 

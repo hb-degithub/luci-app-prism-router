@@ -203,6 +203,136 @@ function sigOf(items, render) {
 	return out.join('\u0001');
 }
 
+// ---------------------------------------------------------------- 安装 / 扫码
+
+/*
+ * PWA 安装入口的全局状态。
+ * beforeinstallprompt 只会在可安装时触发，而且事件对象只能用一次，所以放在模块
+ * 作用域里：页面重建（切标签、返回）不会把已经拿到的安装事件丢掉。
+ */
+var INSTALL = {
+	deferred: null,   /* beforeinstallprompt 事件（Android Chrome / Edge） */
+	installed: false, /* 触发过 appinstalled，或当前就是独立窗口 */
+	applied: false,   /* 已经调过 prompt()，事件不能再用 */
+	bound: false,     /* window 监听只注册一次 */
+	refresh: null     /* 当前挂载视图的状态回写函数 */
+};
+
+/* 当前页面地址（去掉 hash）：二维码与复制都用它 */
+function pageUrl() {
+	try {
+		var href = '' + window.location.href;
+		var i = href.indexOf('#');
+
+		return (i >= 0) ? href.substring(0, i) : href;
+	}
+	catch (e) {
+		return '';
+	}
+}
+
+function isStandalone() {
+	try {
+		if (typeof window.matchMedia == 'function' &&
+			window.matchMedia('(display-mode: standalone)').matches)
+			return true;
+	}
+	catch (e) { }
+
+	try {
+		if (window.navigator != null && window.navigator.standalone === true)
+			return true;
+	}
+	catch (e) { }
+
+	return false;
+}
+
+/* iOS 判断要放在 Android 前面：iPadOS 13+ 的 UA 是 Macintosh。 */
+function platformOf() {
+	var ua = '';
+	var touch = 0;
+
+	try { ua = '' + (window.navigator.userAgent || ''); }
+	catch (e) { ua = ''; }
+
+	try { touch = num(window.navigator.maxTouchPoints); }
+	catch (e) { touch = 0; }
+
+	if (/iphone|ipad|ipod/i.test(ua)) return 'ios';
+	if (/macintosh/i.test(ua) && touch > 1) return 'ios';
+	if (/android/i.test(ua)) return 'android';
+
+	return 'other';
+}
+
+/* installed：已装；prompt：浏览器给了安装事件；manual：只能给分步文案 */
+function installMode() {
+	if (INSTALL.installed || isStandalone()) return 'installed';
+	if (INSTALL.deferred != null) return 'prompt';
+
+	return 'manual';
+}
+
+function notifyInstall() {
+	if (typeof INSTALL.refresh != 'function') return;
+
+	try { INSTALL.refresh(); }
+	catch (e) { }
+}
+
+function bindInstallListeners() {
+	if (INSTALL.bound) return;
+
+	INSTALL.bound = true;
+	INSTALL.installed = isStandalone();
+
+	if (typeof window.addEventListener != 'function') return;
+
+	window.addEventListener('beforeinstallprompt', function(ev) {
+		/* 拦下浏览器自带的安装横幅，改成页面里的按钮触发 */
+		try { ev.preventDefault(); }
+		catch (e) { }
+
+		INSTALL.deferred = ev;
+		notifyInstall();
+	});
+
+	window.addEventListener('appinstalled', function() {
+		INSTALL.installed = true;
+		INSTALL.deferred = null;
+		notifyInstall();
+	});
+}
+
+/*
+ * uqr 输出的 SVG 通常自带 viewBox；万一只有 width/height，就按像素补一个 viewBox，
+ * 这样 CSS 把 svg 拉到 100% 时是等比缩放而不是裁掉右下角。失败一律忽略。
+ */
+function normalizeQrSvg(host) {
+	if (host == null || typeof host.querySelector != 'function') return;
+
+	var svg = null;
+
+	try { svg = host.querySelector('svg'); }
+	catch (e) { svg = null; }
+
+	if (svg == null || typeof svg.getAttribute != 'function') return;
+
+	try {
+		if (!svg.getAttribute('viewBox')) {
+			var w = parseFloat(svg.getAttribute('width'));
+			var h = parseFloat(svg.getAttribute('height'));
+
+			if (isFinite(w) && isFinite(h) && w > 0 && h > 0)
+				svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+		}
+
+		svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+	}
+	catch (e) { }
+}
+
 // ---------------------------------------------------------------- 样式（内联，移动优先）
 
 var CSS = [
@@ -253,6 +383,26 @@ var CSS = [
 	'.tsm-empty-s{font-size:12px;opacity:.7;padding:2px 0}',
 	'.tsm-health{margin-top:16px;padding:9px 12px;border-radius:8px;border-left:4px solid #9e9e9e;background:rgba(127,127,127,.1);font-size:12.5px}',
 	'.tsm-health-r{font-size:11.5px;opacity:.85;margin-top:3px}',
+	/* ---- 安装 / 扫码 ---- */
+	'.tsm-install-card{margin:0 0 4px;padding:14px 12px 12px;border-radius:10px;background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.16);text-align:center}',
+	'.tsm-qr{width:184px;height:184px;padding:8px;margin:0 auto;background:#fff;border-radius:8px;display:flex;align-items:center;justify-content:center}',
+	'.tsm-qr svg{display:block;width:100%!important;height:100%!important}',
+	'.tsm-qr-fail{font-size:11.5px;line-height:1.5;opacity:.6;padding:6px;color:#555}',
+	'.tsm-qr-cap{font-size:11.5px;opacity:.6;margin:7px 0 12px}',
+	'.tsm-inst-btn{font:inherit;font-size:14px;line-height:1.2;padding:10px 20px;min-height:40px;border-radius:20px;border:none;cursor:pointer;color:#fff;background:#1a73e8}',
+	'.tsm-inst-btn:active{opacity:.85}',
+	'.tsm-inst-ok{font-size:13.5px;font-weight:600;color:#2e7d32}',
+	'.tsm-inst-t{font-size:12.5px;opacity:.75;margin:0 0 6px;text-align:left}',
+	'.tsm-inst-steps{margin:0;padding:0}',
+	'.tsm-inst-step{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;line-height:1.5;padding:3px 0;text-align:left}',
+	'.tsm-inst-n{flex:none;width:18px;height:18px;line-height:18px;border-radius:50%;text-align:center;font-size:11px;background:rgba(127,127,127,.22);margin-top:1px}',
+	'.tsm-inst-s{flex:1 1 auto;min-width:0}',
+	'.tsm-inst-hint{font-size:11.5px;opacity:.6;margin-top:8px;line-height:1.5}',
+	'.tsm-url-row{display:flex;gap:8px;align-items:center;margin:12px 0 0;padding-top:12px;border-top:1px dashed rgba(127,127,127,.28)}',
+	'.tsm-url{flex:1 1 auto;min-width:0;font-size:11.5px;line-height:1.45;word-break:break-all;text-align:left;font-family:ui-monospace,Menlo,Consolas,monospace}',
+	'.tsm-copy{flex:none;font:inherit;font-size:12.5px;line-height:1.1;padding:8px 12px;min-height:34px;border-radius:8px;border:none;cursor:pointer;color:#fff;background:#1a73e8}',
+	'.tsm-copy[disabled]{opacity:.75;cursor:default}',
+	'.tsm-install-note{margin:10px 0 0}',
 	'@media (min-width:600px){.tsm-card-v{font-size:19px}.tsm-card-s{font-size:11.5px}.tsm-dev-name{font-size:15px}.tsm-app,.tsm-approw{font-size:13px}}'
 ].join('\n');
 
@@ -292,7 +442,8 @@ return view.extend({
 			E('p', { 'class': 'tsm-note' }, _('累计口径：traffic-statsd 启动以来，进程重启即归零。')),
 			this.renderDevicesSection(),
 			this.renderAppsSection(),
-			this.renderHealth()
+			this.renderHealth(),
+			this.renderInstall()
 		]);
 
 		this.root = root;
@@ -416,6 +567,274 @@ return view.extend({
 		]);
 
 		return this.healthBox;
+	},
+
+	/* ------------------------------------------------------------ 安装 / 扫码 */
+
+	/*
+	 * 页面底部：二维码 + 安装入口 + 当前地址。
+	 * 这一块与 get_state 完全无关（只读 location / beforeinstallprompt），
+	 * 所以后端没数据、手机没网时也照常显示。
+	 */
+	renderInstall: function() {
+		var self = this;
+		var url = pageUrl();
+
+		bindInstallListeners();
+
+		this.qrHost = E('div', { 'class': 'tsm-qr' }, '');
+		this.urlNode = E('code', { 'class': 'tsm-url', title: url }, url.length ? url : '—');
+		this.copyBtn = E('button', {
+			type: 'button',
+			'class': 'tsm-copy',
+			click: function() { self.copyUrl(); }
+		}, _('复制'));
+		this.installHost = E('div', { 'class': 'tsm-inst' }, '');
+
+		/* manifest 是 render 时才注入的，安装事件通常在首屏之后才来，由这里回写状态 */
+		INSTALL.refresh = function() { self.syncInstall(); };
+
+		this.renderQr(this.qrHost, url);
+		this.syncInstall();
+
+		return E('div', { 'class': 'tsm-section' }, [
+			E('h3', { 'class': 'tsm-h3' }, _('安装到手机')),
+			E('div', { 'class': 'tsm-install-card' }, [
+				this.qrHost,
+				E('div', { 'class': 'tsm-qr-cap' }, _('用另一台手机扫码打开')),
+				this.installHost,
+				E('div', { 'class': 'tsm-url-row' }, [ this.urlNode, this.copyBtn ])
+			]),
+			E('p', { 'class': 'tsm-note tsm-install-note' },
+				_('内网 https 自签地址：另一台手机第一次打开会提示证书不受信任，选择「继续访问」即可。'))
+		]);
+	},
+
+	/* 二维码交给 LuCI 自带的 uqr（不在前端重复实现编码），任何失败都只降级成一行提示。 */
+	renderQr: function(host, text) {
+		var done = false;
+
+		var fallback = function() {
+			if (done) return;
+
+			done = true;
+			dom.content(host, E('div', { 'class': 'tsm-qr-fail' },
+				_('二维码不可用，请复制下方地址用另一台手机打开')));
+		};
+
+		var apply = function(mod) {
+			if (done) return false;
+
+			var api = mod;
+
+			if (api != null && typeof api.renderSVG != 'function' &&
+				api['default'] != null && typeof api['default'].renderSVG == 'function')
+				api = api['default'];
+
+			if (api == null || typeof api.renderSVG != 'function') return false;
+
+			try {
+				var svg = api.renderSVG(text, { pixelSize: 5, whiteColor: '#fff', blackColor: '#000' });
+
+				if (typeof svg != 'string' || !svg.length) return false;
+
+				done = true;
+				host.innerHTML = svg;   /* 库生成的纯路径 SVG 标记 */
+				normalizeQrSvg(host);   /* 让 SVG 能按容器缩放（补 viewBox） */
+				host.setAttribute('data-qr', 'ok');
+
+				return true;
+			}
+			catch (e) {
+				return false;
+			}
+		};
+
+		if (!text.length) {
+			fallback();
+			return;
+		}
+
+		var mod = null;
+
+		try { mod = L.require('uqr'); }
+		catch (e) { mod = null; }
+
+		if (apply(mod)) return;
+
+		/* L.require 在 LuCI 里可能返回 Promise，已加载过也可能直接返回模块，两种都接住 */
+		if (mod != null && typeof mod.then == 'function') {
+			mod.then(function(m) { if (!apply(m)) fallback(); })
+				.catch(fallback);
+
+			return;
+		}
+
+		fallback();
+	},
+
+	syncInstall: function() {
+		if (this.installHost == null) return;
+
+		var self = this;
+		var mode = installMode();
+
+		if (mode == 'installed') {
+			dom.content(this.installHost, E('div', {}, [
+				E('div', { 'class': 'tsm-inst-ok' }, '✓ ' + _('已安装（当前以独立窗口打开）')),
+				E('div', { 'class': 'tsm-inst-hint' }, _('要重新安装，先在系统里卸载本应用，再刷新这个页面。'))
+			]));
+
+			return;
+		}
+
+		if (mode == 'prompt') {
+			dom.content(this.installHost, E('div', {}, [
+				E('button', {
+					type: 'button',
+					'class': 'tsm-inst-btn',
+					click: function() { self.promptInstall(); }
+				}, '＋ ' + _('添加到主屏幕')),
+				E('div', { 'class': 'tsm-inst-hint' }, _('点击后由浏览器弹出安装确认；没反应就按下面的手动步骤操作。'))
+			]));
+
+			return;
+		}
+
+		dom.content(this.installHost, this.renderInstallSteps());
+	},
+
+	/* 没有 beforeinstallprompt（iOS Safari / 已拒绝 / 不支持）时给分步文案 */
+	renderInstallSteps: function() {
+		var platform = platformOf();
+		var steps = [];
+
+		var add = function(text) {
+			steps.push(E('div', { 'class': 'tsm-inst-step' }, [
+				E('span', { 'class': 'tsm-inst-n' }, '' + (steps.length + 1)),
+				E('span', { 'class': 'tsm-inst-s' }, text)
+			]));
+		};
+
+		var title = '';
+
+		if (platform == 'ios') {
+			title = _('iPhone / iPad（Safari）：');
+			add(_('点底部工具栏的「分享」按钮（方框带向上箭头）'));
+			add(_('在弹出菜单里选「添加到主屏幕」'));
+			add(_('确认名称后点右上角「添加」'));
+		}
+		else if (platform == 'android') {
+			title = _('Android Chrome：');
+			add(_('点右上角的「⋮」菜单'));
+			add(_('选「添加到主屏幕」或「安装应用」'));
+			add(_('按提示确认安装'));
+		}
+		else {
+			title = _('当前浏览器没有提供安装入口，可以：');
+			add(_('Android Chrome：右上角「⋮」→「添加到主屏幕」/「安装应用」'));
+			add(_('iOS Safari：底部「分享」→「添加到主屏幕」'));
+			add(_('浏览器只在 https（或 localhost）下提供安装能力'));
+		}
+
+		var nodes = [ E('div', { 'class': 'tsm-inst-t' }, title), E('div', { 'class': 'tsm-inst-steps' }, steps) ];
+
+		if (INSTALL.applied)
+			nodes.push(E('div', { 'class': 'tsm-inst-hint' },
+				_('已经弹出过安装确认；如果没有装成功，按上面的步骤手动添加。')));
+
+		return E('div', {}, nodes);
+	},
+
+	/* beforeinstallprompt 的事件对象只能用一次：调用后立刻清掉，失败就回落到手动步骤 */
+	promptInstall: function() {
+		var self = this;
+		var ev = INSTALL.deferred;
+
+		INSTALL.applied = true;
+
+		if (ev == null || typeof ev.prompt != 'function') {
+			INSTALL.deferred = null;
+			this.syncInstall();
+
+			return;
+		}
+
+		INSTALL.deferred = null;
+
+		try { ev.prompt(); }
+		catch (e) { }
+
+		try {
+			if (ev.userChoice != null && typeof ev.userChoice.then == 'function') {
+				ev.userChoice.then(function() { self.syncInstall(); })
+					.catch(function() { self.syncInstall(); });
+			}
+		}
+		catch (e) { }
+
+		this.syncInstall();
+	},
+
+	copyUrl: function() {
+		var self = this;
+		var url = pageUrl();
+
+		var selectText = function() {
+			try {
+				var range = document.createRange();
+
+				range.selectNodeContents(self.urlNode);
+
+				var sel = window.getSelection();
+
+				sel.removeAllRanges();
+				sel.addRange(range);
+			}
+			catch (e) { }
+		};
+
+		var fallback = function() {
+			/* 非安全上下文 / 旧浏览器：退回选中文本，让用户长按复制 */
+			selectText();
+
+			var ok = false;
+
+			try { ok = document.execCommand('copy'); }
+			catch (e) { ok = false; }
+
+			self.flashCopy(ok);
+		};
+
+		try {
+			if (window.navigator.clipboard != null &&
+				typeof window.navigator.clipboard.writeText == 'function') {
+				window.navigator.clipboard.writeText(url)
+					.then(function() { self.flashCopy(true); })
+					.catch(fallback);
+
+				return;
+			}
+		}
+		catch (e) { }
+
+		fallback();
+	},
+
+	flashCopy: function(ok) {
+		var btn = this.copyBtn;
+
+		if (btn == null) return;
+
+		btn.textContent = ok ? _('已复制') : _('已选中，长按复制');
+		btn.disabled = true;
+
+		if (this._copyTimer != null) window.clearTimeout(this._copyTimer);
+
+		this._copyTimer = window.setTimeout(function() {
+			btn.textContent = _('复制');
+			btn.disabled = false;
+		}, 2000);
 	},
 
 	// ------------------------------------------------------------ 同步

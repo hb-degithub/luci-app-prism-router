@@ -60,6 +60,8 @@ define Package/traffic-stats/install
 	$(INSTALL_DIR) $(1)/usr/share/traffic-stats
 	$(if $(wildcard ./files/feishu.uc),$(INSTALL_DATA) ./files/feishu.uc $(1)/usr/share/traffic-stats/feishu.uc)
 	$(if $(wildcard ./files/feishu-test.sh),$(INSTALL_BIN) ./files/feishu-test.sh $(1)/usr/share/traffic-stats/feishu-test.sh)
+	# 数据 / 日志保留与清理（用户 cron 调用；只动白名单目录，见 docs/SPEC.md §9）
+	$(if $(wildcard ./files/retention.uc),$(INSTALL_DATA) ./files/retention.uc $(1)/usr/share/traffic-stats/retention.uc)
 	# 子母多节点：子节点推送脚本
 	$(if $(wildcard ./files/push.uc),$(INSTALL_DATA) ./files/push.uc $(1)/usr/share/traffic-stats/push.uc)
 	# 子母多节点：母节点接收 CGI（必须可执行）

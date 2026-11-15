@@ -35,7 +35,7 @@
 //       retention: dry-run：计划删除 P 个文件、截断 T 个日志，共 B 字节（未改动任何文件）
 //   * 无论有没有东西可删都 exit 0（cron 不会因此发邮件）；单个文件失败只 WARN 并继续。
 //
-// 判定规则（与 docs/SPEC.md §8 一致）：
+// 判定规则（与 docs/SPEC.md §9 一致）：
 //   * 文件名能解析出 YYYY-MM-DD（如 2026-11-15.json）→ 按日期算年龄；否则按 mtime 算。
 //     年龄 > 保留天数 才删（恰好等于保留天数的不删）。日期按**本地时区**解释。
 //   * 保留天数 = 0 表示关闭该目录 / 该项的按天清理（安全阀：配置写成 0 不会把数据删空）。
@@ -59,6 +59,10 @@
 //   * 宁可少删不可多删：任何可疑情况（realpath 不符、不是普通文件、目录是软链）都跳过。
 //   * 单个文件失败不中断：WARN 进 stdout + /tmp/traffic-stats/retention.log + syslog。
 //   * 脚本自己的日志 retention.log 也在 *.log 清理范围内，会被一起截断，不会无限增长。
+//
+// 注意（ucode 的坑，别按 C/JS 直觉改）：ucode 在**函数定义处**绑定标识符，所以每个
+// 被调用的函数 / 常量都必须先定义再被调用（没有函数声明提升）。本文件的顺序是刻意排的：
+// 基础工具 → 时间 → 路径 → 输出 → 安全 → UCI → 清理 → 入口。
 
 const fs = require("fs");
 
@@ -88,8 +92,8 @@ const DEFAULTS = {
 	dry_run: false
 };
 
-const MAX_DAYS  = 36500;      /* 100 年：离谱配置直接回落到默认值 */
-const MAX_KB    = 16777216;   /* 16 GB */
+const MAX_DAYS   = 36500;      /* 100 年：离谱配置直接回落到默认值 */
+const MAX_KB     = 16777216;   /* 16 GB */
 const READ_CHUNK = 65536;
 
 let CFG = null;
@@ -139,8 +143,10 @@ function shq(s) {
 /* 大小显示成 KB（向上取整，0 也显示 0） */
 function kb_text(n) {
 	n = int(n);
+
 	if (n <= 0)
 		return "0";
+
 	return sprintf("%d", int((n + 1023) / 1024));
 }
 
@@ -155,6 +161,7 @@ function tz_offset() {
 
 	if (match(s, /^[+-][0-9]{4}$/)) {
 		const sign = (substr(s, 0, 1) == "-") ? -1 : 1;
+
 		_tz = sign * (int(substr(s, 1, 2)) * 3600 + int(substr(s, 3, 2)) * 60);
 	} else {
 		_tz = 0;
@@ -214,15 +221,12 @@ function local_parts(epoch) {
 function ts_text(epoch) {
 	const p = local_parts(epoch);
 
-	if (p == null)
-		return sprintf("@%d", int(epoch));
-
 	return sprintf("%s %02d:%02d:%02d", p.day, p.h, p.m, p.s);
 }
 
 /* 文件名里的日期：YYYY-MM-DD[.后缀] -> 天序号；解析不了 / 日期非法返回 null。
    只认 4-2-2 位，并且用公历往返校验（2026-02-30 这种会被退回），
-   免得把 node-a.json 之类的名字误当日期。 */
+   免得把 node-a.json / q-1794700000-1-0.json 之类的名字误当日期。 */
 function parse_day_name(name) {
 	const m = match(name, /^([0-9]{4})-([0-9]{2})-([0-9]{2})(\.[A-Za-z0-9._-]+)?$/);
 
@@ -276,52 +280,45 @@ function root_under(path, parent) {
 	return substr(path, 0, length(parent) + 1) == parent + "/";
 }
 
-/* 解析并校验一个白名单根目录：
- *   - 必须是规范绝对路径、且位于 parent 之下（字符串层面就不可能越界）
- *   - 目录不存在 -> 静默跳过（还没产生数据，正常）
- *   - 不是普通目录 / 是符号链接 -> WARN 并跳过
- *   - realpath(解掉 parent 可能的软链) 必须正好等于 parent_real + 剩余路径
- * 返回可用的根路径，或 null（表示本次不碰这个目录）。 */
-function check_root(dir, parent, label) {
-	const path = norm_dir(dir);
+/* ───────────────────────────── 输出（清单 / 日志 / WARN）───────────────────────────── */
 
-	if (!length(path) || !path_ok(path)) {
-		warnf(sprintf("%s 目录 [%s] 不是规范的绝对路径，跳过", label, path));
-		return null;
+/* 动作日志：写 /tmp/traffic-stats/retention.log；目录不可用就只留 stdout */
+function logline(level, msg) {
+	if (LOG_FILE == null)
+		return;
+
+	const line = sprintf("%s [%s] retention: %s\n", ts_text(NOW), level, msg);
+
+	try {
+		const fd = fs.open(LOG_FILE, "a");
+
+		if (fd) {
+			fd.write(line);
+			fd.close();
+		}
+	} catch (e) {
+		/* 日志写不进去不影响清理 */
 	}
-
-	if (!root_under(path, parent)) {
-		warnf(sprintf("拒绝 %s 目录 %s：不在白名单 %s 之下", label, path, parent));
-		return null;
-	}
-
-	const st = fs.lstat(path);
-
-	if (st == null)
-		return null;
-
-	if (st.type != "dir") {
-		warnf(sprintf("%s 目录 %s 不是普通目录（%s），跳过", label, path, st.type));
-		return null;
-	}
-
-	const rp = fs.realpath(path);
-	const pr = fs.realpath(parent);
-
-	if (rp == null || pr == null) {
-		warnf(sprintf("%s 目录 %s 无法 realpath，跳过", label, path));
-		return null;
-	}
-
-	const want = (path == parent) ? pr : pr + substr(path, length(parent));
-
-	if (rp != want) {
-		warnf(sprintf("拒绝 %s 目录 %s：realpath=%s，疑似符号链接", label, path, rp));
-		return null;
-	}
-
-	return path;
 }
+
+/* 一行清单：stdout + retention.log */
+function act(verb, path, note) {
+	const msg = sprintf("%s %s（%s）", verb, path, note);
+
+	print("retention: " + msg + "\n");
+	logline("INFO", msg);
+}
+
+/* 失败不中断：stdout（前缀固定）+ retention.log + syslog。
+   全部走 stdout 是刻意的：这样在 `2>&1` 下摘要仍是最后一行，顺序确定。 */
+function warnf(msg) {
+	print("retention: WARN " + msg + "\n");
+	logline("WARN", msg);
+	run(sprintf("logger -t traffic-stats-retention -p daemon.warn %s 2>/dev/null",
+		shq("retention: " + msg)));
+}
+
+/* ───────────────────────────── 白名单校验 / 安全删除 ───────────────────────────── */
 
 /* 白名单内的安全删除：返回 {ok:true,size} 或 {ok:false,why}。
  * 只有「普通文件 + realpath 正好等于 <root>/<name> 且仍在 root 下」才删。 */
@@ -357,41 +354,52 @@ function safe_unlink(root, name) {
 	return { ok: true, size: st.size };
 }
 
-/* ───────────────────────────── 输出（清单 / 日志 / WARN）───────────────────────────── */
+/* 解析并校验一个白名单根目录：
+ *   - 必须是规范绝对路径、且位于 parent 之下（字符串层面就不可能越界）
+ *   - 目录不存在 -> 静默跳过（还没产生数据，正常）
+ *   - 不是普通目录 / 是符号链接 -> WARN 并跳过
+ *   - realpath（解掉 parent 可能的软链）必须正好等于 parent_real + 剩余路径
+ * 返回可用的根路径，或 null（表示本次不碰这个目录）。 */
+function check_root(dir, parent, label) {
+	const path = norm_dir(dir);
 
-/* 动作日志：写 /tmp/traffic-stats/retention.log；目录不可用就只留 stdout */
-function logline(level, msg) {
-	if (LOG_FILE == null)
-		return;
-
-	const line = sprintf("%s [%s] retention: %s\n", ts_text(NOW), level, msg);
-
-	try {
-		const fd = fs.open(LOG_FILE, "a");
-
-		if (fd) {
-			fd.write(line);
-			fd.close();
-		}
-	} catch (e) {
-		/* 日志写不进去不影响清理 */
+	if (!length(path) || !path_ok(path)) {
+		warnf(sprintf("%s 目录 [%s] 不是规范的绝对路径，跳过", label, path));
+		return null;
 	}
-}
 
-/* 一行清单：stdout + retention.log */
-function act(verb, path, note) {
-	const msg = sprintf("%s %s（%s）", verb, path, note);
+	if (!root_under(path, parent)) {
+		warnf(sprintf("拒绝 %s 目录 %s：不在白名单 %s 之下", label, path, parent));
+		return null;
+	}
 
-	print("retention: " + msg + "\n");
-	logline("INFO", msg);
-}
+	const st = fs.lstat(path);
 
-/* 失败不中断：stdout（前缀固定）+ retention.log + syslog */
-function warnf(msg) {
-	print("retention: WARN " + msg + "\n");
-	logline("WARN", msg);
-	run(sprintf("logger -t traffic-stats-retention -p daemon.warn %s 2>/dev/null",
-		shq("retention: " + msg)));
+	if (st == null)
+		return null;
+
+	/* ucode 的 lstat 类型串是 "directory" / "file" / "link" / ... ; 符号链接不算 */
+	if (st.type != "directory") {
+		warnf(sprintf("%s 目录 %s 不是普通目录（%s），跳过", label, path, st.type));
+		return null;
+	}
+
+	const rp = fs.realpath(path);
+	const pr = fs.realpath(parent);
+
+	if (rp == null || pr == null) {
+		warnf(sprintf("%s 目录 %s 无法 realpath，跳过", label, path));
+		return null;
+	}
+
+	const want = (path == parent) ? pr : pr + substr(path, length(parent));
+
+	if (rp != want) {
+		warnf(sprintf("拒绝 %s 目录 %s：realpath=%s，疑似符号链接", label, path, rp));
+		return null;
+	}
+
+	return path;
 }
 
 /* ───────────────────────────── UCI 配置 ───────────────────────────── */
@@ -669,7 +677,7 @@ function truncate_tail(path, st, keep) {
 		try {
 			fs.chmod(tmp, st.mode % 4096);
 		} catch (e) {
-			/* 权限只是个尽量 */
+			/* 权限只是尽量 */
 		}
 
 		try {
@@ -847,10 +855,12 @@ function selftest() {
 			fail++;
 		}
 	};
+
 	const eqn = function(name, got, want) {
 		eq(name, (got == null) ? "null" : sprintf("%d", got),
 			(want == null) ? "null" : sprintf("%d", want));
 	};
+
 	const eqb = function(name, got, want) {
 		eq(name, got ? 1 : 0, want ? 1 : 0);
 	};
@@ -959,6 +969,15 @@ function main() {
 	const p = local_parts(NOW);
 
 	TODAY = (p != null) ? p.days : 0;
+
+	/* 依赖自检：ucode-mod-fs 太老时没有 fs.realpath，就无法做白名单校验。
+	 * 这种情况**宁可什么都不删**（fail closed），只报一条 WARN + 全 0 摘要。 */
+	if (type(fs.realpath) != "function" || type(fs.lstat) != "function"
+	    || type(fs.lsdir) != "function") {
+		warnf("当前 ucode-mod-fs 缺少 fs.realpath/lstat/lsdir，拒绝执行（无法校验白名单）");
+		summarize();
+		return 0;
+	}
 
 	/* 白名单根：任何一个解析失败只会跳过那个目录，绝不会回退到别处 */
 	const roots = {
