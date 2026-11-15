@@ -21,6 +21,17 @@ var callState = rpc.declare({
 	reject: true
 });
 
+/*
+ * 哑桥 AP 上报的无线站点元数据（只有信号/速率/连接时长，没有字节）。
+ * 老版本后端没有这个方法 → 调用失败时整页照常显示，只是信号列全是 "-"。
+ */
+var callStations = rpc.declare({
+	object: 'traffic-stats',
+	method: 'get_stations',
+	expect: {},
+	reject: true
+});
+
 function num(value) {
 	var n = (typeof value == 'number') ? value : parseInt(value, 10);
 	return (typeof n == 'number' && isFinite(n)) ? n : 0;
@@ -118,15 +129,61 @@ function chainBadge(chain) {
 	}, name);
 }
 
+/* ---- 无线信号（来自哑桥 AP 的元数据，按 MAC 索引）---- */
+
+function indexStations(payload) {
+	var map = {};
+
+	if (payload == null || !Array.isArray(payload.stations)) return map;
+
+	for (var i = 0; i < payload.stations.length; i++) {
+		var st = payload.stations[i];
+
+		if (st == null || typeof st.mac != 'string' || st.mac.length == 0) continue;
+
+		var key = st.mac.toLowerCase();
+
+		if (map[key] == null) map[key] = st;
+	}
+
+	return map;
+}
+
+function stationFor(map, dev) {
+	if (map == null || dev == null || typeof dev.mac != 'string' || dev.mac.length == 0) return null;
+
+	return map[dev.mac.toLowerCase()] || null;
+}
+
+/* 分级：>-60 绿、-60~-75 黄、<-75 红。 */
+function signalColor(dbm) {
+	if (dbm > -60) return '#2e7d32';
+	if (dbm >= -75) return '#f0a020';
+
+	return '#d3302f';
+}
+
 return view.extend({
 	load: function() {
-		return callState().then(function(state) {
-			this.state = (state != null && typeof state == 'object' && state.totals != null) ? state : null;
-			this.error = null;
-		}.bind(this)).catch(function(err) {
-			this.state = null;
-			this.error = (err != null && err.message) ? err.message : '' + err;
-		}.bind(this));
+		var self = this;
+
+		return Promise.all([
+			callState().then(function(state) {
+				self.state = (state != null && typeof state == 'object' && state.totals != null) ? state : null;
+				self.error = null;
+			}).catch(function(err) {
+				self.state = null;
+				self.error = (err != null && err.message) ? err.message : '' + err;
+			}),
+
+			/* 站点元数据是锦上添花：后端没有这个接口 / 没有 AP 上报时退回空表，
+			   设备页照旧可用（信号列全部显示 "-"）。 */
+			callStations().then(function(payload) {
+				self.stations = indexStations(payload);
+			}).catch(function() {
+				self.stations = {};
+			})
+		]);
 	},
 
 	render: function() {
@@ -166,7 +223,12 @@ return view.extend({
 					E('th', { 'class': 'th', style: 'text-align:right' }, _('代理')),
 					E('th', { 'class': 'th', style: 'text-align:right' }, _('合计')),
 					E('th', { 'class': 'th', style: 'text-align:right', title: _('Mb/s（bits），悬浮显示十进制 MB/s') }, _('速率')),
-					E('th', { 'class': 'th', style: 'text-align:right' }, _('最后在线'))
+					E('th', { 'class': 'th', style: 'text-align:right' }, _('最后在线')),
+					E('th', {
+						'class': 'th',
+						style: 'text-align:right',
+						title: _('来自哑桥 AP 的无线信号（仅元数据，不含流量）')
+					}, _('信号'))
 				])
 			].concat(rows))
 		]);
@@ -211,7 +273,7 @@ return view.extend({
 
 		var cell = E('td', {
 			'class': 'td',
-			colspan: 8,
+			colspan: 9,
 			style: 'padding:10px 12px;background:rgba(127,127,127,.06)'
 		}, E('em', {}, _('展开后加载…')));
 
@@ -242,7 +304,8 @@ return view.extend({
 				E('div', {}, '↓ ' + fmtRateBits(num(dev.rx_rate))),
 				E('div', { style: 'font-size:11px;opacity:.7' }, '↑ ' + fmtRateBits(num(dev.tx_rate)))
 			]),
-			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtTime(dev.last_seen))
+			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtTime(dev.last_seen)),
+			this.renderSignal(dev)
 		]);
 
 		row.addEventListener('click', function() {
@@ -257,6 +320,33 @@ return view.extend({
 		}.bind(this));
 
 		return [ row, detailRow ];
+	},
+
+	/* 信号列：有数据就显示 "-53 dBm" 并分级着色；没有该设备的数据就显示 "-"。
+	   数据只来自哑桥 AP 的无线元数据（不含任何流量字节）。 */
+	renderSignal: function(dev) {
+		var st = stationFor(this.stations, dev);
+		var signal = (st != null && typeof st.signal == 'number' && isFinite(st.signal)) ? st.signal : null;
+
+		if (signal == null)
+			return E('td', { 'class': 'td', style: 'text-align:right' }, '-');
+
+		var parts = [];
+
+		if (st.node_name) parts.push('' + st.node_name);
+		if (st.iface) parts.push('' + st.iface);
+
+		var title = _('来自哑桥 AP 的无线信号（仅元数据，不含流量）');
+
+		if (parts.length) title += ' · ' + parts.join(' · ');
+
+		return E('td', {
+			'class': 'td',
+			style: 'text-align:right;white-space:nowrap',
+			title: title
+		}, E('span', {
+			style: 'color:' + signalColor(signal) + ';font-weight:600'
+		}, signal + ' dBm'));
 	},
 
 	renderApps: function(dev) {

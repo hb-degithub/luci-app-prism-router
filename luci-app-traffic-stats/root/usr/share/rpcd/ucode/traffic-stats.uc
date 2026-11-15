@@ -8,6 +8,10 @@
 //   * /tmp/traffic-stats/history.json  当日 5 分钟桶
 //   * /etc/traffic-stats/daily/*.json  每日汇总
 //   * /etc/traffic-stats/nodes/*.json  子节点快照（子母多节点汇总，由 CGI 写入）
+//   * /etc/traffic-stats/stations/<node_id>.json
+//                                      哑桥 AP 的无线站点元数据（由 traffic-stats-stations CGI 写入）。
+//                                      **只有 mac/iface/signal/rx_rate/tx_rate/connected_sec，没有字节**，
+//                                      所以这里绝不投影任何字节字段（前端只用信号列）。
 //
 // 两条硬约束（真机实测，见 docs/SPEC.md 的 rpcd 约定）：
 //   1. 任何文件缺失 / JSON 半截 / UCI 缺失都必须返回空结构，不能让 ubus 调用报错；
@@ -36,6 +40,7 @@ const STATE_FILE   = '/tmp/traffic-stats/state.json';
 const HISTORY_FILE = '/tmp/traffic-stats/history.json';
 const DAILY_DIR    = '/etc/traffic-stats/daily';
 const NODES_DIR    = '/etc/traffic-stats/nodes';
+const STATIONS_DIR = '/etc/traffic-stats/stations';
 const INIT_SCRIPT  = '/etc/init.d/traffic-statsd';
 const VERSION      = '1.0.0';
 
@@ -64,12 +69,17 @@ const NODE_SHAPES = [
 	[  6,  0,  0 ]
 ];
 
+/* get_stations 的裁剪档位：站点行数上限（每行 ~120 字节，400 行约 48 KB）。 */
+const STATION_SHAPES = [ 400, 200, 100, 50, 0 ];
+
 /* 允许前端写入的 UCI 字段白名单（不开放任意 UCI 写）。 */
 const UCI_FIELDS = {
 	settings: [
 		'enabled', 'poll_interval', 'clash_api', 'clash_secret', 'fake_ip_ranges', 'history_days',
 		/* 子母多节点汇总（settings 页暂未提供输入框，先开放给后续页面/脚本复用） */
-		'node_id', 'node_name', 'mother_url', 'mother_secret', 'mother_enabled'
+		'node_id', 'node_name', 'mother_url', 'mother_secret', 'mother_enabled',
+		/* 哑桥 AP 无线站点元数据上报（stations.uc 读，母节点 ingest-stations.uc 校验） */
+		'stations_enabled', 'stations_token', 'station_ifaces'
 	],
 	feishu:   [ 'enabled', 'webhook', 'secret', 'daily_time', 'report_chat_enabled' ]
 };
@@ -545,6 +555,148 @@ function build_nodes() {
 	return out;
 }
 
+// ---------------------------------------------------------------- 无线站点元数据
+
+/* 哑桥 AP 只上报「无线侧元数据」：MAC / 接口 / 信号 / 协商速率 / 连接时长。
+   **没有字节，也不应该有**——AP 是二层桥，字节由母节点的 conntrack 统计，
+   AP 若也报字节就是重复计数（见 docs/AP-ROLE.md）。
+   所以这里只投影上面这几个字段，前端按 MAC 索引后只用来显示「信号」列。 */
+
+/* 信号：合法 dBm 范围 -120..0；缺省/越界 → null（前端显示 "-"）。 */
+function station_signal(value) {
+	const n = integer(value, null);
+
+	if (n == null || n < -120 || n > 0)
+		return null;
+
+	return n;
+}
+
+/* 一台 AP 的站点行。行列里的 ts/age_sec 取该节点快照的时间，便于前端判断新鲜度。 */
+function station_rows(raw, node_id, name, ts, age) {
+	const out = [];
+
+	if (type(raw) != 'array')
+		return out;
+
+	for (let i = 0; i < length(raw); i++) {
+		const st = raw[i];
+
+		if (type(st) != 'object')
+			continue;
+
+		const mac = lc(trim(text(st.mac, '')));
+
+		if (!match(mac, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/))
+			continue;
+
+		push(out, {
+			mac: mac,
+			node_id: node_id,
+			node_name: name,
+			iface: text(st.iface, ''),
+			signal: station_signal(st.signal),
+			rx_rate: integer(st.rx_rate, 0),
+			tx_rate: integer(st.tx_rate, 0),
+			connected_sec: integer(st.connected_sec, 0),
+			ts: ts,
+			age_sec: age
+		});
+	}
+
+	return out;
+}
+
+function read_station_snapshot(file) {
+	const data = read_json(file);
+
+	if (data == null || type(data) != 'object')
+		return null;
+
+	let node_id = trim(text(data.node_id, ''));
+
+	if (length(node_id) == 0)
+		node_id = replace(basename(file), /\.json$/, '');
+
+	/* 文件名来自 CGI 的白名单校验；这里再挡一次，防手工丢进来的怪文件。 */
+	if (!match(node_id, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
+		return null;
+
+	const ts = integer(data.ts, 0);
+	const now = time();
+
+	/* age_sec = -1 表示快照里没有可信时间戳。 */
+	const age = (ts > 0) ? max(0, now - ts) : -1;
+
+	return {
+		node_id: node_id,
+		name: text(data.name, node_id),
+		ts: ts,
+		age_sec: age,
+		count: integer(data.count, 0),
+		stations: (type(data.stations) == 'array') ? data.stations : []
+	};
+}
+
+/* 返回 {enabled, nodes:[{node_id,name,ts,age_sec,count}], stations:[...], count}。
+   文件缺失 / 坏了 / 字段错乱一律退化为空结构，绝不让 ubus 调用报错（同 get_nodes）。 */
+function build_stations() {
+	const enabled = uci_flag('settings', 'stations_enabled', false);
+	const out = { enabled: enabled, nodes: [], stations: [], count: 0 };
+
+	let files = glob(`${STATIONS_DIR}/*.json`) ?? [];
+
+	files = sort(files, (a, b) => (a > b) ? -1 : ((a < b) ? 1 : 0));
+
+	let snaps = [];
+
+	for (let file in files) {
+		const snap = read_station_snapshot(file);
+
+		if (snap != null)
+			push(snaps, snap);
+	}
+
+	snaps = sort(snaps, (a, b) => b.ts - a.ts);
+	/* 按预算逐级裁剪：ubus 单条消息 262144 字节，超了整个调用直接失败。 */
+	for (let i = 0; i < length(STATION_SHAPES); i++) {
+		const cap = STATION_SHAPES[i];
+
+		out.nodes = [];
+		out.stations = [];
+
+		for (let snap in snaps) {
+			const rows = station_rows(snap.stations, snap.node_id, snap.name, snap.ts, snap.age_sec);
+
+			push(out.nodes, {
+				node_id: snap.node_id,
+				name: snap.name,
+				ts: snap.ts,
+				age_sec: snap.age_sec,
+				count: length(rows)
+			});
+
+			for (let row in rows) {
+				if (length(out.stations) >= cap)
+					break;
+
+				push(out.stations, row);
+			}
+		}
+
+		out.count = length(out.stations);
+
+		if (length(sprintf('%J', out)) <= STATE_BUDGET)
+			return out;
+	}
+
+	out.nodes = [];
+	out.stations = [];
+	out.count = 0;
+
+	return out;
+}
+
 // ---------------------------------------------------------------- 动作
 
 function is_root(request) {
@@ -796,6 +948,18 @@ const methods = {
 			catch (e) {
 				/* 多节点页面挂了也不能影响概览/设备页：异常一律退回空结构。 */
 				return { nodes: [] };
+			}
+		}
+	},
+
+	/* 哑桥 AP 上报的无线站点元数据（按 MAC 索引由前端做）。空态/坏文件都返回空结构。 */
+	get_stations: {
+		call: function(request) {
+			try {
+				return build_stations();
+			}
+			catch (e) {
+				return { enabled: false, nodes: [], stations: [], count: 0 };
 			}
 		}
 	},
