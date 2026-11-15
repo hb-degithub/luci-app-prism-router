@@ -64,6 +64,10 @@ D="$W/luci"; mkdir -p "$D/data/www/luci-static/resources/view/traffic-stats" \
   "$D/data/usr/share/luci/menu.d" "$D/data/usr/share/rpcd/acl.d" "$D/data/usr/share/rpcd/ucode" "$D/control"
 cp "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/view/traffic-stats/*.js \
    "$D/data/www/luci-static/resources/view/traffic-stats/"
+# PWA 资源（manifest + 主屏图标）
+mkdir -p "$D/data/www/luci-static/resources/traffic-stats"
+cp "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/traffic-stats/* \
+   "$D/data/www/luci-static/resources/traffic-stats/" 2>/dev/null || true
 cp "$ROOT/luci-app-traffic-stats/root/usr/share/luci/menu.d/luci-app-traffic-stats.json" "$D/data/usr/share/luci/menu.d/"
 cp "$ROOT/luci-app-traffic-stats/root/usr/share/rpcd/acl.d/luci-app-traffic-stats.json"   "$D/data/usr/share/rpcd/acl.d/"
 cp "$ROOT/luci-app-traffic-stats/root/usr/share/rpcd/ucode/traffic-stats.uc"              "$D/data/usr/share/rpcd/ucode/"

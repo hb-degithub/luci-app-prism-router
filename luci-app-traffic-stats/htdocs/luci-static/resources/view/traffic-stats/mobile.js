@@ -272,6 +272,9 @@ return view.extend({
 	render: function() {
 		var root;
 
+		/* PWA：注册 manifest 与主屏图标，装到手机桌面后以独立窗口打开 */
+		this.injectPwaHead();
+
 		this.state = (this.state != null) ? this.state : null;
 		this.expanded = {};
 		this.devSig = null;
@@ -761,6 +764,35 @@ return view.extend({
 	},
 
 	handleSave: null,
+	/* PWA 头信息：manifest + 主屏图标 + 主题色（只注入一次） */
+	injectPwaHead: function() {
+		var base = '/luci-static/resources/traffic-stats/';
+
+		/* Argon 主题自己带了一个 manifest（指向整个 LuCI），会把本页的安装入口抢走。
+		   这里改用本应用的 manifest：装到主屏后直接打开「手机版」而不是 LuCI 首页。
+		   注意 LuCI 是单页应用，head 的改动会保留到本会话结束（刷新即恢复）。 */
+		[].forEach.call(document.querySelectorAll('link[rel="manifest"]'), function(n) {
+			n.parentNode.removeChild(n);
+		});
+		[].forEach.call(document.querySelectorAll('meta[name="theme-color"]'), function(n) {
+			n.parentNode.removeChild(n);
+		});
+
+		document.title = _('流量统计');
+
+		var items = [
+			E('link', { rel: 'manifest', href: base + 'manifest.json' }),
+			E('link', { rel: 'apple-touch-icon', href: base + 'icon-192.png' }),
+			E('link', { rel: 'icon', type: 'image/png', href: base + 'icon-192.png' }),
+			E('meta', { name: 'theme-color', content: '#4a6fe3' }),
+			E('meta', { name: 'apple-mobile-web-app-capable', content: 'yes' }),
+			E('meta', { name: 'apple-mobile-web-app-status-bar-style', content: 'default' }),
+			E('meta', { name: 'apple-mobile-web-app-title', content: '流量统计' })
+		];
+
+		items.forEach(function(el) { document.head.appendChild(el); });
+	},
+
 	handleSaveApply: null,
 	handleReset: null
 });
