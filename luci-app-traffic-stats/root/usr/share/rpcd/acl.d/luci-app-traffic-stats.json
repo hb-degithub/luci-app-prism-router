@@ -3,13 +3,13 @@
 		"description": "流量统计 —— 查看状态与配置",
 		"read": {
 			"ubus": {
-				"traffic-stats": [ "status", "get_state", "get_history", "get_daily", "get_nodes", "get_stations" ]
+				"traffic-stats": [ "status", "get_state", "get_history", "get_daily", "get_nodes", "get_stations", "export_csv" ]
 			},
 			"uci": [ "traffic-stats" ]
 		},
 		"write": {
 			"ubus": {
-				"traffic-stats": [ "test_feishu", "feishu_chats", "set_config", "restart" ]
+				"traffic-stats": [ "test_feishu", "feishu_chats", "set_config", "restart", "set_device_meta" ]
 			},
 			"uci": [ "traffic-stats" ]
 		}

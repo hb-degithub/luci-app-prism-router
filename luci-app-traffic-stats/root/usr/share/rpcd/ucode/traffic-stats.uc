@@ -27,8 +27,19 @@
 //
 'use strict';
 
-import { readfile, access, glob, popen, basename } from 'fs';
+import { readfile, access, glob, popen, basename, writefile, rename, chmod, chown, unlink } from 'fs';
 import { cursor } from 'uci';
+
+/* 测试钩子（生产环境不要设置）：把读/写的固定路径换成 fixture 目录，
+   容器门禁才能在不碰真机、不污染 /etc 的前提下跑别名往返与配额计算。 */
+function env_or(name, fallback) {
+	const value = getenv(name);
+
+	if (value == null || length(value) == 0)
+		return fallback;
+
+	return value;
+}
 
 const UCI_BIN      = '/sbin/uci';
 const CURL_BIN     = '/usr/bin/curl';
@@ -36,13 +47,25 @@ const OPENSSL_BIN  = '/usr/bin/openssl';
 
 const UCI_CONFIG   = 'traffic-stats';
 const CONFIG_FILE  = '/etc/config/traffic-stats';
-const STATE_FILE   = '/tmp/traffic-stats/state.json';
+const STATE_FILE   = env_or('TRAFFIC_STATS_STATE_FILE', '/tmp/traffic-stats/state.json');
 const HISTORY_FILE = '/tmp/traffic-stats/history.json';
-const DAILY_DIR    = '/etc/traffic-stats/daily';
+const DAILY_DIR    = env_or('TRAFFIC_STATS_DAILY_DIR', '/etc/traffic-stats/daily');
 const NODES_DIR    = '/etc/traffic-stats/nodes';
 const STATIONS_DIR = '/etc/traffic-stats/stations';
+/* 设备别名/分组/首次出现（traffic-statsd 与 rpcd 共用的唯一权威文件，SPEC §10.1） */
+const DEVICES_FILE = env_or('TRAFFIC_STATS_DEVICES_FILE', '/etc/traffic-stats/devices.json');
 const INIT_SCRIPT  = '/etc/init.d/traffic-statsd';
 const VERSION      = '1.0.0';
+
+/* 别名/分组单字段字节上限（与守护进程 DEVICE_META_TEXT_MAX 一致） */
+const DEVICE_TEXT_MAX = 128;
+/* 当月用量的聚合上限：设备条目、CSV 行数（防止脏数据撑爆 ubus 报文） */
+const MONTH_DEVICE_MAX = 1024;
+const CSV_MAX_ROWS     = 200;
+/* 当月起止缓存的复用窗口（秒）：前端每 5s 轮询 get_state，别每次都读 31 个 daily 文件 */
+const MONTH_CACHE_SECONDS = 20;
+
+const CSV_BOM = chr(0xef) + chr(0xbb) + chr(0xbf);
 
 const PID_FILES = [ '/var/run/traffic-statsd.pid', '/var/run/traffic-stats.pid' ];
 
@@ -83,8 +106,15 @@ const UCI_FIELDS = {
 		/* 哑桥 AP 无线站点元数据上报（stations.uc 读，母节点 ingest-stations.uc 校验） */
 		'stations_enabled', 'stations_token', 'station_ifaces',
 		/* 软路由自身性能指标：是否采集 + 用哪个接口算 WAN 速率 */
-		'system_enabled', 'wan_iface'
+		'system_enabled', 'wan_iface',
+		/* 月配额（SPEC §10.2）：get_state 只给字节数，剩余量/百分比由前端算 */
+		'quota_mode', 'quota_monthly_gb', 'quota_total_gb',
+		/* Prometheus 指标导出（SPEC §10.3）：/cgi-bin/traffic-stats-metrics */
+		'metrics_enabled', 'metrics_token'
 	],
+	/* 数据/日志保留策略（retention.uc 消费） */
+	retention: [ 'enabled', 'daily_days', 'nodes_days', 'stations_days',
+	             'log_days', 'log_max_kb', 'spool_max_kb', 'dry_run' ],
 	feishu:   [ 'enabled', 'webhook', 'secret', 'daily_time', 'report_chat_enabled',
 	             'app_id', 'app_secret', 'chat_id', 'card_wrapper',
 	             /* 内容 / 时间 / 条件可配（feishu.uc 1.1.0） */
@@ -242,7 +272,9 @@ function empty_summary() {
 			wifi_rx: 0, wifi_tx: 0,
 			wired_rx: 0, wired_tx: 0,
 			unknown_rx: 0, unknown_tx: 0,
-			rx_rate: 0, tx_rate: 0
+			rx_rate: 0, tx_rate: 0,
+			/* 当月合计（rx+tx）：由 build_state 用 daily/ 汇总后填，state.json 里没有这个键 */
+			month_total: 0
 		},
 		nodes: {},
 		/* 软路由自身性能指标；守护进程不写时为空对象，前端按缺字段处理 */
@@ -356,7 +388,7 @@ function app_total(app) {
 	return integer(app?.rx, 0) + integer(app?.tx, 0);
 }
 
-function project_device(dev, max_apps) {
+function project_device(dev, max_apps, view) {
 	const out = {
 		ip: text(dev?.ip, ''),
 		mac: text(dev?.mac, ''),
@@ -371,6 +403,50 @@ function project_device(dev, max_apps) {
 		last_seen: integer(dev?.last_seen, 0),
 		apps: {}
 	};
+
+	/* 别名 / 分组 / 首次出现 / 当月用量：由 device_view() 预先算好，这里只查表
+	   （state 归一化这一段不能前向引用后面那节函数，见文件末尾的分类顺序）。 */
+	let info = null;
+
+	if (view != null) {
+		let key = lc(trim(text(dev?.mac, '')));
+
+		if (length(key) > 0) {
+			if (view.by_mac[key] != null)
+				info = view.by_mac[key];
+			else if (view.by_mac[replace(key, '-', ':')] != null)
+				info = view.by_mac[replace(key, '-', ':')];
+		}
+
+		if (info == null) {
+			const ip = text(dev?.ip, '');
+
+			if (length(ip) > 0 && view.by_ip[ip] != null)
+				info = view.by_ip[ip];
+		}
+	}
+
+	if (info != null) {
+		if (info.alias != null)
+			out.alias = info.alias;
+
+		if (info.group != null)
+			out.group = info.group;
+
+		if (info.first_seen != null)
+			out.first_seen = info.first_seen;
+	}
+
+	/* 当月用量：始终给数值（没有数据就是 0），前端自己算百分比/剩余。 */
+	out.month_rx = (info != null) ? integer(info.month_rx, 0) : 0;
+	out.month_tx = (info != null) ? integer(info.month_tx, 0) : 0;
+	out.month_total = out.month_rx + out.month_tx;
+
+	/* 单设备配额只在「配额模式=device 且配了 GB」时出现（字节）。 */
+	const limit = (view != null) ? integer(view.quota_limit, 0) : 0;
+
+	if (limit > 0)
+		out.quota_limit = limit;
 
 	if (max_apps <= 0 || type(dev?.apps) != 'object')
 		return out;
@@ -416,14 +492,23 @@ function project_app(app) {
 	};
 }
 
-/* 按预算裁剪 get_state 的返回体；返回体中 truncated=true 表示"服务端裁剪过"。 */
-function build_state(raw, running) {
+/* 按预算裁剪 get_state 的返回体；返回体中 truncated=true 表示"服务端裁剪过"。
+   view 是 device_view() 预先算好的投影表（别名/分组/首次出现/当月用量/配额），
+   传 null 时行为与旧版完全一致（老调用方/单测不必构造它）。 */
+function build_state(raw, running, view) {
 	const out = state_summary(raw);
 
 	out.running = running;
 	out.devices = [];
 	out.apps = [];
 	out.truncated = false;
+
+	/* 当月口径（SPEC §10.2）：state.json 本身一个字段都不改，只在返回体里补
+	   totals.month_total 与 quota 段，老消费方零影响。 */
+	out.totals.month_total = (view != null) ? integer(view.month_total, 0) : 0;
+	out.quota = (view != null && type(view.quota) == 'object')
+		? view.quota
+		: { mode: 'none', monthly_gb: 0, total_gb: 0, device_limit: 0, total_limit: 0, period: '' };
 
 	let devices = (type(raw?.devices) == 'array') ? raw.devices : [];
 	let apps = (type(raw?.apps) == 'array') ? raw.apps : [];
@@ -443,7 +528,7 @@ function build_state(raw, running) {
 		out.apps = [];
 
 		for (let i = 0; i < length(devices) && i < max_devices; i++)
-			push(out.devices, project_device(devices[i], max_apps));
+			push(out.devices, project_device(devices[i], max_apps, view));
 
 		for (let i = 0; i < length(apps) && i < max_top; i++)
 			push(out.apps, project_app(apps[i]));
@@ -1038,6 +1123,609 @@ function set_config(request) {
 	return { ok: true };
 }
 
+// ---------------------------------------------------------------- 设备元数据 / 当月用量 / 配额
+//
+// 数据源（都不在 state.json 里，见 docs/SPEC.md §10）：
+//   /etc/traffic-stats/devices.json   { "<mac>": { alias, group, first_seen } }
+//   /etc/traffic-stats/daily/*.json   当月（1 号至今）每设备用量
+//
+// 三条硬约束：
+//   1. 文件缺失 / 半截 JSON / 字段类型错一律退化成空结构，绝不抛给 ubus；
+//   2. 写文件必须原子（临时文件 + rename），权限 0644 root:root；
+//   3. 新增字段只在有值时出现（alias/group/quota_limit/first_seen），老前端无感。
+
+/* UTF-8 安全截断：ucode 的 length() 是字节长度，直接 substr 会切断多字节码点。 */
+function cut_text(s, maxb) {
+	let v = `${s}`;
+
+	if (length(v) <= maxb)
+		return v;
+
+	let n = maxb;
+
+	while (n > 0 && (ord(substr(v, n, 1)) & 0xc0) == 0x80)
+		n--;
+
+	return substr(v, 0, n);
+}
+
+/* 单行文本：丢掉控制字符（含 \n / \t / \r）再 trim + 截断。
+   别名/分组来自用户输入，落进 JSON 前必须清洗。 */
+function clean_text(value, maxb) {
+	const src = text(value, '');
+	let out = '';
+
+	for (let i = 0; i < length(src); i++) {
+		const c = substr(src, i, 1);
+		const n = ord(c);
+
+		if (n < 0x20 || n == 0x7f)
+			continue;
+
+		out += c;
+	}
+
+	return cut_text(trim(out), maxb);
+}
+
+/* MAC 归一：大写 -> 小写、`-` -> `:`，非法返回 ''（state.json 里的 MAC 可能带大写）。 */
+function norm_mac(value) {
+	let m = lc(trim(text(value, '')));
+
+	m = replace(m, '-', ':');
+
+	if (length(m) != 17)
+		return '';
+
+	if (match(m, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) == null)
+		return '';
+
+	return m;
+}
+
+/* 原子写 + 0644 root:root；同名临时文件带时间戳，避免两个写者撞在一起。 */
+function write_atomic(path, content) {
+	const tmp = sprintf('%s.tmp.%d', path, time());
+
+	try {
+		const n = writefile(tmp, content);
+
+		if (type(n) != 'int')
+			return false;
+	}
+	catch (e) {
+		return false;
+	}
+
+	try { chmod(tmp, 420); } catch (e) { }
+	try { chown(tmp, 0, 0); } catch (e) { }
+
+	if (rename(tmp, path))
+		return true;
+
+	try { unlink(tmp); } catch (e) { }
+
+	return false;
+}
+
+/* 读 devices.json -> { "<mac>": { alias?, group?, first_seen? } }。
+   未知键、非法 MAC、非对象条目一律丢弃；first_seen 只收正整数。 */
+function devices_meta_read() {
+	const out = {};
+	const raw = read_json(DEVICES_FILE);
+
+	if (raw == null || type(raw) != 'object')
+		return out;
+
+	let n = 0;
+
+	for (let key, value in raw) {
+		const mac = norm_mac(key);
+
+		if (length(mac) == 0 || type(value) != 'object')
+			continue;
+
+		const entry = {};
+		const alias = clean_text(value.alias, DEVICE_TEXT_MAX);
+		const group = clean_text(value.group, DEVICE_TEXT_MAX);
+		const seen = integer(value.first_seen, 0);
+
+		if (length(alias))
+			entry.alias = alias;
+
+		if (length(group))
+			entry.group = group;
+
+		if (seen > 0)
+			entry.first_seen = seen;
+
+		if (length(keys(entry)) > 0)
+			out[mac] = entry;
+
+		/* 文件被手工塞爆时，别让一次 get_state 读几千条 */
+		if (++n >= MONTH_DEVICE_MAX)
+			break;
+	}
+
+	return out;
+}
+
+function devices_meta_write(meta) {
+	return write_atomic(DEVICES_FILE, `${sprintf('%J', meta)}\n`);
+}
+
+/* 当月用量：从 daily/YYYY-MM-DD.json 汇总「1 号至今」。
+   返回 { month: "YYYY-MM", rx, tx, days, devices: { "m:<mac>"|"i:<ip>": {rx,tx} } }。
+
+   边界（门禁会验）：
+     * 只认文件名里年月等于**当前本地月**的文件 -> 上个月、其它月的文件不会被算进来；
+     * 文件名日期 > 今天（时钟错乱产生的未来文件）跳过；
+     * 坏 JSON / 半截文件跳过，不影响其它天；
+     * 设备键优先用 MAC（state.json 的 MAC 可能为空，此时退回 IP）。 */
+function month_entry_key(dev) {
+	const mac = norm_mac(dev?.mac);
+
+	if (length(mac) > 0)
+		return `m:${mac}`;
+
+	const ip = trim(text(dev?.ip, ''));
+
+	if (match(ip, /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/) != null)
+		return `i:${ip}`;
+
+	return '';
+}
+
+function month_scan(month, today) {
+	const out = { month: month, rx: 0, tx: 0, days: 0, devices: {} };
+
+	let files = [];
+
+	try {
+		files = glob(`${DAILY_DIR}/${month}-[0-9][0-9].json`) ?? [];
+	}
+	catch (e) {
+		files = [];
+	}
+
+	files = sort(files ?? []);
+
+	for (let file in files) {
+		const day = replace(basename(file), /\.json$/, '');
+
+		if (day > today)
+			continue;
+
+		const data = read_json(file);
+
+		if (data == null || type(data) != 'object')
+			continue;
+
+		let rx = 0, tx = 0, used_rows = false;
+
+		if (type(data.devices) == 'array') {
+			for (let dev in data.devices) {
+				if (type(dev) != 'object')
+					continue;
+
+				const drx = max(0, integer(dev.rx, 0));
+				const dtx = max(0, integer(dev.tx, 0));
+				const key = month_entry_key(dev);
+
+				if (length(key) > 0) {
+					let slot = out.devices[key];
+
+					if (slot == null && length(keys(out.devices)) < MONTH_DEVICE_MAX) {
+						slot = { rx: 0, tx: 0 };
+						out.devices[key] = slot;
+					}
+
+					if (slot != null) {
+						slot.rx += drx;
+						slot.tx += dtx;
+					}
+				}
+
+				rx += drx;
+				tx += dtx;
+				used_rows = true;
+			}
+		}
+
+		/* 没有 devices 行的老 daily 文件：退回 totals（direct+proxy 兜底） */
+		if (!used_rows && type(data.totals) == 'object') {
+			rx = max(0, integer(data.totals.rx, 0));
+			tx = max(0, integer(data.totals.tx, 0));
+
+			if (rx == 0 && tx == 0) {
+				rx = max(0, integer(data.totals.direct_rx, 0)) + max(0, integer(data.totals.proxy_rx, 0));
+				tx = max(0, integer(data.totals.direct_tx, 0)) + max(0, integer(data.totals.proxy_tx, 0));
+			}
+		}
+
+		out.rx += rx;
+		out.tx += tx;
+		out.days++;
+	}
+
+	return out;
+}
+
+
+/* 20 秒缓存：key 含「年月 + 今天」，跨天/跨月自动失效（不做时间旅行假设）。 */
+let month_cache = { key: '', ts: 0, data: null };
+
+function month_usage(now) {
+	const t = localtime(now);
+	const month = sprintf('%04d-%02d', t.year, t.mon);
+	const today = sprintf('%04d-%02d-%02d', t.year, t.mon, t.mday);
+	const key = `${month}|${today}`;
+
+	if (month_cache.data != null && month_cache.key == key
+		&& (now < month_cache.ts || (now - month_cache.ts) <= MONTH_CACHE_SECONDS))
+		return month_cache.data;
+
+	const data = month_scan(month, today);
+
+	month_cache = { key: key, ts: now, data: data };
+
+	return data;
+}
+
+/* 单台设备的当月用量：MAC 命中优先，其次 IP；都没有就是 0（不猜）。 */
+function month_device(month, dev) {
+	const mac = norm_mac(dev?.mac);
+
+	if (length(mac) > 0 && month?.devices?.[`m:${mac}`] != null)
+		return month.devices[`m:${mac}`];
+
+	const ip = trim(text(dev?.ip, ''));
+
+	if (length(ip) > 0 && month?.devices?.[`i:${ip}`] != null)
+		return month.devices[`i:${ip}`];
+
+	return { rx: 0, tx: 0 };
+}
+
+/* GB（可带小数，如 0.5 / 50）-> 字节；'' 或非法 -> 0（= 不限制）。
+   ucode 没有 double()，用算术强制转换；非法输入得到 NaN，用 n != n 判定。 */
+function gb_bytes(value) {
+	const s = trim(text(value, ''));
+
+	if (length(s) == 0)
+		return 0;
+
+	const n = s * 1;
+
+	if (n != n || n < 0)
+		return 0;
+
+	const capped = (n > 1048576) ? 1048576 : n;   /* 上限 1 PiB，防配置写飞 */
+
+	return int(capped * 1073741824 + 0.5);
+}
+
+/* 配额配置（UCI settings 段）-> { mode, monthly_gb, total_gb, device_limit, total_limit }。
+   mode 非法/缺省一律 none；只有 mode 命中且数值 > 0 时才给出 *_limit（字节）。 */
+function quota_config() {
+	const raw_mode = lc(trim(text(uci_get('settings', 'quota_mode', 'none'), 'none')));
+	const mode = member([ 'none', 'device', 'total' ], raw_mode) ? raw_mode : 'none';
+
+	const monthly_text = trim(text(uci_get('settings', 'quota_monthly_gb', ''), ''));
+	const total_text = trim(text(uci_get('settings', 'quota_total_gb', ''), ''));
+	const out = {
+		mode: mode,
+		monthly_gb: length(monthly_text) ? (monthly_text * 1) : 0,
+		total_gb: length(total_text) ? (total_text * 1) : 0,
+		device_limit: 0,
+		total_limit: 0
+	};
+
+	if (out.monthly_gb != out.monthly_gb || out.monthly_gb < 0)
+		out.monthly_gb = 0;
+
+	if (out.total_gb != out.total_gb || out.total_gb < 0)
+		out.total_gb = 0;
+
+	if (mode == 'device')
+		out.device_limit = gb_bytes(monthly_text);
+
+	if (mode == 'total')
+		out.total_limit = gb_bytes(total_text);
+
+	return out;
+}
+
+/* 时间戳 -> 本地 "YYYY-MM-DD HH:MM:SS"（0/缺失 -> 空串）。 */
+function datetime_of(ts) {
+	const n = integer(ts, 0);
+
+	if (n <= 0)
+		return '';
+
+	const t = localtime(n);
+
+	return sprintf('%04d-%02d-%02d %02d:%02d:%02d', t.year, t.mon, t.mday, t.hour, t.min, t.sec);
+}
+
+/* 把「devices.json 元数据 + 当月用量 + 配额」算成一张按 MAC / IP 可查的表。
+   build_state / project_device（定义在本节之前）只做查表，不再引用本节函数。 */
+function device_view(raw) {
+	const meta = devices_meta_read();
+	const month = month_usage(time());
+	const quota = quota_config();
+
+	const view = {
+		month_total: month.rx + month.tx,
+		quota: {
+			mode: quota.mode,
+			monthly_gb: quota.monthly_gb,
+			total_gb: quota.total_gb,
+			device_limit: quota.device_limit,
+			total_limit: quota.total_limit,
+			period: month.month
+		},
+		quota_limit: quota.device_limit,
+		by_mac: {},
+		by_ip: {}
+	};
+
+	const devices = (type(raw?.devices) == 'array') ? raw.devices : [];
+
+	for (let dev in devices) {
+		if (type(dev) != 'object')
+			continue;
+
+		const mac = norm_mac(dev.mac);
+		const raw_mac = lc(trim(text(dev.mac, '')));
+		const ip = trim(text(dev.ip, ''));
+
+		if (length(mac) == 0 && length(raw_mac) == 0 && length(ip) == 0)
+			continue;
+
+		const entry = (length(mac) > 0) ? (meta[mac] ?? null) : null;
+		const used = month_device(month, dev);
+		const info = {
+			month_rx: used.rx,
+			month_tx: used.tx,
+			month_total: used.rx + used.tx
+		};
+
+		if (entry != null) {
+			if (entry.alias != null)
+				info.alias = entry.alias;
+
+			if (entry.group != null)
+				info.group = entry.group;
+
+			if (entry.first_seen != null)
+				info.first_seen = entry.first_seen;
+		}
+
+		if (length(mac) > 0)
+			view.by_mac[mac] = info;
+
+		if (length(raw_mac) > 0)
+			view.by_mac[raw_mac] = info;
+
+		if (length(ip) > 0)
+			view.by_ip[ip] = info;
+	}
+
+	return view;
+}
+
+
+// ---------------------------------------------------------------- CSV 导出
+//
+// 约定（SPEC §10.3）：
+//   * 首字节是 UTF-8 BOM（Excel 双击打开中文不乱码）；
+//   * 行尾 CRLF；字段含 逗号/引号/换行 时按 RFC 4180 加引号并把内部引号翻倍；
+//   * 文本字段以 = + - @ 开头时前面加一个 '（防 Excel 公式注入 —— 主机名/别名是
+//     设备侧不可信输入，不能让 CSV 在别人电脑上执行公式）；
+//   * 数值字段不加引号、不加前缀。
+
+function csv_text(value) {
+	let s = text(value, '');
+	const first = substr(s, 0, 1);
+
+	if (member([ '=', '+', '-', '@', '\t', '\r' ], first))
+		s = `'${s}`;
+
+	if (index(s, '"') >= 0 || index(s, ',') >= 0 || index(s, '\n') >= 0 || index(s, '\r') >= 0)
+		s = `"${replace(s, '"', '""')}"`;
+
+	return s;
+}
+
+function csv_num(value) {
+	return sprintf('%d', integer(value, 0));
+}
+
+function daily_totals(data) {
+	let rx = 0, tx = 0;
+
+	if (type(data?.totals) == 'object') {
+		rx = integer(data.totals.rx, 0);
+		tx = integer(data.totals.tx, 0);
+
+		if (rx == 0 && tx == 0) {
+			rx = integer(data.totals.direct_rx, 0) + integer(data.totals.proxy_rx, 0);
+			tx = integer(data.totals.direct_tx, 0) + integer(data.totals.proxy_tx, 0);
+		}
+	}
+
+	return { rx: max(0, rx), tx: max(0, tx) };
+}
+
+function export_csv(request) {
+	const what = lc(trim(text(request.args?.what, 'devices')));
+
+	if (!member([ 'devices', 'apps', 'daily' ], what))
+		return { ok: false, error: 'invalid what (devices|apps|daily)' };
+
+	const now = time();
+	const raw = read_json(STATE_FILE);
+	const meta = devices_meta_read();
+	const month = month_usage(now);
+
+	let header = [];
+	const rows = [];
+
+	if (what == 'devices') {
+		header = [ '主机名', 'IP', 'MAC', '别名', '分组', '接入',
+			'直连下载', '直连上传', '代理下载', '代理上传', '合计',
+			'本月下载', '本月上传', '本月合计', '首次出现' ];
+
+		let list = (type(raw?.devices) == 'array') ? raw.devices : [];
+
+		list = sort(filter(list, dev => type(dev) == 'object'),
+			(a, b) => device_total(b) - device_total(a));
+
+		for (let i = 0; i < length(list) && i < CSV_MAX_ROWS; i++) {
+			const dev = list[i];
+			const mac = norm_mac(dev.mac);
+			const info = (length(mac) > 0) ? meta[mac] : null;
+			const used = month_device(month, dev);
+
+			push(rows, join(',', [
+				csv_text(dev.hostname), csv_text(dev.ip), csv_text(mac),
+				csv_text(info?.alias), csv_text(info?.group), csv_text(link_kind(dev.link)),
+				csv_num(dev.direct_rx), csv_num(dev.direct_tx),
+				csv_num(dev.proxy_rx), csv_num(dev.proxy_tx), csv_num(device_total(dev)),
+				csv_num(used.rx), csv_num(used.tx), csv_num(used.rx + used.tx),
+				csv_text(datetime_of(info?.first_seen))
+			]));
+		}
+	}
+	else if (what == 'apps') {
+		header = [ '应用', '出口链路', '下载', '上传', '合计', '设备数' ];
+
+		let list = (type(raw?.apps) == 'array') ? raw.apps : [];
+
+		list = sort(filter(list, app => type(app) == 'object'),
+			(a, b) => app_total(b) - app_total(a));
+
+		for (let i = 0; i < length(list) && i < CSV_MAX_ROWS; i++) {
+			const app = list[i];
+
+			push(rows, join(',', [
+				csv_text(app.host), csv_text(app.chain),
+				csv_num(app.rx), csv_num(app.tx), csv_num(app_total(app)),
+				csv_num(app.devices)
+			]));
+		}
+	}
+	else {
+		header = [ '日期', '下载', '上传', '合计', '设备数' ];
+
+		let files = [];
+
+		try {
+			files = glob(`${DAILY_DIR}/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].json`) ?? [];
+		}
+		catch (e) {
+			files = [];
+		}
+
+		files = sort(files ?? []);
+		let list = [];
+
+		for (let file in files) {
+			const data = read_json(file);
+
+			if (data == null || type(data) != 'object')
+				continue;
+
+			const totals = daily_totals(data);
+
+			push(list, {
+				day: replace(basename(file), /\.json$/, ''),
+				rx: totals.rx,
+				tx: totals.tx,
+				devices: (type(data.devices) == 'array') ? length(data.devices) : 0
+			});
+		}
+
+		if (length(list) > CSV_MAX_ROWS)
+			list = slice(list, length(list) - CSV_MAX_ROWS, length(list));
+
+		for (let entry in list)
+			push(rows, join(',', [
+				csv_text(entry.day), csv_num(entry.rx), csv_num(entry.tx),
+				csv_num(entry.rx + entry.tx), csv_num(entry.devices)
+			]));
+	}
+
+	let csv = `${CSV_BOM}${join(',', map(header, csv_text))}\r\n`;
+
+	for (let row in rows)
+		csv += `${row}\r\n`;
+
+	return {
+		ok: true,
+		what: what,
+		filename: sprintf('traffic-stats-%s-%s.csv', what, day_of(now)),
+		rows: length(rows),
+		csv: csv
+	};
+}
+
+/* set_device_meta {mac, alias, group}：
+     * alias / group 缺省 = 不改；显式给空串 = 清除该字段；
+     * 三个字段都没了（且没有 first_seen）就把这个 MAC 整条删掉，文件不留空壳；
+     * first_seen 由守护进程写，这里原样保留，绝不覆盖。 */
+function set_device_meta(request) {
+	if (!is_root(request))
+		return { ok: false, error: 'permission denied' };
+
+	const args = request.args ?? {};
+	const mac = norm_mac(args.mac);
+
+	if (length(mac) == 0)
+		return { ok: false, error: 'invalid mac' };
+
+	const has_alias = (args.alias != null);
+	const has_group = (args.group != null);
+
+	if (!has_alias && !has_group)
+		return { ok: false, error: 'nothing to update (alias / group)' };
+
+	const meta = devices_meta_read();
+	const entry = meta[mac] ?? {};
+
+	if (has_alias) {
+		const alias = clean_text(args.alias, DEVICE_TEXT_MAX);
+
+		if (length(alias)) entry.alias = alias;
+		else delete entry.alias;
+	}
+
+	if (has_group) {
+		const group = clean_text(args.group, DEVICE_TEXT_MAX);
+
+		if (length(group)) entry.group = group;
+		else delete entry.group;
+	}
+
+	if (length(keys(entry)) > 0)
+		meta[mac] = entry;
+	else
+		delete meta[mac];
+
+	if (!devices_meta_write(meta))
+		return { ok: false, error: `写入 ${DEVICES_FILE} 失败` };
+
+	return {
+		ok: true,
+		mac: mac,
+		alias: entry?.alias ?? '',
+		group: entry?.group ?? '',
+		devices: length(keys(meta))
+	};
+}
+
+
 // ---------------------------------------------------------------- ubus 方法表
 
 const methods = {
@@ -1069,7 +1757,8 @@ const methods = {
 			const raw = read_json(STATE_FILE);
 			const poll = poll_interval();
 
-			return build_state(raw, daemon_running(raw, poll));
+			/* view = 别名/分组/首次出现/当月用量/配额（只在服务端算一次） */
+			return build_state(raw, daemon_running(raw, poll), device_view(raw));
 		}
 	},
 
@@ -1238,6 +1927,39 @@ const methods = {
 			}
 
 			return {};
+		}
+	},
+
+	/* 设备别名 / 分组（SPEC §10.1）：写 /etc/traffic-stats/devices.json（原子写 0644）。
+	   alias/group 缺省 = 不改；给空串 = 清除。返回 {ok, mac, alias, group, devices}。 */
+	set_device_meta: {
+		/* 参数策略必须声明：不声明时 ubus 会以 "Invalid argument" 拒绝**任何**参数；
+		   而 rpcd 的 args 只支持 boolean/integer/string/array/object，写 null 会让整个
+		   插件注册失败（"Skipping registration of ucode script"，真机实测）。
+		   实测：rpcd 只把调用方真正传了的键放进 request.args —— 声明里的默认值不会替
+		   缺省参数补位，所以「没传 = 不改、空串 = 清除」在 ubus 与调试入口下行为一致。 */
+		args: { mac: '', alias: '', group: '' },
+		call: function(request) {
+			try {
+				return set_device_meta(request);
+			}
+			catch (e) {
+				return { ok: false, error: `${e}` };
+			}
+		}
+	},
+
+	/* CSV 导出（SPEC §10.3）：what = devices|apps|daily -> {ok, filename, rows, csv}。
+	   返回文本自带 UTF-8 BOM 与 CRLF 行尾，前端只需把 csv 存成 .csv 文件即可。 */
+	export_csv: {
+		args: { what: 'devices' },
+		call: function(request) {
+			try {
+				return export_csv(request);
+			}
+			catch (e) {
+				return { ok: false, error: `${e}` };
+			}
 		}
 	},
 

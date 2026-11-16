@@ -1,0 +1,42 @@
+{
+  "视频": [
+    "youtube", "googlevideo", "ytimg", "bilibili", "bilivideo", "hdslb",
+    "iqiyi", "youku", "netflix", "nflxvideo", "douyin", "tiktok",
+    "twitch", "disneyplus", "hulu", "primevideo", "dailymotion", "mgtv",
+    "v.qq.com", "sohu"
+  ],
+  "社交": [
+    "wechat", "weixin", "wx.qq.com", "qq.com", "telegram", "whatsapp",
+    "discord", "twitter", "facebook", "fbcdn", "instagram", "linkedin",
+    "weibo", "zhihu", "reddit", "snapchat", "line-scdn", "line-apps",
+    "signal.org", "mastodon", "messenger", "tinder", "douban"
+  ],
+  "游戏": [
+    "steam", "steampowered", "steamcommunity", "epicgames", "unrealengine",
+    "battle.net", "blizzard", "riotgames", "leagueoflegends", "playstation",
+    "xboxlive", "nintendo", "minecraft", "garena", "wargaming", "ubisoft",
+    "eaassets", "origin.com", "gog.com", "hoyoverse", "mihoyo", "roblox",
+    "supercell", "pubg"
+  ],
+  "下载": [
+    "bittorrent", "torrent", "xunlei", "thunder", "aria2", "qbittorrent",
+    "transmission", "deluge", "mega.nz", "mega.co.nz", "mediafire",
+    "115.com", "pan.baidu", "aliyundrive", "alipan", "123pan", "quark.cn",
+    "pixeldrain", "rapidgator", "nexusmods"
+  ],
+  "开发": [
+    "github", "gitlab", "npmjs", "docker", "openai", "chatgpt", "anthropic",
+    "claude.ai", "huggingface", "stackoverflow", "pypi", "pythonhosted",
+    "crates.io", "golang.org", "rust-lang", "jetbrains", "vercel",
+    "jsdelivr", "unpkg", "codesandbox"
+  ],
+  "购物": [
+    "taobao", "tmall", "jd.com", "pinduoduo", "yangkeduo", "suning",
+    "aliexpress", "amazon", "ebay", "shopee", "lazada", "walmart", "temu",
+    "1688", "xianyu", "goofish"
+  ],
+  "系统": [
+    "apple", "icloud", "microsoft", "windowsupdate", "ubuntu", "debian",
+    "openwrt", "android", "gvt1", "gstatic"
+  ]
+}

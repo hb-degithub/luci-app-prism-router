@@ -33,6 +33,7 @@
  * 仅测试用的环境变量（生产环境不要设置）：
  *   TRAFFIC_STATS_STATE_DIR  覆盖 /tmp/traffic-stats
  *   TRAFFIC_STATS_DAILY_DIR  覆盖 /etc/traffic-stats/daily
+ *   TRAFFIC_STATS_DEVICES_FILE  覆盖 /etc/traffic-stats/devices.json（设备别名/分组/首次出现）
  *   TRAFFIC_STATS_ONCE=1     只跑一轮、写完文件后退出（用于冒烟测试）
  *   TRAFFIC_STATS_ONCE_POLLS=N  仅 --once 时连续跑 N 轮（自测：cpu/wan 需要两次采样）
  *   TRAFFIC_STATS_CONNTRACK_FILE  覆盖 /proc/net/nf_conntrack（合成数据自测用）
@@ -55,8 +56,17 @@ const DAEMON_VERSION = '1.0.0';
 
 const STATE_DIR_DEFAULT = '/tmp/traffic-stats';
 const DAILY_DIR_DEFAULT = '/etc/traffic-stats/daily';
+const DEVICES_FILE_DEFAULT = '/etc/traffic-stats/devices.json';
 const LEASES_FILE = '/tmp/dhcp.leases';
 const CONNTRACK_FILE = '/proc/net/nf_conntrack';
+
+/* 设备元数据（/etc/traffic-stats/devices.json，SPEC §10.1）：
+ *   { "<mac>": { "alias": "客厅电视", "group": "家人", "first_seen": 1794600000 } }
+ * 守护进程只负责 first_seen（首次见到该 MAC 的 unix 时间）；alias/group 由 rpcd 的
+ * set_device_meta 写。两边都走「读-改-写 + 临时文件 rename」，互不覆盖对方的字段。
+ * 上限只是为了让长期运行时的文件有界，家用网关远达不到。 */
+const DEVICE_META_MAX = 512;
+const DEVICE_META_TEXT_MAX = 128; /* alias/group 单字段字节上限（与 rpcd 侧一致） */
 
 /* 资源上限：家庭网关上远达不到，仅用于保证长时间运行内存有界（SPEC §8.7） */
 const MAX_TRACK_DEVICES = 256;    /* 内部跟踪的设备数上限 */
@@ -284,6 +294,32 @@ function load_json(path) {
 	}
 }
 
+/** 原子写 + 显式权限/属主：/etc 下的文件必须 0644 root:root（docs/DEPLOY-RULES.md） */
+function atomic_write_perm(path, text, mode) {
+	let tmp = path + '.tmp.' + sprintf('%d', time());
+	let n = fs.writefile(tmp, text);
+	if (type(n) != 'int') {
+		try { fs.unlink(tmp); } catch (e) { }
+		return false;
+	}
+	try { fs.chmod(tmp, mode); } catch (e) { }
+	try { fs.chown(tmp, 0, 0); } catch (e) { }
+	if (!fs.rename(tmp, path)) {
+		try { fs.unlink(tmp); } catch (e) { }
+		return false;
+	}
+	return true;
+}
+
+/** UTF-8 安全截断：不切断多字节码点（length() 是字节长度） */
+function cut_text(s, maxb) {
+	s = str(s);
+	if (length(s) <= maxb) return s;
+	let n = maxb;
+	while (n > 0 && (ord(substr(s, n, 1)) & 0xc0) == 0x80) n--;
+	return substr(s, 0, n);
+}
+
 function unlink_quiet(list) {
 	for (let f in list) {
 		try {
@@ -474,6 +510,8 @@ function load_config(cur) {
 	c.state_dir = (sd != null && sd != '') ? sd : STATE_DIR_DEFAULT;
 	let dd = getenv('TRAFFIC_STATS_DAILY_DIR');
 	c.daily_dir = (dd != null && dd != '') ? dd : DAILY_DIR_DEFAULT;
+	/* 设备元数据（别名/分组/首次出现）：rpcd 与守护进程共用的同一个文件 */
+	c.devices_file = env_path('TRAFFIC_STATS_DEVICES_FILE', DEVICES_FILE_DEFAULT);
 	let cf = getenv('TRAFFIC_STATS_CONNTRACK_FILE');
 	c.conntrack_file = (cf != null && cf != '') ? cf : CONNTRACK_FILE;
 	let ca = getenv('TRAFFIC_STATS_CLASH_API');
@@ -510,6 +548,154 @@ function load_config(cur) {
 function dbg(ctx, msg) {
 	if (ctx != null && ctx.cfg != null && ctx.cfg.debug) warn('traffic-statsd: ' + msg + '\n');
 }
+
+/* ------------------------------------------------------------------ *
+ * 设备元数据（/etc/traffic-stats/devices.json）—— 只负责 first_seen
+ * ------------------------------------------------------------------ *
+ * 文件是 rpcd（set_device_meta 写 alias/group）与本进程（首次出现时写 first_seen）
+ * 的共同数据源，所以两边都必须「先读盘、只改自己那几把键、再原子写回」，绝不能
+ * 拿内存里的整份对象直接覆盖磁盘（否则会把对方刚写进去的字段抹掉）。
+ *
+ * 任何异常（文件缺失 / 半截 JSON / 字段类型错）都退化成空对象，绝不影响主统计：
+ * 本函数只在 poll() 末尾调用，失败只写调试日志。
+ */
+
+/** 只保留已知字段；MAC 统一小写冒号格式，alias/group 去控制字符并截断。 */
+function devices_meta_read(path) {
+	let out = {};
+	let txt = null;
+	try {
+		txt = fs.readfile(path);
+	} catch (e) {
+		txt = null;
+	}
+	if (txt == null || txt == '') return out;
+
+	let raw = null;
+	try {
+		raw = json(txt);
+	} catch (e) {
+		return out;
+	}
+	if (type(raw) != 'object') return out;
+
+	let n = 0;
+	for (let key in raw) {
+		let mac = lc(replace(str(key), '-', ':'));
+		if (!is_mac(mac)) continue;
+
+		let v = raw[key];
+		if (type(v) != 'object') continue;
+
+		let e = {};
+		let seen = to_int(v.first_seen, 0);
+		if (seen > 0) e.first_seen = seen;
+		let alias = str(v.alias);
+		if (alias != '') e.alias = cut_text(alias, DEVICE_META_TEXT_MAX);
+		let group = str(v.group);
+		if (group != '') e.group = cut_text(group, DEVICE_META_TEXT_MAX);
+
+		if (length(keys(e)) == 0) continue;
+
+		out[mac] = e;
+		if (++n >= DEVICE_META_MAX) break;
+	}
+
+	return out;
+}
+
+/** 上限裁剪：有 alias/group 的先留（用户手动命名的设备），其余按 first_seen 从新到旧。 */
+function devices_meta_prune(meta) {
+	let macs = keys(meta);
+	if (length(macs) <= DEVICE_META_MAX) return meta;
+
+	let keep = {}, n = 0;
+	for (let mac in macs) {
+		if (n >= DEVICE_META_MAX) break;
+		if (meta[mac].alias == null && meta[mac].group == null) continue;
+		keep[mac] = meta[mac];
+		n++;
+	}
+
+	let rest = [];
+	for (let mac in macs)
+		if (keep[mac] == null) push(rest, mac);
+
+	rest = sort(rest, function(a, b) {
+		return to_int(meta[b].first_seen, 0) - to_int(meta[a].first_seen, 0);
+	});
+
+	for (let i = 0; i < length(rest) && n < DEVICE_META_MAX; i++) {
+		keep[rest[i]] = meta[rest[i]];
+		n++;
+	}
+
+	return keep;
+}
+
+function devices_meta_write(path, meta) {
+	let dir = fs.dirname(path);
+	if (dir != null && dir != '' && dir != '/' && !mkpath(dir)) return false;
+
+	/* /etc 在 overlay flash 上：只有真的出现新 MAC 时才走到这里，写入频率极低 */
+	return atomic_write_perm(path, jenc(devices_meta_prune(meta)) + '\n', 420 /* 0644 */);
+}
+
+/**
+ * 记录「首次出现」：只给还没有 first_seen 的 MAC 补一个时间，然后原子写回。
+ * 没有新设备时最多每 30 秒读一次 devices.json（缓存），不会每轮 poll 都碰闪存。
+ */
+function first_seen_track(ctx) {
+	let path = ctx.cfg.devices_file;
+	let want = false;
+
+	for (let ip in ctx.devices) {
+		let mac = lc(str(ctx.devices[ip].mac));
+		if (!is_mac(mac)) continue;
+		let e = (ctx.devices_meta != null) ? ctx.devices_meta[mac] : null;
+		if (e == null || to_int(e.first_seen, 0) <= 0) { want = true; break; }
+	}
+
+	if (!want) {
+		if (ctx.devices_meta == null
+			|| ctx.now < ctx.devices_meta_ts
+			|| (ctx.now - ctx.devices_meta_ts) >= 30) {
+			ctx.devices_meta = devices_meta_read(path);
+			ctx.devices_meta_ts = ctx.now;
+		}
+		return;
+	}
+
+	/* 有新设备：立刻从磁盘重读再合并（rpcd 可能刚写进 alias/group，不能被覆盖） */
+	let disk = devices_meta_read(path);
+	let changed = false;
+
+	for (let ip in ctx.devices) {
+		let mac = lc(str(ctx.devices[ip].mac));
+		if (!is_mac(mac)) continue;
+
+		let e = disk[mac];
+		if (e == null) {
+			disk[mac] = { first_seen: ctx.now };
+			changed = true;
+		} else if (to_int(e.first_seen, 0) <= 0) {
+			e.first_seen = ctx.now;
+			changed = true;
+		}
+	}
+
+	if (changed) {
+		if (!devices_meta_write(path, disk)) {
+			dbg(ctx, 'write ' + path + ' failed: ' + str(fs.error()));
+			return;          /* 写失败时保留旧缓存，下一轮再试 */
+		}
+		dbg(ctx, 'first_seen: ' + sprintf('%d', length(keys(disk))) + ' devices -> ' + path);
+	}
+
+	ctx.devices_meta = disk;
+	ctx.devices_meta_ts = ctx.now;
+}
+
 
 /* ------------------------------------------------------------------ *
  * LAN / fake-ip 网段识别
@@ -1954,6 +2140,14 @@ function poll(ctx) {
 	history_flush(ctx, false);
 	daily_write(ctx, false);
 
+	/* 陌生设备标记（SPEC §10.4）：把首次出现的 MAC 时间落进 devices.json。
+	   只在新 MAC 出现时才写 /etc（闪存），任何失败都不影响主统计。 */
+	try {
+		first_seen_track(ctx);
+	} catch (e) {
+		dbg(ctx, 'first_seen track failed: ' + str(e));
+	}
+
 	return st;
 }
 
@@ -2037,8 +2231,7 @@ function new_ctx() {
 		lan_prefixes: [],
 		fake_cidrs: [],
 		/* 接入方式（FDB）状态 */
-		link_brctl: 'brctl',
-		link_source: 'none',
+		link_brctl: 'brctl',		link_source: 'none',
 		link_ports: [],
 		link_ports_cfg: [],
 		link_ap_ports: [],
@@ -2055,6 +2248,9 @@ function new_ctx() {
 		sys_disk: null,
 		sys_disk_ts: 0,
 		sys_wan_prev: null,
+		/* 设备元数据缓存（devices.json：alias/group/first_seen 的只读副本） */
+		devices_meta: null,
+		devices_meta_ts: 0,
 		poll_apps: {},
 		poll_devs: {},
 		last_history_flush: 0,

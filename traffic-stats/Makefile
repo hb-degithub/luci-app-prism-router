@@ -70,6 +70,8 @@ define Package/traffic-stats/install
 	# 哑桥 AP 无线站点元数据（只报信号/速率，不报字节，避免与主路由双计）
 	$(if $(wildcard ./files/stations.uc),$(INSTALL_DATA) ./files/stations.uc $(1)/usr/share/traffic-stats/stations.uc)
 	$(if $(wildcard ./files/ingest-stations.uc),$(INSTALL_BIN) ./files/ingest-stations.uc $(1)/www/cgi-bin/traffic-stats-stations)
+	# Prometheus 指标导出（只读 CGI；token 认证，未启用/未配 token 一律 403，见 SPEC §10.3）
+	$(if $(wildcard ./files/traffic-stats-metrics.uc),$(INSTALL_BIN) ./files/traffic-stats-metrics.uc $(1)/www/cgi-bin/traffic-stats-metrics)
 endef
 
 define Package/traffic-stats/postinst

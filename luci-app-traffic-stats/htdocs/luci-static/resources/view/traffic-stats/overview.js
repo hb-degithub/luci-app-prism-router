@@ -21,11 +21,19 @@
  *   - 代理/直连 与 无线/有线 是两个**正交**维度（同一字节在两边各出现一次），
  *     所以各自成条、各自带百分比，绝不合并成一个"总计"；
  *   - history.json 在 tmpfs、且只存当日的 5 分钟桶（跨日只有日粒度），
- *     所以趋势图只画当天桶，标题按实际跨度写，不谎称"近 24h"。
+ *     所以趋势图只画 days[0]（今天的桶，最多 288 个），标题按实际跨度写；
+ *   - "较昨日"对比的是**同一天截止到同一时刻**的桶累计，不是整天对比；昨天的桶
+ *     来自 daily/<日期>.json（get_history 的 days[1]），拿不到就显示 —（绝不给 0% 或 NaN）。
  *
  * rpc 预算（硬约束）：
- *   进入页面 get_state ×1 + get_history ×1（history 只取 days=1，不轮询、不重试）；
+ *   进入页面 get_state ×1 + get_history ×1（days=2：今天 + 昨天，只为算"较昨日"；
+ *   后端已对每个桶做瘦身，两天实测约 120 KiB，仍在 ubus 单条 262144B 以内）；
  *   之后每 5s 只复用 get_state 刷新数字，不重画图表、不重排布局、不加新请求。
+ *
+ * 陌生设备（只读，绝不执行任何命令）：
+ *   - Top 5 设备里，first_seen 在 24 小时内的设备打「新」标记；
+ *   - 每台设备给一个「阻断建议」，弹出针对该设备 MAC 的 nftables 规则文本供复制，
+ *     本页不调用任何写入接口、不自动执行任何命令。
  */
 
 // ---------------------------------------------------------------- rpc
@@ -38,10 +46,12 @@ var callState = rpc.declare({
 });
 
 /*
- * get_history 只取 days=1：
- *   - history.json 里只有当日 5 分钟桶（SPEC §3.1），多要一天只换来一份没有桶的日汇总；
- *   - 返回体带每桶 top_apps/top_devices，一天 288 桶已接近 ubus 单条消息 262144B 上限，
- *     请求到 days=2 有把整次调用打到 "Operation not supported" 的风险。
+ * get_history 取 days=2：
+ *   - days[0] 一般是 history.json（今天，5 分钟桶），days[1] 是 daily/<昨天>.json；
+ *     趋势图仍然只画 days[0]，多出来的昨天桶只用于"较昨日"的同截止时间对比；
+ *   - 后端在 rpcd 里按 200 KB 预算逐个桶瘦身（去掉 top_apps/top_devices），
+ *     两天实测约 120 KiB，仍在 ubus 单条消息 262144B 以内；
+ *   - 取不到（或失败）时：趋势图与环比一起降级为"—"，不影响 get_state 的其余数字。
  */
 var callHistory = rpc.declare({
 	object: 'traffic-stats',
@@ -59,6 +69,10 @@ var BUCKET_SEC = 300;       /* 兜底桶宽：守护进程 BUCKET_SECONDS=300 */
 var MAX_POINTS = 288;       /* 一天 5 分钟桶上限，跨日脏数据也只画这么久 */
 var TREND_H = 168;          /* 趋势图默认高度（px） */
 var TREND_MAX_H = 340;      /* 趋势图最大高度：右侧面板再高也不无限拉伸 */
+var NEW_DEVICE_SEC = 86400; /* 陌生设备口径：first_seen 在 24 小时内 */
+var FIRST_SEEN_KEY = 'luci-traffic-stats.device-first-seen';
+var FIRST_SEEN_KEEP = 30 * 86400;  /* 本浏览器只记 30 天，避免 localStorage 越攒越多 */
+var FIRST_SEEN_MAX = 512;          /* 最多记 512 台设备（家用规模绰绰有余） */
 
 /* 出口维度（代理 / 直连） */
 var COLOR_PROXY = '#2b7de9';
@@ -227,6 +241,221 @@ function deviceName(dev) {
 	return _('未知设备');
 }
 
+// ---------------------------------------------------------------- 环比 / 陌生设备
+
+var DAY_SEC = 86400;
+
+function localDayKey(ts) {
+	var d = new Date(num(ts) * 1000);
+
+	return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
+/* 一个 5 分钟桶的 rx+tx（四个桶都要，代理/直连是正交的两条腿） */
+function bucketBytes(b) {
+	if (b == null || typeof b != 'object') return 0;
+
+	return num(b.direct_rx) + num(b.direct_tx) + num(b.proxy_rx) + num(b.proxy_tx);
+}
+
+/*
+ * 「较昨日」：把 get_history 的桶按本地日期分组。
+ *   今天：全部桶相加 —— 这本身就是"截至现在"的累计；
+ *   昨天：只加 ts <= now - 86400 的桶 —— 同一时刻截止，不是整天对比。
+ * 任何一步缺数据都返回 ok:false，由前端渲染成"—"并给 title，绝不显示 0% / NaN。
+ */
+function yesterdayCompare(history, nowSec) {
+	var now = (num(nowSec) > 0) ? num(nowSec) : Math.floor(Date.now() / 1000);
+	var days = (history != null && Array.isArray(history.days)) ? history.days : [];
+	var byDay = {}, i, j, bs, b, ts, key, cut, ySum = 0, tSum = 0, delta, rounded;
+	var todayKey, yKey, yList, yCutSum = 0, tEnd = 0, yEnd = 0;
+
+	function fail(why) {
+		return { ok: false, text: _('较昨日') + ' —', title: why, color: '' };
+	}
+
+	if (days.length == 0)
+		return fail(_('没有历史数据（get_history 返回空），无法计算环比。'));
+
+	for (i = 0; i < days.length; i++) {
+		bs = (days[i] != null && Array.isArray(days[i].buckets)) ? days[i].buckets : [];
+
+		for (j = 0; j < bs.length; j++) {
+			b = bs[j];
+
+			if (b == null || typeof b != 'object') continue;
+
+			ts = num(b.ts);
+			if (ts <= 0) continue;
+			if (ts > 1e11) ts = Math.floor(ts / 1000);   /* 毫秒时间戳容错 */
+			if (ts > now + 600) continue;
+
+			key = localDayKey(ts);
+
+			if (byDay[key] == null) byDay[key] = [];
+
+			byDay[key].push({ ts: ts, bytes: bucketBytes(b) });
+		}
+	}
+
+	todayKey = localDayKey(now);
+	yKey = localDayKey(now - DAY_SEC);
+	yList = byDay[yKey] || [];
+
+	if (!byDay[todayKey])
+		return fail(_('今天还没有 5 分钟桶（守护进程刚启动，或今天的桶还没落盘），无法和昨天比较。'));
+
+	if (yList.length == 0)
+		return fail(_('昨天没有 5 分钟桶（首次使用，或昨天的 daily 文件已被清理 / 压缩成日汇总），无法按同一截止时间比较。'));
+
+	cut = now - DAY_SEC;
+
+	/*
+	 * 只统计**完整的** 5 分钟桶，两边区间才严格对齐：
+	 *   今天：[00:00, 最近一个完整桶结束]；昨天：同一时刻那一段。
+	 * 两边都不含正在进行中的那个半截桶 —— 否则昨天的半截桶是满 5 分钟、
+	 * 今天的只有加载时刻的几秒，今天会系统性偏低。
+	 */
+	for (i = 0; i < yList.length; i++)
+		if (yList[i].ts + BUCKET_SEC <= cut) {
+			yCutSum += yList[i].bytes;
+			if (yList[i].ts > yEnd) yEnd = yList[i].ts;
+		}
+
+	for (i = 0; i < byDay[todayKey].length; i++)
+		if (byDay[todayKey][i].ts + BUCKET_SEC <= now) {
+			tSum += byDay[todayKey][i].bytes;
+			if (byDay[todayKey][i].ts > tEnd) tEnd = byDay[todayKey][i].ts;
+		}
+
+	ySum = yCutSum;
+
+	if (!(yEnd > 0))
+		return fail(_('昨天截至同一时刻还没有完整的 5 分钟桶，无法比较。'));
+
+	if (!(tEnd > 0))
+		return fail(_('今天还没有完整的 5 分钟桶（刚过零点或守护进程刚启动），无法和昨天比较。'));
+
+	if (!(ySum > 0))
+		return fail(_('昨天截至同一时刻的累计为 0，环比没有意义。'));
+
+	delta = (tSum - ySum) * 100 / ySum;
+
+	if (!isFinite(delta))
+		return fail(_('昨日同一时刻的累计为 0，无法计算百分比。'));
+
+	rounded = Math.round(delta * 10) / 10;
+
+	return {
+		ok: true,
+		text: _('较昨日') + ' ' + ((rounded > 0) ? '+' : '') + rounded.toFixed(1) + '%',
+		color: (rounded > 0) ? '#c62828' : ((rounded < 0) ? '#2e7d32' : ''),
+		delta: rounded,
+		todayBytes: tSum,
+		yestBytes: ySum,
+		title: _('对比区间：今天 00:00–') + fmtHM(tEnd + BUCKET_SEC) + _('。昨日同一时段 ') +
+			fmtBytes(ySum) + _('，今天 ') + fmtBytes(tSum) +
+			_('（只算完整的 5 分钟桶；同日截止时间对比，不是整天对比，与上面"累计"也不是同一口径）。')
+	};
+}
+
+function macOf(dev) {
+	var mac = (dev != null && dev.mac != null) ? ('' + dev.mac).trim() : '';
+
+	if (!mac.length) return '';
+
+	return mac.replace(/-/g, ':').toUpperCase();
+}
+
+/* 后端字段优先；当前 rpcd 还没吐 first_seen，所以下面用浏览器本地记录兜底 */
+function backendFirstSeen(dev) {
+	var ts = (dev != null) ? num(dev.first_seen) : 0;
+
+	if (ts > 1e11) ts = Math.floor(ts / 1000);
+
+	return (ts > 0) ? ts : 0;
+}
+
+/*
+ * 浏览器本地的「第一次看到这个 MAC」记录（只写 localStorage，不碰后端）：
+ *   { v: 1, base: <建立基线的时间>, seen: { MAC: 首次观测时间 } }
+ * base 是第一次打开本页时的时间点：**base 之后才出现的 MAC** 才算"陌生设备"，
+ * 建立基线时已经在的设备不会在之后 24 小时内被误标成「新」。
+ */
+function readFirstSeen() {
+	var seen = {}, count = 0, raw = null, obj = null, key = '';
+
+	try {
+		raw = (typeof window != 'undefined' && window.localStorage)
+			? window.localStorage.getItem(FIRST_SEEN_KEY) : null;
+	}
+	catch (e) {
+		return { seen: {}, base: 0, count: 0 };
+	}
+
+	if (!raw) return { seen: {}, base: 0, count: 0 };
+
+	try { obj = JSON.parse(raw); }
+	catch (e) { return { seen: {}, base: 0, count: 0 }; }
+
+	if (obj == null || typeof obj != 'object' || Array.isArray(obj) ||
+		obj.seen == null || typeof obj.seen != 'object')
+		return { seen: {}, base: 0, count: 0 };
+
+	for (key in obj.seen) {
+		if (!obj.seen.hasOwnProperty(key)) continue;
+		if (!(num(obj.seen[key]) > 0)) continue;
+
+		seen[key] = num(obj.seen[key]);
+		count++;
+	}
+
+	return { seen: seen, base: num(obj.base), count: count };
+}
+
+function writeFirstSeen(seen, base, now) {
+	var keys = [], kept = {}, i, key;
+
+	for (key in seen) {
+		if (!seen.hasOwnProperty(key)) continue;
+		if (!(num(seen[key]) > 0)) continue;
+
+		/* 基线里的设备（fs <= base）要一直留着：它们一旦被清掉，下次又会被当成
+		   "基线之后才出现"的新设备；只有基线之后发现、且已经满 30 天的才裁剪。 */
+		if (num(seen[key]) > num(base) && now - num(seen[key]) > FIRST_SEEN_KEEP) continue;
+
+		keys.push(key);
+	}
+
+	if (keys.length > FIRST_SEEN_MAX) {
+		keys.sort(function(a, b) { return num(seen[b]) - num(seen[a]); });
+		keys = keys.slice(0, FIRST_SEEN_MAX);
+	}
+
+	for (i = 0; i < keys.length; i++)
+		kept[keys[i]] = num(seen[keys[i]]);
+
+	try {
+		window.localStorage.setItem(FIRST_SEEN_KEY, JSON.stringify({ v: 1, base: num(base), seen: kept }));
+	}
+	catch (e) { }
+}
+
+function firstSeenBadge(fs, fromBackend) {
+	var d = new Date(num(fs) * 1000);
+	var when = fmtHM(fs);
+
+	if (localDayKey(fs) != localDayKey(Math.floor(Date.now() / 1000)))
+		when = pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + when;
+
+	var title = _('24 小时内首次出现：') + when;
+
+	if (!fromBackend)
+		title += _('（后端未提供 first_seen，按本浏览器首次观测时间估算）');
+
+	return E('span', { 'class': 'tso-new', title: title }, [ E('i', {}), _('新') ]);
+}
+
 function linkLook(kind) {
 	var k = '' + (kind == null ? 'unknown' : kind);
 
@@ -345,6 +574,13 @@ function onlineCount(state, nowSec) {
 }
 
 // ---------------------------------------------------------------- 趋势数据
+
+/* 趋势图只要最近一天：多取的昨天那一份只给"较昨日"对比用，不进图表 */
+function newestDay(history) {
+	var days = (history != null && Array.isArray(history.days)) ? history.days : [];
+
+	return { days: days.slice(0, 1) };
+}
 
 /*
  * 把 get_history 的 {days:[{day,buckets:[...]}]} 归一化成折线可用的点集。
@@ -527,6 +763,22 @@ var CSS = [
 	'#ts-overview .tso-mini i{display:block;height:100%}',
 	'#ts-overview .tso-lnum{font-size:12px;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}',
 
+	/* 「新」设备标记 + 阻断建议（只读：只显示命令，不执行） */
+	'#ts-overview .tso-new{display:inline-flex;align-items:center;gap:3px;margin-left:5px;font-size:10px;',
+	'line-height:1.6;padding:0 5px;border-radius:6px;background:rgba(198,40,40,.14);color:#c62828;',
+	'flex:none;white-space:nowrap}',
+	'#ts-overview .tso-new i{width:6px;height:6px;border-radius:50%;background:#c62828;display:inline-block;flex:none}',
+	'#ts-overview .tso-block{margin-top:9px;padding:8px 10px;border-radius:8px;font-size:11.5px;line-height:1.7;',
+	'background:rgba(255,152,0,.1);border:1px solid rgba(255,152,0,.35)}',
+	'#ts-overview .tso-block-h{display:flex;align-items:center;gap:7px;flex-wrap:wrap}',
+	'#ts-overview .tso-block pre{margin:6px 0;padding:7px 9px;border-radius:6px;background:rgba(127,127,127,.14);',
+	'font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-all;overflow-x:auto}',
+	'#ts-overview .tso-block-n{font-size:10.5px;opacity:.65;margin-top:4px;line-height:1.6}',
+
+	/* 「较昨日」小字（总流量卡最后一行） */
+	'#ts-overview .tso-cmp{font-size:11px;line-height:1.55;margin-top:1px;white-space:nowrap;',
+	'overflow:hidden;text-overflow:ellipsis}',
+
 	/* 窄屏：KPI 2×2、两列变一列、状态条允许换行 */
 	'@media (max-width:1000px){',
 	'#ts-overview .tso-cols-main,#ts-overview .tso-cols-top{grid-template-columns:minmax(0,1fr)}',
@@ -611,20 +863,28 @@ return view.extend({
 		this.stateError = '';
 		this.historyError = '';
 
-		/* 两个 rpc 并行发；任何一个失败都不影响另一个（history 失败只让趋势图降级） */
+		/* 两个 rpc 并行发；任何一个失败都不影响另一个（history 失败只让趋势图/环比降级） */
 		return Promise.all([
 			callState().catch(function(err) {
 				self.stateError = (err != null && err.message) ? ('' + err.message) : '' + err;
 				return null;
 			}),
-			callHistory(1).catch(function(err) {
+			callHistory(2).catch(function(err) {
 				self.historyError = (err != null && err.message) ? ('' + err.message) : '' + err;
 				return null;
 			})
 		]).then(function(res) {
+			var nowSec = Math.floor(Date.now() / 1000);
+
 			self.state = (res[0] != null && typeof res[0] == 'object' && res[0].totals != null) ? res[0] : null;
 			self.history = (res[1] != null && typeof res[1] == 'object') ? res[1] : null;
-			self.trend = trendOf(self.history, Math.floor(Date.now() / 1000));
+			/* 趋势图仍然只画最近的一天（days[0]）；多取的昨天只给"较昨日"用 */
+			self.trend = trendOf(newestDay(self.history), nowSec);
+			self.compare = yesterdayCompare(self.history, nowSec);
+
+			/* history 整个失败时把 rpc 错误写进 title，比"没有历史数据"更好排查 */
+			if (self.history == null && self.historyError)
+				self.compare.title = _('读取 get_history 失败：') + shorten(self.historyError, 120) + _('，无法计算环比。');
 		});
 	},
 
@@ -640,6 +900,8 @@ return view.extend({
 		this.tick = 0;
 		this.renderSeq = 0;
 		this.trend = (this.trend != null) ? this.trend : trendOf(null, 0);
+		this.compare = (this.compare != null) ? this.compare
+			: yesterdayCompare(null, Math.floor(Date.now() / 1000));
 
 		if (state == null)
 			return this.renderUnavailable();
@@ -843,7 +1105,8 @@ return view.extend({
 			return E('div', { 'class': 'tso-kpi-s' }, nodes);
 		}
 
-		function card(title, chip, chipTitle, valueNode, subNodes, barNode) {
+		/* extraNode：主数字下面的额外一行小字（目前只有"较昨日"用） */
+		function card(title, chip, chipTitle, valueNode, subNodes, extraNode, barNode) {
 			return E('div', { 'class': 'tso-kpi' }, [
 				E('div', { 'class': 'tso-kpi-h' }, [
 					E('span', { 'class': 'tso-kpi-t' }, title),
@@ -851,9 +1114,17 @@ return view.extend({
 				]),
 				E('div', { 'class': 'tso-kpi-v' }, valueNode),
 				subNodes,
+				extraNode || '',
 				barNode || ''
 			]);
 		}
+
+		/* "较昨日"：同一天截止到同一时刻的桶对比（不是整天，也不是进程累计） */
+		var cmp = (this.compare != null) ? this.compare
+			: { text: _('较昨日') + ' —', title: _('没有可用的历史数据。'), color: '' };
+		var cmpNode = E('div', { 'class': 'tso-cmp', title: cmp.title }, cmp.text);
+
+		if (cmp.color) cmpNode.style.color = cmp.color;
 
 		/* 总流量：代理 + 直连（rx+tx），口径是"进程启动以来累计" */
 		var totalCard = card(_('总流量'),
@@ -868,6 +1139,7 @@ return view.extend({
 					return up > 0 ? (_('已运行') + ' ' + fmtDuration(up)) : '';
 				})
 			]),
+			cmpNode,
 			null);
 
 		/* 实时速率 */
@@ -879,6 +1151,7 @@ return view.extend({
 				'↑ ', this.cell(function(s) { return fmtRateBits(num((s.totals || {}).tx_rate)); }, { style: 'color:' + COLOR_TX }),
 				' · ', this.cell(function(s) { return fmtRateBytes(num((s.totals || {}).rx_rate)); })
 			]),
+			null,
 			null);
 
 		/* 无线 / 有线：接入维度（与代理/直连正交），数字 + 占比 + 细条 */
@@ -899,6 +1172,7 @@ return view.extend({
 						return l.unknown > 0 ? (' · ' + _('未知') + ' ' + fmtPercent(l.unknown, l.wifi + l.wired + l.unknown)) : '';
 					}) : ''
 				]),
+				null,
 				E('div', { 'class': 'tso-kpi-bar' }, [
 					this.bar(function(s) {
 						var l = linkTotals(s.totals);
@@ -1306,6 +1580,9 @@ return view.extend({
 		this.topDevBox = E('div', { 'class': 'tso-list' });
 		dom.content(this.topDevBox, this.renderDeviceRows(state));
 
+		/* 「阻断建议」面板：默认隐藏，点某台设备的按钮后在这里显示规则文本（只显示，不执行） */
+		this.blockBox = E('div', { 'class': 'tso-block', style: 'display:none' });
+
 		return E('div', { 'class': 'tso-panel' }, [
 			E('div', { 'class': 'tso-ph' }, [
 				E('span', { 'class': 'tso-ph-t' }, _('Top 5 设备')),
@@ -1317,17 +1594,77 @@ return view.extend({
 					href: L.url('admin/services/traffic-stats/devices')
 				}, _('全部 →')))
 			]),
-			this.topDevBox
+			this.topDevBox,
+			this.blockBox
 		]);
 	},
 
+	/*
+	 * 陌生设备判定（只读）：
+	 *   1. 后端给了 first_seen 就直接用（24 小时内 → 打「新」）；
+	 *   2. 当前 rpcd 的 project_device 还没有 first_seen，于是用浏览器 localStorage 里的
+	 *      "第一次看到这个 MAC 的时间"兜底；只有 **base（首次打开本页）之后才出现** 的
+	 *      MAC 才算新设备 —— 否则第一眼就把所有老设备都标成「新」。
+	 * 这里只读写 localStorage，不碰任何后端接口、不执行命令。
+	 */
+	syncFirstSeen: function(devices, now) {
+		var store = readFirstSeen();
+		var seen = store.seen;
+		var base = (store.base > 0) ? store.base : now;   /* 没有基线就以本次为基线 */
+		var seeded = (store.count > 0);
+		var out = {}, dirty = (store.base <= 0);
+		var i, dev, mac, ts, prev, fs;
+
+		for (i = 0; i < devices.length; i++) {
+			dev = devices[i];
+			mac = macOf(dev);
+
+			if (!mac.length) continue;
+
+			ts = backendFirstSeen(dev);
+			if (ts > now + 600) ts = 0;              /* 未来时间戳（时钟漂移）当没有 */
+
+			prev = num(seen[mac]);
+			fs = (ts > 0) ? ts : prev;
+
+			/* 两处都有值时取更早的那个：首次出现只会越记越早 */
+			if (fs > 0 && prev > 0 && prev < fs) fs = prev;
+
+			if (fs <= 0) {
+				/* 建立基线的那一次：已有设备都记成 base（它们不算"新"设备）；
+				   之后再出现的 MAC 记成 max(now, base+1)，与基线内的设备区分开
+				   （同一秒内出现也能区分；这个时间戳只用于 24h 窗口和展示）。 */
+				fs = seeded ? Math.max(now, base + 1) : base;
+				seen[mac] = fs;
+				dirty = true;
+			}
+			else if (prev != fs) {
+				seen[mac] = fs;
+				dirty = true;
+			}
+
+			/* 后端 first_seen 权威；否则只认"基线建立之后才第一次看到"的设备 */
+			if (ts > 0 && (now - ts) <= NEW_DEVICE_SEC && ts <= now + 600)
+				out[mac] = ts;
+			else if (seeded && fs > base && (now - fs) <= NEW_DEVICE_SEC)
+				out[mac] = fs;
+		}
+
+		if (dirty) writeFirstSeen(seen, base, now);
+
+		return out;
+	},
+
 	renderDeviceRows: function(state) {
+		var self = this;
 		var devices = (state != null && Array.isArray(state.devices)) ? state.devices.slice() : [];
+		var now = Math.floor(Date.now() / 1000);
 
 		devices.sort(function(a, b) { return devBytes(b) - devBytes(a); });
 
 		var top = devices.slice(0, 5);
 		var max = devBytes(top[0] || null);
+		var seen = this.syncFirstSeen(devices, now);
 
 		if (top.length == 0)
 			return E('div', { 'class': 'tso-note', style: 'padding:12px 0' }, _('暂无设备数据'));
@@ -1338,14 +1675,38 @@ return view.extend({
 			var total = devBytes(dev);
 			var link = linkLook(dev.link);
 			var name = deviceName(dev);
+			var mac = macOf(dev);
+			var fs = num(seen[mac]);
+			var age = now - fs;
+			var isNew = (fs > 0) && age <= NEW_DEVICE_SEC && age > -600;
+			var fromBackend = backendFirstSeen(dev) > 0;
 
 			return E('div', { 'class': 'tso-lrow' }, [
 				E('div', {}, [
-					E('div', { 'class': 'tso-lname', title: name }, [ shorten(name, 26) ]),
+					E('div', { 'class': 'tso-lname', title: name, style: 'display:flex;align-items:center;gap:4px' }, [
+						E('span', {
+							style: 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap'
+						}, [ shorten(name, 26) ]),
+						isNew ? firstSeenBadge(fs, fromBackend) : '',
+						mac ? E('button', {
+							'class': 'tso-btn',
+							type: 'button',
+							style: 'margin-left:auto;flex:none;font-size:10px;padding:0 6px;line-height:1.6',
+							title: _('生成针对该设备 MAC 的 nftables 阻断规则（只显示，不执行）'),
+							click: function(ev) {
+								ev.preventDefault();
+								self.showBlockAdvice(dev);
+							}
+						}, [ _('阻断建议') ]) : ''
+					]),
 					E('div', { 'class': 'tso-lsub' }, [
 						/* 没主机名时名字本身就是 IP，别再重复一遍 */
 						(dev.ip && ('' + dev.ip) != name) ? E('code', {}, [ '' + dev.ip ]) : '',
-						E('span', { 'class': 'tso-chip', style: 'color:' + link.color }, [ link.label ])
+						E('span', { 'class': 'tso-chip', style: 'color:' + link.color }, [ link.label ]),
+						mac ? '' : E('span', {
+							'class': 'tso-chip',
+							title: _('state.json 里没有这台设备的 MAC，无法生成基于 MAC 的规则')
+						}, [ _('无 MAC') ])
 					])
 				]),
 				E('div', { 'class': 'tso-mini', title: _('代理') + ' ' + fmtPercent(proxy, total) + ' · ' + _('直连') + ' ' + fmtPercent(direct, total) }, [
@@ -1355,6 +1716,119 @@ return view.extend({
 				E('div', { 'class': 'tso-lnum' }, [ fmtBytes(total) ])
 			]);
 		}));
+	},
+
+	/* 只生成 / 显示规则文本，不调用任何写入接口、不执行任何命令 */
+	showBlockAdvice: function(dev) {
+		var self = this;
+		var mac = macOf(dev);
+		var name = deviceName(dev);
+
+		if (this.blockBox == null) return;
+
+		if (!mac.length) {
+			dom.content(this.blockBox, [
+				E('div', { 'class': 'tso-block-h' }, E('strong', {}, _('阻断建议'))),
+				E('div', { 'class': 'tso-block-n' },
+					_('这台设备的 state.json 里没有 MAC（只有 IP），无法生成基于 MAC 的 nftables 规则。'))
+			]);
+
+			this.blockBox.style.display = '';
+
+			return;
+		}
+
+		var cmd = 'nft add rule inet fw4 forward ether saddr ' + mac + ' counter drop';
+		var copyBtn = E('button', {
+			'class': 'tso-btn',
+			type: 'button',
+			title: _('只复制命令，不执行'),
+			click: function(ev) {
+				ev.preventDefault();
+				self.copyText(cmd, copyBtn);
+			}
+		}, [ _('复制命令') ]);
+
+		var closeBtn = E('button', {
+			'class': 'tso-btn',
+			type: 'button',
+			click: function(ev) {
+				ev.preventDefault();
+				self.hideBlockAdvice();
+			}
+		}, [ _('收起') ]);
+
+		dom.content(this.blockBox, [
+			E('div', { 'class': 'tso-block-h' }, [
+				E('strong', {}, _('阻断建议') + '：' + shorten(name, 30)),
+				E('code', { style: 'font-size:10.5px;opacity:.75' }, mac),
+				E('span', { style: 'margin-left:auto;display:flex;gap:6px' }, [ copyBtn, closeBtn ])
+			]),
+			E('p', { style: 'margin:4px 0 0 0;color:#e65100' },
+				_('需在路由器 SSH 中手动执行；执行前请确认不是自己的设备')),
+			E('pre', {}, E('code', {}, cmd)),
+			E('div', { 'class': 'tso-block-n' },
+				_('本页只显示命令，不会执行；nft 规则在防火墙重载 / 重启后失效。'))
+		]);
+
+		this.blockBox.style.display = '';
+	},
+
+	hideBlockAdvice: function() {
+		if (this.blockBox == null) return;
+
+		this.blockBox.style.display = 'none';
+		dom.content(this.blockBox, '');
+	},
+
+	/* 复制到剪贴板：安全上下文用 navigator.clipboard，否则退回选中 + execCommand；都不行就提示手动复制 */
+	copyText: function(text, btn) {
+		var flash = function(ok) {
+			if (btn == null) return;
+
+			btn.textContent = ok ? _('已复制') : _('请手动复制');
+
+			window.setTimeout(function() {
+				if (btn != null) btn.textContent = _('复制命令');
+			}, 2000);
+		};
+
+		var fallback = function() {
+			var ok = false, area = null;
+
+			try {
+				area = document.createElement('textarea');
+				area.value = text;
+				area.setAttribute('readonly', '');
+				area.style.position = 'fixed';
+				area.style.top = '-1000px';
+				document.body.appendChild(area);
+				area.select();
+				ok = (typeof document.execCommand == 'function') ? document.execCommand('copy') : false;
+			}
+			catch (e) {
+				ok = false;
+			}
+			finally {
+				if (area != null && area.parentNode != null) area.parentNode.removeChild(area);
+			}
+
+			flash(ok === true);
+		};
+
+		try {
+			if (window.navigator != null && window.navigator.clipboard != null &&
+				typeof window.navigator.clipboard.writeText == 'function') {
+				window.navigator.clipboard.writeText(text).then(function() {
+					flash(true);
+				}).catch(fallback);
+
+				return;
+			}
+		}
+		catch (e) { }
+
+		fallback();
 	},
 
 	renderTopApps: function(state) {

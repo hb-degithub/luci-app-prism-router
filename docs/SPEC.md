@@ -30,12 +30,14 @@
 /tmp/traffic-stats/state.json      # 守护进程每 5s 原子写入（rename）
 /tmp/traffic-stats/history.json    # 当日 5 分钟桶
 /etc/traffic-stats/daily/          # 每日汇总（JSON，一天一个文件，很小）
+/etc/traffic-stats/devices.json    # 设备别名/分组/首次出现（§10.1；0644 root:root，原子写）
 /etc/traffic-stats/nodes/          # 子节点快照 <node_id>.json / 采样 <node_id>.jsonl（§9 清理）
 /etc/traffic-stats/stations/       # 哑桥 AP 站点元数据 <node_id>.json（§9 清理）
 /tmp/traffic-stats/*.log           # 各模块日志（§9 按天删 + 超限截断）
 /tmp/traffic-stats/feishu-queue/   # 飞书重试队列（§9 总量上限）
 /usr/share/traffic-stats/retention.uc     # 数据/日志保留与清理脚本（cron 调用，见 §9）
 /usr/share/rpcd/ucode/traffic-stats.uc   # rpcd 后端，读 state/history 返回 JSON
+/www/cgi-bin/traffic-stats-metrics # Prometheus 指标导出 CGI（§10.3；只读 + token 认证）
 /usr/share/rpcd/acl.d/luci-app-traffic-stats.json
 /usr/share/luci/menu.d/luci-app-traffic-stats.json
 /htdocs/luci-static/resources/view/traffic-stats/*.js
@@ -59,6 +61,13 @@ config settings 'settings'
     # 软路由自身性能指标（state.json 的 system 段，见 §3.3）
     option system_enabled '1'         # 1=采集；0=整段不写入 state.json
     option wan_iface ''               # WAN 接口名（eth3/pppoe-wan…）；留空=默认路由所在接口
+    # ── 月配额（§10.2；后端只给字节数，剩余量/百分比由前端算）──────────
+    option quota_mode 'none'          # none | device | total
+    option quota_monthly_gb ''        # 单设备默认月配额（GB，可带小数）；空=不限制
+    option quota_total_gb ''          # 全屋月度总配额（GB）；空=不限制
+    # ── Prometheus 指标导出（§10.3）────────────────────────────────
+    option metrics_enabled '0'        # 1=允许抓取；0=关闭
+    option metrics_token ''           # 抓取令牌；未启用或为空时一律 403
 config feishu 'feishu'
     option enabled '0'
     # 路线一：群自定义机器人（复制 webhook，无二维码流程）
@@ -158,6 +167,8 @@ config feishu 'feishu'
 ```
 
 - `rx` = 下载方向（到设备），`tx` = 上传方向。**统一按"设备视角"**。
+- **§10 的新字段（alias/group/first_seen/month_*/quota）不在 state.json 里**：它们由 rpcd 在
+  `get_state` 里算出来拼上去（`state.json` 只有守护进程写，契约不变，老消费方零影响）。
 - `apps` 每设备保留 **Top 15**（按 rx 排序），其余合并为 `__other__`。
 - `devices` 按 `proxy_rx + direct_rx` 降序，**最多 40 个**；全局 `apps` 最多 40 条。
 - **硬限制（实测）**：ubus 单条消息上限 **262144 字节**，超过会报 `Operation not supported`。所以 state.json 必须控制在 ~180KB 以内——40 设备 × 15 应用实测约 8–12KB，安全。
@@ -274,11 +285,16 @@ config feishu 'feishu'
 | `get_state` | 无 | state.json 原文对象（含 `devices[].link`、`health.link_*`、`system` 段，按 180KB 预算裁剪） |
 | `get_history` | `{days}` | `{days:[{day, buckets:[...]}]}` |
 | `get_daily` | `{day}` | 当日汇总 |
+| `get_nodes` | 无 | 子节点快照（§多节点） |
+| `get_stations` | 无 | 哑桥 AP 站点元数据（只读，无字节） |
+| `set_device_meta` | `{mac, alias, group}` | `{ok, mac, alias, group, devices}`；写 `/etc/traffic-stats/devices.json`（§10.1） |
+| `export_csv` | `{what}` | `{ok, what, filename, rows, csv}`；what = devices\|apps\|daily（§10.3） |
 | `test_feishu` | 无 | `{ok, code, msg}` |
-| `set_config` | `{section, options}` | `{ok}`；`settings` 白名单含 `lan_bridge/wireless_ports/ap_macs/link_refresh` |
+| `set_config` | `{section, options}` | `{ok}`；`settings` 白名单含 `lan_bridge/wireless_ports/ap_macs/link_refresh/system_enabled/wan_iface/quota_mode/quota_monthly_gb/quota_total_gb/metrics_enabled/metrics_token` |
 | `restart` | 无 | `{ok}` |
 
-ACL：`read.ubus.traffic-stats` 给 status/get_state/get_history/get_daily；`write.ubus.traffic-stats` 给 test_feishu/set_config/restart。
+ACL：`read.ubus.traffic-stats` 给 status/get_state/get_history/get_daily/get_nodes/get_stations/**export_csv**；
+`write.ubus.traffic-stats` 给 test_feishu/feishu_chats/set_config/restart/**set_device_meta**。
 
 ---
 
@@ -416,6 +432,10 @@ cron（用户自己加；`scheduled` 才按配置判定）：
    两次采样时 `cpu_pct`/`mem_pct`/load 与构造值一致；`temp` 缺失时字段省略；
    `df` 在 60 秒内只执行一次；`/proc` 读不到时 `system` 为空对象、`direct/proxy` 与
    关闭 `system_enabled` 时**逐字节一致**且 `reasons` 不增加。
+10. 设备元数据/配额/导出（§10）：`set_device_meta` 往返一致、`devices.json` 0644 root:root 且无 `.tmp` 残留；
+    `get_state` 每设备有 `month_rx/month_tx/month_total`、顶层 `totals.month_total`，上月文件不计入；
+    `export_csv` 三种 what 都能出 CSV（带 BOM、逗号/引号转义正确）；Prometheus CGI 未配置/错 token 一律 403，
+    正确 token 返回合法 Prometheus 文本；`tests/container-validate-features.sh` 全绿。
 
 ---
 
@@ -594,3 +614,204 @@ ucode /usr/share/traffic-stats/retention.uc --dry-run
 - 日期判定跟随本机时区（`/etc/TZ`）；容器里通常是 UTC，与真机本地时区结论可能差一天，
   门禁用相对天数（`date -d @epoch`）构造，不受影响。
 
+
+---
+
+## 10. 设备别名/分组 · 月配额 · 导出（CSV / Prometheus）· 陌生设备标记
+
+三块能力都**只追加**：`state.json` 一个字段都没变（新字段只在 rpcd 的 `get_state` 返回体里拼上去），
+老前端、飞书卡片、`push.uc` 子节点快照完全无感。
+
+### 10.1 设备元数据 `/etc/traffic-stats/devices.json`
+
+**唯一权威文件**，守护进程与 rpcd 共用：
+
+```json
+{ "<mac>": { "alias": "客厅电视", "group": "家人", "first_seen": 1794600000 } }
+```
+
+- 键是 **小写冒号 MAC**（`DC-56-...` / `dc-56-...` 由写方归一）；非法 MAC 的条目读取时丢弃。
+- 三个值都可缺省：`alias` / `group` 为空时**不写这个键**；`first_seen` 只收正整数。
+- 文本清洗：去控制字符（含 `\n` `\t` `\r`）、`trim`、**UTF-8 安全截断到 128 字节**（不切断多字节码点）。
+- 权限 **0644 root:root**；写入必须**同目录临时文件 + `rename`**（`devices.json.tmp.<时间戳>`），
+  读端永远看不到半截 JSON。文件缺失 / 损坏 / 字段类型错 → 读成空对象 `{}`，不报错、不崩。
+- 上限 **512 条**；写方超限时按「有 alias/group 的优先 → `first_seen` 从新到旧」保留；
+  读取端最多认 1024 条。
+- 两个写者，都走「读盘 → 只改自己那几个键 → 原子写回」，互不覆盖：
+  * rpcd `set_device_meta` 写 `alias` / `group`；
+  * `traffic-statsd` 在**新 MAC 首次出现**时写 `first_seen`（绝不碰 alias/group）。
+
+`get_state` 的 `devices[]` 里**有值才带** `alias` / `group` / `first_seen`（没有就整个键不出现）。
+
+**`set_device_meta {mac, alias, group}`** → `{ok, mac, alias, group, devices}`：
+
+- `alias` / `group` **没传 = 不改**，**传空串 = 清除**；两个都清空且没有 `first_seen` → 整条记录删除。
+- 非法 MAC → `{ok:false, error:"invalid mac"}`；两个字段都没传 → `{ok:false, error:"nothing to update …"}`。
+- 写失败 → `{ok:false, error:"写入 <路径> 失败"}`（权限/只读 overlay）。
+- 参数策略必须声明（`args: {mac, alias, group}` 三个字符串）：不声明时 ubus 会以
+  `Invalid argument` 拒绝**任何**参数；写 `null` 会让整个插件加载失败（`Skipping registration`）。
+  实测 rpcd 只把调用方真正传了的键放进 `request.args`，所以「没传=不改」在 ubus 与调试入口下一致。
+
+### 10.2 月配额
+
+UCI `settings` 段：
+
+| 选项 | 默认 | 取值 | 语义 |
+|---|---|---|---|
+| `quota_mode` | `none` | `none` / `device` / `total` | `none` 关闭；`device` 每台设备同一配额；`total` 全屋合计 |
+| `quota_monthly_gb` | `''` | 数字（可带小数，如 `50` / `0.5`） | 单设备默认月配额（GB）；空 = 不限制 |
+| `quota_total_gb` | `''` | 同上 | 全屋月度总配额（GB）；空 = 不限制 |
+
+**计算口径**（rpcd 侧，`get_state` 内）：
+
+- 只读 `/etc/traffic-stats/daily/YYYY-MM-DD.json`，且**文件名年月 == 当前本地月**（1 号至今）；
+- 文件名日期 **> 今天**（时钟错乱产生的未来文件）跳过；
+- 每天的 `devices[].rx/tx` 按 MAC 累加（`mac` 为空则用 IP 作键，state 侧同样 MAC 优先、IP 回退）；
+- 某天没有 `devices` 数组 → 用该文件 `totals.rx/tx` 兜底，再兜底 `direct_* + proxy_*`；
+- 坏 JSON / 半截文件跳过，不影响其它天；目录不存在 → 全 0；
+- 跨天/跨月自动失效（缓存 key 含「年月 + 今天」，复用窗口 20 秒）。
+
+**`get_state` 新增返回字段**：
+
+```json
+"totals": { "…": "…", "month_total": 1463 },
+"quota": { "mode": "device", "monthly_gb": 10, "total_gb": 0,
+           "device_limit": 10737418240, "total_limit": 0, "period": "2026-11" },
+"devices": [
+  { "…": "…", "month_rx": 900, "month_tx": 90, "month_total": 990,
+    "quota_limit": 10737418240 }
+]
+```
+
+- `month_rx` / `month_tx` / `month_total` **始终是数字**（没有数据就是 0）。
+- `quota.device_limit` / `quota.total_limit` 是**字节**：`int(gb * 1073741824 + 0.5)`（四舍五入），
+  上限 1 PiB；空 / 非数字 / 负数 → 0（= 不限制）；`quota_mode` 非法 → 按 `none` 处理。
+- `devices[].quota_limit` **只在 `mode=device` 且 `quota_monthly_gb > 0` 时出现**。
+- 剩余量/百分比**由前端算**：`remaining = limit - used`，`pct = used / limit * 100`；
+  分母 0（未配置）时前端显示 `—`，不要做除法。
+
+### 10.3 导出
+
+#### 10.3.1 CSV —— rpcd `export_csv {what}`
+
+参数 `what` ∈ `devices` | `apps` | `daily`（缺省 `devices`；非法 → `{ok:false, error}`）。
+返回 `{ok, what, filename, rows, csv}`，文件名 `traffic-stats-<what>-YYYY-MM-DD.csv`。
+前端只需把 `csv` 字符串存成 `.csv` 文件（已带 BOM，不要再自己加）。
+
+CSV 规则（门禁逐条验）：
+
+- **首 3 字节 UTF-8 BOM**（`EF BB BF`），行尾 **CRLF** —— Excel 双击打开中文不乱码、不串行；
+- 字段含 `,` `"` 换行 → 整体加引号、内部 `"` 翻倍（RFC 4180）；
+- 文本字段以 `= + - @ \t \r` 开头 → 前面加一个 `'`（**防 Excel 公式注入**，主机名/别名是不可信输入）；
+- 数值字段不加引号；单位一律**字节**；
+- 最多 200 行：devices/apps 按流量降序取前 200；daily 取最近 200 天（仍按日期升序）；
+- 源文件缺失/损坏 → 只有表头（`rows:0`），`ok:true`，不报错。
+
+列（顺序固定）：
+
+| `what` | 列 |
+|---|---|
+| `devices` | 主机名,IP,MAC,别名,分组,接入,直连下载,直连上传,代理下载,代理上传,合计,本月下载,本月上传,本月合计,首次出现 |
+| `apps` | 应用,出口链路,下载,上传,合计,设备数 |
+| `daily` | 日期,下载,上传,合计,设备数 |
+
+`接入` 只会是 `wifi` / `wired` / `unknown` / 空；`首次出现` 是本地时间 `YYYY-MM-DD HH:MM:SS`（没有就空）。
+
+#### 10.3.2 Prometheus —— CGI `/cgi-bin/traffic-stats-metrics`
+
+安装为 `/www/cgi-bin/traffic-stats-metrics`（ucode，**只读**：只读 state.json 与 devices.json，
+不写文件、不 fork 子进程）。
+
+**认证**：`metrics_enabled=1` **且** `metrics_token` 非空；请求带 `?token=<tok>` 或
+`Authorization: Bearer <tok>`（大小写不敏感），比对为常量时间。
+未启用 / 未配 token / token 不对 → **一律 403**（不区分原因，不给探测者信息）；`GET`/`HEAD` 以外 → **405**。
+响应头：`Content-Type: text/plain; version=0.0.4; charset=utf-8`、`Cache-Control: no-store`。
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `traffic_info{version="…"}` | gauge | 恒 `1` |
+| `traffic_up` | gauge | `1` = state.json 足够新（`now - ts <= max(30, 6×poll_interval)`） |
+| `traffic_state_present` | gauge | `1` = state.json 可读且是合法 JSON |
+| `traffic_state_ts_seconds` | gauge | state.json 的 `ts`（有才输出） |
+| `traffic_state_age_seconds` | gauge | `now - ts`（有才输出） |
+| `traffic_devices_online` | gauge | `last_seen` 在 300 秒内的设备数 |
+| `traffic_rx_rate_bytes_per_second` / `…tx…` | gauge | `totals.rx_rate/tx_rate` |
+| `traffic_proxy_rx_bytes_total` / `…tx` / `traffic_direct_rx_bytes_total` / `…tx` | counter | 进程启动以来累计 |
+| `traffic_device_rx_bytes{mac,hostname,alias,group}` / `…tx…` | gauge | 每设备 `direct+proxy` 字节（进程启动以来），最多 200 台 |
+| `traffic_system_cpu_pct` / `cpu_cores` / `load1` / `load5` / `load15` / `mem_total_bytes` / `mem_avail_bytes` / `mem_pct` / `swap_total_bytes` / `swap_free_bytes` / `temp_celsius` / `disk_total_bytes` / `disk_used_bytes` / `disk_pct` / `uptime_seconds` / `wan_rx_bytes_per_second` / `wan_tx_bytes_per_second` | gauge | 对应 `state.json` 的 `system` 段，**字段存在才输出**（缺数据不写 0） |
+
+- 数值全是**定点整数或 1 位小数**，不会出现科学计数法；
+- 标签值按 Prometheus 文本格式转义：`\` → `\\`、`"` → `\"`、换行 → `\n`，其它控制字符 → 空格；
+  设备没有别名/分组时标签是**空串**（标签集合固定为 4 个，避免序列漂移）；
+- 降级：state.json 缺失/损坏 → 仍然 200，只有 `traffic_info/traffic_up/traffic_state_present`；
+  devices.json 坏 → alias/group 标签为空串；
+- ⚠ `*_bytes_total` 与 `traffic_device_*_bytes` 都是**守护进程启动以来累计**（重启归零），
+  不是持久单调计数器——Prometheus 会看到一次 reset，用 `rate()`/`increase()` 时请注意；
+  月配额没有直接暴露为 Prometheus 指标（需要就抓 `get_state` / `export_csv`）。
+
+### 10.4 陌生设备标记 `first_seen`
+
+- 由 `traffic-statsd` 在每轮 poll 末尾记录：只针对**有 MAC** 的设备
+  （没有 DHCP 租约 → MAC 为空 → 没有 `first_seen`）。
+- 已有 `first_seen` **绝不覆盖**；`alias` / `group` 不动；同一进程内不会重复写
+  （重复运行后 `devices.json` 字节级不变）。
+- 没有新 MAC 时最多 30 秒读一次 `devices.json`（缓存），不会每轮 poll 碰闪存。
+- 写失败（`/etc` 只读、磁盘满）只记调试日志，**不影响** `direct_* / proxy_* / link / system` 任何数值。
+- `devices.json` 损坏 → 下次自动重建为合法 JSON（旧内容丢失，`first_seen` 重新计时）。
+- 前端标记「新设备」：`now - first_seen < N 天`（N 由前端定，后端不判）。
+
+### 10.5 兼容性
+
+- **`state.json` 一个字段都没变**：新字段只在 rpcd 返回体里；老消费方（飞书、push.uc、子节点快照）无感。
+- 新增字段「有值才出现」（`alias/group/first_seen/quota_limit`）；`month_*` 与 `quota` 段始终存在，
+  老前端忽略未知键即可（月总量为 0 时也只是多个数字）。
+- 老配置没有 `quota_*` / `metrics_*` → `quota_mode=none`、`metrics_enabled=0`，与装前行为一致。
+- 新方法只增不改：`status/get_state/get_history/get_daily/get_nodes/get_stations` 签名与语义不变。
+
+### 10.6 调试/测试钩子（生产环境不要设置）
+
+| 环境变量 | 作用 |
+|---|---|
+| `TRAFFIC_STATS_DEVICES_FILE` | 覆盖 `devices.json` 路径（daemon / rpcd / metrics CGI 都用） |
+| `TRAFFIC_STATS_STATE_FILE` | 覆盖 rpcd 与 metrics CGI 读的 state.json 路径 |
+| `TRAFFIC_STATS_DAILY_DIR` | 覆盖 rpcd 读的 daily 目录（daemon 侧本来就是它的写目录） |
+
+### 10.7 已知不足
+
+- `devices.json` 是「读-改-写」：daemon 与 rpcd 在同一毫秒写会丢一次更新（最后写入者胜，
+  JSON 永不半截）。实际触发需要「新 MAC 首次出现」与「用户改别名」同时发生，概率极低。
+- `first_seen` 依赖守护进程跑过；从没跑过 daemon（`enabled=0`）时前端拿不到 `first_seen`。
+- 月用量来自 `daily/`：当天数据最迟滞后一个 `DAILY_WRITE_SECONDS`（300 秒）；
+  `daily/` 被 retention 清掉、重装清 `/etc`、或跨年归档，都会让对应月份的「当月」数值变小。
+- `daily/` 每台设备只在文件里存最多 200 台（守护进程上限）；本机设备数超过
+  `MONTH_DEVICE_MAX`（1024 个 MAC/IP 键）时聚合会截断。
+- 别名/分组只按 **MAC** 记：手机开随机 MAC 后是新设备，需要重新命名。
+- CSV 的公式注入防护会在文本前多一个 `'`（安全换可读性）；Excel 里看起来是多一个字符。
+- Prometheus 指标是**进程生命周期累计**（重启 reset），不是持久计数器；也没有做多抓取端缓存/限流，
+  每次抓取读两个小文件（`state.json` ~10KB、`devices.json` ~几 KB）。
+- `metrics_token` 明文存放于 `/etc/config/traffic-stats`；走 URL 查询串时会进 web 服务器访问日志；
+  通道无 TLS、不防重放 —— **仅限内网**，不要把 web 端口暴露到 WAN。
+- 月口径跟随本机时区（`/etc/TZ`），与 `daily/` 文件名口径一致；改时区后同一天可能重复/漏算一次。
+
+### 10.8 容器门禁
+
+`tests/container-validate-features.sh`（隔离容器、`--network none`，**147 项**）覆盖：
+
+- 安装后 `/etc /usr /www /www/cgi-bin` 权限不变；`traffic-stats-metrics` 0644/0755 落位；
+  三份 ucode（daemon / rpcd / CGI）语法检查；5 个新配置项与默认值
+- `set_device_meta` 往返：大写+短横线 MAC 归一、0644 root:root、无 `.tmp` 残留、
+  alias 空串清除、全空删除记录、非法 MAC / 空更新拒绝、`\n \t` 清洗、128 字节截断
+- 月配额：当月 1 号至今累加、上月文件不计、未来日期不计、坏 JSON 跳过、无 devices 行用 totals 兜底、
+  daily 目录缺失；`none/device/total`、小数 GB、非法/负数/空值回落；设备 `quota_limit` 只在 device 模式出现
+- `first_seen`：守护进程记录新 MAC、已有 `first_seen`/alias/group 不被覆盖、重复运行幂等、
+  坏文件重建、0644、无 `.tmp`
+- `export_csv` devices/apps/daily：BOM、CRLF、表头、逗号/引号转义、公式注入前缀、行数、文件名、
+  非法 `what`、缺省 `what`、坏文件跳过
+- Prometheus CGI：未启用/未配 token/未带/错 token → 403；`?token=` 与 `Bearer`（含小写）→ 200；
+  POST → 405；逐行校验文本格式（HELP/TYPE/样本/标签转义/无重复序列/无科学计数法/定点小数）；
+  state.json 缺失或损坏 → 200 + `state_present=0`；devices.json 坏 → 标签空串
+- 向后兼容：12 个原有设备字段、无元数据时不多出键、`state.json` 无新字段、5 个旧方法仍返回合法 JSON、
+  `get_state` < 180 KiB
+- ACL（read 含 `export_csv`、write 含 `set_device_meta`）、`set_config` 放行 5 个新选项、未知字段仍拒绝
+- 真实 ubus → rpcd：插件注册成功（无 `Skipping registration`）、`get_state`/`set_device_meta`/`export_csv`
+  端到端；缺省参数不改、空串清除

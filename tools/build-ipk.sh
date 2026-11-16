@@ -15,7 +15,8 @@ pack() { # $1=dir $2=basename（不带扩展名）
   chmod 755 "$d/data/usr/bin/traffic-statsd" "$d/data/etc/init.d/traffic-statsd" \
     "$d/data/usr/share/traffic-stats/feishu-test.sh" \
     "$d/data/www/cgi-bin/traffic-stats-ingest" \
-    "$d/data/www/cgi-bin/traffic-stats-stations" 2>/dev/null || true
+    "$d/data/www/cgi-bin/traffic-stats-stations" \
+    "$d/data/www/cgi-bin/traffic-stats-metrics" 2>/dev/null || true
   local TO="--owner=0 --group=0 --numeric-owner"
   ( cd "$d/data"    && tar $TO -czf ../data.tar.gz . )
   ( cd "$d/control" && tar $TO -czf ../control.tar.gz . )
@@ -50,6 +51,8 @@ cp "$ROOT/traffic-stats/files/ingest.uc"          "$D/data/www/cgi-bin/traffic-s
 cp "$ROOT/traffic-stats/files/stations.uc"        "$D/data/usr/share/traffic-stats/stations.uc"; chmod 644 "$D/data/usr/share/traffic-stats/stations.uc"
 # 母节点接收端：AP 站点元数据 CGI（必须可执行；不写 jsonl 历史）
 cp "$ROOT/traffic-stats/files/ingest-stations.uc" "$D/data/www/cgi-bin/traffic-stats-stations"; chmod 755 "$D/data/www/cgi-bin/traffic-stats-stations"
+# Prometheus 指标导出 CGI（只读；token 认证；未启用/未配 token 一律 403）
+cp "$ROOT/traffic-stats/files/traffic-stats-metrics.uc" "$D/data/www/cgi-bin/traffic-stats-metrics"; chmod 755 "$D/data/www/cgi-bin/traffic-stats-metrics"
 cp "$ROOT/traffic-stats/files/traffic-statsd.init" "$D/data/etc/init.d/traffic-statsd"; chmod 755 "$D/data/etc/init.d/traffic-statsd"
 cp "$ROOT/traffic-stats/files/traffic-stats.config" "$D/data/etc/config/traffic-stats"; chmod 644 "$D/data/etc/config/traffic-stats"
 ctl "$D" traffic-stats net "ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl" \
