@@ -13,6 +13,20 @@
 | `traffic-stats` | 采集守护进程 `traffic-statsd.uc`、飞书推送 `feishu.uc`、子节点推送 `push.uc`、母节点接收 CGI `traffic-stats-ingest`、init/UCI 配置 |
 | `luci-app-traffic-stats` | 5 个界面页（概览/设备/应用/节点/设置）、rpcd 后端、菜单与 ACL |
 
+## 功能
+
+- **按设备**：每台设备的直连/代理流量、实时速率、在线状态、接入方式（无线/有线）、信号强度、首次出现时间
+- **按应用**：真实域名（来自 mihomo `/connections`）与出口节点，含类别（视频/社交/游戏/下载/开发/购物/系统）
+- **两个正交维度**：代理 vs 直连、无线 vs 有线——各自独立成条，**不可相加**
+- **软路由自身性能**：CPU / 内存 / Swap / 负载 / 磁盘 / 温度 / 运行时长 / WAN 上下行速率
+- **六类界面**：概览、设备、应用、节点、设置、手机版；另有独立「详细面板」（六标签，铺满整屏）
+- **手机版 PWA**：扫码安装到主屏，独立窗口打开，含绑定二维码与安装引导
+- **飞书可配**：发什么（7 个区块任选）、什么时候（daily/weekly/both + 时间）、什么条件下（应用超限/突增/离线/CPU/内存/磁盘/免打扰）
+- **子母多节点**：HMAC 签名的推送通道，母节点汇总各子节点快照
+- **哑桥 AP 信号**：只上报无线元数据（不含字节，避免双计）
+- **数据治理**：保留策略（daily/nodes/stations/日志/队列，带 dry-run）、CSV 导出、Prometheus 指标
+- **设备管理**：别名、分组、月配额与剩余量、陌生设备标记与阻断命令生成
+
 ## 安装
 
 ```sh
@@ -90,6 +104,22 @@ ucode /usr/share/traffic-stats/push.uc && echo ok
 界面「节点」页展示各节点最后上报时间、总流量、代理/直连、设备数；超 5 分钟未更新标黄。
 
 ## 部署前验证（强制）
+
+九套容器门禁（全部 `--network none` 隔离运行）：
+
+```sh
+./tests/container-validate.sh            # 基础 28
+./tests/container-validate-2305.sh       # 23.05 兼容 28
+./tests/container-validate-links.sh      # 接入方式 102
+./tests/container-validate-nodes.sh      # 子母多节点 75
+./tests/container-validate-stations.sh   # AP 站点 93
+./tests/container-validate-system.sh     # 软路由性能 78
+./tests/container-validate-retention.sh  # 保留策略 93
+./tests/container-validate-feishu.sh     # 飞书可配 151
+./tests/container-validate-features.sh   # 别名/配额/导出 156
+```
+
+合计 **804 项断言**。真机部署后再跑 `./tests/smoke.sh`（15 项）与 `Luci 密码=... ./tests/ui/run.sh`（6 页渲染）。
 
 ```sh
 ./tests/container-validate.sh        # 28 项：包安装、属主权限、系统目录未被改动、守护进程离线用例

@@ -1652,6 +1652,27 @@ return view.extend({
 
 		if (dirty) writeFirstSeen(seen, base, now);
 
+		/* devices.json 刚建立时，守护进程会把当时所有在线设备一次性写进 first_seen，
+		   它们本来都不是"新设备"。判据：这批时间戳彼此相差不到 2 分钟、且都产生在
+		   最近 15 分钟内 —— 属于同一次 bootstrap，全部不标"新"，避免满屏红点。
+		   之后新接入的设备时间戳会明显晚于这批，照常标记。 */
+		var batch = [], k;
+
+		for (k in out)
+			batch.push(out[k]);
+
+		if (batch.length >= 2) {
+			var mn = batch[0], mx = batch[0], i2;
+
+			for (i2 = 1; i2 < batch.length; i2++) {
+				if (batch[i2] < mn) mn = batch[i2];
+				if (batch[i2] > mx) mx = batch[i2];
+			}
+
+			if (mx - mn <= 120 && (now - mx) <= 900)
+				return {};
+		}
+
 		return out;
 	},
 
