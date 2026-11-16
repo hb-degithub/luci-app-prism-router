@@ -1656,21 +1656,24 @@ return view.extend({
 		   它们本来都不是"新设备"。判据：这批时间戳彼此相差不到 2 分钟、且都产生在
 		   最近 15 分钟内 —— 属于同一次 bootstrap，全部不标"新"，避免满屏红点。
 		   之后新接入的设备时间戳会明显晚于这批，照常标记。 */
-		var batch = [], k;
+		/* 判定基线：所有已知设备里最早的 first_seen，就是 devices.json 建立的时刻。
+		   与它相差不到 2 分钟的设备属于同一次 bootstrap（当时全屋设备被一次性写入），
+		   本来都不是"新设备"，不标红点；只有明显晚于这个拐点的才算新接入。
+		   这个规则与"多久以前建立的"无关，所以不会随时间漂移。 */
+		var base_ts = 0, k, v;
 
-		for (k in out)
-			batch.push(out[k]);
+		for (k in seen) {
+			v = num(seen[k]);
 
-		if (batch.length >= 2) {
-			var mn = batch[0], mx = batch[0], i2;
+			if (v > 0 && (base_ts === 0 || v < base_ts))
+				base_ts = v;
+		}
 
-			for (i2 = 1; i2 < batch.length; i2++) {
-				if (batch[i2] < mn) mn = batch[i2];
-				if (batch[i2] > mx) mx = batch[i2];
+		if (base_ts > 0) {
+			for (k in out) {
+				if (num(out[k]) - base_ts <= 120)
+					delete out[k];
 			}
-
-			if (mx - mn <= 120 && (now - mx) <= 900)
-				return {};
 		}
 
 		return out;
