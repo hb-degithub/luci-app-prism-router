@@ -84,6 +84,8 @@ var CSS = [
 	'.tsd-head{margin:0 0 10px}',
 	'.tsd-title-main{margin:0 0 4px;font-size:20px;line-height:1.3}',
 	'.tsd-sub{margin:0;color:#666;font-size:12.5px;line-height:1.5}',
+	'.tsd-panel-link{margin-left:10px;color:#ff6f00;text-decoration:none;white-space:nowrap}',
+	'.tsd-panel-link:hover{text-decoration:underline}',
 	'.tsd-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;',
 	'padding:10px 12px;margin:0 0 14px;background:#f4f6f8;',
 	'border:1px solid #e0e4e8;border-radius:6px}',
@@ -809,7 +811,16 @@ return view.extend({
 			E('style', {}, CSS),
 			E('div', { 'class': 'tsd-head' }, [
 				E('h2', { 'class': 'tsd-title-main' }, _('流量统计 · 诊断')),
-				E('p', { 'class': 'tsd-sub' }, _('只读检查，不会修改任何配置。'))
+				E('p', { 'class': 'tsd-sub' }, [
+					_('只读检查，不会修改任何配置。'),
+					E('a', {
+						'class': 'tsd-panel-link',
+						href: L.url('admin/services/traffic-stats/panel'),
+						target: '_blank',
+						rel: 'noopener noreferrer',
+						title: _('在新标签页打开详细面板')
+					}, _('详细面板 ↗'))
+				])
 			]),
 			E('div', { 'class': 'tsd-toolbar' }, [ this.sumEl, this.timeEl, this.btn ]),
 			this.listEl,

@@ -635,6 +635,14 @@ async function testSemantics() {
 		/method:\s*'status'/.test(diagnosticsPage) &&
 		!/set_config|set_device_meta|method:\s*'restart'|uci\.set\s*\(/.test(diagnosticsPage) &&
 		/数据源/.test(diagnosticsPage) && /未更新|新鲜/.test(diagnosticsPage));
+
+	/* 详细面板是独立页面：概览/手机版/诊断都用真链接 + 新标签，不走 window.open。 */
+	check('三处入口都用新标签链接打开详细面板',
+		/traffic-stats\/panel/.test(overview) && /target: '_blank'/.test(overview) &&
+		/traffic-stats\/panel/.test(mobile) && /target: '_blank'/.test(mobile) &&
+		/traffic-stats\/panel/.test(diagnosticsPage) && /target: '_blank'/.test(diagnosticsPage));
+	check('概览不用 window.open 打开详细面板',
+		!/window\.open\(\s*L\.url\('admin\/services\/traffic-stats\/panel'\)/.test(overview));
 	check('menu.d 含诊断页且 order 在手机版与面板之间',
 		/"admin\/services\/traffic-stats\/diagnostics"/.test(readView('diagnostics')) === false &&
 		/"path": "traffic-stats\/diagnostics"/.test(

@@ -1759,15 +1759,15 @@ return view.extend({
 
 		this.btnTech = more;
 
-		/* 详细内容（趋势、Top 榜、逐设备/逐应用）放到独立窗口，LuCI 里只留这份概览 */
-		var panelBtn = E('button', {
+		/* 详细内容（趋势、Top 榜、逐设备/逐应用）放到独立页面：
+		   用真正的链接而不是 window.open——可右键新标签、可分享 URL，
+		   也不会被浏览器的弹窗拦截规则挡掉。 */
+		var panelBtn = E('a', {
 			'class': 'tso-btn',
-			title: _('在新窗口打开详细面板（铺满整屏，隐藏侧栏）'),
-			click: function(ev) {
-				ev.preventDefault();
-				window.open(L.url('admin/services/traffic-stats/panel'), '_blank',
-					'width=1500,height=950,noopener');
-			}
+			href: L.url('admin/services/traffic-stats/panel'),
+			target: '_blank',
+			rel: 'noopener noreferrer',
+			title: _('在新标签页打开详细面板（铺满整屏，隐藏侧栏）')
 		}, _('详细面板 ↗'));
 
 		this.syncAutoLook();

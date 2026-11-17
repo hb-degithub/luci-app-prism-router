@@ -1771,10 +1771,20 @@ return view.extend({
 			click: function() { self.refresh(true); }
 		}, _('刷新'));
 
+		/* 详细面板是独立页面：用真链接 + 新标签，手机上也能直接打开宽屏面板。 */
+		this.panelLink = E('a', {
+			'class': 'tsm-refresh',
+			href: L.url('admin/services/traffic-stats/panel'),
+			target: '_blank',
+			rel: 'noopener noreferrer',
+			title: _('在新标签页打开详细面板')
+		}, _('详细面板 ↗'));
+
 		return E('div', { 'class': 'tsm-head' }, [
 			E('h2', {}, _('流量统计')),
 			E('div', { 'class': 'tsm-meta' }, [
 				E('span', {}, [ _('更新于') + ' ', this.updatedNode ]),
+				this.panelLink,
 				this.refreshBtn
 			])
 		]);
