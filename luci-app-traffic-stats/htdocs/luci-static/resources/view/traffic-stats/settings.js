@@ -18,6 +18,12 @@
  *   retention —— 新增 section：enabled / daily_days / nodes_days / stations_days / log_days /
  *                log_max_kb / spool_max_kb / dry_run，外加「立即预览（dry-run）」
  *   settings —— system_enabled / wan_iface（系统指标采集）
+ *   settings —— quota_mode / quota_monthly_gb / quota_total_gb（月配额，SPEC §10.2）：
+ *               这三个键必须真的进 collect() 的 settings 对象并由 writeSection 提交；
+ *               留空 = 不限制，模式 none 时不显示配额卡片。
+ *   export   —— 「导出每日汇总 CSV」走 rpcd export_csv {what:'daily'}（SPEC §10.3）。
+ *               metrics_enabled / metrics_token 目前没有界面入口，本页也不改它们，
+ *               避免保存时把用户手写的 metrics 配置清掉（后端只写传入的键）。
  *
  * 兼容与降级（页面绝不因为老后端/缺字段报错）：
  *   - 选项不存在 → 显示内置默认值，并在 label 旁标注「默认」；
@@ -59,6 +65,14 @@ var callFeishuChats = rpc.declare({
 var callRestart = rpc.declare({
 	object: 'traffic-stats',
 	method: 'restart',
+	expect: {}
+});
+
+/* CSV 导出（SPEC §10.3）：设置页只放“每日汇总”一种，设备/应用在各自页面导出。 */
+var callExportCsv = rpc.declare({
+	object: 'traffic-stats',
+	method: 'export_csv',
+	params: [ 'what' ],
 	expect: {}
 });
 
@@ -113,7 +127,11 @@ var DEFAULTS = {
 		ap_macs: '',
 		link_refresh: '30',
 		system_enabled: '1',
-		wan_iface: ''
+		wan_iface: '',
+		/* 月配额（SPEC §10.2）：mode=none 时后两项不生效 */
+		quota_mode: 'none',
+		quota_monthly_gb: '',
+		quota_total_gb: ''
 	},
 	feishu: {
 		enabled: '0',
@@ -218,8 +236,27 @@ function isFlagValue(value) {
 	return (v === '1' || v === 'true' || v === 'yes' || v === 'on');
 }
 
+/* 记账状态枚举（SPEC）：unavailable/degraded 绝不能显示成“健康/精确”。 */
+function confidenceLabel(value) {
+	var conf = str(value || 'unknown');
+
+	if (conf === 'exact') return _('精确');
+	if (conf === 'degraded') return _('降级');
+	if (conf === 'unavailable') return _('不可用');
+
+	return _('未知');
+}
+
 function str(value) {
 	return (value == null) ? '' : ('' + value);
+}
+
+/* 清空节点用 DOM API，不写 HTML 字符串（设置页的群列表会重复填）。 */
+function clearNode(node) {
+	if (node == null) return;
+
+	while (node.firstChild)
+		node.removeChild(node.firstChild);
 }
 
 function isIntegerInRange(value, min, max) {
@@ -329,6 +366,56 @@ function isMissingMethodError(err) {
 	return /not\s*found|no\s+such|unknown\s+method|invalid\s+method|method.*missing|-32601|404/i.test(message);
 }
 
+/*
+ * 设置页是写页面：menu.d 已给它 depends.acl=luci-app-traffic-stats-admin。
+ * 这里再检查一次 L.env.acls，作为「老版本 dispatcher 仍放行」或手工打开 URL
+ * 时的前端兜底。环境里没有 acls 时以 menu.d 的 depends 为准（返回 true），
+ * 不把正常管理员误伤；走到了这个页面的无 admin 用户才会被禁用写控件。
+ */
+var ADMIN_ACL = 'luci-app-traffic-stats-admin';
+
+function aclValues() {
+	var env = (typeof L != 'undefined' && L != null) ? L.env : null;
+
+	if (env == null || env.acls == null)
+		return null;
+
+	var a = env.acls;
+
+	if (Array.isArray(a))
+		return a.map(function(v) { return '' + v; });
+
+	if (typeof a == 'string')
+		return a.split(/[\s,]+/);
+
+	if (typeof a == 'object') {
+		var group = a['access-group'];
+
+		if (Array.isArray(group))
+			return group.map(function(v) { return '' + v; });
+
+		if (group != null && typeof group == 'object')
+			return Object.keys(group);
+
+		return Object.keys(a);
+	}
+
+	return null;
+}
+
+function canManage() {
+	var acls = aclValues();
+
+	if (acls != null && acls.indexOf(ADMIN_ACL) < 0) return false;
+
+	/* 后端动作目前仅 root 可执行；用 status 的能力位兼容未注入 acls 的 LuCI。 */
+	if (typeof L != 'undefined' && L.env != null &&
+		typeof L.env.trafficStatsCanManage == 'boolean')
+		return L.env.trafficStatsCanManage;
+
+	return acls != null;
+}
+
 return view.extend({
 	load: function() {
 		this.uciOk = true;
@@ -342,6 +429,8 @@ return view.extend({
 			}.bind(this)),
 			callStatus().then(function(status) {
 				this.status = (status != null && typeof status == 'object') ? status : null;
+				if (this.status != null && typeof this.status.can_manage == 'boolean')
+					L.env.trafficStatsCanManage = this.status.can_manage;
 			}.bind(this)).catch(function() {
 				this.status = null;
 			}.bind(this))
@@ -367,8 +456,8 @@ return view.extend({
 			E('h2', {}, _('流量统计 · 设置')),
 			this.renderStatusBanner(),
 			this.uciOk ? '' : E('div', { 'class': 'alert-message error', style: 'padding:10px 14px;margin-bottom:16px' }, [
-				E('strong', {}, _('读不到 UCI 配置（当前显示的可能是默认值）')),
-				E('p', {}, _('常见原因是 ACL 未生效或 rpcd 未重载；保存会由后端直接校验。')),
+				E('strong', {}, _('读不到 UCI 配置：已禁用保存/重启（不会用默认值覆盖现有配置）')),
+				E('p', {}, _('当前页面可能显示默认值（包括空密钥、空配额）。请检查 ACL 或 rpcd 后刷新页面，确认能读到配置再保存。')),
 				this.loadError ? E('p', {}, E('code', {}, this.loadError)) : ''
 			]),
 			this.renderCaptureSection(),
@@ -388,17 +477,25 @@ return view.extend({
 		var status = this.status;
 		var running = (status != null) && (status.running === true);
 		var enabled = (status != null) ? (status.enabled !== false) : true;
+		var conf = (status != null && status.confidence != null) ? ('' + status.confidence) : 'unknown';
+		var look;
 
-		var look = running
-			? { color: '#2e7d32', bg: 'rgba(76,175,80,.12)' }
-			: { color: '#c62828', bg: 'rgba(198,40,40,.12)' };
+		/* 记账 unavailable/degraded 时横幅不能是健康绿；服务没跑则一律红。 */
+		if (!running)
+			look = { color: '#c62828', bg: 'rgba(198,40,40,.12)' };
+		else if (conf === 'exact')
+			look = { color: '#2e7d32', bg: 'rgba(76,175,80,.12)' };
+		else if (conf === 'unavailable')
+			look = { color: '#c62828', bg: 'rgba(198,40,40,.12)' };
+		else
+			look = { color: '#e65100', bg: 'rgba(255,152,0,.14)' };
 
 		var bits = [];
 
 		if (status != null) {
 			bits.push(_('采集中') + ': ' + (enabled ? _('是') : _('否')));
 			bits.push(_('服务运行') + ': ' + (running ? _('是') : _('否')));
-			bits.push(_('记账状态') + ': ' + (status.confidence || 'unknown'));
+			bits.push(_('记账状态') + ': ' + confidenceLabel(status.confidence));
 
 			if (status.sources != null) {
 				bits.push('clash=' + (status.sources.clash || '?'));
@@ -426,7 +523,9 @@ return view.extend({
 			style: 'padding:10px 14px;margin-bottom:16px;border-left:4px solid ' + look.color +
 				';border-radius:6px;background:' + look.bg
 		}, [
-			E('strong', { style: 'color:' + look.color }, running ? _('服务运行中') : _('服务未运行')),
+			E('strong', { style: 'color:' + look.color }, running
+				? (conf === 'exact' ? _('服务运行中') : _('服务运行中（记账降级）'))
+				: _('服务未运行')),
 			' ',
 			this.statusNode
 		]);
@@ -654,6 +753,24 @@ return view.extend({
 			_('用于计算 WAN 上下行速率，例如 eth3 / pppoe-wan。留空 = 自动取默认路由所在接口。'),
 			'text', { placeholder: _('留空 = 自动') }));
 
+		/* ---- 月配额（SPEC §10.2）：get_state 的 month_* / quota 段只读展示在设备页 ---- */
+		fields.push(this.subhead(_('月配额'), false));
+		fields.push(E('div', { 'class': 'cbi-value-description', style: 'margin:0 0 6px 0' },
+			_('按自然月统计（1 号至今）。关闭 = 不做任何限制；设备模式对所有设备使用同一月配额；全屋模式只算总用量。')));
+		fields.push(this.field('settings', 'quota_mode', _('配额模式'),
+			_('none = 关闭；device = 每台设备同一月配额；total = 全屋月度总配额。'),
+			'select', { options: [
+				[ 'none', _('关闭') ],
+				[ 'device', _('每台设备') ],
+				[ 'total', _('全屋合计') ]
+			] }));
+		fields.push(this.field('settings', 'quota_monthly_gb', _('单设备月配额（GB）'),
+			_('可带小数，例如 50 / 0.5；留空 = 单设备不限制。仅「每台设备」模式使用。'),
+			'number', { min: 0, step: '0.01', placeholder: _('留空 = 不限制') }));
+		fields.push(this.field('settings', 'quota_total_gb', _('全屋月配额（GB）'),
+			_('可带小数；留空 = 不限制。仅「全屋合计」模式使用。'),
+			'number', { min: 0, step: '0.01', placeholder: _('留空 = 不限制') }));
+
 		return E('div', { 'class': 'cbi-section', style: 'margin-bottom:18px' }, [
 			E('h3', {}, _('采集设置')),
 			E('div', { 'class': 'cbi-section-node' }, fields)
@@ -747,17 +864,21 @@ return view.extend({
 		this.testNode = E('span', { style: 'font-size:12px;opacity:.85' }, '');
 		this.chatNode = E('div', { style: 'font-size:12px;margin-top:8px' }, '');
 
+		var writeDisabled = ((!canManage()) || this.uciOk !== true) ? true : null;
+
 		var section = E('div', { 'class': 'cbi-section', style: 'margin-bottom:18px' }, [
 			E('h3', {}, _('飞书报表')),
 			E('div', { 'class': 'cbi-section-node' }, fields),
 			E('div', { 'class': 'cbi-section-actions', style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, [
 				E('button', {
 					'class': 'cbi-button cbi-button-action',
-					'click': ui.createHandlerFn(this, this.testFeishu)
+					'click': ui.createHandlerFn(this, this.testFeishu),
+					'disabled': writeDisabled
 				}, _('测试发送')),
 				E('button', {
 					'class': 'cbi-button',
-					'click': ui.createHandlerFn(this, this.listFeishuChats)
+					'click': ui.createHandlerFn(this, this.listFeishuChats),
+					'disabled': writeDisabled
 				}, _('列出机器人所在的群')),
 				this.testNode
 			]),
@@ -889,23 +1010,50 @@ return view.extend({
 
 	renderActions: function() {
 		this.statusText = E('span', { style: 'font-size:12px;margin-left:10px' }, '');
+		this.exportStatus = E('span', { style: 'font-size:12px;margin-left:10px;word-break:break-word' }, '');
 
-		return E('div', { 'class': 'cbi-page-actions' }, [
+		/* uciOk=false 时页面上的 secret/quota 可能是内置默认值，保存/重启一律禁用，
+		   避免把空值当成用户配置提交；save() 里还有同样的硬拒绝。
+		   没有 admin ACL 的只读账号（老 dispatcher 放行时）也在这里禁用写按钮。 */
+		var noAcl = !canManage();
+		var blocked = (this.uciOk !== true) || noAcl;
+		var disabled = blocked ? true : null;
+		var blockedTitle = (this.uciOk !== true)
+			? _('UCI 配置未加载成功，已禁用（避免用默认值覆盖）')
+			: (noAcl ? _('当前账号没有管理 ACL，写操作已禁用') : null);
+
+		return E('div', { 'class': 'cbi-page-actions', style: 'flex-wrap:wrap;gap:6px 0' }, [
 			E('button', {
+				'id': 'ts-settings-save-apply',
 				'class': 'cbi-button cbi-button-apply',
-				'click': ui.createHandlerFn(this, this.saveApply)
+				'click': ui.createHandlerFn(this, this.saveApply),
+				'disabled': disabled,
+				'title': blockedTitle
 			}, _('保存并应用')),
 			' ',
 			E('button', {
+				'id': 'ts-settings-save-only',
 				'class': 'cbi-button cbi-button-save',
-				'click': ui.createHandlerFn(this, this.saveOnly)
+				'click': ui.createHandlerFn(this, this.saveOnly),
+				'disabled': disabled,
+				'title': blockedTitle
 			}, _('仅保存')),
 			' ',
 			E('button', {
+				'id': 'ts-settings-restart',
 				'class': 'cbi-button cbi-button-reset',
-				'click': ui.createHandlerFn(this, this.restartService)
+				'click': ui.createHandlerFn(this, this.restartService),
+				'disabled': disabled,
+				'title': blockedTitle
 			}, _('重启服务')),
-			this.statusText
+			' ',
+			E('button', {
+				'id': 'ts-settings-export',
+				'class': 'cbi-button cbi-button-action',
+				'click': ui.createHandlerFn(this, this.exportDaily)
+			}, _('导出每日汇总 CSV')),
+			this.statusText,
+			this.exportStatus
 		]);
 	},
 
@@ -1010,6 +1158,12 @@ return view.extend({
 		settings.link_refresh = this.inputValue('settings', 'link_refresh');
 		settings.system_enabled = this.inputChecked('settings', 'system_enabled') ? '1' : '0';
 		this.setOptional(settings, 'settings', 'wan_iface', this.inputValue('settings', 'wan_iface'));
+
+		/* 月配额：模式永远显式写入（none/device/total），两个 GB 字段非空就写；
+		   原本存在、现在清空的字段写空串，语义是“取消限制”，不能悄悄保留旧配额。 */
+		settings.quota_mode = this.inputValue('settings', 'quota_mode') || 'none';
+		this.setOptional(settings, 'settings', 'quota_monthly_gb', this.inputValue('settings', 'quota_monthly_gb'));
+		this.setOptional(settings, 'settings', 'quota_total_gb', this.inputValue('settings', 'quota_total_gb'));
 
 		feishu.enabled = this.inputChecked('feishu', 'enabled') ? '1' : '0';
 		feishu.webhook = this.inputValue('feishu', 'webhook');
@@ -1137,6 +1291,21 @@ return view.extend({
 		if (wan.length > 0 && !/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,31}$/.test(wan))
 			return _('WAN 接口名不合法（字母/数字/._:@- 组成，留空 = 自动）');
 
+		if ([ 'none', 'device', 'total' ].indexOf(str(settings.quota_mode)) < 0)
+			return _('配额模式只能是 none / device / total');
+
+		var gbFields = [
+			[ 'quota_monthly_gb', _('单设备月配额') ],
+			[ 'quota_total_gb', _('全屋月配额') ]
+		];
+
+		for (i = 0; i < gbFields.length; i++) {
+			var gb = str(settings[gbFields[i][0]]);
+
+			if (gb.length > 0 && !isDecimalInRange(gb, 0, 1048576))
+				return gbFields[i][1] + ' ' + _('必须是 0–1048576 之间的数字（GB，留空 = 不限制）');
+		}
+
 		if (feishu.webhook.length > 0 && !/^https?:\/\/[^\s]+$/.test(feishu.webhook))
 			return _('飞书 webhook 必须是 http(s) 地址');
 
@@ -1255,6 +1424,30 @@ return view.extend({
 
 	save: function(restartAfter) {
 		var self = this;
+
+		/*
+		 * 硬闸门放在 collect() 之前：uciOk=false 时输入框里是内置默认值
+		 * （clash_secret / feishu.secret / app_secret / quota_* 都可能是空串），
+		 * 一旦 collect 后提交，就等于把用户现有配置覆盖成空值。宁可拒绝保存。
+		 */
+		if (this.uciOk !== true) {
+			var blocked = _('读不到 UCI 配置，已拒绝保存：不会用页面默认值（空密钥/空配额等）覆盖现有配置。请检查 ACL 或 rpcd 后刷新页面重试。');
+
+			this.setStatus(blocked, 'error');
+			this.notify(blocked, true);
+
+			return Promise.resolve();
+		}
+
+		if (!canManage()) {
+			var denied = _('当前账号没有管理 ACL（luci-app-traffic-stats-admin），已拒绝保存。');
+
+			this.setStatus(denied, 'error');
+			this.notify(denied, true);
+
+			return Promise.resolve();
+		}
+
 		var cfg = this.collect();
 		var err = this.validate(cfg);
 		var warnings = [];
@@ -1531,11 +1724,18 @@ return view.extend({
 	listFeishuChats: function() {
 		var self = this;
 
-		this.chatNode.innerHTML = '';
+		if (!canManage()) {
+			clearNode(this.chatNode);
+			this.chatNode.appendChild(E('span', { style: 'color:#c62828' },
+				_('当前账号没有管理 ACL（luci-app-traffic-stats-admin），无法查询群。')));
+			return Promise.resolve();
+		}
+
+		clearNode(this.chatNode);
 		this.chatNode.appendChild(E('em', {}, _('查询中…（用已保存的 App ID/Secret 换 token）')));
 
 		return callFeishuChats().then(function(res) {
-			self.chatNode.innerHTML = '';
+			clearNode(self.chatNode);
 
 			if (res == null || res.ok !== true) {
 				self.chatNode.appendChild(E('span', { style: 'color:#c62828' },
@@ -1562,12 +1762,66 @@ return view.extend({
 				}, [ E('code', {}, c.chat_id), E('span', { style: 'margin-left:8px' }, c.name || '') ]));
 			});
 		}).catch(function(e) {
-			self.chatNode.innerHTML = '';
+			clearNode(self.chatNode);
 			self.chatNode.appendChild(E('span', { style: 'color:#c62828' }, _('获取失败：') + e));
 		});
 	},
 
+	/* 「导出每日汇总 CSV」：what=daily，单位字节，最多最近 200 天（后端决定）。 */
+	exportDaily: function() {
+		var self = this;
+
+		this.setExportStatus(_('正在导出每日汇总…'), '');
+
+		return callExportCsv('daily').then(function(res) {
+			if (res == null || res.ok !== true || typeof res.csv != 'string')
+				throw new Error((res != null && res.error != null) ? ('' + res.error) : _('后端没有返回 CSV 内容'));
+
+			self.saveCsv(res, 'daily');
+			self.setExportStatus(_('已导出') + ' ' + ((res.rows != null) ? res.rows : 0) + ' ' + _('行'), '#2e7d32');
+		}).catch(function(err) {
+			var message = (err != null && err.message) ? ('' + err.message) : ('' + err);
+
+			self.setExportStatus(_('导出失败：') + message, '#c62828');
+			ui.addNotification(null, E('p', {}, _('导出失败：') + message), 'error');
+		});
+	},
+
+	setExportStatus: function(text, color) {
+		if (this.exportStatus == null) return;
+
+		this.exportStatus.textContent = text;
+		this.exportStatus.style.color = color || '';
+	},
+
+	saveCsv: function(res, what) {
+		var csv = (res != null && typeof res.csv == 'string') ? res.csv : '';
+
+		if (!csv.length) throw new Error(_('CSV 内容为空'));
+
+		var now = new Date();
+		var fallback = 'traffic-stats-' + what + '-' + now.getFullYear() + '-' +
+			pad2(now.getMonth() + 1) + '-' + pad2(now.getDate()) + '.csv';
+		var filename = (res != null && res.filename) ? ('' + res.filename) : fallback;
+		var blob = new Blob([ csv ], { type: 'text/csv;charset=utf-8' });
+		var url = URL.createObjectURL(blob);
+		var a = document.createElement('a');
+
+		a.href = url;
+		a.download = filename;
+		a.style.display = 'none';
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+		setTimeout(function() { URL.revokeObjectURL(url); }, 1500);
+	},
+
 	testFeishu: function(ev) {
+		if (!canManage()) {
+			this.setTestResult(_('当前账号没有管理 ACL（luci-app-traffic-stats-admin），不能发送测试消息。'), true);
+			return Promise.resolve();
+		}
+
 		this.setTestResult(_('正在发送测试消息…'), false);
 
 		return callTestFeishu().then(function(res) {
@@ -1587,6 +1841,24 @@ return view.extend({
 	},
 
 	restartService: function(ev) {
+		if (this.uciOk !== true) {
+			var blocked = _('读不到 UCI 配置，已禁用重启：请先确认配置能正常读取，避免在错误状态下重启服务。');
+
+			this.setStatus(blocked, 'error');
+			this.notify(blocked, true);
+
+			return Promise.resolve();
+		}
+
+		if (!canManage()) {
+			var denied = _('当前账号没有管理 ACL（luci-app-traffic-stats-admin），已禁用重启。');
+
+			this.setStatus(denied, 'error');
+			this.notify(denied, true);
+
+			return Promise.resolve();
+		}
+
 		var confirmed = (typeof window.confirm == 'function')
 			? window.confirm(_('确定要重启 traffic-statsd 服务吗？'))
 			: true;

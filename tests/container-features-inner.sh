@@ -126,8 +126,10 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 echo "=== 1. 安装两个包 ==="
-opkg install --force-depends /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install --force-depends /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+# 严格依赖安装：不使用 --force-depends。前端已改用内置 SVG，不再依赖
+# luci-lib-chartjs；其余依赖 deps 镜像都有，所以不需要任何占位包。
+opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats（严格依赖）" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats（严格依赖）" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新配置项 / 文件落位 / 权限 / 语法 ==="
 for k in quota_mode quota_monthly_gb quota_total_gb metrics_enabled metrics_token; do

@@ -35,7 +35,7 @@ WORK=/tmp/fs-gate
 rm -rf "$WORK"; mkdir -p "$WORK"
 
 echo "=== 0. 安装 traffic-stats ==="
-opkg install --force-depends /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/fs-install.log 2>&1 \
+opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/fs-install.log 2>&1 \
   && ok "安装成功" || { bad "安装失败"; tail -5 /tmp/fs-install.log; }
 [ -f "$FEISHU" ] && ok "feishu.uc 已安装（$FEISHU）" || { bad "feishu.uc 缺失"; exit 1; }
 if grep -q "report_items" "$CFG"; then

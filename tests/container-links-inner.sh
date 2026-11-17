@@ -87,6 +87,7 @@ run_once(){
   mkdir -p "$(dirname "$SD")"
   env PATH="$RUN_PATH" TRAFFIC_STATS_ONCE=1 \
     TRAFFIC_STATS_STATE_DIR="$SD" \
+    TRAFFIC_STATS_DAILY_DIR="$SD.daily" \
     TRAFFIC_STATS_CONNTRACK_FILE=/tmp/ct.txt \
     TRAFFIC_STATS_CLASH_API=127.0.0.1:19091 \
     ucode /usr/bin/traffic-statsd >"$SD.log" 2>&1
@@ -98,8 +99,8 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 echo "=== 1. 安装两个包 ==="
-opkg install --force-depends /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install --force-depends /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新配置项与文件权限 ==="
 for k in lan_bridge wireless_ports ap_macs link_refresh; do
@@ -172,19 +173,19 @@ UCI set traffic-stats.settings.lan_ranges='192.168.100.0/24'
 UCI set traffic-stats.settings.poll_interval='5'
 cfg_commit
 
-# 期望值（conntrack 3 条 + clash 4 条，固定 fixture）：
-#   direct_rx 7000(ct) + 7000(c2 DIRECT) = 14000      direct_tx 700 + 700 = 1400
+# 期望值（conntrack 3 条与 clash c1/c2/c3 同五元组，全部只在 Clash 侧计一次）：
+#   direct_rx 7000(c2 DIRECT)                        direct_tx 700
 #   proxy_rx  5000(c1) + 9000(c3) + 111(c4 无 sourceIP) = 14111
 #   proxy_tx  500 + 900 + 11 = 1411
-#   wifi_rx   5000 + 1000(ct101) = 6000              wifi_tx   500 + 100 = 600
-#   wired_rx  7000 + 2000(ct102) = 9000              wired_tx  700 + 200 = 900
-#   unknown_rx 9000 + 111 + 4000(ct103) = 13111      unknown_tx 900 + 11 + 400 = 1311
-EXP_DIRECT_RX=14000;  EXP_DIRECT_TX=1400
+#   wifi_rx   5000(c1)                                wifi_tx 500
+#   wired_rx  7000(c2 DIRECT)                         wired_tx 700
+#   unknown_rx 9000 + 111(c4) = 9111                 unknown_tx 900 + 11 = 911
+EXP_DIRECT_RX=7000;  EXP_DIRECT_TX=700
 EXP_PROXY_RX=14111;   EXP_PROXY_TX=1411
-EXP_WIFI_RX=6000;     EXP_WIFI_TX=600
-EXP_WIRED_RX=9000;    EXP_WIRED_TX=900
-EXP_UNKNOWN_RX=13111; EXP_UNKNOWN_TX=1311
-EXP_ALL_RX=28111;     EXP_ALL_TX=2811
+EXP_WIFI_RX=5000;     EXP_WIFI_TX=500
+EXP_WIRED_RX=7000;    EXP_WIRED_TX=700
+EXP_UNKNOWN_RX=9111; EXP_UNKNOWN_TX=911
+EXP_ALL_RX=21111;     EXP_ALL_TX=2111
 
 echo "=== 6. Case A：ap_macs 反查上联端口（$LINK64 -> 端口 3）==="
 UCI set traffic-stats.settings.lan_bridge='br-lan'
@@ -217,8 +218,8 @@ if [ -f /tmp/lk/a/state.json ]; then
   chk_inv /tmp/lk/a/state.json "Case A"
   D=$(devq /tmp/lk/a/state.json 192.168.100.101)
   OLDIFS=$IFS; IFS='|'; set -- $D; IFS=$OLDIFS
-  if [ "$1" = "wifi" ] && [ "$2" = "1000" ] && [ "$3" = "5000" ]; then
-    ok "设备 101：link=wifi direct_rx=1000 proxy_rx=5000（接入与代理/直连正交）"
+  if [ "$1" = "wifi" ] && [ "$2" = "0" ] && [ "$3" = "5000" ]; then
+    ok "设备 101：link=wifi direct_rx=0 proxy_rx=5000（同五元组不重复计）"
   else
     bad "设备 101：$D"
   fi

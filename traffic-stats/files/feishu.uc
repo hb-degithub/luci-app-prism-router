@@ -2,7 +2,7 @@
 // feishu.uc — OpenWrt 流量统计插件的飞书群机器人推送模块
 //
 // 负责：日报卡片（JSON 2.0）生成 / 告警文本 / 签名 / 发送 / 失败重试 / 冷却去重
-// 依赖：ucode（fs/uci/json 内建）、curl、openssl（openssl-util）
+// 依赖：ucode（fs/uci/json 内建）、curl、sha256sum（busybox；缺失时回退 openssl dgst）
 // 环境：iStoreOS 24.10（x86_64/musl）；没有 python3 / jq / node，也不使用它们。
 //
 // 用法（安装后位于 /usr/share/traffic-stats/feishu.uc，见 traffic-stats/Makefile）：
@@ -180,9 +180,14 @@ shq = function(s) {
 ensure_dir = function(path) {
     if (!path || path == "." || path == "/")
         return true;
-    if (fs.access(path))
-        return true;
-    return run("mkdir -p " + shq(path)).code == 0;
+    let st = null;
+    try { st = fs.lstat(path); } catch (e) { return false; }
+    if (st)
+        return st.type == "directory" && st.uid == 0 && st.gid == 0;
+    if (run("mkdir -p " + shq(path)).code != 0)
+        return false;
+    try { st = fs.lstat(path); } catch (e) { return false; }
+    return st != null && st.type == "directory" && st.uid == 0 && st.gid == 0;
 };
 
 getpid = function() {
@@ -221,10 +226,49 @@ write_atomic = function(path, content) {
     return false;
 };
 
+/* 0600 原子写：用于 tenant_access_token 缓存等凭证。 */
+let write_atomic_private = function(path, content) {
+    let tmp = sprintf("%s.tmp.%d.%d.%d", path, getpid(), _seq++, int(time()));
+    try {
+        let fd = fs.open(tmp, "w", 384);
+        if (!fd)
+            return false;
+        fd.write(content);
+        fd.close();
+        if (fs.rename(tmp, path)) {
+            try { fs.chmod(path, 384); } catch (e) { }
+            return true;
+        }
+    } catch (e) {
+        // fallthrough
+    }
+    try { fs.unlink(tmp); } catch (e) { }
+    return false;
+};
+
+/* 预创建 0600 文件：curl 的 output= 与 shell 的 2> 会保留原权限。 */
+let write_private = function(path, content) {
+    try {
+        let fd = fs.open(path, "w", 384);       // 0o600
+        if (!fd)
+            return false;
+        if (content != null)
+            fd.write(content);
+        fd.close();
+        return true;
+    } catch (e) {
+        return false;
+    }
+};
+
 log = function(level, msg) {
     let line = sprintf("%s [%s] %s\n", nowstr(), level, msg);
     try {
-        ensure_dir(BASE);
+        // BASE 不是真实 root 目录（例如 /tmp/traffic-stats 被换成 symlink）→ 不写日志。
+        if (!ensure_dir(BASE)) {
+            print(line);
+            return;
+        }
         let lp = BASE + "/feishu.log";
         if (fs.access(lp)) {
             let st = fs.stat(lp);
@@ -555,26 +599,179 @@ in_quiet = function(windows, epoch) {
 
 // ───────────────────────────── 签名 ─────────────────────────────
 
-// key = ts + "\n" + secret；HMAC-SHA256 签空字节串；Base64
+// 签名：key = ts + "\n" + secret；HMAC-SHA256 签空字节串；Base64。
+//
+// ⚠️ 目标容器 OpenSSL 3.0.22 实测：`dgst -hmac` / `-macopt key:<文件>` 都只能
+// 从 argv 拿字面量 key，没有“从文件/fd 读 HMAC key”的选项；环境变量会出现在
+// /proc/<pid>/environ。因此改为纯 ucode HMAC + sha256sum 读 stdin：
+//   * secret 只在本进程内存里派生 ipad/opad；
+//   * argv 里只有临时文件路径，没有 key；
+//   * 临时文件只保存 hash 的十六进制文本，权限 0600，用完即删。
+
+let auth_tmp_seq = 0;
+
+const AUTH_TMP = "/tmp/traffic-stats/.auth";
+const AUTH_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// 安全目录（与 traffic-stats-node-auth.uc 同步）：
+// lstat 不跟随符号链接；只接受真实目录且 root:root。已存在但不安全时直接失败，
+// 绝不先 chmod/chown 再信任（符号链接不会被 chmod 变成目录）。
+let auth_lstat_dir = function(path) {
+    let st = null;
+    try { st = fs.lstat(path); } catch (e) { return null; }
+    if (!st || st.type != "directory" || st.uid != 0 || st.gid != 0)
+        return null;
+    return st;
+};
+
+let auth_secure_dir = function(path, mode) {
+    let st = auth_lstat_dir(path);
+    if (!st) {
+        let raw = null;
+        try { raw = fs.lstat(path); } catch (e) { raw = null; }
+        if (raw)
+            return false;
+        try { fs.mkdir(path, mode); } catch (e) { }
+        st = auth_lstat_dir(path);
+        if (!st)
+            return false;
+    }
+    try { fs.chmod(path, mode); } catch (e) { return false; }
+    try { fs.chown(path, 0, 0); } catch (e) { return false; }
+    return auth_lstat_dir(path) != null;
+};
+
+// /tmp 必须是 root 的 sticky 真实目录；否则不创建任何认证临时目录。
+let auth_safe_tmp_parent = function() {
+    let st = null;
+    try { st = fs.lstat("/tmp"); } catch (e) { return false; }
+    return st != null && st.type == "directory" && st.uid == 0
+        && st.perm != null && st.perm.sticky == true;
+};
+
+// /tmp/traffic-stats 先安全创建/校验，再建 0700 的 .auth。
+let auth_ensure_tmp = function() {
+    if (!auth_safe_tmp_parent())
+        return false;
+    if (!auth_secure_dir("/tmp/traffic-stats", 493))   // 0755
+        return false;
+    return auth_secure_dir(AUTH_TMP, 448);             // 0700
+};
+
+// sha256sum 的输出仍是行首 64 hex；openssl dgst -sha256 的
+// `SHA2-256(stdin)= <64hex>` 尾部格式只在回退时接受。
+let auth_digest_hex = function(raw) {
+    let text = trim(sprintf("%s", raw ?? ""));
+    let m = match(text, /^([0-9a-fA-F]{64})/);
+    if (m)
+        return lc(m[1]);
+    m = match(text, /(SHA2-256|SHA256)\(stdin\)= *([0-9a-fA-F]{64}) *$/);
+    if (m)
+        return lc(m[2]);
+    m = match(text, /\(stdin\)= *([0-9a-fA-F]{64}) *$/);
+    return m ? lc(m[1]) : "";
+};
+
+let auth_hash_cmd = function() {
+    for (let path in [ "/usr/bin/sha256sum", "/bin/sha256sum" ])
+        if (fs.access(path))
+            return path;
+    for (let path in [ "/usr/bin/openssl", "/usr/sbin/openssl", "/bin/openssl" ])
+        if (fs.access(path))
+            return sprintf("%s dgst -sha256", path);
+    return "sha256sum";
+};
+
+let auth_sha256_hex = function(data) {
+    if (!auth_ensure_tmp())
+        return "";
+    let out = sprintf("%s/h-%d-%d-%d", AUTH_TMP, time(), getpid(), auth_tmp_seq++);
+    try {
+        // 'wx'：目标已存在（含预先放置的符号链接/文件）就失败，绝不跟随写入。
+        let fd = fs.open(out, "wx", 384);      // 0o600
+        if (!fd)
+            return "";
+        fd.close();
+    } catch (e) {
+        return "";
+    }
+    let p = null;
+    try { p = fs.popen(sprintf("%s > %s", auth_hash_cmd(), shq(out)), "w"); }
+    catch (e) { p = null; }
+    if (!p) {
+        try { fs.unlink(out); } catch (e) { }
+        return "";
+    }
+    let off = 0;
+    try {
+        while (off < length(data)) {
+            let n = p.write(substr(data, off));
+            if (n == null || n <= 0)
+                break;
+            off += n;
+        }
+    } catch (e) { }
+    let rc = p.close();
+    let raw = "";
+    try { raw = fs.readfile(out) ?? ""; } catch (e) { raw = ""; }
+    try { fs.unlink(out); } catch (e) { }
+    if (rc != 0)
+        return "";
+    return auth_digest_hex(raw);
+};
+
+let auth_hex_bin = function(hex) {
+    let out = "";
+    for (let i = 0; i + 1 < length(hex); i += 2)
+        out += chr(int(substr(hex, i, 2), 16));
+    return out;
+};
+
+let auth_b64 = function(bin) {
+    let out = "";
+    for (let i = 0; i < length(bin); i += 3) {
+        let b0 = ord(substr(bin, i, 1));
+        let has1 = (i + 1 < length(bin));
+        let has2 = (i + 2 < length(bin));
+        let b1 = has1 ? ord(substr(bin, i + 1, 1)) : 0;
+        let b2 = has2 ? ord(substr(bin, i + 2, 1)) : 0;
+        out += substr(AUTH_B64, (b0 >> 2) & 63, 1);
+        out += substr(AUTH_B64, ((b0 & 3) << 4) | ((b1 >> 4) & 15), 1);
+        out += has1 ? substr(AUTH_B64, ((b1 & 15) << 2) | ((b2 >> 6) & 3), 1) : "=";
+        out += has2 ? substr(AUTH_B64, b2 & 63, 1) : "=";
+    }
+    return out;
+};
+
+let auth_hmac_b64 = function(secret, message) {
+    let msg = sprintf("%s", message);
+    let key = sprintf("%s", secret);
+    if (length(key) > 64) {
+        let kh = auth_sha256_hex(key);
+        if (!length(kh))
+            return "";
+        key = auth_hex_bin(kh);
+    }
+    let ipad = "", opad = "";
+    for (let i = 0; i < 64; i++) {
+        let b = (i < length(key)) ? ord(substr(key, i, 1)) : 0;
+        ipad += chr(b ^ 0x36);
+        opad += chr(b ^ 0x5c);
+    }
+    let inner = auth_sha256_hex(ipad + msg);
+    if (!length(inner))
+        return "";
+    let outer = auth_sha256_hex(opad + auth_hex_bin(inner));
+    if (!length(outer))
+        return "";
+    return auth_b64(auth_hex_bin(outer));
+};
+
 hmac_sign = function(ts, secret) {
-    let key = sprintf("%s\n%s", ts, secret);
-    // 主路径：-hmac 直接把 key 作为 argv（shq 保证特殊字符安全）
-    let r = run(sprintf("openssl dgst -sha256 -hmac %s -binary < /dev/null | openssl base64 -A", shq(key)));
-    let sig = trim(r.out);
-    if (r.code == 0 && match(sig, /^[A-Za-z0-9+\/=]+$/))
-        return sig;
-
-    // 备用路径：hexkey（本机没有 od/base64 命令，hex 由 ucode 生成，base64 用 openssl）
-    let hex = "";
-    for (let i = 0; i < length(key); i++)
-        hex += sprintf("%02x", ord(substr(key, i, 1)));
-    r = run(sprintf("openssl dgst -sha256 -mac HMAC -macopt hexkey:%s -binary < /dev/null | openssl base64 -A", hex));
-    sig = trim(r.out);
-    if (r.code == 0 && match(sig, /^[A-Za-z0-9+\/=]+$/))
-        return sig;
-
-    log("ERROR", sprintf("签名计算失败：openssl rc=%d stderr=%s", r.code, cut(trim(r.out), 120)));
-    return "";
+    let sig = auth_hmac_b64(sprintf("%s\n%s", ts, secret), "");
+    if (!length(sig))
+        log("ERROR", "签名计算失败（缺少 sha256sum，或临时目录不可写）；密钥未进 argv/环境变量");
+    return sig;
 };
 
 // ───────────────────────────── UCI 配置 ─────────────────────────────
@@ -788,6 +985,17 @@ load_cfg = function(opts) {
     return c;
 };
 
+/* webhook 校验：ucode 的 ERE 对字符类里的 \s 支持不一致，别用 [^\s"'\\]。
+   这里显式禁止空白/引号/反斜杠，避免把 URL 拼进 curl 配置时破坏语法。 */
+webhook_ok = function(u) {
+    if (!match(u, /^https?:\/\//))
+        return false;
+    for (let bad in [ " ", "\t", "\r", "\n", "\"", "'", "\\" ])
+        if (index(u, bad) >= 0)
+            return false;
+    return true;
+};
+
 // 空 webhook/secret -> 静默跳过（只记日志，不报错、不重试）
 send_allowed = function(cfg, ignore_enabled) {
     /* 自建应用路线：只要三件套齐全就放行，不要求 webhook/secret */
@@ -807,7 +1015,7 @@ send_allowed = function(cfg, ignore_enabled) {
         log("INFO", "traffic-stats.feishu.secret 未配置，跳过发送（签名校验需要密钥）");
         return false;
     }
-    if (!match(cfg.webhook, /^https?:\/\/[^\s"'\\]+$/)) {
+    if (!webhook_ok(cfg.webhook)) {
         log("ERROR", "traffic-stats.feishu.webhook 格式非法，跳过发送");
         return false;
     }
@@ -1518,14 +1726,15 @@ http_post = function(url, body) {
     let dir = BASE + "/tmp";
     if (!ensure_dir(dir))
         return { http: 0, curl: -1, body: "", err: "无法创建临时目录 " + dir };
+    try { fs.chmod(dir, 448); } catch (e) { }     // 0o700
 
-    let tag = sprintf("%d-%d-%d", time(), getpid(), _seq++);
+    let tag = sprintf("%d-%d-%d-%d", time(), getpid(), _seq++, int(time() * 1000));
     let bf = sprintf("%s/body-%s.json", dir, tag);
     let rf = sprintf("%s/resp-%s.json", dir, tag);
     let ef = sprintf("%s/err-%s.txt", dir, tag);
     let cf = sprintf("%s/curl-%s.conf", dir, tag);
 
-    // curl 配置文件避免把 webhook/路径拼进 shell；data-binary 保证字节不被改动
+    // 所有文件 0600；webhook（含 hook token）只进 curl 配置文件，不拼命令行。
     let conf = sprintf(
         "url = \"%s\"\n" +
         "request = \"POST\"\n" +
@@ -1534,15 +1743,23 @@ http_post = function(url, body) {
         "show-error\n" +
         "connect-timeout = 8\n" +
         "max-time = 25\n" +
+        "max-filesize = 65536\n" +
+        "proto = \"=http,https\"\n" +
+        "proto-redir = \"=https\"\n" +
+        "max-redirs = 0\n" +
         "data-binary = \"@%s\"\n" +
         "output = \"%s\"\n" +
         "write-out = \"%%{http_code}\"\n", url, bf, rf);
 
-    try {
-        fs.writefile(bf, body);
-        fs.writefile(cf, conf);
-    } catch (e) {
-        return { http: 0, curl: -1, body: "", err: "写临时文件失败：" + e };
+    let ok = write_private(bf, body) && write_private(rf, "") &&
+             write_private(ef, "") && write_private(cf, conf);
+
+    if (!ok) {
+        try { fs.unlink(bf); } catch (e) { }
+        try { fs.unlink(rf); } catch (e) { }
+        try { fs.unlink(ef); } catch (e) { }
+        try { fs.unlink(cf); } catch (e) { }
+        return { http: 0, curl: -1, body: "", err: "写临时文件失败" };
     }
 
     let r = run(sprintf("curl -sS -K %s 2>%s", shq(cf), shq(ef)));
@@ -1556,6 +1773,8 @@ http_post = function(url, body) {
         fs.unlink(rf);
         fs.unlink(ef);
     } catch (e) { }
+    if (length(resp) > 65536)
+        resp = "";
     return { http: http, curl: r.code, body: resp, err: err };
 };
 
@@ -1602,29 +1821,54 @@ app_http = function(method, url, bearer, body) {
     let dir = BASE + "/tmp";
     if (!ensure_dir(dir))
         return { http: 0, curl: -1, body: "", err: "无法创建临时目录 " + dir };
-    let tag = sprintf("%d-%d-%d", time(), getpid(), _seq++);
+    try { fs.chmod(dir, 448); } catch (e) { }
+
+    let tag = sprintf("%d-%d-%d-%d", time(), getpid(), _seq++, int(time() * 1000));
     let bf = sprintf("%s/abody-%s.json", dir, tag);
     let rf = sprintf("%s/aresp-%s.json", dir, tag);
+    let cf = sprintf("%s/acurl-%s.conf", dir, tag);
 
-    let cmd = sprintf("curl -sS -X %s", method);
+    // Bearer token / app_secret 请求体都只进 0600 配置文件，绝不进 argv。
+    let lines = [
+        sprintf("url = \"%s\"", url),
+        sprintf("request = \"%s\"", method),
+        "silent",
+        "show-error",
+        "connect-timeout = 8",
+        "max-time = 25",
+        "max-filesize = 65536",
+        "proto = \"=https\"",
+        "proto-redir = \"=https\"",
+        "max-redirs = 0",
+        sprintf("output = \"%s\"", rf),
+        "write-out = \"%{http_code}\""
+    ];
     if (length(bearer))
-        cmd += sprintf(" -H %s", shq("Authorization: Bearer " + bearer));
+        push(lines, sprintf("header = \"Authorization: Bearer %s\"", bearer));
     if (length(body)) {
-        try { fs.writefile(bf, body); } catch (e) {
-            return { http: 0, curl: -1, body: "", err: "写请求体失败：" + e };
-        }
-        cmd += sprintf(" -H %s", shq("Content-Type: application/json"));
-        cmd += sprintf(" --data-binary %s", shq("@" + bf));
+        push(lines, "header = \"Content-Type: application/json\"");
+        push(lines, sprintf("data-binary = \"@%s\"", bf));
     }
-    cmd += sprintf(" -o %s -w '%%{http_code}' --connect-timeout 8 --max-time 25 %s 2>/dev/null",
-                   shq(rf), shq(url));
 
-    let r = run(cmd);
+    let ok = write_private(bf, body ?? "") && write_private(rf, "") &&
+             write_private(cf, join("\n", lines) + "\n");
+
+    if (!ok) {
+        try { fs.unlink(bf); } catch (e) { }
+        try { fs.unlink(rf); } catch (e) { }
+        try { fs.unlink(cf); } catch (e) { }
+        return { http: 0, curl: -1, body: "", err: "写临时文件失败" };
+    }
+
+    let r = run(sprintf("curl -sS -K %s 2>/dev/null", shq(cf)));
     let http = intv(trim(r.out));
     let resp = "";
     try { if (fs.access(rf)) resp = fs.readfile(rf); } catch (e) { }
     try { fs.unlink(bf); } catch (e) { }
     try { fs.unlink(rf); } catch (e) { }
+    try { fs.unlink(cf); } catch (e) { }
+    if (length(resp) > 65536)
+        resp = "";
     return { http: http, curl: r.code, body: resp, err: length(resp) ? "" : "curl exit " + r.code };
 };
 
@@ -1644,10 +1888,17 @@ app_token = function(cfg, force) {
     let tok = (j != null && type(j) == "object" && j.tenant_access_token != null) ? j.tenant_access_token : "";
     let exp = (j != null && type(j) == "object" && j.expire != null) ? intv(j.expire) : 7200;
     if (!length(tok)) {
-        log("ERROR", sprintf("tenant_access_token 获取失败 http=%d body=%s", r.http, cut(r.body, 200)));
+        let code = -1, msg = "";
+        if (j != null && type(j) == "object") {
+            code = intv(j.code ?? -1);
+            msg = sprintf("%s", j.msg ?? "");
+        }
+        /* 不记录响应体原文：里面可能有诊断信息，也可能被上游塞入凭证。 */
+        log("ERROR", sprintf("tenant_access_token 获取失败 http=%d code=%d msg=%s",
+            r.http, code, cut(msg, 160)));
         return "";
     }
-    write_atomic(cp, sprintf('%J', { app_id: cfg.app_id, token: tok, expire: now + exp }));
+    write_atomic_private(cp, sprintf('%J', { app_id: cfg.app_id, token: tok, expire: now + exp }));
     return tok;
 };
 

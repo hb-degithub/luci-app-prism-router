@@ -27,7 +27,7 @@
 //
 'use strict';
 
-import { readfile, access, glob, popen, basename, writefile, rename, chmod, chown, unlink } from 'fs';
+import { readfile, access, glob, popen, basename, writefile, rename, chmod, chown, unlink, mkdir, rmdir, stat } from 'fs';
 import { cursor } from 'uci';
 
 /* 测试钩子（生产环境不要设置）：把读/写的固定路径换成 fixture 目录，
@@ -71,6 +71,15 @@ const PID_FILES = [ '/var/run/traffic-statsd.pid', '/var/run/traffic-stats.pid' 
 
 /* get_state 的裁剪预算：ubus 上限 262144B，留出 blobmsg / JSON-RPC 封装余量。 */
 const STATE_BUDGET = 180 * 1024;
+/* get_history 的预算：30/31 天 + 当天 288 个 5 分钟桶也必须装得下。 */
+const HISTORY_BUDGET = 180 * 1024;
+const HISTORY_MAX_BUCKETS = 400;
+
+/* devices.json 写锁：ucode 没有 flock，用 mkdir 的原子性互斥；有限重试 +
+   陈旧锁回收，避免一个崩溃的写者让另一个永久卡住。 */
+const DEVICE_LOCK_STALE_SECONDS = 25;
+const DEVICE_LOCK_RETRY_MS = 25;
+const DEVICE_LOCK_RETRIES = 60;
 
 /* 裁剪档位：[设备数, 每设备应用数, 顶层应用数]，按顺序取第一个放得下的档位。 */
 const STATE_SHAPES = [
@@ -103,6 +112,9 @@ const UCI_FIELDS = {
 		'lan_bridge', 'wireless_ports', 'ap_macs', 'link_refresh',
 		/* 子母多节点汇总（settings 页暂未提供输入框，先开放给后续页面/脚本复用） */
 		'node_id', 'node_name', 'mother_url', 'mother_secret', 'mother_enabled',
+		/* 旧共享协议仅作短期迁移；新部署应注册 config node/station 的独立凭证。 */
+		'legacy_shared_secret', 'legacy_stations_token',
+		'mother_ca', 'mother_pinned_sha256', 'stations_ca', 'stations_pinned_sha256',
 		/* 哑桥 AP 无线站点元数据上报（stations.uc 读，母节点 ingest-stations.uc 校验） */
 		'stations_enabled', 'stations_token', 'station_ifaces',
 		/* 软路由自身性能指标：是否采集 + 用哪个接口算 WAN 速率 */
@@ -237,6 +249,29 @@ function day_of(ts) {
 	return sprintf('%04d-%02d-%02d', t.year, t.mon, t.mday);
 }
 
+/* 严格校验 YYYY-MM-DD（日历日期，不接受 2026-13-40 这种「格式正确但非法」的值）。 */
+function valid_day(value) {
+	const s = text(value, '');
+
+	if (match(s, /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/) == null)
+		return false;
+
+	const y = integer(substr(s, 0, 4), 0);
+	const m = integer(substr(s, 5, 2), 0);
+	const d = integer(substr(s, 8, 2), 0);
+
+	if (y < 1970 || y > 9999 || m < 1 || m > 12 || d < 1)
+		return false;
+
+	const mdays = [ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 ];
+	let maxd = mdays[m - 1];
+
+	if (m == 2 && ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)))
+		maxd = 29;
+
+	return d <= maxd;
+}
+
 function daemon_running(raw, poll) {
 	const ts = integer(raw?.ts, 0);
 
@@ -285,6 +320,7 @@ function empty_summary() {
 			conntrack_count: 0,
 			clash_connections: 0,
 			clash_poll_ms: 0,
+			clash_deduped: 0,
 			link_source: 'none',
 			link_bridge: '',
 			link_ports: [],
@@ -349,13 +385,15 @@ function state_summary(raw) {
 		const h = raw.health;
 		let conf = text(h.accounting_confidence, 'unknown');
 
-		if (!member([ 'exact', 'degraded', 'unknown' ], conf))
+		if (!member([ 'exact', 'degraded', 'unavailable', 'unknown' ], conf))
 			conf = 'unknown';
 
 		out.health.accounting_confidence = conf;
 		out.health.conntrack_count = integer(h.conntrack_count, 0);
 		out.health.clash_connections = integer(h.clash_connections, 0);
 		out.health.clash_poll_ms = integer(h.clash_poll_ms, 0);
+		/* 双源去重跳过数（clash 已计的 conntrack 流）；老 state 没有该键时为 0。 */
+		out.health.clash_deduped = integer(h.clash_deduped, 0);
 
 		/* 接入方式（与 direct/proxy 正交）：状态透传给前端，缺字段时保持默认值。 */
 		out.health.link_source = (text(h.link_source, 'none') == 'brctl') ? 'brctl' : 'none';
@@ -861,8 +899,9 @@ function build_stations() {
 // ---------------------------------------------------------------- 动作
 
 function is_root(request) {
-	const user = request?.info?.acl?.user;
-	return (user == null || user == 'root');
+	/* 严格判定：rpcd 会把会话用户放在 request.info.acl.user。缺失 / 非 root
+	 * （包括 null、空串、guest）一律拒绝；调试入口自己构造 root 身份，见文件末尾。 */
+	return request?.info?.acl?.user == 'root';
 }
 
 function curl_binary() {
@@ -1050,7 +1089,150 @@ function uci_run(args) {
 	for (let arg in args)
 		push(cmd, arg);
 
+	/* system() 的数组形式不经过 shell：值里的 $(...)、;、| 都只是普通字符。 */
 	return system(cmd) == 0;
+}
+
+/** 只捕获输出、不经过用户数据：参数全部来自固定常量 / UCI 白名单。 */
+function uci_capture(args) {
+	let cmd = '';
+
+	for (let arg in args)
+		cmd += (length(cmd) ? ' ' : '') + shellquote(`${arg}`);
+
+	try {
+		const fd = popen(`${cmd} 2>/dev/null`);
+		if (fd == null)
+			return '';
+
+		const out = fd.read('all');
+		fd.close();
+
+		return (out == null) ? '' : `${out}`;
+	}
+	catch (e) {
+		return '';
+	}
+}
+
+/** 当前 staged 的 UCI 变更集合：key = "section" 或 "section.option"，
+ *  value = { action: "set"|"delete"|"list" }。
+ *
+ *  uci changes 的删除行形如 `-traffic-stats.settings.clash_secret`（没有 `=`）：
+ *  旧实现只认 `key=value`，会把别人的 staged 删除当成「没有 staged」，
+ *  失败回滚时 revert 掉这次 set，同时也把别人的删除意图一起清掉。
+ *  这里显式解析前导 `-`，保留最后一行动作（uci delta 按输出顺序生效）。 */
+function uci_changes() {
+	const out = uci_capture([ UCI_BIN, '-q', 'changes', UCI_CONFIG ]);
+	const map = {};
+	const prefix = `${UCI_CONFIG}.`;
+
+	for (let line in split(out, '\n')) {
+		let s = trim(line);
+
+		if (length(s) == 0)
+			continue;
+
+		let action = 'set';
+
+		if (substr(s, 0, 1) == '-') {
+			action = 'delete';
+			s = trim(substr(s, 1));
+		}
+		else if (substr(s, 0, 1) == '+') {
+			action = 'set';
+			s = trim(substr(s, 1));
+		}
+
+		const eq = index(s, '=');
+		let key = (eq < 0) ? s : trim(substr(s, 0, eq));
+
+		if (length(key) == 0)
+			continue;
+
+		/* list 增量：key 末尾的 +/-（如 settings.lan_ranges+='x'）。 */
+		const tail = substr(key, length(key) - 1, 1);
+
+		if (action != 'delete' && (tail == '+' || tail == '-')) {
+			action = 'list';
+			key = substr(key, 0, length(key) - 1);
+		}
+
+		if (substr(key, 0, length(prefix)) == prefix)
+			key = substr(key, length(prefix));
+		else
+			continue;
+
+		if (length(key) > 0)
+			map[key] = { action: action };
+	}
+
+	return map;
+}
+
+function uci_revert_section(section) {
+	try {
+		return system([ UCI_BIN, '-q', 'revert', `${UCI_CONFIG}.${section}` ]) == 0;
+	}
+	catch (e) {
+		return false;
+	}
+}
+
+function uci_revert_option(section, option) {
+	try {
+		return system([ UCI_BIN, '-q', 'revert', `${UCI_CONFIG}.${section}.${option}` ]) == 0;
+	}
+	catch (e) {
+		return false;
+	}
+}
+
+/* 不调用 shell 判断 section 是否存在：直接读 /etc/config/traffic-stats 的
+ * `config <type> ['<name>']` 行。这样 set_config 全程只有 argv 数组，没有 sh -c。 */
+function config_has_section(section) {
+	let raw = null;
+
+	try {
+		raw = readfile(CONFIG_FILE);
+	}
+	catch (e) {
+		return false;
+	}
+
+	if (type(raw) != 'string' || length(raw) == 0)
+		return false;
+
+	for (let line in split(raw, '\n')) {
+		const s = trim(line);
+
+		if (length(s) == 0 || substr(s, 0, 1) == '#')
+			continue;
+
+		const toks = [];
+
+		for (let t in split(replace(s, '\t', ' '), ' '))
+			if (t != '')
+				push(toks, t);
+
+		if (length(toks) < 2 || toks[0] != 'config')
+			continue;
+
+		let name = (length(toks) >= 3) ? toks[2] : '';
+
+		if (length(name) >= 2) {
+			const a = substr(name, 0, 1);
+			const b = substr(name, length(name) - 1, 1);
+
+			if ((a == "'" && b == "'") || (a == '"' && b == '"'))
+				name = substr(name, 1, length(name) - 2);
+		}
+
+		if (name == section || (length(name) == 0 && toks[1] == section))
+			return true;
+	}
+
+	return false;
 }
 
 function set_config(request) {
@@ -1081,12 +1263,59 @@ function set_config(request) {
 	if (type(options) != 'object')
 		return { ok: false, error: 'invalid options' };
 
-	/* 先确认 section 存在；不存在就建一个同名 section（uci set cfg.name=type）。
-	   uci 会把命中的 section 类型打到 stdout，这里用 sh 重定向掉，别污染 rpcd。 */
-	if (system([ 'sh', '-c', sprintf('%s -q get %s >/dev/null 2>&1',
-			UCI_BIN, shellquote(`${UCI_CONFIG}.${section}`)) ]) != 0) {
+	/* 记录调用前的 staged 状态：失败时只能撤销「本次真正写过的 option」，
+	 * 绝不能 uci revert 整个 config（会清掉别的写者/别的字段已 staged 的改动）。
+	 * 对本来就 staged 的 option，保存旧值并在失败时放回，避免 revert 误清。 */
+	const staged_before = uci_changes();
+	let touched = [];
+	let created_section = false;
+
+	let restore = function() {
+		const staged_after = uci_changes();
+
+		/* 本次新建的 section：只要它仍是 staged 状态就整体撤销（section 内的
+		 * 本次改动一并消失）；若 commit 失败但 section 已落盘，则不回滚已提交部分。 */
+		if (created_section) {
+			if (staged_after[section] != null) {
+				uci_revert_section(section);
+				return;
+			}
+		}
+
+		for (let t in touched) {
+			const key = `${section}.${t.option}`;
+
+			/* 已 committed 的字段不再回滚（commit 失败也可能有部分已提交）。 */
+			if (staged_after[key] == null)
+				continue;
+
+			/* 调用前这个 option 已经是「staged 删除」：本次 set 失败后必须重新
+			 * uci delete，把删除意图放回去；否则 revert 会恢复已提交值，
+			 * 静默清掉别人的 staged 删除。先 revert 掉本次 set/旧 delta，
+			 * 再 delete，使最终 staged 状态只剩 -option。 */
+			if (t.prev != null && t.prev.action == 'delete') {
+				uci_revert_option(section, t.option);
+				uci_run([ 'delete', `${UCI_CONFIG}.${section}.${t.option}` ]);
+				continue;
+			}
+
+			if (t.was_staged && length(t.value) > 0)
+				uci_run([ 'set', `${UCI_CONFIG}.${section}.${t.option}=${t.value}` ]);
+			else
+				uci_revert_option(section, t.option);
+		}
+	};
+
+	let fail = function(msg) {
+		restore();
+		return { ok: false, error: msg };
+	};
+
+	/* section 不存在就建一个同名 section（uci set cfg.name=type），仍走 argv 数组。 */
+	if (!config_has_section(section) && staged_before[section] == null) {
 		if (!uci_run([ 'set', `${UCI_CONFIG}.${section}=${section}` ]))
 			return { ok: false, error: `无法创建 section ${section}` };
+		created_section = true;
 	}
 
 	let applied = 0;
@@ -1106,19 +1335,31 @@ function set_config(request) {
 			value = `${value}`;
 
 		if (length(value) > 1024)
-			return { ok: false, error: `字段 ${key} 过长` };
+			return fail(`字段 ${key} 过长`);
+
+		const staged_key = `${section}.${key}`;
+		const was_staged = staged_before[staged_key] != null;
+
+		/* 旧值必须在 set 之前取（cursor 读取包含 staged 值，能保存别人的 staged 值）。 */
+		const old_value = was_staged ? text(uci_get(section, key, ''), '') : '';
 
 		if (!uci_run([ 'set', `${UCI_CONFIG}.${section}.${key}=${value}` ]))
-			return { ok: false, error: `写入 ${section}.${key} 失败` };
+			return fail(`写入 ${section}.${key} 失败`);
 
+		push(touched, {
+			option: key,
+			was_staged: was_staged,
+			value: old_value,
+			prev: staged_before[staged_key] ?? null
+		});
 		applied++;
 	}
 
 	if (applied == 0)
-		return { ok: false, error: 'no valid options' };
+		return fail('no valid options');
 
 	if (!uci_run([ 'commit', UCI_CONFIG ]))
-		return { ok: false, error: 'uci commit 失败' };
+		return fail('uci commit 失败');
 
 	return { ok: true };
 }
@@ -1183,17 +1424,24 @@ function norm_mac(value) {
 	return m;
 }
 
-/* 原子写 + 0644 root:root；同名临时文件带时间戳，避免两个写者撞在一起。 */
+/* 原子写 + 0644 root:root；同名临时文件带「秒 + clock 纳秒 + 进程内序号」，
+   两个并发写者（守护进程 / 另一次 rpcd 调用）不会撞在同一个临时文件上。 */
+let write_seq = 0;
+
 function write_atomic(path, content) {
-	const tmp = sprintf('%s.tmp.%d', path, time());
+	write_seq++;
+	const tmp = sprintf('%s.tmp.%d.%d.%d', path, time(), clock()[1], write_seq);
 
 	try {
 		const n = writefile(tmp, content);
 
-		if (type(n) != 'int')
+		if (type(n) != 'int') {
+			try { unlink(tmp); } catch (e) { }
 			return false;
+		}
 	}
 	catch (e) {
+		try { unlink(tmp); } catch (e) { }
 		return false;
 	}
 
@@ -1206,6 +1454,124 @@ function write_atomic(path, content) {
 	try { unlink(tmp); } catch (e) { }
 
 	return false;
+}
+
+/* devices.json 的 mkdir 互斥锁：多个 rpcd 进程 / 守护进程同时读改写时，
+   只有拿到锁的写者能提交，避免「后写覆盖前写」丢更新。
+   锁目录内写 owner（pid + 进程内唯一 token）；陈旧锁回收必须 rename 到自己的
+   唯一 stale 路径，rename 成功者才删除，避免并发回收互删；释放校验 owner。
+   协议必须与 traffic-statsd.uc 完全一致。 */
+let lock_seq = 0;
+let lock_pid = 0;
+let lock_rnd = '';
+
+function lock_owner_pid() {
+	if (lock_pid > 0)
+		return lock_pid;
+
+	let txt = '';
+
+	try { txt = `${readfile('/proc/self/stat') ?? ''}`; } catch (e) { txt = ''; }
+
+	let n = 0;
+
+	for (let i = 0; i < length(txt); i++) {
+		const ch = substr(txt, i, 1);
+
+		if (ch < '0' || ch > '9')
+			break;
+
+		n = n * 10 + ord(ch) - 48;
+	}
+
+	if (n <= 0)
+		n = int(time() % 1000000) + 1;
+
+	lock_pid = n;
+
+	return lock_pid;
+}
+
+function lock_owner_nonce() {
+	if (length(lock_rnd) > 0)
+		return lock_rnd;
+
+	try { lock_rnd = replace(trim(text(readfile('/proc/sys/kernel/random/uuid'), '')), '-', ''); }
+	catch (e) { lock_rnd = ''; }
+
+	if (length(lock_rnd) == 0)
+		lock_rnd = sprintf('%d%d', int(time()), int(clock()[1]));
+
+	return lock_rnd;
+}
+
+function lock_owner_token() {
+	lock_seq++;
+
+	return sprintf('%d|%d|%s|%d', lock_owner_pid(), int(time()), lock_owner_nonce(), lock_seq);
+}
+
+function device_lock_acquire(path) {
+	const lock = `${path}.lock`;
+
+	for (let i = 0; i < DEVICE_LOCK_RETRIES; i++) {
+		if (mkdir(lock, 448)) {
+			const token = lock_owner_token();
+			let n = null;
+
+			try { n = writefile(`${lock}/owner`, `${token}\n`); } catch (e) { n = null; }
+
+			if (type(n) == 'int')
+				return { path: lock, token: token };
+
+			try { unlink(`${lock}/owner`); } catch (e) { }
+			try { rmdir(lock); } catch (e) { }
+
+			return null;
+		}
+
+		let st = null;
+
+		try { st = stat(lock); } catch (e) { st = null; }
+
+		if (st != null && (time() - integer(st.mtime, 0)) >= DEVICE_LOCK_STALE_SECONDS) {
+			const stale = `${lock}.stale.${lock_owner_token()}`;
+
+			if (rename(lock, stale)) {
+				try { unlink(`${stale}/owner`); } catch (e) { }
+				try { rmdir(stale); } catch (e) { }
+
+				continue;
+			}
+		}
+
+		sleep(DEVICE_LOCK_RETRY_MS);
+	}
+
+	return null;
+}
+
+function device_lock_release(lock) {
+	if (lock == null)
+		return false;
+
+	const dir = (type(lock) == 'object') ? `${lock.path ?? ''}` : `${lock}`;
+	const token = (type(lock) == 'object') ? `${lock.token ?? ''}` : '';
+
+	if (length(dir) == 0)
+		return false;
+
+	let cur = null;
+
+	try { cur = readfile(`${dir}/owner`); } catch (e) { cur = null; }
+
+	if (length(token) > 0 && (cur == null || trim(`${cur}`) != token))
+		return false;
+
+	try { unlink(`${dir}/owner`); } catch (e) { }
+	try { rmdir(dir); } catch (e) { }
+
+	return true;
 }
 
 /* 读 devices.json -> { "<mac>": { alias?, group?, first_seen? } }。
@@ -1293,7 +1659,8 @@ function month_scan(month, today) {
 	for (let file in files) {
 		const day = replace(basename(file), /\.json$/, '');
 
-		if (day > today)
+		/* 非法日期 / 未来日期 / 文件内日期与文件名不一致：一律跳过。 */
+		if (!valid_day(day) || day > today)
 			continue;
 
 		const data = read_json(file);
@@ -1301,8 +1668,39 @@ function month_scan(month, today) {
 		if (data == null || type(data) != 'object')
 			continue;
 
-		let rx = 0, tx = 0, used_rows = false;
+		const file_day = text(data.day, '');
 
+		if (length(file_day) > 0 && file_day != day)
+			continue;
+
+		let rx = 0, tx = 0, used_rows = false, has_totals = false;
+
+		/* 总账以 daily 的 totals 为准：devices 数组在守护进程里最多 200 行，
+		 * 用截断后的设备行求和会低估当月总用量。
+		 * 只有 totals 里真的有有效 rx/tx（哪怕都是 0）或 direct/proxy 拆分时，
+		 * 才认为总账可用；空对象 {} 必须回退到设备行，否则老文件会丢整月用量。 */
+		if (type(data.totals) == 'object') {
+			const t = data.totals;
+			const has_rx = (t.rx != null && integer(t.rx, -1) >= 0);
+			const has_tx = (t.tx != null && integer(t.tx, -1) >= 0);
+			const has_split = (t.direct_rx != null || t.direct_tx != null
+				|| t.proxy_rx != null || t.proxy_tx != null);
+
+			if (has_rx || has_tx || has_split) {
+				rx = has_rx ? max(0, integer(t.rx, 0)) : 0;
+				tx = has_tx ? max(0, integer(t.tx, 0)) : 0;
+
+				if (has_split && !has_rx && !has_tx) {
+					rx = max(0, integer(t.direct_rx, 0)) + max(0, integer(t.proxy_rx, 0));
+					tx = max(0, integer(t.direct_tx, 0)) + max(0, integer(t.proxy_tx, 0));
+				}
+
+				has_totals = true;
+			}
+		}
+
+		/* 每设备用量仍从 devices 行汇总（这是唯一有设备维度的数据）；
+		 * 老文件没有 totals 时，总账才退回设备行求和。 */
 		if (type(data.devices) == 'array') {
 			for (let dev in data.devices) {
 				if (type(dev) != 'object')
@@ -1326,25 +1724,19 @@ function month_scan(month, today) {
 					}
 				}
 
-				rx += drx;
-				tx += dtx;
+				if (!has_totals) {
+					rx += drx;
+					tx += dtx;
+				}
 				used_rows = true;
 			}
 		}
 
-		/* 没有 devices 行的老 daily 文件：退回 totals（direct+proxy 兜底） */
-		if (!used_rows && type(data.totals) == 'object') {
-			rx = max(0, integer(data.totals.rx, 0));
-			tx = max(0, integer(data.totals.tx, 0));
+		if (!has_totals && !used_rows)
+			continue;
 
-			if (rx == 0 && tx == 0) {
-				rx = max(0, integer(data.totals.direct_rx, 0)) + max(0, integer(data.totals.proxy_rx, 0));
-				tx = max(0, integer(data.totals.direct_tx, 0)) + max(0, integer(data.totals.proxy_tx, 0));
-			}
-		}
-
-		out.rx += rx;
-		out.tx += tx;
+		out.rx += max(0, rx);
+		out.tx += max(0, tx);
 		out.days++;
 	}
 
@@ -1691,6 +2083,14 @@ function set_device_meta(request) {
 	if (!has_alias && !has_group)
 		return { ok: false, error: 'nothing to update (alias / group)' };
 
+	/* 两个写者（本 rpcd 调用 / 守护进程 first_seen）必须真正互斥：
+	 * 拿锁 -> 重读 -> 只改自己的键 -> 原子写 -> 放锁。拿不到锁就快速失败，
+	 * 让上层重试，绝不无锁覆盖别人的更新。 */
+	const lock = device_lock_acquire(DEVICES_FILE);
+
+	if (lock == null)
+		return { ok: false, error: '设备元数据忙，请重试' };
+
 	const meta = devices_meta_read();
 	const entry = meta[mac] ?? {};
 
@@ -1713,7 +2113,11 @@ function set_device_meta(request) {
 	else
 		delete meta[mac];
 
-	if (!devices_meta_write(meta))
+	const ok = devices_meta_write(meta);
+
+	device_lock_release(lock);
+
+	if (!ok)
 		return { ok: false, error: `写入 ${DEVICES_FILE} 失败` };
 
 	return {
@@ -1727,6 +2131,61 @@ function set_device_meta(request) {
 
 
 // ---------------------------------------------------------------- ubus 方法表
+
+/* get_history 的桶瘦身：前端趋势图只需要时间戳与四个方向的字节数；
+   top_apps/top_devices 是每日文件里的重字段，30 天一起返回会撑爆 ubus。 */
+function history_bucket_slim(b) {
+	if (type(b) != 'object')
+		return null;
+
+	const out = { ts: integer(b.ts, 0) };
+	const fields = [
+		'direct_rx', 'direct_tx', 'proxy_rx', 'proxy_tx',
+		'wifi_rx', 'wifi_tx', 'wired_rx', 'wired_tx',
+		'unknown_rx', 'unknown_tx'
+	];
+
+	for (let k in fields)
+		if (b[fields[k]] != null)
+			out[fields[k]] = integer(b[fields[k]], 0);
+
+	return out;
+}
+
+/* 往日 daily 只保留前端实际会用的轻量 summary：totals + 几个计数。
+   绝不把 devices[] / apps[] 原样塞进 get_history（30 天 × 200 设备会远超预算）。 */
+function history_summary_light(data, day) {
+	const t = daily_totals(data);
+	const totals = { rx: t.rx, tx: t.tx };
+	const src = (type(data?.totals) == 'object') ? data.totals : {};
+	const split = [ 'direct_rx', 'direct_tx', 'proxy_rx', 'proxy_tx',
+		'wifi_rx', 'wifi_tx', 'wired_rx', 'wired_tx', 'unknown_rx', 'unknown_tx' ];
+	let has_split = false;
+
+	for (let k in split) {
+		if (src[split[k]] != null) {
+			totals[split[k]] = max(0, integer(src[split[k]], 0));
+			has_split = true;
+		}
+	}
+
+	/* 老 daily 只有 rx/tx：归入 direct，保证趋势图总量不丢。 */
+	if (!has_split) {
+		totals.direct_rx = t.rx;
+		totals.direct_tx = t.tx;
+		totals.proxy_rx = 0;
+		totals.proxy_tx = 0;
+	}
+
+	return {
+		day: day,
+		ts: integer(data?.ts, 0),
+		totals: totals,
+		devices: (type(data?.devices) == 'array') ? length(data.devices) : 0,
+		apps: (type(data?.apps) == 'array') ? length(data.apps) : 0,
+		nodes: (type(data?.nodes) == 'object') ? length(keys(data.nodes)) : 0
+	};
+}
 
 const methods = {
 	status: {
@@ -1747,7 +2206,9 @@ const methods = {
 				link_bridge: summary.health.link_bridge,
 				link_ports: summary.health.link_ports,
 				link_ports_from: summary.health.link_ports_from,
-				version: VERSION
+				version: VERSION,
+				/* 能力探测而非读取密钥：供没有 L.env.acls 的 LuCI 隐藏写入口。 */
+				can_manage: is_root(request)
 			};
 		}
 	},
@@ -1789,9 +2250,9 @@ const methods = {
 	get_history: {
 		args: { days: 1 },
 		call: function(request) {
-			let days = clamp(integer(request.args?.days, 1), 1, 31);
+			const days = clamp(integer(request.args?.days, 1), 1, 31);
 
-			const out = [];
+			let out = [];
 			const seen = {};
 			const today = day_of(time());
 
@@ -1800,8 +2261,25 @@ const methods = {
 			if (history != null && type(history.buckets) == 'array') {
 				const day = text(history.day, today);
 
-				push(out, { day: day, buckets: history.buckets });
-				seen[day] = true;
+				/* 未来日期 / 非法日期一律不返回，避免时钟错乱时前端出现"明天"。 */
+				if (valid_day(day) && day <= today) {
+					let list = history.buckets;
+
+					if (length(list) > HISTORY_MAX_BUCKETS)
+						list = slice(list, length(list) - HISTORY_MAX_BUCKETS, length(list));
+
+					const buckets = [];
+
+					for (let b in list) {
+						const slim = history_bucket_slim(b);
+
+						if (slim != null)
+							push(buckets, slim);
+					}
+
+					push(out, { day: day, buckets: buckets });
+					seen[day] = true;
+				}
 			}
 
 			/* 历史日：每天一个文件，文件名就是日期。新的在前。 */
@@ -1815,24 +2293,25 @@ const methods = {
 
 				const day = replace(basename(file), /\.json$/, '');
 
-				if (seen[day] == true)
+				if (!valid_day(day) || day > today || seen[day] == true)
 					continue;
 
 				const data = read_json(file);
 
-				if (data == null)
+				if (data == null || type(data) != 'object')
 					continue;
 
-				const entry = {
+				const file_day = text(data.day, '');
+
+				if (length(file_day) > 0 && file_day != day)
+					continue;
+
+				/* summary 只保留 totals 和计数；devices/apps 明细不随 get_history 下发。 */
+				push(out, {
 					day: day,
-					buckets: (type(data.buckets) == 'array') ? data.buckets : []
-				};
-
-				/* 每日汇总里没有桶时，把原始文件挂在 summary 上，前端可自行取用。 */
-				if (length(entry.buckets) == 0)
-					entry.summary = data;
-
-				push(out, entry);
+					buckets: [],
+					summary: history_summary_light(data, day)
+				});
 				seen[day] = true;
 			}
 
@@ -1840,55 +2319,38 @@ const methods = {
 			if (length(out) == 0) {
 				const data = read_json(`${DAILY_DIR}/${today}.json`);
 
-				if (data != null)
-					push(out, { day: today, buckets: [], summary: data });
+				if (data != null && type(data) == 'object')
+					push(out, { day: today, buckets: [], summary: history_summary_light(data, today) });
 			}
 
-			/* ubus 单条消息上限 262144B：满一天 288 桶 × 每桶 top 列表会到 ~318 KiB，
-			   整次调用会直接失败（前端只能降级成"暂无历史数据"）。按预算逐级瘦身：
-			   ① 去掉桶内的 top_apps / top_devices（趋势图只需要 totals）
-			   ② 仍超则只保留每个 day 最近的 200 个桶 */
-			let slim_buckets = function(list) {
-				for (let d in list) {
-					let nb = [];
+			/* ubus 单条消息上限 262144B：按 180KiB 预算逐级瘦身，并带 truncated 标志。
+			   桶默认已只保留 ts + 字节数，正常 31 天 + 288 桶远小于预算；这里仍
+			   保留兜底，防止脏 history.json 把整个调用打挂。 */
+			let truncated = false;
+			let enc = sprintf('%J', { days: out, truncated: truncated });
 
-					for (let b in d.buckets) {
-						let o = {};
+			for (let limit in [ 96, 48, 24, 12, 0 ]) {
+				if (length(enc) <= HISTORY_BUDGET)
+					break;
 
-						for (let k in b)
-							if (k != 'top_apps' && k != 'top_devices')
-								o[k] = b[k];
-
-						push(nb, o);
-					}
-
-					d.buckets = nb;
-				}
-
-				return list;
-			};
-
-			let enc = sprintf('%J', { days: out });
-
-			if (length(enc) > 200000)
-				slim_buckets(out);
-
-			enc = sprintf('%J', { days: out });
-
-			if (length(enc) > 200000) {
 				for (let d in out) {
-					if (length(d.buckets) > 200) {
-						let keep = [];
-
-						for (let i = length(d.buckets) - 200; i < length(d.buckets); i++)
-							push(keep, d.buckets[i]);
-
-						d.buckets = keep;
+					if (length(d.buckets) > limit) {
+						d.buckets = slice(d.buckets, length(d.buckets) - limit, length(d.buckets));
+						truncated = true;
 					}
 				}
+
+				enc = sprintf('%J', { days: out, truncated: truncated });
 			}
 
-			return { days: out };
+			/* 仍超预算：优先保留最近的天数，并明确标记截断。 */
+			while (length(enc) > HISTORY_BUDGET && length(out) > 1) {
+				out = slice(out, 0, length(out) - 1);
+				truncated = true;
+				enc = sprintf('%J', { days: out, truncated: truncated });
+			}
+
+			return { days: out, truncated: truncated };
 		}
 	},
 

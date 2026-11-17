@@ -25,8 +25,8 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=$B_CGI"
 
 echo "=== 1. 安装两个包 ==="
-opkg install --force-depends /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install --force-depends /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新文件落位与权限 ==="
 check /usr/share/traffic-stats/push.uc "root:root -rw-r--r--"
@@ -78,6 +78,8 @@ UCI set traffic-stats.settings.lan_ranges='192.168.100.0/24'
 UCI set traffic-stats.settings.mother_enabled='1'
 UCI set traffic-stats.settings.mother_url='http://127.0.0.1:8080'
 UCI set traffic-stats.settings.mother_secret='testsecret'
+# 本用例专门回归 v1 报文/查询串兼容；默认拒绝由 security-fixes 门禁覆盖。
+UCI set traffic-stats.settings.legacy_shared_secret='1'
 UCI set traffic-stats.settings.node_id='node-a'
 UCI set traffic-stats.settings.node_name='客厅 AP'
 UCI commit traffic-stats

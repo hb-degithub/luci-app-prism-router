@@ -39,6 +39,7 @@ run_once(){
   rm -rf "$SD"; mkdir -p "$SD"
   env TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_ONCE_POLLS="$N" \
       TRAFFIC_STATS_STATE_DIR="$SD" \
+      TRAFFIC_STATS_DAILY_DIR="$SD.daily" \
       TRAFFIC_STATS_CONNTRACK_FILE=/fixtures/nf_conntrack \
       TRAFFIC_STATS_CLASH_API=127.0.0.1:1 \
       $EXTRA \
@@ -142,8 +143,8 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 echo "=== 1. 安装两个包 ==="
-opkg install --force-depends /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install --force-depends /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新配置项与文件权限 ==="
 for k in system_enabled wan_iface; do

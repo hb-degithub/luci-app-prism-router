@@ -27,6 +27,8 @@ define Package/traffic-stats
   CATEGORY:=Network
   SUBMENU:=Traffic Control
   TITLE:=Traffic statistics daemon (OpenClash API + conntrack)
+  # curl：push.uc / feishu.uc 的 HTTP 发送；openssl-util：飞书 HMAC 签名、push 签名、
+  # ingest.uc / feishu.uc 的 openssl 验签。两者都是运行时真实 exec 的依赖，不能删。
   DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-uloop +curl +openssl-util
   PKGARCH:=all
 endef
@@ -69,6 +71,8 @@ define Package/traffic-stats/install
 	$(if $(wildcard ./files/ingest.uc),$(INSTALL_BIN) ./files/ingest.uc $(1)/www/cgi-bin/traffic-stats-ingest)
 	# 哑桥 AP 无线站点元数据（只报信号/速率，不报字节，避免与主路由双计）
 	$(if $(wildcard ./files/stations.uc),$(INSTALL_DATA) ./files/stations.uc $(1)/usr/share/traffic-stats/stations.uc)
+	# 安全模块的节点/站点认证共享库（存在才装；ingest/push/stations 里仍保留内嵌副本）
+	$(if $(wildcard ./files/traffic-stats-node-auth.uc),$(INSTALL_DATA) ./files/traffic-stats-node-auth.uc $(1)/usr/share/traffic-stats/traffic-stats-node-auth.uc)
 	$(if $(wildcard ./files/ingest-stations.uc),$(INSTALL_BIN) ./files/ingest-stations.uc $(1)/www/cgi-bin/traffic-stats-stations)
 	# Prometheus 指标导出（只读 CGI；token 认证，未启用/未配 token 一律 403，见 SPEC §10.3）
 	$(if $(wildcard ./files/traffic-stats-metrics.uc),$(INSTALL_BIN) ./files/traffic-stats-metrics.uc $(1)/www/cgi-bin/traffic-stats-metrics)

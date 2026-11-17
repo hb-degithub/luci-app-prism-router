@@ -1,10 +1,63 @@
 #!/bin/bash
 # 不依赖 OpenWrt SDK 手搓 .ipk（纯脚本包，无编译产物）
+#
+# 产物（默认只有 2 个 modern 包 + SHA256SUMS）：
+#   dist/traffic-stats_1.0.0-1_all.ipk
+#   dist/luci-app-traffic-stats_1.0.0-1_all.ipk
+#   dist/SHA256SUMS
+#
+# 24.10 / 23.05 的 .ipk 外层都是 tar.gz（见 docs/IPK-FORMAT.md）。
+# 极旧版本（21.02 及更早）才需要 ar 容器；默认不再生成，只有显式
+# `--legacy` 才会额外产出 *.legacy.ipk，并打印“不可发布”警告。
+#
+# 用法：
+#   tools/build-ipk.sh                 # 重建 dist/，2 个 modern 包 + SHA256SUMS
+#   tools/build-ipk.sh --legacy        # 额外产 ar 包（仅排查极旧版本，不要发布）
+#   tools/build-ipk.sh --out DIR       # 输出到指定目录（供测试用临时目录）
+#   tools/build-ipk.sh --help
 set -euo pipefail
+# 事故复核（docs/INCIDENT-2026-11-14.md）：任何 mktemp/install 默认都必须是
+# 755/644，不能把调用者的 0077 之类的 umask 带进归档。
+umask 022
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$ROOT/dist"; VER=1.0.0; REL=1
-rm -rf "$OUT"; mkdir -p "$OUT"
+OUT="$ROOT/dist"; LEGACY=0
+VER=1.0.0; REL=1
+
+usage() {
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --legacy) LEGACY=1 ;;
+    --out)    [ $# -ge 2 ] || { echo "build-ipk: --out 需要目录参数" >&2; exit 2; }
+              OUT="$2"; shift ;;
+    --out=*)  OUT="${1#--out=}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "build-ipk: 未知参数 $1（--help 查看用法）" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -n "$OUT" ] || { echo "build-ipk: 输出目录为空" >&2; exit 2; }
+case "$OUT" in
+  /|.|..|"$HOME"|"$ROOT") echo "build-ipk: 拒绝把输出目录设为 $OUT" >&2; exit 2 ;;
+esac
+case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
+# 自定义输出必须位于项目 dist 或系统临时目录，防止误清空普通工作目录。
+if [ "$OUT" != "$ROOT/dist" ]; then
+  case "$OUT" in
+    /tmp/*) ;;
+    *) echo "build-ipk: --out 仅允许 $ROOT/dist 或 /tmp/ 下的专用目录" >&2; exit 2 ;;
+  esac
+fi
+# 输出目录是纯构建产物；先清空，避免旧包/旧 SHA 混进发布集。
+rm -rf -- "$OUT"
+mkdir -p -- "$OUT"
+chmod 755 "$OUT"
+
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+chmod 755 "$W"
 
 pack() { # $1=dir $2=basename（不带扩展名）
   local d="$1" base="$2"
@@ -17,68 +70,126 @@ pack() { # $1=dir $2=basename（不带扩展名）
     "$d/data/www/cgi-bin/traffic-stats-ingest" \
     "$d/data/www/cgi-bin/traffic-stats-stations" \
     "$d/data/www/cgi-bin/traffic-stats-metrics" 2>/dev/null || true
-  local TO="--owner=0 --group=0 --numeric-owner"
-  ( cd "$d/data"    && tar $TO -czf ../data.tar.gz . )
-  ( cd "$d/control" && tar $TO -czf ../control.tar.gz . )
+  # control 归档：目录 755，control/conffiles 644，维护脚本 755（opkg 会直接 exec）
+  find "$d/control" -type d -exec chmod 755 {} +
+  chmod 644 "$d/control/control"
+  [ -f "$d/control/conffiles" ] && chmod 644 "$d/control/conffiles" || true
+  [ -f "$d/control/postinst" ]  && chmod 755 "$d/control/postinst" || true
+  [ -f "$d/control/prerm" ]     && chmod 755 "$d/control/prerm" || true
+  # --sort=name：条目顺序稳定；owner/group 固定 0。时间位不追平（需求只要求权限/元数据可复现）。
+  local TO=(--owner=0 --group=0 --numeric-owner --sort=name)
+  ( cd "$d/data"    && tar "${TO[@]}" -czf ../data.tar.gz . )
+  ( cd "$d/control" && tar "${TO[@]}" -czf ../control.tar.gz . )
   printf '2.0\n' > "$d/debian-binary"
-  # OpenWrt 24.10+ 的 ipk 外层就是 tar.gz（不是 ar！）
-  ( cd "$d" && tar $TO -czf "$OUT/${base}.ipk" ./debian-binary ./data.tar.gz ./control.tar.gz )
-  # 23.05 及更早用 ar 容器，留一份备用
-  ( cd "$d" && ar rc "$OUT/${base}.legacy.ipk" debian-binary control.tar.gz data.tar.gz )
-  echo "  ✓ dist/${base}.ipk         $(stat -c%s "$OUT/${base}.ipk") B (tar.gz, 24.10+)"
-  echo "  ✓ dist/${base}.legacy.ipk  $(stat -c%s "$OUT/${base}.legacy.ipk") B (ar, 极旧版本, 未验证)"
+  chmod 644 "$d/debian-binary"
+  # OpenWrt 23.05 / 24.10 的 ipk 外层就是 tar.gz（不是 ar！）
+  ( cd "$d" && tar "${TO[@]}" -czf "$OUT/${base}.ipk" ./debian-binary ./data.tar.gz ./control.tar.gz )
+  chmod 644 "$OUT/${base}.ipk"
+  # 23.05 及更早用 ar 容器，留一份备用（仅 --legacy）
+  if [ "$LEGACY" = 1 ]; then
+    ( cd "$d" && ar rcD "$OUT/${base}.legacy.ipk" debian-binary control.tar.gz data.tar.gz )
+    chmod 644 "$OUT/${base}.legacy.ipk"
+    echo "  ⚠ dist/${base}.legacy.ipk  $(stat -c%s "$OUT/${base}.legacy.ipk") B (ar, 极旧版本, 未验证, 不可发布)"
+  fi
+  echo "  ✓ dist/${base}.ipk         $(stat -c%s "$OUT/${base}.ipk") B (tar.gz, 23.05/24.10)"
 }
+
 ctl() { # $1=dir  $2=pkgname  $3=section  $4=depends  $5=desc
-  printf 'Package: %s\nVersion: %s-%s\nArchitecture: all\nMaintainer: traffic-stats\nSection: %s\nPriority: optional\nDepends: %s\nDescription: %s\n' \
+  # Priority 必须是 Debian/OpenWrt 的合法值；不能把占位符/密码类字符串写进 control。
+  # Depends 必须与两个 Makefile 保持一致（release gate 会逐项比对）。
+  printf 'Package: %s\nVersion: %s-%s\nArchitecture: all\nMaintainer: traffic-stats\nSection: %s\nPriority: standard\nDepends: %s\nDescription: %s\n' \
     "$2" "$VER" "$REL" "$3" "$4" "$5" > "$1/control/control"
+  chmod 644 "$1/control/control"
 }
-hook() { printf '%s\n' "$@" > "$W/_h"; }
+hook() { printf '%s\n' "$@" > "$W/_h"; chmod 644 "$W/_h"; }
 
 # ================= traffic-stats =================
 D="$W/ts"; mkdir -p "$D/data/usr/bin" "$D/data/usr/share/traffic-stats" \
   "$D/data/etc/init.d" "$D/data/etc/config" "$D/data/etc/traffic-stats/daily" \
   "$D/data/www/cgi-bin" "$D/control"
-cp "$ROOT/traffic-stats/files/traffic-statsd.uc"  "$D/data/usr/bin/traffic-statsd"; chmod 755 "$D/data/usr/bin/traffic-statsd"
-cp "$ROOT/traffic-stats/files/feishu.uc"          "$D/data/usr/share/traffic-stats/feishu.uc"; chmod 644 "$D/data/usr/share/traffic-stats/feishu.uc"
-cp "$ROOT/traffic-stats/files/feishu-test.sh"     "$D/data/usr/share/traffic-stats/feishu-test.sh"; chmod 755 "$D/data/usr/share/traffic-stats/feishu-test.sh"
+chmod 755 "$D" "$D/control" "$D/data" "$D/data/usr" "$D/data/usr/bin" \
+  "$D/data/usr/share" "$D/data/usr/share/traffic-stats" \
+  "$D/data/etc" "$D/data/etc/init.d" "$D/data/etc/config" \
+  "$D/data/etc/traffic-stats" "$D/data/etc/traffic-stats/daily" \
+  "$D/data/www" "$D/data/www/cgi-bin"
+install -m 755 "$ROOT/traffic-stats/files/traffic-statsd.uc"  "$D/data/usr/bin/traffic-statsd"
+install -m 644 "$ROOT/traffic-stats/files/feishu.uc"          "$D/data/usr/share/traffic-stats/feishu.uc"
+install -m 755 "$ROOT/traffic-stats/files/feishu-test.sh"     "$D/data/usr/share/traffic-stats/feishu-test.sh"
 # 数据 / 日志保留与清理（用户 cron 调用；只动白名单目录，见 docs/SPEC.md §9）
-cp "$ROOT/traffic-stats/files/retention.uc"       "$D/data/usr/share/traffic-stats/retention.uc"; chmod 644 "$D/data/usr/share/traffic-stats/retention.uc"
+install -m 644 "$ROOT/traffic-stats/files/retention.uc"       "$D/data/usr/share/traffic-stats/retention.uc"
 # 子节点推送脚本（cron 调用；不进 PATH，避免和守护进程抢名字）
-cp "$ROOT/traffic-stats/files/push.uc"            "$D/data/usr/share/traffic-stats/push.uc"; chmod 644 "$D/data/usr/share/traffic-stats/push.uc"
+install -m 644 "$ROOT/traffic-stats/files/push.uc"            "$D/data/usr/share/traffic-stats/push.uc"
 # 母节点接收端：CGI，必须可执行（uhttpd -c /cgi-bin 直接 exec）
-cp "$ROOT/traffic-stats/files/ingest.uc"          "$D/data/www/cgi-bin/traffic-stats-ingest"; chmod 755 "$D/data/www/cgi-bin/traffic-stats-ingest"
+install -m 755 "$ROOT/traffic-stats/files/ingest.uc"          "$D/data/www/cgi-bin/traffic-stats-ingest"
 # 哑桥 AP 侧：无线站点元数据上报（cron 调用；只报信号/速率，绝不报字节）
-cp "$ROOT/traffic-stats/files/stations.uc"        "$D/data/usr/share/traffic-stats/stations.uc"; chmod 644 "$D/data/usr/share/traffic-stats/stations.uc"
+install -m 644 "$ROOT/traffic-stats/files/stations.uc"        "$D/data/usr/share/traffic-stats/stations.uc"
+# 安全模块新增的节点/站点认证共享库：存在就打包，不存在不影响；不能因手打包漏掉。
+if [ -f "$ROOT/traffic-stats/files/traffic-stats-node-auth.uc" ]; then
+  install -m 644 "$ROOT/traffic-stats/files/traffic-stats-node-auth.uc" \
+    "$D/data/usr/share/traffic-stats/traffic-stats-node-auth.uc"
+  echo "  + traffic-stats: 含 traffic-stats-node-auth.uc"
+fi
 # 母节点接收端：AP 站点元数据 CGI（必须可执行；不写 jsonl 历史）
-cp "$ROOT/traffic-stats/files/ingest-stations.uc" "$D/data/www/cgi-bin/traffic-stats-stations"; chmod 755 "$D/data/www/cgi-bin/traffic-stats-stations"
+install -m 755 "$ROOT/traffic-stats/files/ingest-stations.uc" "$D/data/www/cgi-bin/traffic-stats-stations"
 # Prometheus 指标导出 CGI（只读；token 认证；未启用/未配 token 一律 403）
-cp "$ROOT/traffic-stats/files/traffic-stats-metrics.uc" "$D/data/www/cgi-bin/traffic-stats-metrics"; chmod 755 "$D/data/www/cgi-bin/traffic-stats-metrics"
-cp "$ROOT/traffic-stats/files/traffic-statsd.init" "$D/data/etc/init.d/traffic-statsd"; chmod 755 "$D/data/etc/init.d/traffic-statsd"
-cp "$ROOT/traffic-stats/files/traffic-stats.config" "$D/data/etc/config/traffic-stats"; chmod 644 "$D/data/etc/config/traffic-stats"
-ctl "$D" traffic-stats net "ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl" \
+install -m 755 "$ROOT/traffic-stats/files/traffic-stats-metrics.uc" "$D/data/www/cgi-bin/traffic-stats-metrics"
+install -m 755 "$ROOT/traffic-stats/files/traffic-statsd.init" "$D/data/etc/init.d/traffic-statsd"
+install -m 644 "$ROOT/traffic-stats/files/traffic-stats.config" "$D/data/etc/config/traffic-stats"
+# openssl-util 是飞书 HMAC-SHA256 与子母节点签名的真实运行时依赖，必须声明。
+ctl "$D" traffic-stats net "ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util" \
   "Traffic statistics daemon: per-device/per-app usage with proxy-vs-direct split (OpenClash API + conntrack)."
-printf '/etc/config/traffic-stats\n' > "$D/control/conffiles"
+printf '/etc/config/traffic-stats\n' > "$D/control/conffiles"; chmod 644 "$D/control/conffiles"
 hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' '/etc/init.d/traffic-statsd enable >/dev/null 2>&1' '/etc/init.d/traffic-statsd restart >/dev/null 2>&1' 'exit 0'
-cp "$W/_h" "$D/control/postinst"; chmod 755 "$D/control/postinst"
+install -m 755 "$W/_h" "$D/control/postinst"
 hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' '/etc/init.d/traffic-statsd stop >/dev/null 2>&1' '/etc/init.d/traffic-statsd disable >/dev/null 2>&1' 'exit 0'
-cp "$W/_h" "$D/control/prerm"; chmod 755 "$D/control/prerm"
+install -m 755 "$W/_h" "$D/control/prerm"
 pack "$D" "traffic-stats_${VER}-${REL}_all"
 
 # ================= luci-app-traffic-stats =================
 D="$W/luci"; mkdir -p "$D/data/www/luci-static/resources/view/traffic-stats" \
+  "$D/data/www/luci-static/resources/traffic-stats" \
   "$D/data/usr/share/luci/menu.d" "$D/data/usr/share/rpcd/acl.d" "$D/data/usr/share/rpcd/ucode" "$D/control"
-cp "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/view/traffic-stats/*.js \
-   "$D/data/www/luci-static/resources/view/traffic-stats/"
-# PWA 资源（manifest + 主屏图标）
-mkdir -p "$D/data/www/luci-static/resources/traffic-stats"
-cp "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/traffic-stats/* \
-   "$D/data/www/luci-static/resources/traffic-stats/" 2>/dev/null || true
-cp "$ROOT/luci-app-traffic-stats/root/usr/share/luci/menu.d/luci-app-traffic-stats.json" "$D/data/usr/share/luci/menu.d/"
-cp "$ROOT/luci-app-traffic-stats/root/usr/share/rpcd/acl.d/luci-app-traffic-stats.json"   "$D/data/usr/share/rpcd/acl.d/"
-cp "$ROOT/luci-app-traffic-stats/root/usr/share/rpcd/ucode/traffic-stats.uc"              "$D/data/usr/share/rpcd/ucode/"
-find "$D/data/www" -type f -exec chmod 644 {} \;
-ctl "$D" luci-app-traffic-stats luci "luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, traffic-stats" \
-  "LuCI pages for traffic statistics (overview / devices / apps / settings)."
+chmod 755 "$D" "$D/control" "$D/data" "$D/data/www" \
+  "$D/data/www/luci-static" "$D/data/www/luci-static/resources" \
+  "$D/data/www/luci-static/resources/view" "$D/data/www/luci-static/resources/view/traffic-stats" \
+  "$D/data/www/luci-static/resources/traffic-stats" \
+  "$D/data/usr" "$D/data/usr/share" "$D/data/usr/share/luci" "$D/data/usr/share/luci/menu.d" \
+  "$D/data/usr/share/rpcd" "$D/data/usr/share/rpcd/acl.d" "$D/data/usr/share/rpcd/ucode"
+for f in "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/view/traffic-stats/*.js; do
+  [ -f "$f" ] || continue
+  install -m 644 "$f" "$D/data/www/luci-static/resources/view/traffic-stats/$(basename "$f")"
+done
+# PWA 资源（manifest + 主屏图标 + 应用类别表）
+for f in "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/traffic-stats/*; do
+  [ -f "$f" ] || continue
+  install -m 644 "$f" "$D/data/www/luci-static/resources/traffic-stats/$(basename "$f")"
+done
+# root/ 整树安装，与 luci.mk 的行为一致：未来新增的 menu/acl/rpcd ucode 插件
+# （例如安全 agent 的 traffic-stats-node-auth.uc）放进来就自动进包，不会漏。
+# 源文件常被 0600/0700 的 umask 创建，这里按“可执行→755、其余→644”归一。
+while IFS= read -r f; do
+  rel="${f#"$ROOT/luci-app-traffic-stats/root/"}"
+  if [ -x "$f" ]; then m=755; else m=644; fi
+  install -D -m "$m" "$f" "$D/data/$rel"
+done < <(find "$ROOT/luci-app-traffic-stats/root" -type f | LC_ALL=C sort)
+# 内置 SVG 不需要 luci-lib-chartjs；curl / openssl-util 是飞书 RPC 的真实依赖。
+ctl "$D" luci-app-traffic-stats luci "luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, curl, openssl-util, traffic-stats" \
+  "LuCI pages for traffic statistics (overview / devices / apps / settings). Conffile: /etc/config/traffic-stats (owned by traffic-stats)."
 hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' 'rm -f /tmp/luci-indexcache* 2>/dev/null' '/etc/init.d/rpcd reload >/dev/null 2>&1' 'exit 0'
-cp "$W/_h" "$D/control/postinst"; chmod 755 "$D/control/postinst"
+install -m 755 "$W/_h" "$D/control/postinst"
 pack "$D" "luci-app-traffic-stats_${VER}-${REL}_all"
+
+# ================= 发布校验和 =================
+# 只覆盖本次实际生成的 *.ipk（默认 2 个 modern；--legacy 时含 4 个）。
+(
+  cd "$OUT"
+  find . -maxdepth 1 -type f -name '*.ipk' -printf '%f\n' | LC_ALL=C sort | while IFS= read -r f; do
+    sha256sum "$f"
+  done > SHA256SUMS
+)
+chmod 644 "$OUT/SHA256SUMS"
+echo "  ✓ dist/SHA256SUMS ($(wc -l < "$OUT/SHA256SUMS") 个文件)"
+if [ "$LEGACY" = 1 ]; then
+  echo "WARNING: 本次额外生成了 *.legacy.ipk（ar 容器，极旧版本未验证）。" >&2
+  echo "WARNING: legacy 包仅用于排查/负例测试，禁止发布或安装到 23.05/24.10。" >&2
+fi

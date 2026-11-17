@@ -182,6 +182,8 @@ config feishu 'feishu'
 - **`accounting_confidence` 枚举固定为** `exact | degraded | unavailable`，不得新增其它值。
 - **`__other__` 桶固定为** `{ rx, tx, chain: "MIXED" }`；前端按 `chain` 过滤时必须把 `MIXED` 当作"混合"而不是节点名。
 - **历史精度现实**：`history.json` 在 tmpfs，重启即丢 → "近 7 天折线"实际是「当天 5 分钟精度 + 往日日粒度」，前端要么两段拼接，要么只画当日。SPEC 不承诺跨天 5 分钟数据。
+- **软重启连续性**：守护进程在 `/tmp/traffic-stats/baseline.json` 原子保存连接计数器基线（含采样时间与日期），启动时只接受同日且新鲜的基线；不存在/损坏/过期时首轮只采样，不将历史连接累计值当作新流量。当日 daily 在启动时恢复；每轮先成功写 daily 再保存连接基线，避免把已入账的连接差量重复计算。`/tmp` 清空后首轮重建基线，可能少计停机后的第一段流量，但不回放完整连接历史。
+- **双源补充去重**：除 fake-ip 网段外，conntrack 命中本轮或上一轮 Clash 活跃连接的协议、设备/目的地址与端口时跳过；相应计数放入 `health.clash_deduped`。失效基线或读取失败必须进入降级原因，不能仍声称精确。
 - **已知漏计**：完全落在两次轮询之间的短连接（clash 从未见过它、conntrack 又因 fake-ip 去重被跳过）会两边都不计。这是当前架构的固有盲区，需在文档中如实说明；缓解手段是缩短 `poll_interval`。
 
 ### 3.2 接入方式（无线 / 有线）——与代理/直连正交的第二个维度
@@ -283,7 +285,7 @@ config feishu 'feishu'
 |---|---|---|
 | `status` | 无 | `{enabled, running, confidence, sources:{clash,conntrack}, link_source, link_bridge, link_ports, link_ports_from, version}` |
 | `get_state` | 无 | state.json 原文对象（含 `devices[].link`、`health.link_*`、`system` 段，按 180KB 预算裁剪） |
-| `get_history` | `{days}` | `{days:[{day, buckets:[...]}]}` |
+| `get_history` | `{days}` | `{days:[{day, buckets:[...], summary:{totals}}]}`；daily 只投影 `summary.totals`，最终响应受 180KB 预算限制，裁剪时带 `truncated` |
 | `get_daily` | `{day}` | 当日汇总 |
 | `get_nodes` | 无 | 子节点快照（§多节点） |
 | `get_stations` | 无 | 哑桥 AP 站点元数据（只读，无字节） |
@@ -295,6 +297,15 @@ config feishu 'feishu'
 
 ACL：`read.ubus.traffic-stats` 给 status/get_state/get_history/get_daily/get_nodes/get_stations/**export_csv**；
 `write.ubus.traffic-stats` 给 test_feishu/feishu_chats/set_config/restart/**set_device_meta**。
+
+### 5.1 节点 / AP 认证协议（v2）
+
+- 母节点按类型化 UCI 注册表查找凭证：`config node` + `option node_id/secret`，AP 为 `config station` + `option node_id/token`。UCI section 名不能含 `-`，带连字符的 ID 使用匿名 section + 显式 `node_id`。
+- 节点签名原文：`v2\n<node_id>\n<timestamp>\n<nonce>\n<sha256(body)>`；使用 `Authorization: TrafficStats ...` 传递，签名与 token 不进 URL。nonce 为随机 16 字节 hex，母节点以 `/tmp` 下有界 TTL 记录拒绝重放。
+- 未知节点、错误凭证、重复 nonce、超限或长度不符的 body 均拒绝；`Content-Length` 在读取前检查。
+- HMAC 在 ucode 内组装，sha256sum/openssl 只接收数据，不把密钥放入 argv、环境或临时磁盘。
+- HTTPS 默认验证系统 CA 与主机名，不使用 `-k`；支持显式 CA/公钥 pin。禁止跨源和降级重定向。
+- `legacy_shared_secret=1` / `legacy_stations_token=1` 仅用于短期迁移旧全局凭证，默认均为 0；不得作为长期多节点方案。
 
 ---
 
@@ -633,11 +644,11 @@ ucode /usr/share/traffic-stats/retention.uc --dry-run
 - 键是 **小写冒号 MAC**（`DC-56-...` / `dc-56-...` 由写方归一）；非法 MAC 的条目读取时丢弃。
 - 三个值都可缺省：`alias` / `group` 为空时**不写这个键**；`first_seen` 只收正整数。
 - 文本清洗：去控制字符（含 `\n` `\t` `\r`）、`trim`、**UTF-8 安全截断到 128 字节**（不切断多字节码点）。
-- 权限 **0644 root:root**；写入必须**同目录临时文件 + `rename`**（`devices.json.tmp.<时间戳>`），
+- 权限 **0644 root:root**；写入必须**同目录唯一临时文件 + `rename`**（时间 + 纳秒时钟 + 序号），
   读端永远看不到半截 JSON。文件缺失 / 损坏 / 字段类型错 → 读成空对象 `{}`，不报错、不崩。
 - 上限 **512 条**；写方超限时按「有 alias/group 的优先 → `first_seen` 从新到旧」保留；
   读取端最多认 1024 条。
-- 两个写者，都走「读盘 → 只改自己那几个键 → 原子写回」，互不覆盖：
+- 两个写者都在共享 mkdir 锁内走「读盘 → 只改自己那几个键 → 原子写回」，互不覆盖：
   * rpcd `set_device_meta` 写 `alias` / `group`；
   * `traffic-statsd` 在**新 MAC 首次出现**时写 `first_seen`（绝不碰 alias/group）。
 
@@ -667,7 +678,7 @@ UCI `settings` 段：
 - 只读 `/etc/traffic-stats/daily/YYYY-MM-DD.json`，且**文件名年月 == 当前本地月**（1 号至今）；
 - 文件名日期 **> 今天**（时钟错乱产生的未来文件）跳过；
 - 每天的 `devices[].rx/tx` 按 MAC 累加（`mac` 为空则用 IP 作键，state 侧同样 MAC 优先、IP 回退）；
-- 某天没有 `devices` 数组 → 用该文件 `totals.rx/tx` 兜底，再兜底 `direct_* + proxy_*`；
+- **月度总账始终使用 daily 的 `totals.rx/tx`**（缺失再取 direct+proxy），不能按被 Top N 截断的设备行求和；设备行只用于单设备配额；
 - 坏 JSON / 半截文件跳过，不影响其它天；目录不存在 → 全 0；
 - 跨天/跨月自动失效（缓存 key 含「年月 + 今天」，复用窗口 20 秒）。
 
@@ -778,8 +789,7 @@ CSV 规则（门禁逐条验）：
 
 ### 10.7 已知不足
 
-- `devices.json` 是「读-改-写」：daemon 与 rpcd 在同一毫秒写会丢一次更新（最后写入者胜，
-  JSON 永不半截）。实际触发需要「新 MAC 首次出现」与「用户改别名」同时发生，概率极低。
+- `devices.json` 的 daemon 与 rpcd 写者通过同一目录的原子 mkdir 锁保护「读-改-写」，临时文件名含进程时钟与序号；锁有有限等待和陈旧恢复，避免长期阻塞。
 - `first_seen` 依赖守护进程跑过；从没跑过 daemon（`enabled=0`）时前端拿不到 `first_seen`。
 - 月用量来自 `daily/`：当天数据最迟滞后一个 `DAILY_WRITE_SECONDS`（300 秒）；
   `daily/` 被 retention 清掉、重装清 `/etc`、或跨年归档，都会让对应月份的「当月」数值变小。
@@ -795,7 +805,7 @@ CSV 规则（门禁逐条验）：
 
 ### 10.8 容器门禁
 
-`tests/container-validate-features.sh`（隔离容器、`--network none`，**147 项**）覆盖：
+`tests/container-validate-features.sh`（隔离容器、`--network none`，**156 项**）覆盖：
 
 - 安装后 `/etc /usr /www /www/cgi-bin` 权限不变；`traffic-stats-metrics` 0644/0755 落位；
   三份 ucode（daemon / rpcd / CGI）语法检查；5 个新配置项与默认值

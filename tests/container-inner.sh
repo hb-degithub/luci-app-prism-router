@@ -15,7 +15,7 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www)
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW"
 
 echo "=== 1. 安装 traffic-stats ==="
-opkg install --force-depends /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装成功" || { bad "安装失败"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装成功（严格依赖，无 --force-depends）" || { bad "安装失败"; tail -5 /tmp/i1.log; }
 
 echo "=== 2. 关键文件与属主权限 ==="
 for f in /usr/bin/traffic-statsd /etc/init.d/traffic-statsd /etc/config/traffic-stats /usr/share/traffic-stats/feishu.uc; do
@@ -27,7 +27,10 @@ check /etc/init.d/traffic-statsd "root:root -rwxr-xr-x"
 check /etc/config/traffic-stats "root:root -rw-r--r--"
 
 echo "=== 3. 安装 luci-app ==="
-opkg install --force-depends /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装成功" || { bad "安装失败"; tail -5 /tmp/i2.log; }
+# 前端趋势图已改为内置 SVG，luci-app 不再依赖 luci-lib-chartjs；
+# 其余依赖（luci-base/rpcd-mod-ucode/ucode/curl/openssl-util）deps 镜像都有，
+# 因此这里可以严格安装，不需要 --force-depends，也不需要伪造任何依赖包。
+opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装成功（严格依赖，无 --force-depends）" || { bad "安装失败"; tail -5 /tmp/i2.log; }
 check /www/luci-static/resources/view/traffic-stats "root:root drwxr-xr-x"
 check /www/luci-static/resources/view/traffic-stats/overview.js "root:root -rw-r--r--"
 check /usr/share/rpcd/ucode/traffic-stats.uc "root:root -rw-r--r--"

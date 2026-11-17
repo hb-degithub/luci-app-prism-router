@@ -22,11 +22,13 @@
  *     所以各自成条、各自带百分比，绝不合并成一个"总计"；
  *   - history.json 在 tmpfs、且只存当日的 5 分钟桶（跨日只有日粒度），
  *     所以趋势图只画 days[0]（今天的桶，最多 288 个），标题按实际跨度写；
- *   - "较昨日"对比的是**同一天截止到同一时刻**的桶累计，不是整天对比；昨天的桶
- *     来自 daily/<日期>.json（get_history 的 days[1]），拿不到就显示 —（绝不给 0% 或 NaN）。
+ *   - 概览不再假装后端有“昨日 5 分钟桶”：daily/<日期>.json 是整天汇总，
+ *     get_history 第二天只带 `summary.totals`。所以这里只显示「昨日全天 X」，
+ *     明确不对今天（进程累计或今日桶）做百分比；同截止时间的环比后端不提供，
+ *     文案里直接写不可用，绝不用 now-86400 去混时区分组或硬凑 0%。
  *
  * rpc 预算（硬约束）：
- *   进入页面 get_state ×1 + get_history ×1（days=2：今天 + 昨天，只为算"较昨日"；
+ *   进入页面 get_state ×1 + get_history ×1（days=2：今天桶 + 昨天日汇总，只为「昨日全天」；
  *   后端已对每个桶做瘦身，两天实测约 120 KiB，仍在 ubus 单条 262144B 以内）；
  *   之后每 5s 只复用 get_state 刷新数字，不重画图表、不重排布局、不加新请求。
  *
@@ -47,11 +49,12 @@ var callState = rpc.declare({
 
 /*
  * get_history 取 days=2：
- *   - days[0] 一般是 history.json（今天，5 分钟桶），days[1] 是 daily/<昨天>.json；
- *     趋势图仍然只画 days[0]，多出来的昨天桶只用于"较昨日"的同截止时间对比；
+ *   - 今天的 history.json（5 分钟桶）+ 最近一天/几天的 daily 汇总（整天汇总，
+ *     没有 buckets，只有 summary.totals）；
+ *     趋势图仍然只画最新一天；「昨日全天」按每项的 day 字段查找，不写死数组下标；
  *   - 后端在 rpcd 里按 200 KB 预算逐个桶瘦身（去掉 top_apps/top_devices），
- *     两天实测约 120 KiB，仍在 ubus 单条消息 262144B 以内；
- *   - 取不到（或失败）时：趋势图与环比一起降级为"—"，不影响 get_state 的其余数字。
+ *     并可能裁剪 daily 的 devices/apps；summary.totals 保持兼容，不被裁掉；
+ *   - 取不到（或失败）时：趋势图与「昨日全天」一起降级为"—"，不影响 get_state 的数字。
  */
 var callHistory = rpc.declare({
 	object: 'traffic-stats',
@@ -228,6 +231,8 @@ function healthLook(confidence) {
 		return { color: '#2e7d32', bg: 'rgba(76,175,80,.12)', label: _('记账精确') };
 	if (conf == 'degraded')
 		return { color: '#e65100', bg: 'rgba(255,152,0,.14)', label: _('记账降级') };
+	if (conf == 'unavailable')
+		return { color: '#c62828', bg: 'rgba(198,40,40,.12)', label: _('记账不可用') };
 
 	return { color: '#c62828', bg: 'rgba(198,40,40,.12)', label: _('记账状态未知') };
 }
@@ -241,121 +246,156 @@ function deviceName(dev) {
 	return _('未知设备');
 }
 
-// ---------------------------------------------------------------- 环比 / 陌生设备
+// ---------------------------------------------------------------- 昨日全天 / 陌生设备
 
-var DAY_SEC = 86400;
-
-function localDayKey(ts) {
-	var d = new Date(num(ts) * 1000);
+function dayKeyFromDate(d) {
+	if (d == null || isNaN(d.getTime())) return '';
 
 	return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
 }
 
-/* 一个 5 分钟桶的 rx+tx（四个桶都要，代理/直连是正交的两条腿） */
-function bucketBytes(b) {
-	if (b == null || typeof b != 'object') return 0;
+function localDayKey(ts) {
+	var d = new Date(num(ts) * 1000);
 
-	return num(b.direct_rx) + num(b.direct_tx) + num(b.proxy_rx) + num(b.proxy_tx);
+	return dayKeyFromDate(d);
 }
 
 /*
- * 「较昨日」：把 get_history 的桶按本地日期分组。
- *   今天：全部桶相加 —— 这本身就是"截至现在"的累计；
- *   昨天：只加 ts <= now - 86400 的桶 —— 同一时刻截止，不是整天对比。
- * 任何一步缺数据都返回 ok:false，由前端渲染成"—"并给 title，绝不显示 0% / NaN。
+ * 后端日期是 YYYY-MM-DD（本地时区的日粒度）。这里用「本地日历日加减」而不是
+ * 粗暴减 86400 秒：夏令时切换日只有 23/25 小时，减固定秒数可能落到错误的日期。
+ * 中午 12 点构造 Date 再 setDate(±1)，跨 DST 也由运行时的本地日历规则处理。
  */
+function parseDayKey(key) {
+	var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec('' + ((key == null) ? '' : key));
+
+	if (m == null) return null;
+
+	var y = +m[1], mo = +m[2], da = +m[3];
+	var d = new Date(y, mo - 1, da, 12, 0, 0, 0);
+
+	/* 拒绝 2026-02-31 这类越界日期（Date 会自动进位）。 */
+	if (d.getFullYear() !== y || d.getMonth() !== mo - 1 || d.getDate() !== da)
+		return null;
+
+	return d;
+}
+
+function shiftDayKey(key, delta) {
+	var d = parseDayKey(key);
+
+	if (d == null) return '';
+
+	d.setDate(d.getDate() + num(delta));
+
+	return dayKeyFromDate(d);
+}
+
+function latestDayKeyOf(days) {
+	var latest = '';
+
+	for (var i = 0; i < days.length; i++) {
+		var d = days[i];
+		var key = (d != null && typeof d.day == 'string') ? d.day : '';
+
+		if (parseDayKey(key) != null && key > latest)
+			latest = key;
+	}
+
+	return latest;
+}
+
+/*
+ * 「昨日的 day」不能假设数组下标：后端把今天 history 放第一，
+ * 但 daily 文件可能缺失、乱序，或只有昨天一天。用后端 day 字段查找：
+ *   1. 最近一个有效 day 的「前一天」（后端时区）；
+ *   2. 浏览器本地今天的「前一天」（用户/路由器时区不一致时兜底）；
+ * 两个候选都按 day 精确匹配，找不到就降级，不猜下标。
+ */
+function findYesterdayDay(days, nowSec) {
+	var latest = latestDayKeyOf(days);
+	var candidates = [];
+	var seen = {};
+
+	function add(key) {
+		if (key.length && !seen[key]) {
+			seen[key] = true;
+			candidates.push(key);
+		}
+	}
+
+	add(shiftDayKey(latest, -1));
+	add(shiftDayKey(localDayKey(nowSec), -1));
+
+	for (var c = 0; c < candidates.length; c++) {
+		for (var i = 0; i < days.length; i++) {
+			var d = days[i];
+
+			if (d != null && typeof d.day == 'string' && d.day === candidates[c])
+				return { day: d, key: candidates[c] };
+		}
+	}
+
+	return { day: null, key: candidates.length ? candidates[0] : '' };
+}
+
+/*
+ * 「昨日全天」：从 get_history 的 days 里按 day 字段找昨天，只读
+ * summary.totals。daily 文件是整天汇总，没有 5 分钟桶；后端也不为历史日
+ * 重建桶，所以这里**不做**同截止时间环比，只展示昨日整天值，并在 title
+ * 里明确写“同截止时间对比不可用”。缺数据一律渲染成 —，绝不显示 0% / NaN。
+ */
+function summaryTotalOf(totals) {
+	if (totals == null || typeof totals != 'object') return null;
+
+	var keys = [ 'rx', 'tx', 'direct_rx', 'direct_tx', 'proxy_rx', 'proxy_tx' ];
+	var any = false, i;
+
+	for (i = 0; i < keys.length; i++)
+		if (typeof totals[keys[i]] == 'number' || typeof totals[keys[i]] == 'string')
+			if (isFinite(Number(totals[keys[i]]))) any = true;
+
+	if (!any) return null;
+
+	var rx = (typeof totals.rx != 'undefined')
+		? num(totals.rx)
+		: (num(totals.direct_rx) + num(totals.proxy_rx));
+	var tx = (typeof totals.tx != 'undefined')
+		? num(totals.tx)
+		: (num(totals.direct_tx) + num(totals.proxy_tx));
+
+	return { rx: rx, tx: tx, total: rx + tx };
+}
+
 function yesterdayCompare(history, nowSec) {
-	var now = (num(nowSec) > 0) ? num(nowSec) : Math.floor(Date.now() / 1000);
 	var days = (history != null && Array.isArray(history.days)) ? history.days : [];
-	var byDay = {}, i, j, bs, b, ts, key, cut, ySum = 0, tSum = 0, delta, rounded;
-	var todayKey, yKey, yList, yCutSum = 0, tEnd = 0, yEnd = 0;
+	var found = findYesterdayDay(days, nowSec);
+	var day = found.day;
+	var totals, sum;
 
 	function fail(why) {
-		return { ok: false, text: _('较昨日') + ' —', title: why, color: '' };
+		return { ok: false, text: _('昨日全天') + ' —', title: why, color: '', wholeDay: true };
 	}
 
-	if (days.length == 0)
-		return fail(_('没有历史数据（get_history 返回空），无法计算环比。'));
+	if (day == null)
+		return fail(_('get_history 里没有找到昨天（' + (found.key || '?') + '）的每日汇总；昨日全天数字不可用（后端不提供昨日 5 分钟桶，同截止时间对比也不可用）。'));
 
-	for (i = 0; i < days.length; i++) {
-		bs = (days[i] != null && Array.isArray(days[i].buckets)) ? days[i].buckets : [];
+	totals = (day.summary != null && typeof day.summary == 'object') ? day.summary.totals : null;
+	sum = summaryTotalOf(totals);
 
-		for (j = 0; j < bs.length; j++) {
-			b = bs[j];
-
-			if (b == null || typeof b != 'object') continue;
-
-			ts = num(b.ts);
-			if (ts <= 0) continue;
-			if (ts > 1e11) ts = Math.floor(ts / 1000);   /* 毫秒时间戳容错 */
-			if (ts > now + 600) continue;
-
-			key = localDayKey(ts);
-
-			if (byDay[key] == null) byDay[key] = [];
-
-			byDay[key].push({ ts: ts, bytes: bucketBytes(b) });
-		}
-	}
-
-	todayKey = localDayKey(now);
-	yKey = localDayKey(now - DAY_SEC);
-	yList = byDay[yKey] || [];
-
-	if (!byDay[todayKey])
-		return fail(_('今天还没有 5 分钟桶（守护进程刚启动，或今天的桶还没落盘），无法和昨天比较。'));
-
-	if (yList.length == 0)
-		return fail(_('昨天没有 5 分钟桶（首次使用，或昨天的 daily 文件已被清理 / 压缩成日汇总），无法按同一截止时间比较。'));
-
-	cut = now - DAY_SEC;
-
-	/*
-	 * 只统计**完整的** 5 分钟桶，两边区间才严格对齐：
-	 *   今天：[00:00, 最近一个完整桶结束]；昨天：同一时刻那一段。
-	 * 两边都不含正在进行中的那个半截桶 —— 否则昨天的半截桶是满 5 分钟、
-	 * 今天的只有加载时刻的几秒，今天会系统性偏低。
-	 */
-	for (i = 0; i < yList.length; i++)
-		if (yList[i].ts + BUCKET_SEC <= cut) {
-			yCutSum += yList[i].bytes;
-			if (yList[i].ts > yEnd) yEnd = yList[i].ts;
-		}
-
-	for (i = 0; i < byDay[todayKey].length; i++)
-		if (byDay[todayKey][i].ts + BUCKET_SEC <= now) {
-			tSum += byDay[todayKey][i].bytes;
-			if (byDay[todayKey][i].ts > tEnd) tEnd = byDay[todayKey][i].ts;
-		}
-
-	ySum = yCutSum;
-
-	if (!(yEnd > 0))
-		return fail(_('昨天截至同一时刻还没有完整的 5 分钟桶，无法比较。'));
-
-	if (!(tEnd > 0))
-		return fail(_('今天还没有完整的 5 分钟桶（刚过零点或守护进程刚启动），无法和昨天比较。'));
-
-	if (!(ySum > 0))
-		return fail(_('昨天截至同一时刻的累计为 0，环比没有意义。'));
-
-	delta = (tSum - ySum) * 100 / ySum;
-
-	if (!isFinite(delta))
-		return fail(_('昨日同一时刻的累计为 0，无法计算百分比。'));
-
-	rounded = Math.round(delta * 10) / 10;
+	if (sum == null)
+		return fail(_('昨天的每日汇总没有 summary.totals（可能是老版本或文件损坏）；后端不返回昨日 5 分钟桶，同截止时间对比不可用。'));
 
 	return {
 		ok: true,
-		text: _('较昨日') + ' ' + ((rounded > 0) ? '+' : '') + rounded.toFixed(1) + '%',
-		color: (rounded > 0) ? '#c62828' : ((rounded < 0) ? '#2e7d32' : ''),
-		delta: rounded,
-		todayBytes: tSum,
-		yestBytes: ySum,
-		title: _('对比区间：今天 00:00–') + fmtHM(tEnd + BUCKET_SEC) + _('。昨日同一时段 ') +
-			fmtBytes(ySum) + _('，今天 ') + fmtBytes(tSum) +
-			_('（只算完整的 5 分钟桶；同日截止时间对比，不是整天对比，与上面"累计"也不是同一口径）。')
+		wholeDay: true,
+		text: _('昨日全天') + ' ' + fmtBytes(sum.total),
+		color: '',
+		/* 兼容旧字段，避免其它渲染代码读 undefined；含义是“昨天整天”。 */
+		yestBytes: sum.total,
+		todayBytes: null,
+		title: _('昨日全天') + (day.day ? '（' + day.day + '）' : '') + _('：') +
+			fmtBytes(sum.total) + _('。这是 daily 汇总的整天值，不是与今天同截止时间的对比；') +
+			_('后端只有今天的 5 分钟桶，昨日同截止时间环比不可用。')
 	};
 }
 
@@ -567,7 +607,11 @@ function onlineCount(state, nowSec) {
 	for (var i = 0; i < devices.length; i++) {
 		var ls = num(devices[i].last_seen);
 
-		if (!ls || (nowSec - ls) <= ONLINE_SEC) n++;
+		/*
+		 * 在线 = last_seen 是正数且距今 ≤ 10 分钟。
+		 * 没有 last_seen（新设备/老后端）绝不算在线；未来时间戳（时钟漂移）也不冒充在线。
+		 */
+		if (ls > 0 && ls <= nowSec + 60 && (nowSec - ls) <= ONLINE_SEC) n++;
 	}
 
 	return n;
@@ -575,7 +619,7 @@ function onlineCount(state, nowSec) {
 
 // ---------------------------------------------------------------- 趋势数据
 
-/* 趋势图只要最近一天：多取的昨天那一份只给"较昨日"对比用，不进图表 */
+/* 趋势图只要最近一天：多取的昨天日汇总只给「昨日全天」用，不进图表 */
 function newestDay(history) {
 	var days = (history != null && Array.isArray(history.days)) ? history.days : [];
 
@@ -775,7 +819,7 @@ var CSS = [
 	'font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-all;overflow-x:auto}',
 	'#ts-overview .tso-block-n{font-size:10.5px;opacity:.65;margin-top:4px;line-height:1.6}',
 
-	/* 「较昨日」小字（总流量卡最后一行） */
+	/* 「昨日全天」小字（总流量卡最后一行） */
 	'#ts-overview .tso-cmp{font-size:11px;line-height:1.55;margin-top:1px;white-space:nowrap;',
 	'overflow:hidden;text-overflow:ellipsis}',
 
@@ -800,7 +844,33 @@ var CSS = [
  * Chart.prototype 上只有 Doughnut / Pie，没有 Line（实测会抛
  * "(intermediate value).Line is not a function"）。引外部 CDN 不可行，
  * 所以趋势图自己用 SVG 画，零依赖、可缩放、支持明暗主题（用半透明中性色）。
+ *
+ * 标签/图例全部用 createElementNS + textContent 创建，不再拼 HTML 字符串：
+ * 刻度、日期、数据集名称都可能来自后端，不能被当成标记解析。
  * ------------------------------------------------------------------ */
+
+var SVG_NS = 'http://www.w3.org/2000/svg';
+
+function clearChildren(node) {
+	while (node != null && node.firstChild)
+		node.removeChild(node.firstChild);
+}
+
+function svgNode(name, attrs, text) {
+	var node = document.createElementNS(SVG_NS, name);
+
+	if (attrs != null) {
+		for (var key in attrs) {
+			if (attrs.hasOwnProperty(key))
+				node.setAttribute(key, '' + attrs[key]);
+		}
+	}
+
+	if (text != null) node.textContent = '' + text;
+
+	return node;
+}
+
 function tsRenderLine(host, data, opts) {
 	if (host == null) return null;
 
@@ -819,41 +889,79 @@ function tsRenderLine(host, data, opts) {
 	var x = function (i) { return PL + (n === 1 ? 0 : (W - PL - PR) * i / (n - 1)); };
 	var y = function (v) { return H - PB - (H - PT - PB) * (Math.max(0, +v) / max); };
 
-	var out = [];
-	var g, gy;
+	var svg = svgNode('svg', {
+		viewBox: '0 0 ' + W + ' ' + H,
+		preserveAspectRatio: 'none',
+		style: 'width:100%;height:100%;display:block'
+	});
+	var g, gy, i;
 
 	for (g = 0; g <= 3; g++) {
 		gy = PT + (H - PT - PB) * g / 3;
-		out.push('<line x1="' + PL + '" y1="' + gy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + gy.toFixed(1) +
-			'" stroke="rgba(127,127,127,.16)" stroke-width="1"/>');
-		out.push('<text x="' + (PL - 6) + '" y="' + (gy + 3).toFixed(1) +
-			'" font-size="10" fill="rgba(127,127,127,.85)" text-anchor="end">' + fmtY(max * (1 - g / 3)) + '</text>');
+		svg.appendChild(svgNode('line', {
+			x1: PL, y1: gy.toFixed(1), x2: W - PR, y2: gy.toFixed(1),
+			stroke: 'rgba(127,127,127,.16)', 'stroke-width': 1
+		}));
+		svg.appendChild(svgNode('text', {
+			x: PL - 6, y: (gy + 3).toFixed(1), 'font-size': 10,
+			fill: 'rgba(127,127,127,.85)', 'text-anchor': 'end'
+		}, fmtY(max * (1 - g / 3))));
 	}
 
 	sets.forEach(function (s) {
-		var d = s.data.map(function (v, i) { return (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1); }).join(' ');
-		out.push('<path d="' + d + '" fill="none" stroke="' + (s.strokeColor || '#1a73e8') +
-			'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>');
+		var d = s.data.map(function (v, idx) {
+			return (idx ? 'L' : 'M') + x(idx).toFixed(1) + ' ' + y(v).toFixed(1);
+		}).join(' ');
+
+		svg.appendChild(svgNode('path', {
+			d: d,
+			fill: 'none',
+			stroke: s.strokeColor || '#1a73e8',
+			'stroke-width': 2,
+			'stroke-linejoin': 'round',
+			'stroke-linecap': 'round',
+			'vector-effect': 'non-scaling-stroke'
+		}));
 	});
 
 	var step = Math.max(1, Math.ceil(n / 7));
 
-	for (var i = 0; i < n; i += step)
-		out.push('<text x="' + x(i).toFixed(1) + '" y="' + (H - 6) +
-			'" font-size="10" fill="rgba(127,127,127,.85)" text-anchor="middle">' + labels[i] + '</text>');
+	for (i = 0; i < n; i += step) {
+		svg.appendChild(svgNode('text', {
+			x: x(i).toFixed(1), y: H - 6, 'font-size': 10,
+			fill: 'rgba(127,127,127,.85)', 'text-anchor': 'middle'
+		}, labels[i]));
+	}
 
-	var legend = sets.map(function (s) {
-		return '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px">' +
-			'<i style="width:10px;height:3px;border-radius:2px;background:' + (s.strokeColor || '#1a73e8') + ';display:inline-block"></i>' +
-			(s.label || '') + '</span>';
-	}).join('');
+	var legend = E('div', { style: 'font-size:11px;opacity:.75;padding:6px 0 0 46px' },
+		sets.map(function (s) {
+			return E('span', {
+				style: 'display:inline-flex;align-items:center;gap:5px;margin-right:14px'
+			}, [
+				E('i', {
+					style: 'width:10px;height:3px;border-radius:2px;display:inline-block;background:' +
+						(s.strokeColor || '#1a73e8')
+				}),
+				(s.label || '')
+			]);
+		}));
 
-	host.innerHTML = '<div style="width:100%;height:100%;display:flex;flex-direction:column">' +
-		'<div style="flex:1;min-height:0"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" ' +
-		'style="width:100%;height:100%;display:block">' + out.join('') + '</svg></div>' +
-		'<div style="font-size:11px;opacity:.75;padding:6px 0 0 46px">' + legend + '</div></div>';
+	var wrap = E('div', {
+		style: 'width:100%;height:100%;display:flex;flex-direction:column'
+	}, [
+		E('div', { style: 'flex:1;min-height:0' }, svg),
+		legend
+	]);
 
-	return { destroy: function () { try { host.innerHTML = ''; } catch (e) { } } };
+	clearChildren(host);
+	dom.content(host, wrap);
+
+	return {
+		destroy: function() {
+			try { clearChildren(host); }
+			catch (e) { }
+		}
+	};
 }
 
 return view.extend({
@@ -863,7 +971,7 @@ return view.extend({
 		this.stateError = '';
 		this.historyError = '';
 
-		/* 两个 rpc 并行发；任何一个失败都不影响另一个（history 失败只让趋势图/环比降级） */
+		/* 两个 rpc 并行发；任何一个失败都不影响另一个（history 失败只让趋势图/昨日全天降级） */
 		return Promise.all([
 			callState().catch(function(err) {
 				self.stateError = (err != null && err.message) ? ('' + err.message) : '' + err;
@@ -878,13 +986,13 @@ return view.extend({
 
 			self.state = (res[0] != null && typeof res[0] == 'object' && res[0].totals != null) ? res[0] : null;
 			self.history = (res[1] != null && typeof res[1] == 'object') ? res[1] : null;
-			/* 趋势图仍然只画最近的一天（days[0]）；多取的昨天只给"较昨日"用 */
+			/* 趋势图仍然只画最近的一天（days[0]）；多取的昨天只给「昨日全天」用 */
 			self.trend = trendOf(newestDay(self.history), nowSec);
 			self.compare = yesterdayCompare(self.history, nowSec);
 
-			/* history 整个失败时把 rpc 错误写进 title，比"没有历史数据"更好排查 */
+			/* history 整个失败时把 rpc 错误写进 title，比“没有历史数据”更好排查 */
 			if (self.history == null && self.historyError)
-				self.compare.title = _('读取 get_history 失败：') + shorten(self.historyError, 120) + _('，无法计算环比。');
+				self.compare.title = _('读取 get_history 失败：') + shorten(self.historyError, 120) + _('，无法显示昨日全天。');
 		});
 	},
 
@@ -1105,7 +1213,7 @@ return view.extend({
 			return E('div', { 'class': 'tso-kpi-s' }, nodes);
 		}
 
-		/* extraNode：主数字下面的额外一行小字（目前只有"较昨日"用） */
+		/* extraNode：主数字下面的额外一行小字（目前只有「昨日全天」用） */
 		function card(title, chip, chipTitle, valueNode, subNodes, extraNode, barNode) {
 			return E('div', { 'class': 'tso-kpi' }, [
 				E('div', { 'class': 'tso-kpi-h' }, [
@@ -1119,9 +1227,9 @@ return view.extend({
 			]);
 		}
 
-		/* "较昨日"：同一天截止到同一时刻的桶对比（不是整天，也不是进程累计） */
+		/* 「昨日全天」：按 day 字段找到昨天的 summary.totals，明确不是同截止时间环比。 */
 		var cmp = (this.compare != null) ? this.compare
-			: { text: _('较昨日') + ' —', title: _('没有可用的历史数据。'), color: '' };
+			: { text: _('昨日全天') + ' —', title: _('没有可用的昨日每日汇总。'), color: '' };
 		var cmpNode = E('div', { 'class': 'tso-cmp', title: cmp.title }, cmp.text);
 
 		if (cmp.color) cmpNode.style.color = cmp.color;
@@ -1220,19 +1328,6 @@ return view.extend({
 			])
 		];
 
-		/* 图表库由 luci-lib-chartjs 提供（nlbw.chart.min.js，Chart.js v1 API）。
-		   异步注入：必须等 script 的 load 事件，不能在 render 里直接 new Chart。 */
-		if (has && typeof window.Chart != 'function') {
-			nodes.push(E('script', {
-				type: 'text/javascript',
-				src: L.resource('nlbw.chart.min.js'),
-				load: function() { self.drawTrend(); },
-				error: function() {
-					self.chartFailed(_('图表库未安装（luci-lib-chartjs），趋势图无法绘制；上面的数字仍然有效。'));
-				}
-			}));
-		}
-
 		return E('div', { 'class': 'tso-panel' }, nodes);
 	},
 
@@ -1301,12 +1396,10 @@ return view.extend({
 
 		if (this.trend.points.length == 0) return;
 
-		if (typeof window.Chart == 'function') {
-			/* 图表库已在（第二次进页面）：等节点进 DOM 后再量宽度 */
-			window.setTimeout(function() {
-				if (run == self.renderSeq) self.drawTrend();
-			}, 0);
-		}
+		/* 内置 SVG 无外部图表库；等节点进 DOM 后再量宽度。 */
+		window.setTimeout(function() {
+			if (run == self.renderSeq) self.drawTrend();
+		}, 0);
 	},
 
 	onResize: function() {
@@ -1337,28 +1430,20 @@ return view.extend({
 		}, 60);
 	},
 
-	/* Chart.js v1 按 canvas.width/height 绘制（没有 responsive），所以自己量容器宽度 */
+	/* 内置 SVG 不依赖 canvas 或外部图表库，容器宽度由 CSS 自适应。 */
 	drawTrend: function() {
 		var host = this.plotHost;
-		var canvas = this.canvas;
-		var ChartLib = window.Chart;
 
-		if (host == null || canvas == null) return;
-		if (typeof ChartLib != 'function') return;
+		if (host == null) return;
 		if (this.trend == null || this.trend.points.length == 0) return;
 		if (!document.body.contains(canvas)) return;
 
 		var w = Math.floor(host.clientWidth || host.offsetWidth || 0);
-		var h = Math.floor(host.clientHeight || 0);
 
 		if (!(w >= 120)) w = 640;      /* 布局还没生效时给一个兜底宽度 */
 		if (!(h >= 120)) h = TREND_H;
 		if (h > TREND_MAX_H) h = TREND_MAX_H;
 
-		canvas.width = w;
-		canvas.height = h;
-		canvas.style.width = w + 'px';
-		canvas.style.height = h + 'px';
 
 		var step = this.trend.step;
 		var points = this.trend.points;

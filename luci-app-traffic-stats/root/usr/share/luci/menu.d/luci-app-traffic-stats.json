@@ -49,6 +49,11 @@
 		"action": {
 			"type": "view",
 			"path": "traffic-stats/settings"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-traffic-stats-admin"
+			]
 		}
 	},
 	"admin/services/traffic-stats/mobile": {

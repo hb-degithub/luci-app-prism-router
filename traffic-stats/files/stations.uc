@@ -15,16 +15,16 @@
 //
 // ───────────────────────────── 安全边界（必读）─────────────────────────────
 // AP 上没有 openssl，算不了 HMAC-SHA256，所以这条通道**不是签名通道**，而是
-// 「共享 token + 时间戳」：仅限可信局域网使用，端口不要暴露到 WAN。
+// 「按节点注册的 token + nonce + 时间戳」：仅限可信局域网使用，端口不要暴露到 WAN。
 // 具体能保证什么、不能保证什么，写在 ingest-stations.uc 的文件头里（母节点是权威说明）。
-// 本端能做的都做了：token 只从 UCI 读，不放命令行参数里（避免 ps 里可见）。
+// 本端：token 只从 UCI 读；走 Authorization: Bearer，不放 URL 查询串、不拼命令行；
+// 临时文件 0600；curl 不 -k、不自动跨源重定向。
 //
 // ───────────────────────────── 协议 ─────────────────────────────
-//   POST <mother_url>/cgi-bin/traffic-stats-stations
+//   POST <mother_url>/cgi-bin/traffic-stats-stations?node_id=..&ts=..&proto=2&nonce=..
 //   Content-Type: application/json
-//   X-Node-Id:   <node_id>
-//   X-Timestamp: <unix 秒>
-//   X-Token:     <stations_token>
+//   Authorization: Bearer <token>       ← uhttpd 会转发，token 不进 URL
+//   X-Node-Id / X-Timestamp / X-Proto / X-Nonce / X-Token（给 nginx 等标准 CGI 用）
 //   body: {"node_id","name","ts","stations":[
 //            {"mac":"22:77:08:69:a9:1f","iface":"phy0.1-ap0","signal":-53,
 //             "rx_rate":866600,"tx_rate":650000,"connected_sec":3600}]}
@@ -34,11 +34,9 @@
 //     rx_rate/tx_rate  协商速率，**kbit/s**（iw 的 "866.6 MBit/s" → 866600）
 //     connected_sec 秒
 //
-// ⚠️ 真机实测：OpenWrt 的 uhttpd 只把 HTTP_ACCEPT / HTTP_AUTHORIZATION / HTTP_HOST /
-// HTTP_USER_AGENT 这几个头传进 CGI 环境，自定义 X-* 头会被静默丢弃。所以除了上面的头，
-// 本脚本还把 node_id / ts / token 以 percent 编码放进 URL 查询串；母节点先读头、读不到
-// 再读查询串。头照样发，方便 nginx 等标准 CGI 环境。代价是 token 会出现在 web 服务器
-// 访问日志里 —— 局域网内可接受，别把该端口暴露到 WAN（见上面的安全边界）。
+// 真机实测：uhttpd 只转发 HTTP_ACCEPT / HTTP_AUTHORIZATION / HTTP_HOST / HTTP_USER_AGENT，
+// 自定义 X-* 会被丢弃；Authorization 可用。所以 token 走 Bearer，URL 里只剩
+// node_id/ts/proto/nonce（不是机密，且 nonce 由母节点原子占用防重放）。
 //
 // ───────────────────────────── 定时 ─────────────────────────────
 // 包不改 crontab，由用户自行添加（AP 上 crond 有；别用 /etc/crontabs/root 以外的机制）：
@@ -51,10 +49,17 @@
 //   stations_enabled '0'   1 = 允许上报；0 = 关闭（默认）
 //   station_ifaces   ''    逗号分隔的 AP 接口名；留空 = 自动枚举 `iw dev` 里的 phy*-ap*
 //   mother_url       ''    母节点地址，例如 http://192.168.100.1（与 push.uc 共用）
-//   stations_token   ''    母/子共享令牌（母节点 stations_token 必须一致，否则拒收）
+//   stations_token   ''    旧全局令牌（仅当本机没有 config station 独立 token 时兜底）
 //   node_id          ''    节点 ID；留空则按「主机名 + 主 LAN 口 MAC 后 4 位」推导
 //                          （口径与 push.uc 相同；这里不回写 UCI，避免两个脚本抢写配置）
 //   node_name        ''    展示名；留空则用 node_id
+//   stations_ca / stations_pinned_sha256  HTTPS 校验（默认验证系统 CA）
+//
+//   本机独立 token（推荐）：
+//     config station
+//         option node_id '<与 settings.node_id 一致>'
+//         option token   '<母节点上同一 AP 的 token>'
+
 //
 // ───────────────────────────── 失败处理 ─────────────────────────────
 // 采不到 / 没站点 / 网络不通 / 非 200 / 响应 code != 0 → 记日志并 exit 0（cron 每分钟会再试，
@@ -70,7 +75,7 @@
 // 风格：与 push.uc 一致（run/shq/throttle/log/jstr 等小工具同名同义）。
 'use strict';
 
-import { readfile, access, popen, writefile, unlink, stat, open, rename, lsdir } from 'fs';
+import { readfile, access, popen, writefile, unlink, stat, open, rename, lsdir, chmod, chown, lstat, mkdir } from 'fs';
 import { cursor } from 'uci';
 
 const UCI_CONFIG    = 'traffic-stats';
@@ -200,14 +205,24 @@ function stamp() {
         t.year, t.mon, t.mday, t.hour, t.min, t.sec);
 }
 
+/* 目录必须落成真实 root 目录：已存在但不是目录/属主非 root（含 symlink）→ false。 */
 function ensure_dir(path) {
     if (length(path) == 0 || path == '.')
         return false;
 
-    if (access(path))
-        return true;
+    let st = null;
 
-    return system([ 'mkdir', '-p', path ]) == 0;
+    try { st = lstat(path); } catch (e) { return false; }
+
+    if (st != null)
+        return st.type == 'directory' && st.uid == 0 && st.gid == 0;
+
+    if (system([ 'mkdir', '-p', path ]) != 0)
+        return false;
+
+    try { st = lstat(path); } catch (e) { return false; }
+
+    return st != null && st.type == 'directory' && st.uid == 0 && st.gid == 0;
 }
 
 /* 日志节流：同一类消息在 interval 秒内最多记一次（必然要在 log() 之前定义）。 */
@@ -235,7 +250,11 @@ function log(level, msg) {
     const line = sprintf('%s [%s] %s\n', stamp(), level, msg);
 
     try {
-        ensure_dir(BASE);
+        /* BASE 不是真实 root 目录（例如 /tmp/traffic-stats 被换成 symlink）→ 不写日志。 */
+        if (!ensure_dir(BASE)) {
+            print(line);
+            return;
+        }
 
         const lp = `${BASE}/stations.log`;
 
@@ -268,6 +287,353 @@ function log(level, msg) {
             system([ 'logger', '-t', 'traffic-stats-stations', '-p',
                 (level == 'ERROR' ? 'daemon.err' : 'daemon.warn'), cut(one_line(msg), 200) ]);
     }
+}
+
+// ───────────────────── 认证工具（与 traffic-stats-node-auth.uc 同步）─────────
+//
+// 目标容器 OpenSSL 3.0.22 实测：`dgst -hmac` / `-macopt key:<文件>` 都只接受
+// argv 里的字面量，没有“从文件/fd 读 HMAC key”的选项；环境变量又会出现在
+// /proc/<pid>/environ。因此这里用 ucode 内存拼 ipad/opad + sha256sum 读 stdin，
+// 密钥不进 argv / 环境变量 / 磁盘，只把 hash 的十六进制文本落到 0600 临时文件。
+
+const AUTH_TMP = '/tmp/traffic-stats/.auth';
+let _auth_seq = 0;
+
+function auth_text(value, fallback) {
+    return (value == null) ? fallback : `${value}`;
+}
+
+function auth_nonce() {
+    let raw = '';
+
+    try {
+        const fd = open('/dev/urandom', 'r');
+
+        if (fd != null) {
+            raw = fd.read(16) ?? '';
+            fd.close();
+        }
+    }
+    catch (e) {
+        raw = '';
+    }
+
+    if (length(raw) < 16) {
+        try {
+            raw = replace(trim(auth_text(readfile('/proc/sys/kernel/random/uuid'), '')), '-', '');
+        }
+        catch (e) {
+            raw = '';
+        }
+    }
+
+    if (length(raw) < 16)
+        raw = sprintf('%08x%08x%08x%08x', time(), int(time() / 1000), _auth_seq, 0);
+
+    let hex = '';
+
+    for (let i = 0; i < length(raw) && length(hex) < 32; i++)
+        hex += sprintf('%02x', ord(substr(raw, i, 1)));
+
+    return hex;
+}
+
+function auth_valid_nonce(nonce) {
+    return match(nonce, /^[A-Za-z0-9_-]{16,64}$/) != null;
+}
+
+/* 安全目录（与 traffic-stats-node-auth.uc 同步）：
+   lstat 不跟随符号链接；只接受真实目录且 root:root。已存在但不安全时直接失败，
+   绝不先 chmod/chown 再信任（符号链接不会被 chmod 变成目录）。 */
+function auth_lstat_dir(path) {
+    let st = null;
+
+    try { st = lstat(path); } catch (e) { return null; }
+
+    if (st == null || st.type != 'directory' || st.uid != 0 || st.gid != 0)
+        return null;
+
+    return st;
+}
+
+function auth_secure_dir(path, mode) {
+    let st = auth_lstat_dir(path);
+
+    if (st == null) {
+        let raw = null;
+
+        try { raw = lstat(path); } catch (e) { raw = null; }
+
+        if (raw != null)
+            return false;
+
+        try { mkdir(path, mode); } catch (e) { }
+
+        st = auth_lstat_dir(path);
+        if (st == null)
+            return false;
+    }
+
+    try { chmod(path, mode); } catch (e) { return false; }
+    try { chown(path, 0, 0); } catch (e) { return false; }
+
+    return auth_lstat_dir(path) != null;
+}
+
+/* /tmp 必须是 root 的 sticky 真实目录；否则不创建任何认证临时目录。 */
+function auth_safe_tmp_parent() {
+    let st = null;
+
+    try { st = lstat('/tmp'); } catch (e) { return false; }
+
+    return st != null && st.type == 'directory' && st.uid == 0
+        && st.perm != null && st.perm.sticky == true;
+}
+
+/* /tmp/traffic-stats 先安全创建/校验，再建 0700 的 .auth。 */
+function auth_ensure_tmp() {
+    if (!auth_safe_tmp_parent())
+        return false;
+
+    if (!auth_secure_dir('/tmp/traffic-stats', 493))   /* 0755 */
+        return false;
+
+    return auth_secure_dir(AUTH_TMP, 448);             /* 0700 */
+}
+
+/* sha256sum 的输出仍是行首 64 hex；openssl dgst -sha256 的
+   `SHA2-256(stdin)= <64hex>` 尾部格式只在回退时接受。 */
+function auth_digest_hex(raw) {
+    const text = trim(auth_text(raw, ''));
+    let m = match(text, /^([0-9a-fA-F]{64})/);
+
+    if (m != null)
+        return lc(m[1]);
+
+    m = match(text, /(SHA2-256|SHA256)\(stdin\)= *([0-9a-fA-F]{64}) *$/);
+    if (m != null)
+        return lc(m[2]);
+
+    m = match(text, /\(stdin\)= *([0-9a-fA-F]{64}) *$/);
+
+    return (m != null) ? lc(m[1]) : '';
+}
+
+function auth_hash_cmd() {
+    for (let path in [ '/usr/bin/sha256sum', '/bin/sha256sum' ])
+        if (access(path))
+            return path;
+
+    for (let path in [ '/usr/bin/openssl', '/usr/sbin/openssl', '/bin/openssl' ])
+        if (access(path))
+            return sprintf('%s dgst -sha256', path);
+
+    return 'sha256sum';
+}
+
+/* sha256_hex(data)：数据从 stdin 进，stdout 重定向到 0600 文件；argv 里只有路径。 */
+function auth_sha256_hex(data) {
+    if (!auth_ensure_tmp())
+        return '';
+
+    const out = sprintf('%s/h-%d-%d-%s', AUTH_TMP, int(time()), _auth_seq++, auth_nonce());
+    let fd = null;
+
+    try {
+        /* 'wx'：目标已存在（含预先放置的符号链接/文件）就失败，绝不跟随写入。 */
+        fd = open(out, 'wx', 384);         /* 384 = 0o600 */
+        if (fd == null)
+            return '';
+
+        fd.close();
+    }
+    catch (e) {
+        try { if (fd != null) fd.close(); } catch (e2) { }
+        try { unlink(out); } catch (e2) { }
+        return '';
+    }
+
+    let p = null;
+
+    try {
+        p = popen(sprintf('%s > %s', auth_hash_cmd(), shq(out)), 'w');
+    }
+    catch (e) {
+        p = null;
+    }
+
+    if (p == null) {
+        try { unlink(out); } catch (e) { }
+        return '';
+    }
+
+    let off = 0;
+
+    try {
+        while (off < length(data)) {
+            const n = p.write(substr(`${data}`, off));
+
+            if (n == null || n <= 0)
+                break;
+
+            off += n;
+        }
+    }
+    catch (e) {
+        /* 关闭管道后按实际输出判定 */
+    }
+
+    const rc = p.close();
+    let raw = '';
+
+    try { raw = auth_text(readfile(out), ''); } catch (e) { raw = ''; }
+    try { unlink(out); } catch (e) { }
+
+    if (rc != 0)
+        return '';
+
+    return auth_digest_hex(raw);
+}
+
+function auth_hex_bin(hex) {
+    let out = '';
+
+    for (let i = 0; i + 1 < length(hex); i += 2)
+        out += chr(int(substr(hex, i, 2), 16));
+
+    return out;
+}
+
+const AUTH_B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function auth_b64(bin) {
+    let out = '';
+
+    for (let i = 0; i < length(bin); i += 3) {
+        const b0 = ord(substr(bin, i, 1));
+        const has1 = (i + 1 < length(bin));
+        const has2 = (i + 2 < length(bin));
+        const b1 = has1 ? ord(substr(bin, i + 1, 1)) : 0;
+        const b2 = has2 ? ord(substr(bin, i + 2, 1)) : 0;
+
+        out += substr(AUTH_B64, (b0 >> 2) & 63, 1);
+        out += substr(AUTH_B64, ((b0 & 3) << 4) | ((b1 >> 4) & 15), 1);
+        out += has1 ? substr(AUTH_B64, ((b1 & 15) << 2) | ((b2 >> 6) & 3), 1) : '=';
+        out += has2 ? substr(AUTH_B64, b2 & 63, 1) : '=';
+    }
+
+    return out;
+}
+
+function auth_hmac_b64(secret, message) {
+    const msg = `${message}`;
+    let key = `${secret}`;
+
+    if (length(key) > 64) {
+        const kh = auth_sha256_hex(key);
+
+        if (length(kh) == 0)
+            return '';
+
+        key = auth_hex_bin(kh);
+    }
+
+    let ipad = '', opad = '';
+
+    for (let i = 0; i < 64; i++) {
+        const b = (i < length(key)) ? ord(substr(key, i, 1)) : 0;
+
+        ipad += chr(b ^ 0x36);
+        opad += chr(b ^ 0x5c);
+    }
+
+    const inner_hex = auth_sha256_hex(ipad + msg);
+
+    if (length(inner_hex) == 0)
+        return '';
+
+    const outer_hex = auth_sha256_hex(opad + auth_hex_bin(inner_hex));
+
+    if (length(outer_hex) == 0)
+        return '';
+
+    return auth_b64(auth_hex_bin(outer_hex));
+}
+
+function auth_same(a, b) {
+    if (length(a) != length(b))
+        return false;
+
+    let diff = 0;
+
+    for (let i = 0; i < length(a); i++)
+        diff |= ord(substr(a, i, 1)) ^ ord(substr(b, i, 1));
+
+    return diff == 0;
+}
+
+function auth_message_v2(node_id, ts, nonce, body_digest) {
+    return sprintf('v2\n%s\n%s\n%s\n%s', node_id, ts, nonce, body_digest);
+}
+
+function auth_message_v1(node_id, ts, body_digest) {
+    return sprintf('%s\n%s\n%s', node_id, ts, body_digest);
+}
+
+/* UCI section 的“节点 ID”：优先 option node_id；命名 section 才回落到 section 名。
+   UCI 的 section 名只允许 [A-Za-z0-9_]，带 '-' 的 node_id 必须写 option node_id。 */
+function auth_section_id(s) {
+    let id = trim(auth_text(s.node_id, ''));
+
+    if (length(id) == 0 && s['.anonymous'] != true)
+        id = trim(auth_text(s['.name'], ''));
+
+    return id;
+}
+
+/* 只认 .type == 'node' 的 section；未知 node_id 返回 ''（调用方必须拒绝）。 */
+function auth_node_secret(c, node_id) {
+    let found = '';
+
+    if (c == null)
+        return '';
+
+    c.foreach(UCI_CONFIG, 'node', function(s) {
+        if (length(found) || type(s) != 'object' || s['.type'] != 'node')
+            return;
+
+        if (auth_section_id(s) != node_id)
+            return;
+
+        const secret = trim(auth_text(s.secret, ''));
+
+        if (length(secret))
+            found = secret;
+    });
+
+    return found;
+}
+
+function auth_station_token(c, node_id) {
+    let found = '';
+
+    if (c == null)
+        return '';
+
+    c.foreach(UCI_CONFIG, 'station', function(s) {
+        if (length(found) || type(s) != 'object' || s['.type'] != 'station')
+            return;
+
+        if (auth_section_id(s) != node_id)
+            return;
+
+        const token = trim(auth_text(s.token, ''));
+
+        if (length(token))
+            found = token;
+    });
+
+    return found;
 }
 
 // ───────────────────────────── JSON ─────────────────────────────
@@ -741,9 +1107,12 @@ function load_config() {
         enabled: uci_flag('settings', 'stations_enabled', false),
         ifaces: ifaces,
         url: trim(text(uci_get('settings', 'mother_url', ''), '')),
-        token: trim(text(uci_get('settings', 'stations_token', ''), '')),
+        /* 旧字段仍读取；若本节点有 config station 独立 token，则优先用独立 token。 */
+        token_global: trim(text(uci_get('settings', 'stations_token', ''), '')),
         node_id: trim(text(uci_get('settings', 'node_id', ''), '')),
-        node_name: trim(text(uci_get('settings', 'node_name', ''), ''))
+        node_name: trim(text(uci_get('settings', 'node_name', ''), '')),
+        ca: trim(text(uci_get('settings', 'stations_ca', ''), '')),
+        pin: trim(text(uci_get('settings', 'stations_pinned_sha256', ''), ''))
     };
 }
 
@@ -826,10 +1195,41 @@ function build_payload(cfg, node_id, stations) {
 
 /* mother_url 允许这几种写法：http://host / http://host:port / http://host/cgi-bin
    / 已经带 /cgi-bin/<script> 的完整地址。 */
-function stations_url(url) {
-    let base = trim(url);
+function url_parts(u) {
+    const raw = `${u}`;
 
-    if (!match(base, /^https?:\/\/[^\/\s]+/))
+    if (match(raw, /[\r\n\t ]/))
+        return null;
+
+    if (index(raw, '@') >= 0 || index(raw, '#') >= 0)
+        return null;
+
+    const m = match(raw, /^(https?):\/\/(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:([0-9]{1,5}))?(\/[^?#]*)?(\?[^#]*)?$/);
+
+    if (m == null)
+        return null;
+
+    const scheme = lc(m[1]);
+    const port = integer(m[4], scheme == 'https' ? 443 : 80);
+
+    if (port <= 0 || port > 65535)
+        return null;
+
+    return {
+        scheme: scheme,
+        host: lc(m[2]),
+        port: port,
+        path: length(m[5]) ? m[5] : '/',
+        query: length(m[6]) ? m[6] : ''
+    };
+}
+
+/* mother_url 允许 http(s)://host[:port][/path]；不允许 userinfo/查询串。 */
+function stations_url(url) {
+    let base = trim(`${url}`);
+    const p = url_parts(base);
+
+    if (p == null || length(p.query))
         return '';
 
     base = replace(base, /\/+$/, '');
@@ -843,44 +1243,169 @@ function stations_url(url) {
     return `${base}/cgi-bin/traffic-stats-stations`;
 }
 
-// ───────────────────────────── HTTP ─────────────────────────────
+/* 只允许同主机、同路径/查询、http:80 -> https:443（或同端口）的重定向。 */
+function same_origin_upgrade(from, to) {
+    const a = url_parts(from), b = url_parts(to);
 
-function http_post(curl, url, headers, body) {
-    const tag = sprintf('%d-%d', getpid(), _seq++);
+    if (a == null || b == null)
+        return '';
+
+    if (a.scheme != 'http' || b.scheme != 'https')
+        return '';
+
+    if (a.host != b.host)
+        return '';
+
+    if (!(a.port == b.port || (a.port == 80 && b.port == 443)))
+        return '';
+
+    if (a.path != b.path || a.query != b.query)
+        return '';
+
+    return `${to}`;
+}
+
+function redact_url(u) {
+    return replace(`${u}`, /\?.*$/, '');
+}
+
+function curl_quote(s) {
+    const v = `${s}`;
+
+    if (match(v, /[\r\n]/))
+        return null;
+
+    return `"${replace(replace(v, /\\/g, '\\\\'), /"/g, '\\"')}"`;
+}
+
+function write_private(path, content) {
+    let fd = null;
+
+    try {
+        fd = open(path, 'w', 384);
+    }
+    catch (e) {
+        return false;
+    }
+
+    if (fd == null)
+        return false;
+
+    try {
+        fd.write(`${content}`);
+        fd.close();
+        return true;
+    }
+    catch (e) {
+        try { fd.close(); } catch (e2) { }
+        return false;
+    }
+}
+
+function pin_value(pin) {
+    const p = trim(`${pin}`);
+
+    if (length(p) == 0)
+        return '';
+
+    if (match(p, /^sha256\/\/[A-Za-z0-9+\/=]+$/))
+        return p;
+
+    if (match(p, /^[0-9a-fA-F]{64}$/))
+        return `sha256//${auth_b64(auth_hex_bin(lc(p)))}`;
+
+    return '';
+}
+
+/* 临时文件全部 0600；token 只进 Authorization / curl 配置文件，URL 里不再带 token。 */
+function http_post(curl, url, headers, body, cfg) {
+    const tag = sprintf('%d-%d-%s', getpid(), _seq++, auth_nonce());
     const bf = sprintf('%s/.stations-body-%s.json', BASE, tag);
     const rf = sprintf('%s/.stations-resp-%s.json', BASE, tag);
     const ef = sprintf('%s/.stations-err-%s.txt', BASE, tag);
+    const cf = sprintf('%s/.stations-curl-%s.conf', BASE, tag);
 
     if (!ensure_dir(BASE))
-        return { http: 0, curl: -1, resp: '', err: '无法创建临时目录' };
+        return { http: 0, curl: -1, resp: '', err: '无法创建临时目录', redirect: '' };
 
-    try {
-        writefile(bf, body);
+    if (!write_private(bf, body) || !write_private(rf, '') || !write_private(ef, '') || !write_private(cf, '')) {
+        try { unlink(bf); } catch (e) { }
+        try { unlink(rf); } catch (e) { }
+        try { unlink(ef); } catch (e) { }
+        try { unlink(cf); } catch (e) { }
+        return { http: 0, curl: -1, resp: '', err: '写临时文件失败', redirect: '' };
     }
-    catch (e) {
-        return { http: 0, curl: -1, resp: '', err: sprintf('写请求体失败：%s', e) };
+
+    const lines = [
+        `url = ${curl_quote(url)}`,
+        'request = "POST"',
+        `data-binary = "@${bf}"`,
+        `output = ${curl_quote(rf)}`,
+        'write-out = "%{http_code} %{redirect_url}"',
+        'silent',
+        'show-error',
+        'connect-timeout = 5',
+        `max-time = ${CURL_TIMEOUT}`,
+        'max-filesize = 65536',
+        'proto = "=http,https"',
+        'proto-redir = "=https"',
+        'max-redirs = 0'
+    ];
+
+    for (let name in headers) {
+        const hq = curl_quote(sprintf('%s: %s', name, headers[name]));
+
+        if (hq == null) {
+            try { unlink(bf); } catch (e) { }
+            try { unlink(rf); } catch (e) { }
+            try { unlink(ef); } catch (e) { }
+            try { unlink(cf); } catch (e) { }
+            return { http: 0, curl: -1, resp: '', err: '非法请求头', redirect: '' };
+        }
+
+        push(lines, `header = ${hq}`);
     }
 
-    /* --data-binary 用 @file 发原始字节；-L 跟随 uhttpd 的 307；-k 接受自签证书。 */
-    let cmd = sprintf('%s -sSLk -m %d --connect-timeout 5 -o %s -w %%{http_code}',
-        curl, CURL_TIMEOUT, shq(rf));
+    if (length(cfg.ca))
+        push(lines, `cacert = ${curl_quote(cfg.ca)}`);
 
-    for (let name in headers)
-        cmd += sprintf(' -H %s', shq(sprintf('%s: %s', name, headers[name])));
+    const pin = pin_value(cfg.pin);
 
-    cmd += sprintf(' --data-binary %s %s 2>%s', shq(`@${bf}`), shq(url), shq(ef));
+    if (length(pin))
+        push(lines, `pinnedpubkey = ${curl_quote(pin)}`);
 
-    const r = run(cmd);
-    let resp = '', err = '';
+    if (!write_private(cf, `${join('\n', lines)}\n`)) {
+        try { unlink(bf); } catch (e) { }
+        try { unlink(rf); } catch (e) { }
+        try { unlink(ef); } catch (e) { }
+        try { unlink(cf); } catch (e) { }
+        return { http: 0, curl: -1, resp: '', err: '写 curl 配置失败', redirect: '' };
+    }
+
+    const r = run(sprintf('%s -sS -K %s 2>%s', curl, shq(cf), shq(ef)));
+    let resp = '', err = '', redirect = '', http = 0;
 
     try { if (access(rf)) resp = readfile(rf); } catch (e) { }
     try { if (access(ef)) err = trim(readfile(ef)); } catch (e) { }
 
+    const meta = split(trim(r.out), ' ');
+
+    http = integer(meta[0], 0);
+
+    if (length(meta) > 1)
+        redirect = trim(meta[1]);
+
     try { unlink(bf); } catch (e) { }
     try { unlink(rf); } catch (e) { }
     try { unlink(ef); } catch (e) { }
+    try { unlink(cf); } catch (e) { }
 
-    return { http: integer(trim(r.out), 0), curl: r.code, resp: resp, err: err };
+    if (length(resp) > 65536) {
+        resp = '';
+        err = '响应体超过 64 KiB，已丢弃';
+    }
+
+    return { http: http, curl: r.code, resp: resp, err: err, redirect: redirect };
 }
 
 function parse_response(res) {
@@ -924,15 +1449,23 @@ function main() {
         return 0;
     }
 
-    if (length(cfg.token) == 0) {
-        log('ERROR', 'stations_enabled=1 但 stations_token 为空，母节点会拒收，跳过');
+    /* TLS 验证绝不放宽：配置了 CA / pin 就必须存在且格式合法。 */
+    if (length(cfg.ca)) {
+        if (!match(cfg.ca, /^\/[^\r\n]*$/) || !access(cfg.ca)) {
+            log('ERROR', sprintf('stations_ca 必须是存在的绝对路径：%s', cut(cfg.ca, 120)));
+            return 1;
+        }
+    }
+
+    if (length(cfg.pin) && !length(pin_value(cfg.pin))) {
+        log('ERROR', 'stations_pinned_sha256 格式非法（应为 sha256//base64 或 64 位 hex）');
         return 1;
     }
 
     const url = stations_url(cfg.url);
 
     if (length(url) == 0) {
-        log('ERROR', sprintf('mother_url 不是合法的 http(s) 地址：%s', cut(cfg.url, 120)));
+        log('ERROR', sprintf('mother_url 不是合法的 http(s) 地址（不允许 userinfo/查询串）：%s', cut(cfg.url, 120)));
         return 1;
     }
 
@@ -956,6 +1489,13 @@ function main() {
     }
 
     const node_id = sanitize_id(cfg.node_id) || gen_node_id();
+    const token = auth_station_token(uci_cursor(), node_id) || cfg.token_global;
+
+    if (length(token) == 0) {
+        log('ERROR', sprintf('节点 %s 没有 config station token，也没有 settings.stations_token，跳过', node_id));
+        return 1;
+    }
+
     const got = collect_stations(scan);
 
     if (length(got.list) == 0) {
@@ -965,16 +1505,20 @@ function main() {
 
     const body = jstr(build_payload(cfg, node_id, got.list));
     const ts = sprintf('%d', time());
+    const nonce = auth_nonce();
     const headers = {
         'Content-Type': 'application/json',
         'X-Node-Id': node_id,
         'X-Timestamp': ts,
-        'X-Token': cfg.token
+        'X-Proto': '2',
+        'X-Nonce': nonce,
+        'X-Token': token,
+        'Authorization': `Bearer ${token}`
     };
 
-    /* uhttpd 不转发自定义头，所以同样的值再挂一份到查询串（见文件头说明）。 */
-    const query = sprintf('node_id=%s&ts=%s&token=%s',
-        url_encode(node_id), url_encode(ts), url_encode(cfg.token));
+    /* token 只在 Authorization / X-Token（curl 配置文件 0600），查询串只放 nonce 等非机密。 */
+    const query = sprintf('node_id=%s&ts=%s&proto=2&nonce=%s',
+        url_encode(node_id), url_encode(ts), url_encode(nonce));
     const sep = (index(url, '?') >= 0) ? '&' : '?';
 
     if (DRY_RUN) {
@@ -982,7 +1526,25 @@ function main() {
         return 0;
     }
 
-    const res = parse_response(http_post(curl_bin(), url + sep + query, headers, body));
+    let raw = http_post(curl_bin(), url + sep + query, headers, body, cfg);
+
+    if (raw.http >= 300 && raw.http < 400) {
+        const next = length(raw.redirect) ? same_origin_upgrade(url + sep + query, raw.redirect) : '';
+
+        if (length(next)) {
+            if (throttle('redirect', 3600))
+                log('WARN', sprintf('母节点同源 http->https 重定向，按安全规则重发：%s', redact_url(next)));
+
+            raw = http_post(curl_bin(), next, headers, body, cfg);
+        }
+        else {
+            log('ERROR', sprintf('拒绝重定向（跨源/降级/路径或查询串变化）：%s -> %s',
+                redact_url(url), cut(redact_url(raw.redirect), 160)));
+            return 0;
+        }
+    }
+
+    const res = parse_response(raw);
 
     if (!res.ok) {
         /* 网络 / 非 200 / code != 0 都不算脚本故障：记日志，下个周期再试。 */
@@ -992,8 +1554,8 @@ function main() {
     }
 
     if (throttle('ok', 600))
-        log('INFO', sprintf('上报成功：%s 站点=%d 请求体=%d 字节 ts=%s',
-            url, length(got.list), length(body), ts));
+        log('INFO', sprintf('上报成功：%s 站点=%d 请求体=%d 字节 ts=%s proto=2',
+            redact_url(url), length(got.list), length(body), ts));
 
     return 0;
 }

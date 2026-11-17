@@ -18,6 +18,9 @@
  * 映射文件取不到时本页降级为"不做类别统计"（类别列显示 —、表上方的占比条换成一句说明），
  * 域名排行与下钻不受影响。
  *
+ * 导出（SPEC §10.3）：`export_csv {what:'apps'}` 返回带 BOM/CRLF 的 CSV，
+ * 前端只负责存盘，不再补 BOM；失败时在按钮旁给出文字错误。
+ *
  * 单位：流量二进制（GiB/MiB），速率不出现在本页。
  */
 
@@ -26,6 +29,13 @@ var callState = rpc.declare({
 	method: 'get_state',
 	expect: {},
 	reject: true
+});
+
+var callExportCsv = rpc.declare({
+	object: 'traffic-stats',
+	method: 'export_csv',
+	params: [ 'what' ],
+	expect: {}
 });
 
 function num(value) {
@@ -189,7 +199,8 @@ var CSS = [
 	'#ts-apps .tsa-lg i{width:8px;height:8px;border-radius:2px;display:inline-block;flex:none}',
 	'#ts-apps .tsa-lg.on{font-weight:600;border-bottom-style:solid}',
 	'#ts-apps .tsa-lg.off{opacity:.5}',
-	'#ts-apps .tsa-cat{display:inline-block;font-size:10.5px;line-height:1.6;padding:0 6px;border-radius:5px;white-space:nowrap}'
+	'#ts-apps .tsa-cat{display:inline-block;font-size:10.5px;line-height:1.6;padding:0 6px;border-radius:5px;white-space:nowrap}',
+	'#ts-apps .tsa-export{font-size:12px;opacity:.9;min-width:0;word-break:break-word}'
 ].join('\n');
 
 return view.extend({
@@ -260,6 +271,7 @@ return view.extend({
 
 		this.summaryWrap = E('div', {});
 		this.tableWrap = E('div', {});
+		this.exportStatus = E('span', { 'class': 'tsa-export' }, '');
 
 		var root = E('div', { 'id': 'ts-apps' }, [
 			E('style', {}, CSS),
@@ -278,7 +290,12 @@ return view.extend({
 				E('label', { style: 'font-size:13px;margin-left:6px' }, _('类别')),
 				this.catSelect,
 				E('span', { style: 'font-size:12px;opacity:.7' },
-					_('切换筛选不会重新请求后端；点行展开可下钻到设备'))
+					_('切换筛选不会重新请求后端；点行展开可下钻到设备')),
+				E('button', {
+					'class': 'cbi-button cbi-button-action',
+					click: ui.createHandlerFn(this, function() { return this.exportCsv('apps'); })
+				}, _('导出应用 CSV')),
+				this.exportStatus
 			]),
 			this.summaryWrap,
 			this.tableWrap
@@ -691,6 +708,55 @@ return view.extend({
 				E('a', { href: L.url('admin/services/traffic-stats/overview') }, _('返回总览'))
 			])
 		]);
+	},
+
+	/* CSV 导出：后端返回 {filename, rows, csv}，csv 已带 BOM/CRLF，原样存盘。 */
+	exportCsv: function(what) {
+		var self = this;
+
+		this.setExportStatus(_('正在导出…'), '');
+
+		return callExportCsv(what).then(function(res) {
+			if (res == null || res.ok !== true || typeof res.csv != 'string')
+				throw new Error((res != null && res.error != null) ? ('' + res.error) : _('后端没有返回 CSV 内容'));
+
+			self.saveCsv(res, what);
+			self.setExportStatus(_('已导出') + ' ' + ((res.rows != null) ? res.rows : 0) + ' ' + _('行'), '#2e7d32');
+		}).catch(function(err) {
+			var message = (err != null && err.message) ? ('' + err.message) : ('' + err);
+
+			self.setExportStatus(_('导出失败：') + message, '#c62828');
+			ui.addNotification(null, E('p', {}, _('导出失败：') + message), 'error');
+		});
+	},
+
+	setExportStatus: function(text, color) {
+		if (this.exportStatus == null) return;
+
+		this.exportStatus.textContent = text;
+		this.exportStatus.style.color = color || '';
+	},
+
+	saveCsv: function(res, what) {
+		var csv = (res != null && typeof res.csv == 'string') ? res.csv : '';
+
+		if (!csv.length) throw new Error(_('CSV 内容为空'));
+
+		var now = new Date();
+		var fallback = 'traffic-stats-' + what + '-' + now.getFullYear() + '-' +
+			pad2(now.getMonth() + 1) + '-' + pad2(now.getDate()) + '.csv';
+		var filename = (res != null && res.filename) ? ('' + res.filename) : fallback;
+		var blob = new Blob([ csv ], { type: 'text/csv;charset=utf-8' });
+		var url = URL.createObjectURL(blob);
+		var a = document.createElement('a');
+
+		a.href = url;
+		a.download = filename;
+		a.style.display = 'none';
+		document.body.appendChild(a);
+		a.click();
+		document.body.removeChild(a);
+		setTimeout(function() { URL.revokeObjectURL(url); }, 1500);
 	},
 
 	handleSave: null,

@@ -34,8 +34,8 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=$B_CGI"
 
 echo "=== 1. 安装两个包 ==="
-opkg install --force-depends /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install --force-depends /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新文件落位与权限 ==="
 check /usr/share/traffic-stats/stations.uc "root:root -rw-r--r--"
@@ -142,6 +142,8 @@ UCI set traffic-stats.settings.node_name='客厅 AP'
 UCI set traffic-stats.settings.mother_url='http://127.0.0.1:8080'
 UCI set traffic-stats.settings.stations_enabled='1'
 UCI set traffic-stats.settings.stations_token="$TOKEN"
+# 本用例专门回归旧 AP 的无 nonce 通道；默认拒绝由 security-fixes 门禁覆盖。
+UCI set traffic-stats.settings.legacy_stations_token='1'
 UCI set traffic-stats.settings.station_ifaces='phy0.1-ap0,phy0.0-ap1'
 UCI commit traffic-stats
 [ "$(CGET traffic-stats.settings.stations_token)" = "$TOKEN" ] && ok "UCI 站点选项写入成功" || bad "UCI 写入失败"
@@ -350,11 +352,13 @@ grep -q 'bytes' /etc/traffic-stats/stations/ap-2.json && bad "字节字段被落
   || ok "落盘文件里没有 bytes（白名单闸门生效）"
 
 echo "=== 12. 母节点未配置 token 时拒绝（绝不匿名写入）==="
-UCI set traffic-stats.settings.stations_token=''; UCI commit traffic-stats
+UCI set traffic-stats.settings.stations_token=''
+UCI set traffic-stats.settings.legacy_stations_token='0'; UCI commit traffic-stats
 curl -sS -m 5 -o /tmp/n10.json -X POST "$POST_URL?node_id=ap-1&ts=$(date +%s)&token=" \
   -H "Content-Type: application/json" --data-binary "$BODY" >/dev/null 2>&1
 C=$(code_of /tmp/n10.json); [ "$C" = "3" ] && ok "母节点 stations_token 为空 → code=3" || bad "空 token → code=$C 期望 3"
-UCI set traffic-stats.settings.stations_token="$TOKEN"; UCI commit traffic-stats
+UCI set traffic-stats.settings.stations_token="$TOKEN"
+UCI set traffic-stats.settings.legacy_stations_token='1'; UCI commit traffic-stats
 
 echo "=== 13. dry-run 只打印请求、不发包 ==="
 BEFORE=$(F=/etc/traffic-stats/stations/ap-1.json ucode -e 'let fs=require("fs"); print(json(fs.readfile(getenv("F"))).received_ts);')

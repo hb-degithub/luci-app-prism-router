@@ -46,6 +46,8 @@
  *   TRAFFIC_STATS_DF         覆盖 df 命令（自测：假 df 统计调用次数）
  *   TRAFFIC_STATS_ROOTFS     覆盖 df 的目标（默认 /）
  *   TRAFFIC_STATS_PRUNE_NOW=1  启动时立刻跑一次 daily 清理判定（自测：验证 daily 清理归属）
+ *   TRAFFIC_STATS_TEST_ROLLOVER_AFTER=N  仅测试：第 N 轮模拟跨天（验证日切失败 pending 重试）
+ *   TRAFFIC_STATS_BASELINE_MAX_ENTRIES=N 仅测试：降低 baseline 条目上限（生产固定 8192）
  *   TRAFFIC_STATS_DEBUG=1    详细日志输出到 stderr
  */
 
@@ -82,7 +84,34 @@ const TOP_PER_BUCKET = 10;
 const HISTORY_FLUSH_SECONDS = 60; /* history.json 最少刷新间隔 */
 const DAILY_RETRY_SECONDS = 600;  /* daily 目录写失败后的重试间隔 */
 const DAILY_WRITE_SECONDS = 300;  /* daily 文件最短落盘间隔：/etc 在闪存上，别每轮都写 */
+const DAILY_PENDING_RETRY_SECONDS = 5; /* 日切写失败后 pending 快照的重试间隔（跨天数据不能丢） */
+/* 日切 pending 快照持久化在 state_dir（tmpfs）。限制天数只为让长期异常时内存/文件有界：
+ * 正常最多只会有 1 天（日切失败），单位数天足够覆盖连续失败。 */
+const DAILY_PENDING_MAX_DAYS = 16;
 const SYSTEM_DISK_SECONDS = 60;   /* `df -k /` 最短间隔：磁盘容量变化慢，别每轮 fork */
+
+/* 跨软重启基线（/tmp 在软重启后仍然存在；hard reboot 自然清空）：
+ *   baseline.json = { v, ts, day, clash_ts, ct_ts, clash_prev, ct_prev }
+ * 只接受「同一天 + 不超过 BASELINE_MAX_AGE 秒」的基线；损坏/过期一律降级为
+ * 「先采样、不记增量」（prime），避免首帧把现存连接全量加一遍造成虚高速率。 */
+const BASELINE_FILE = 'baseline.json';
+const BASELINE_VERSION = 3;
+const BASELINE_MAX_AGE = 3600;
+const BASELINE_MAX_ENTRIES = 8192;
+/* baseline 是 /tmp 下的 JSON，读取前先看大小：异常大的文件直接拒绝恢复，
+ * 不让伪造/损坏文件把内存撑爆。正常上限见 baseline_write（四个 8192 表）。 */
+const BASELINE_MAX_BYTES = 8 * 1024 * 1024;
+/* 去重/故障账本里持久化的过期时间只允许落在「现在 + 24h」以内：
+ * 合法值最多是 failure TTL（< 1h），超过这个范围视为被篡改。 */
+const BASELINE_EXP_MAX_AHEAD = 86400;
+const BASELINE_KEY_MAX_LEN = 160;
+
+/* 双源去重键的保留时长：至少覆盖 1~2 个轮询间隔，避免 clash / conntrack
+ * 两次拉取之间的边界把同一条流漏掉或重复计入。 */
+const DEDUP_TTL_MIN = 10;
+const DEDUP_MAX_ENTRIES = 8192;
+
+let tmp_seq = 0;
 
 /*
  * ucode 不做函数提升：被调用者必须先于调用者定义。
@@ -186,16 +215,68 @@ function parse_mac_list(s) {
 	return out;
 }
 
-/** URI 清洗：去掉 shell 元字符与引号，防止拼进命令行时被注入 */
-function sanitize_uri(s) {
-	let bad = " \t\n\r\"'\\`$;&|<>(){}*?!";
-	let out = '';
+/** 从 clash_api 配置里取出「scheme://host[:port]」origin。
+ *  支持：
+ *    - 127.0.0.1:9090
+ *    - http://127.0.0.1:9090
+ *    - https://user:pw@host:9090
+ *    - OpenClash 控制台 URL：http://host:9090/ui/#/connections?foo=1
+ *      （/路径、?query、#hash 全部丢弃，只保留 origin）
+ *  非法字符直接拒绝；返回值只用于 shell_quote 包裹后的 curl 参数，不拼 shell。 */
+function parse_clash_origin(raw) {
+	let s = trim(str(raw));
+	if (s == '') return '';
+
+	let scheme = 'http';
+	let sep = index(s, '://');
+	if (sep >= 0) {
+		scheme = lc(substr(s, 0, sep));
+		s = substr(s, sep + 3);
+		if (scheme != 'http' && scheme != 'https') return '';
+	}
+
+	/* 去掉 path / query / hash：origin 在第一个 /?# 之前 */
+	let end = length(s);
 	for (let i = 0; i < length(s); i++) {
 		let c = substr(s, i, 1);
-		if (index(bad, c) >= 0) continue;
-		out += c;
+		if (c == '/' || c == '?' || c == '#') { end = i; break; }
 	}
-	return out;
+	let auth = substr(s, 0, end);
+	if (auth == '') return '';
+
+	/* 只允许 origin 需要的字符：IPv4/域名/IPv6 方括号、端口、userinfo。 */
+	for (let i = 0; i < length(auth); i++) {
+		let c = substr(auth, i, 1);
+		let n = ord(c);
+		let okc = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			|| (c >= '0' && c <= '9') || c == '.' || c == ':' || c == '-'
+			|| c == '_' || c == '[' || c == ']' || c == '@' || c == '%';
+		if (!okc || n < 0x21 || n > 0x7e) return '';
+	}
+
+	/* 端口显式存在时必须是 1..65535；没有端口交给 curl 用默认端口。 */
+	let hostpart = auth;
+	let at = 0;
+	for (let i = 0; i < length(auth); i++) if (substr(auth, i, 1) == '@') at = i + 1;
+	hostpart = substr(auth, at);
+	let port = '';
+	if (substr(hostpart, 0, 1) == '[') {
+		let close = index(hostpart, ']');
+		if (close < 0) return '';
+		if (substr(hostpart, close + 1, 1) == ':') port = substr(hostpart, close + 2);
+	} else {
+		let colon = 0, seen = false;
+		for (let i = 0; i < length(hostpart); i++) {
+			if (substr(hostpart, i, 1) == ':') { colon = i; seen = true; }
+		}
+		if (seen) port = substr(hostpart, colon + 1);
+	}
+	if (port != '') {
+		let p = to_int(port, -1);
+		if (p < 1 || p > 65535) return '';
+	}
+
+	return scheme + '://' + auth;
 }
 
 /** curl 配置文件里的值：只去掉会破坏 "header = \\"...\\"" 的字符 */
@@ -229,6 +310,10 @@ function store_add(store, host, chain, rx, tx, ip, cap) {
 	}
 	a.rx += rx;
 	a.tx += tx;
+	/* 从 daily 恢复的应用只带 rx/tx/chain/devices，没有 chain_rx 明细；
+	 * 合并新流量时按需补回，避免 a.chain_rx[...] 对 null 赋值。 */
+	if (type(a.chain_rx) != 'object') a.chain_rx = {};
+	if (type(a.devs) != 'object') a.devs = {};
 	a.chain_rx[chain] = (a.chain_rx[chain] || 0) + rx;
 	let best = a.chain, best_v = -1;
 	for (let k in a.chain_rx) {
@@ -238,7 +323,14 @@ function store_add(store, host, chain, rx, tx, ip, cap) {
 		}
 	}
 	a.chain = best;
-	if (ip != null && ip != '') a.devs[ip] = 1;
+	if (ip != null && ip != '') {
+		if (a.devs[ip] == null) {
+			a.devs[ip] = 1;
+			/* 从 daily 恢复的应用只有设备数（devices 字段），没有 IP 明细；
+			 * 这里在同一应用又出现新 IP 时把计数加回去，保持 daily 兼容。 */
+			if (a.dev_count != null) a.dev_count++;
+		}
+	}
 	return a;
 }
 
@@ -268,16 +360,20 @@ function mkpath(dir) {
 	return fs.stat(dir) != null;
 }
 
-/** 原子写：同目录临时文件 + rename（SPEC §8.7 不允许半截文件） */
+/** 原子写：同目录唯一临时文件 + rename（SPEC §8.7 不允许半截文件）
+ *  临时名带 pid 不可得，这里用「秒 + clock 纳秒 + 进程内序号」保证两个写者
+ *  （守护进程 / rpcd）不会撞到同一个临时文件；真正需要互斥的 devices.json
+ *  另见 first_seen_track() 的 mkdir 锁。 */
 function atomic_write(path, text) {
-	let tmp = path + '.tmp';
+	tmp_seq++;
+	let tmp = path + '.tmp.' + sprintf('%d.%d.%d', time(), clock()[1], tmp_seq);
 	let n = fs.writefile(tmp, text);
 	if (type(n) != 'int') {
-		fs.unlink(tmp);
+		try { fs.unlink(tmp); } catch (e) { }
 		return false;
 	}
 	if (!fs.rename(tmp, path)) {
-		fs.unlink(tmp);
+		try { fs.unlink(tmp); } catch (e) { }
 		return false;
 	}
 	return true;
@@ -296,7 +392,8 @@ function load_json(path) {
 
 /** 原子写 + 显式权限/属主：/etc 下的文件必须 0644 root:root（docs/DEPLOY-RULES.md） */
 function atomic_write_perm(path, text, mode) {
-	let tmp = path + '.tmp.' + sprintf('%d', time());
+	tmp_seq++;
+	let tmp = path + '.tmp.' + sprintf('%d.%d.%d', time(), clock()[1], tmp_seq);
 	let n = fs.writefile(tmp, text);
 	if (type(n) != 'int') {
 		try { fs.unlink(tmp); } catch (e) { }
@@ -519,6 +616,8 @@ function load_config(cur) {
 	c.debug = getenv('TRAFFIC_STATS_DEBUG') != null;
 	c.once = (getenv('TRAFFIC_STATS_ONCE') != null);
 	c.once_polls = clamp(to_int(getenv('TRAFFIC_STATS_ONCE_POLLS'), 1), 1, 1000);
+	/* 仅测试：模拟第 N 轮跨天（验证日切失败 pending 重试）；生产不设置。 */
+	c.test_rollover_after = clamp(to_int(getenv('TRAFFIC_STATS_TEST_ROLLOVER_AFTER'), 0), 0, 100000);
 
 	/* /proc 与 sysfs 读取路径：默认走真实内核接口，测试用环境变量指向固定内容 */
 	let pd = env_path('TRAFFIC_STATS_PROC_DIR', '/proc');
@@ -633,12 +732,133 @@ function devices_meta_prune(meta) {
 	return keep;
 }
 
+/** devices.json 是否损坏（存在但不是合法 JSON 对象）。
+ *  只用于「没有新设备时也把坏文件修回合法 JSON」；正常读取仍走 devices_meta_read()。 */
+function devices_meta_broken(path) {
+	let txt = null;
+	try {
+		txt = fs.readfile(path);
+	} catch (e) {
+		return false;
+	}
+	if (txt == null)
+		return false;
+	if (trim(txt) == '')
+		return true;
+	try {
+		let o = json(txt);
+		return (type(o) != 'object');
+	} catch (e) {
+		return true;
+	}
+}
+
 function devices_meta_write(path, meta) {
 	let dir = fs.dirname(path);
 	if (dir != null && dir != '' && dir != '/' && !mkpath(dir)) return false;
 
 	/* /etc 在 overlay flash 上：只有真的出现新 MAC 时才走到这里，写入频率极低 */
 	return atomic_write_perm(path, jenc(devices_meta_prune(meta)) + '\n', 420 /* 0644 */);
+}
+
+/* devices.json 是守护进程（first_seen）与 rpcd（alias/group）两个写者的共同文件。
+ * 两边都必须「拿锁 -> 重读 -> 只改自己的键 -> 原子写 -> 放锁」，只靠「读改写 +
+ * pid 临时名」仍会丢更新。ucode 没有 flock，这里用 mkdir 的原子性做互斥：
+ *   - 有限重试（约 1.5 秒），拿不到锁就让本次更新失败、下一轮再试；
+ *   - 锁目录里写 owner（pid + 进程内唯一 token）。陈旧锁回收必须先用 rename
+ *     把原锁整体挪到自己的唯一 stale 路径，只有 rename 成功的一方才能删除它：
+ *     避免两个写者同时 unlink/rmdir 同一个目录时把对方刚建的新锁删掉；
+ *   - 释放时校验 owner 是否仍属于自己，绝不动别人的锁。
+ * 协议必须与 luci-app-traffic-stats/root/usr/share/rpcd/ucode/traffic-stats.uc 完全一致。 */
+const DEVICE_LOCK_STALE_SECONDS = 25;
+const DEVICE_LOCK_RETRY_MS = 25;
+const DEVICE_LOCK_RETRIES = 60;
+
+let lock_seq = 0;
+let lock_pid = 0;
+let lock_rnd = '';
+
+/** ucode 没有 getpid()：从 /proc/self/stat 读第一个字段。失败用时间兜底（仅用于诊断）。 */
+function lock_owner_pid() {
+	if (lock_pid > 0) return lock_pid;
+	let txt = '';
+	try { txt = str(fs.readfile('/proc/self/stat')); } catch (e) { txt = ''; }
+	let n = 0;
+	for (let i = 0; i < length(txt); i++) {
+		let ch = substr(txt, i, 1);
+		if (ch < '0' || ch > '9') break;
+		n = n * 10 + ord(ch) - 48;
+	}
+	if (n <= 0) n = int(time() % 1000000) + 1;
+	lock_pid = n;
+	return lock_pid;
+}
+
+/** 随机唯一值：优先内核 uuid；读不到时退到高精度时钟（仍有 pid+序号保证唯一）。 */
+function lock_owner_nonce() {
+	if (lock_rnd != '') return lock_rnd;
+	try {
+		lock_rnd = replace(trim(str(fs.readfile('/proc/sys/kernel/random/uuid'))), '-', '');
+	} catch (e) {
+		lock_rnd = '';
+	}
+	if (lock_rnd == '') lock_rnd = sprintf('%d%d', int(time()), int(clock()[1]));
+	return lock_rnd;
+}
+
+/** owner 内容：pid|秒|随机唯一值|序号。 */
+function lock_owner_token() {
+	lock_seq++;
+	let cl = clock();
+	return sprintf('%d|%d|%s|%d', lock_owner_pid(), int(time()), lock_owner_nonce(), lock_seq);
+}
+
+/** 返回 { path, token }；null = 拿不到锁（调用方快速失败，下一轮再试）。 */
+function device_lock_acquire(path) {
+	let lock = path + '.lock';
+	for (let i = 0; i < DEVICE_LOCK_RETRIES; i++) {
+		if (fs.mkdir(lock, 448 /* 0700 */)) {
+			let token = lock_owner_token();
+			let n = fs.writefile(lock + '/owner', token + '\n');
+			if (type(n) == 'int') return { path: lock, token: token };
+			/* 刚创建的锁写不进 owner（磁盘满/权限异常）：清掉自己再失败，
+			 * 绝不把一个没有 owner 的锁留给后续写者误判。 */
+			try { fs.unlink(lock + '/owner'); } catch (e) { }
+			try { fs.rmdir(lock); } catch (e) { }
+			return null;
+		}
+
+		let st = null;
+		try { st = fs.stat(lock); } catch (e) { st = null; }
+		if (st != null && (time() - to_int(st.mtime, 0)) >= DEVICE_LOCK_STALE_SECONDS) {
+			/* 陈旧锁：rename 是原子操作，多个回收者里只有一个成功。
+			 * 失败者不能碰原路径（可能已被别人重建），下一轮按新锁重试。 */
+			let stale = lock + '.stale.' + lock_owner_token();
+			if (fs.rename(lock, stale)) {
+				try { fs.unlink(stale + '/owner'); } catch (e) { }
+				try { fs.rmdir(stale); } catch (e) { }
+				continue; /* 立刻重试 mkdir，不白等一个 sleep */
+			}
+		}
+		sleep(DEVICE_LOCK_RETRY_MS);
+	}
+	return null;
+}
+
+function device_lock_release(lock) {
+	if (lock == null) return false;
+	let dir = (type(lock) == 'object') ? str(lock.path) : str(lock);
+	let token = (type(lock) == 'object') ? str(lock.token) : '';
+	if (dir == '') return false;
+
+	/* 只有 owner 仍等于自己才删除：陈旧锁被回收后目录可能已经属于新写者。 */
+	let cur = null;
+	try { cur = fs.readfile(dir + '/owner'); } catch (e) { cur = null; }
+	if (token != '' && (cur == null || trim(str(cur)) != token)) return false;
+
+	try { fs.unlink(dir + '/owner'); } catch (e) { }
+	try { fs.rmdir(dir); } catch (e) { }
+	return true;
 }
 
 /**
@@ -660,13 +880,35 @@ function first_seen_track(ctx) {
 		if (ctx.devices_meta == null
 			|| ctx.now < ctx.devices_meta_ts
 			|| (ctx.now - ctx.devices_meta_ts) >= 30) {
+			let broken = devices_meta_broken(path);
 			ctx.devices_meta = devices_meta_read(path);
 			ctx.devices_meta_ts = ctx.now;
+
+			/* 没有新设备也要把损坏的 devices.json 修回合法 JSON：
+			 * 否则 rpcd 侧一直读到空对象，用户改的别名永远落不了盘。 */
+			if (broken) {
+				let lock = device_lock_acquire(path);
+				if (lock != null) {
+					if (devices_meta_broken(path) && !devices_meta_write(path, {}))
+						dbg(ctx, 'repair ' + path + ' failed: ' + str(fs.error()));
+					device_lock_release(lock);
+				}
+			}
 		}
 		return;
 	}
 
-	/* 有新设备：立刻从磁盘重读再合并（rpcd 可能刚写进 alias/group，不能被覆盖） */
+	/* 有新设备：拿 devices.json 锁，再从磁盘重读并合并（rpcd 可能刚写进 alias/group，
+	   不能被覆盖；拿不到锁就下一轮再试，绝不无锁覆盖）。 */
+	let lock_dir = fs.dirname(path);
+	if (lock_dir != null && lock_dir != '' && lock_dir != '/')
+		mkpath(lock_dir);
+	let lock = device_lock_acquire(path);
+	if (lock == null) {
+		dbg(ctx, 'devices.json lock busy, retry next poll');
+		return;
+	}
+
 	let disk = devices_meta_read(path);
 	let changed = false;
 
@@ -687,11 +929,13 @@ function first_seen_track(ctx) {
 	if (changed) {
 		if (!devices_meta_write(path, disk)) {
 			dbg(ctx, 'write ' + path + ' failed: ' + str(fs.error()));
+			device_lock_release(lock);
 			return;          /* 写失败时保留旧缓存，下一轮再试 */
 		}
 		dbg(ctx, 'first_seen: ' + sprintf('%d', length(keys(disk))) + ' devices -> ' + path);
 	}
 
+	device_lock_release(lock);
 	ctx.devices_meta = disk;
 	ctx.devices_meta_ts = ctx.now;
 }
@@ -1072,22 +1316,33 @@ evict_device = function(ctx) {
  * ------------------------------------------------------------------ */
 
 function clash_url(ctx) {
-	let api = sanitize_uri(ctx.cfg.clash_api);
-	if (index(api, '://') < 0) api = 'http://' + api;
-	return api + '/connections';
+	let origin = parse_clash_origin(ctx.cfg.clash_api);
+	if (origin == '') return '';
+	return origin + '/connections';
+}
+
+/** curl 的 -m 超时（秒）：与 fetch_clash 共用，故障续期 TTL 必须覆盖它。 */
+function clash_fetch_timeout(ctx) {
+	return clamp(to_int(ctx.cfg.poll_interval, 5) * 2, 2, 10);
 }
 
 /** 取一次 /connections；返回 { ok, conns, n, ms, reason } */
 function fetch_clash(ctx) {
 	let t0 = clock();
+	let res = { ok: false, conns: [], ms: 0, reason: '', http: 0, n: 0 };
+	let url = clash_url(ctx);
+	if (url == '') {
+		res.reason = 'clash: clash_api 配置无效（只支持 http(s)://host:port 或 host:port）';
+		res.ms = elapsed_ms(t0);
+		return res;
+	}
 	let body = ctx.cfg.state_dir + '/.clash.body';
 	let code = ctx.cfg.state_dir + '/.clash.code';
 	let errf = ctx.cfg.state_dir + '/.clash.err';
-	let timeout = clamp(ctx.cfg.poll_interval * 2, 2, 10);
+	let timeout = clash_fetch_timeout(ctx);
 	let cmd = 'curl -sS -m ' + timeout + ' -K - -o ' + shell_quote(body)
-		+ " -w '%{http_code}' " + shell_quote(clash_url(ctx))
+		+ " -w '%{http_code}' " + shell_quote(url)
 		+ ' > ' + shell_quote(code) + ' 2> ' + shell_quote(errf);
-	let res = { ok: false, conns: [], ms: 0, reason: '', http: 0, n: 0 };
 
 	try {
 		let p = fs.popen(cmd, 'w');
@@ -1159,6 +1414,236 @@ function ms_between(a, b) {
 	return int(((b[0] - a[0]) * 1000000000 + (b[1] - a[1])) / 1000000);
 }
 
+/* ------------------------------------------------------------------ *
+ * 双源去重（clash 活跃连接 -> conntrack）
+ * ------------------------------------------------------------------ *
+ * fake-ip 只能挡住「目的地址被改写成 fake-ip」的代理流；DIRECT 链以及部分
+ * 未走 fake-ip 的代理流，conntrack 里看到的是真实目的 IP，会和 clash 侧重复。
+ * 所以每轮都用 clash 的**全部活跃连接**建一份去重集合：
+ *
+ *   key = proto|deviceIP|peerIP|devicePort|peerPort
+ *
+ * 其中 deviceIP 是 LAN 设备、peerIP 是外部对端；devicePort 缺失时用 `*`。
+ * 出方向与入方向各建一条，conntrack 按自己的 orig 方向选对应 key。
+ * 集合保留 2 个轮询间隔（至少 DEDUP_TTL_MIN 秒），覆盖两次拉取的时间差。
+ */
+function clash_proto(md) {
+	let p = lc(str(md.network));
+	if (p == 'tcp' || p == 'udp') return p;
+	let t = lc(str(md.type));
+	if (t == 'tcp' || t == 'udp') return t;
+	return '*';
+}
+
+function dedup_key(proto, dev, peer, devport, peerport) {
+	if (dev == '' || peer == '' || peerport == '') return '';
+	return str(proto) + '|' + dev + '|' + peer + '|'
+		+ ((devport != '') ? devport : '*') + '|' + peerport;
+}
+
+function dedup_add(ctx, key, exp) {
+	if (key == '') return;
+	if (length(keys(ctx.clash_dedup)) >= DEDUP_MAX_ENTRIES && ctx.clash_dedup[key] == null) {
+		/* 极端情况下先清过期项，仍满则放弃新键（宁可少去重也不无限涨内存）。 */
+		for (let k in keys(ctx.clash_dedup))
+			if (ctx.clash_dedup[k] < ctx.now) delete ctx.clash_dedup[k];
+		if (length(keys(ctx.clash_dedup)) >= DEDUP_MAX_ENTRIES) return;
+	}
+	ctx.clash_dedup[key] = exp;
+}
+
+/** 一次流在两个方向上的所有可能 key（源端口/协议缺失时包含 `*` 兜底）。 */
+function dedup_keys(proto, dev, peer, devport, peerport) {
+	let out = [];
+	let protos = [ proto ];
+	if (proto != '*') push(protos, '*');
+	let ports = [ (devport != '') ? devport : '*' ];
+	if (devport != '' && devport != '*') push(ports, '*');
+
+	for (let p in protos) {
+		for (let dp in ports) {
+			let key = dedup_key(p, dev, peer, dp, peerport);
+			if (key != '') push(out, key);
+		}
+	}
+	return out;
+}
+
+/** 查 conntrack 流是否命中某张 key->过期时间 的表（去重表 / 故障期 conntrack 表）。
+ *  热路径（每条 conntrack 流）不分配临时数组，直接枚举 proto/源端口两个兜底维度。 */
+function dedup_lookup(map, now, proto, dev, peer, devport, peerport) {
+	if (map == null) return false;
+	let proto2 = (proto != '*') ? '*' : null;
+	let port2 = (devport != '' && devport != '*') ? '*' : null;
+	for (let pi = 0; pi < 2; pi++) {
+		let p = (pi == 0) ? proto : proto2;
+		if (p == null) break;
+		for (let di = 0; di < 2; di++) {
+			let dp = (di == 0) ? ((devport != '') ? devport : '*') : port2;
+			if (dp == null) break;
+			let key = dedup_key(p, dev, peer, dp, peerport);
+			if (key == '') continue;
+			let exp = map[key];
+			if (exp != null && exp >= now) return true;
+		}
+	}
+	return false;
+}
+
+/** 查 conntrack 流是否命中 clash 活跃连接。 */
+function dedup_match(ctx, proto, dev, peer, devport, peerport) {
+	return dedup_lookup(ctx.clash_dedup, ctx.now, proto, dev, peer, devport, peerport);
+}
+
+/**
+ * 去重 key 的保留时长：只由「配置的轮询间隔」和本轮实际 dt 决定，且实际 dt
+ * 最多按 3 个轮询间隔计。绝不能直接用恢复基线后的 dt —— 跨软重启时
+ * last_poll_ts 被锚定到最多 1 小时前，会得到 2 小时的 TTL，把去重键留到
+ * 实际连接早已结束之后。自适应降频的真实 dt 最多也是 3 倍配置间隔。
+ */
+function dedup_ttl(ctx) {
+	let base = to_int(ctx.cfg.poll_interval, 5);
+	if (base < 1) base = 1;
+	let cap = base * 3;
+	let dt = (ctx.poll_dt > 0) ? ctx.poll_dt : base;
+	if (dt > cap) dt = cap;
+	if (dt < 1) dt = 1;
+	return max(DEDUP_TTL_MIN, dt * 2);
+}
+
+/**
+ * 故障期间续期/故障账本的 TTL：必须覆盖「本轮 curl 最长耗时 + 下一轮最长调度
+ * 间隔 + 余量」。下一轮可能在空闲降频后变成 3 倍间隔（上限 30s），不能只按
+ * 当前 poll_interval 算；否则慢 curl 一次跨过 TTL，键会在恢复前被清掉。
+ */
+function dedup_failure_ttl(ctx) {
+	let base = to_int(ctx.cfg.poll_interval, 5);
+	if (base < 1) base = 1;
+	let next = min(base * 3, 30);
+	if (next < base) next = base;
+	let need = clash_fetch_timeout(ctx) + next + DEDUP_TTL_MIN;
+	return max(dedup_ttl(ctx), need);
+}
+
+/** 用本轮 clash 活跃连接重建去重集合（所有链，含 DIRECT / 代理）。 */
+function build_clash_dedup(ctx, conns) {
+	/* 保留 2 轮：自适应降频到 30s 时也能覆盖两次拉取边界；恢复基线的
+	 * 陈旧 dt 已被 dedup_ttl() clamp，不让锚点年龄参与。 */
+	let ttl = dedup_ttl(ctx);
+	let exp = ctx.now + ttl;
+
+	for (let k in keys(ctx.clash_dedup))
+		if (ctx.clash_dedup[k] < ctx.now) delete ctx.clash_dedup[k];
+
+	for (let c in conns) {
+		if (type(c) != 'object') continue;
+		let md = (type(c.metadata) == 'object') ? c.metadata : {};
+		let src = str(md.sourceIP);
+		let dst = str(md.destinationIP);
+		let sport = str(md.sourcePort);
+		let dport = str(md.destinationPort);
+		if (src == '' || dst == '' || dport == '') continue;
+
+		let proto = clash_proto(md);
+		dedup_add(ctx, dedup_key(proto, src, dst, sport, dport), exp);
+		/* 入方向：clash 把 sourceIP 报成 LAN 设备时，conntrack 的 orig 是反的。 */
+		dedup_add(ctx, dedup_key(proto, dst, src, dport, sport), exp);
+	}
+	dbg(ctx, sprintf('clash dedup: entries=%d ttl=%ds dt=%ds',
+		length(keys(ctx.clash_dedup)), ttl, ctx.poll_dt));
+}
+
+/**
+ * clash 拉取失败时续期已有去重键：故障期间 conntrack 仍会看到这些真实目的 IP
+ * 的流，如果键在 TTL 后过期，conntrack 会先按 direct 记账；恢复后 clash 又按
+ * 旧基线把同一段增量算成 proxy，造成双计。
+ *
+ * 关键点（终审阻断 1）：
+ *   - **不删除过期键**。慢 curl 可能一次阻塞 10s，跨过原 TTL；这里从续期时的
+ *     真实 time() 重新计 TTL，并把所有已有的键（包括已过期但本轮还没来得及
+ *     用的）全部续上。过期清理只发生在成功 build_clash_dedup() 时。
+ *   - TTL 覆盖 curl 超时 + 下一轮最长调度间隔 + 余量（见 dedup_failure_ttl）。
+ *   - 表大小仍受 DEDUP_MAX_ENTRIES 限制（只续期、不加新键，不增长）。
+ */
+function renew_clash_dedup_on_failure(ctx) {
+	let now = time();
+	if (now < ctx.now) now = ctx.now;
+	let ttl = dedup_failure_ttl(ctx);
+	let exp = now + ttl;
+	let kept = 0;
+	for (let k in keys(ctx.clash_dedup)) {
+		let old = ctx.clash_dedup[k];
+		/* 只接受内部生成的字符串键 + 正整数过期时间，坏值直接丢弃（不续期）。 */
+		if (type(k) != 'string' || type(old) != 'int' || old <= 0) {
+			delete ctx.clash_dedup[k];
+			continue;
+		}
+		ctx.clash_dedup[k] = exp;
+		kept++;
+	}
+	/* 故障期 conntrack 记录的 5 元组必须保留到「恢复成功轮」：它们是恢复时
+	 * 判断「这条 clash 连接是否已经被 conntrack 按 direct 计过」的唯一依据。
+	 * 同样不在这里删除过期项；只续期。 */
+	let notes = 0;
+	for (let k in keys(ctx.clash_outage_ct)) {
+		let old = ctx.clash_outage_ct[k];
+		if (type(k) != 'string' || type(old) != 'int' || old <= 0) {
+			delete ctx.clash_outage_ct[k];
+			continue;
+		}
+		ctx.clash_outage_ct[k] = exp;
+		notes++;
+	}
+	dbg(ctx, sprintf('clash dedup renewed on failure: entries=%d outage=%d ttl=%ds dt=%ds',
+		kept, notes, ttl, ctx.poll_dt));
+}
+
+/** 故障账本满时淘汰一个最早过期的条目（故障期新流量比旧条目更值得保留）。 */
+function outage_evict_one(ctx) {
+	let worst = null, worst_v = null;
+	for (let k in ctx.clash_outage_ct) {
+		let v = ctx.clash_outage_ct[k];
+		let n = (type(v) == 'int') ? v : 0;
+		if (worst_v == null || n < worst_v) {
+			worst_v = n;
+			worst = k;
+		}
+	}
+	if (worst != null) {
+		delete ctx.clash_outage_ct[worst];
+		return true;
+	}
+	return false;
+}
+
+/** 故障期间 conntrack 已按 direct 记账的流：记录其 key，恢复 clash 时若同一流
+ *  没有旧基线（故障期间新建），不能又把当前累计值全量加一遍。
+ *  过期时间用故障 TTL（覆盖恢复前的整个故障窗口），并随 baseline 持久化。 */
+function outage_note(ctx, proto, dev, peer, devport, peerport) {
+	let ks = dedup_keys(proto, dev, peer, devport, peerport);
+	if (length(ks) == 0) return;
+
+	let now = time();
+	if (now < ctx.now) now = ctx.now;
+	let exp = now + dedup_failure_ttl(ctx);
+
+	/* 有界：先按新键数量腾出槽位，再写入；绝不因为账本满就无界增长。 */
+	let add = 0;
+	for (let key in ks)
+		if (ctx.clash_outage_ct[key] == null) add++;
+	let over = length(keys(ctx.clash_outage_ct)) + add - DEDUP_MAX_ENTRIES;
+	while (over > 0) {
+		if (!outage_evict_one(ctx)) break;
+		over--;
+	}
+	for (let key in ks)
+		ctx.clash_outage_ct[key] = exp;
+}
+
+function outage_seen(ctx, proto, dev, peer, devport, peerport) {
+	return dedup_lookup(ctx.clash_outage_ct, ctx.now, proto, dev, peer, devport, peerport);
+}
+
 /**
  * clash 侧增量累计
  *  - id 是稳定键，用上轮快照做差；连接消失时删除快照（最后一次已知值即已计入）
@@ -1166,7 +1651,7 @@ function ms_between(a, b) {
  *  - 域名取 metadata.host，空则用 destinationIP:destinationPort
  *  - 设备用 metadata.sourceIP
  */
-function accumulate_clash(ctx, conns) {
+function accumulate_clash(ctx, conns, priming) {
 	let seen = {};
 	for (let c in conns) {
 		if (type(c) != 'object') continue;
@@ -1180,9 +1665,35 @@ function accumulate_clash(ctx, conns) {
 		if (dl < 0) dl = 0;
 		if (ul < 0) ul = 0;
 
+		/* 没有可用基线（首次安装 / hard reboot / 文件损坏 / 过期）：
+		 * 只记录当前累计值，不把现存连接的全量字节算进第一帧。 */
+		if (priming) {
+			ctx.clash_prev[id] = { rx: dl, tx: ul };
+			continue;
+		}
+
 		let prev = ctx.clash_prev[id];
 		let ddl, dul;
 		if (prev == null) {
+			/* 基线被截断时，没被写进 baseline 的连接不能把当前累计值全量补进
+			 * daily（重启后这些字节其实早已计过）。首轮只采样；下一轮起新连接
+			 * 照常按增量计。 */
+			if (ctx.prime_missing_clash) {
+				ctx.clash_prev[id] = { rx: dl, tx: ul };
+				continue;
+			}
+			/* clash 故障期间 conntrack 可能已经把这条新建流按 direct 计过：
+			 * 恢复时若命中故障期 conntrack 记录，同样只采样，避免双计。 */
+			if (ctx.clash_recovering) {
+				let rs = str(md.sourceIP), rd = str(md.destinationIP);
+				let rsp = str(md.sourcePort), rdp = str(md.destinationPort);
+				let rp = clash_proto(md);
+				if (outage_seen(ctx, rp, rs, rd, rsp, rdp)
+					|| outage_seen(ctx, rp, rd, rs, rdp, rsp)) {
+					ctx.clash_prev[id] = { rx: dl, tx: ul };
+					continue;
+				}
+			}
 			ddl = dl;
 			dul = ul;
 		} else {
@@ -1254,6 +1765,8 @@ function accumulate_clash(ctx, conns) {
 	for (let id in keys(ctx.clash_prev)) {
 		if (seen[id] == null) delete ctx.clash_prev[id];
 	}
+	/* 截断基线的「未覆盖条目只采样」只作用于恢复后的第一轮成功采样。 */
+	ctx.prime_missing_clash = false;
 }
 
 node_add = function(store, node, rx, tx) {
@@ -1341,10 +1854,12 @@ function parse_ct_line(line) {
 	if (length(groups) == 0) return null;
 	let orig = groups[0];
 	if (orig.src == null || orig.dst == null) return null;
+	/* bytes= 是否存在取决于 nf_conntrack_acct；缺失时不能假装精确。 */
+	let acct = (orig.bytes != null);
 	if (orig.bytes == null) orig.bytes = 0;
 	let reply = (length(groups) > 1) ? groups[1] : null;
 	if (reply != null && reply.bytes == null) reply.bytes = 0;
-	return { family: family, proto: proto, orig: orig, reply: reply };
+	return { family: family, proto: proto, orig: orig, reply: reply, acct: acct };
 }
 
 /**
@@ -1353,7 +1868,7 @@ function parse_ct_line(line) {
  * 方向统一按“设备视角”：orig 是设备发出的 -> tx，reply 是设备收到的 -> rx；
  * 若设备是 orig.dst（外网主动连入），则反过来。
  */
-function accumulate_conntrack(ctx, text) {
+function accumulate_conntrack(ctx, text, priming) {
 	let seen = {};
 	let total = 0;
 
@@ -1384,7 +1899,7 @@ function accumulate_conntrack(ctx, text) {
 			continue; /* 与 LAN 设备无关（路由自身 / clash 的出站腿） */
 		}
 
-		/* 去重：orig.dst 落在 fake-ip 段 -> 已被 clash 接管，跳过，绝不重复计入直连 */
+		/* 去重 1：orig.dst 落在 fake-ip 段 -> 已被 clash 接管，跳过，绝不重复计入直连 */
 		if (odst != null && cidr_match(ctx.fake_cidrs, odst)) {
 			ctx.fakeip_skipped++;
 			continue;
@@ -1402,9 +1917,39 @@ function accumulate_conntrack(ctx, text) {
 		let cur_tx = (dir == 1) ? o.bytes : ((flow.reply != null) ? flow.reply.bytes : 0);
 		let cur_rx = (dir == 1) ? ((flow.reply != null) ? flow.reply.bytes : 0) : o.bytes;
 
+		ctx.ct_lan_flows++;
+		if (flow.acct) ctx.ct_acct_flows++;
+
+		/* 去重 2：DIRECT 链 / 非 fake-ip 的代理流，conntrack 里是真实目的 IP，
+		 * 只要命中本轮或上一轮 clash 活跃连接就跳过；同时把快照对齐到当前值，
+		 * 避免 TTL 过期后把已计过的字节再算一遍。 */
+		let dev, peer, devport, peerport;
+		if (dir == 1) {
+			dev = o.src; peer = o.dst; devport = str(o.sport); peerport = str(o.dport);
+		} else {
+			dev = o.dst; peer = o.src; devport = str(o.dport); peerport = str(o.sport);
+		}
+		if (dedup_match(ctx, flow.proto, dev, peer, devport, peerport)) {
+			ctx.clash_deduped++;
+			ctx.ct_prev[key] = { rx: cur_rx, tx: cur_tx };
+			continue;
+		}
+
+		/* 无基线首帧：只采样不记账（避免把现存直连流的全部字节算成新流量）。 */
+		if (priming) {
+			ctx.ct_prev[key] = { rx: cur_rx, tx: cur_tx };
+			continue;
+		}
+
 		let prev = ctx.ct_prev[key];
 		let d_rx, d_tx;
 		if (prev == null) {
+			/* 截断基线的未覆盖流：首轮只采样，避免重启后把已计过的累积字节
+			 * 全量重加（和 clash 侧同一策略）。 */
+			if (ctx.prime_missing_ct) {
+				ctx.ct_prev[key] = { rx: cur_rx, tx: cur_tx };
+				continue;
+			}
 			d_rx = cur_rx;
 			d_tx = cur_tx;
 		} else {
@@ -1415,6 +1960,11 @@ function accumulate_conntrack(ctx, text) {
 		}
 		ctx.ct_prev[key] = { rx: cur_rx, tx: cur_tx };
 		if (d_rx == 0 && d_tx == 0) continue;
+
+		/* clash 故障期间按 direct 记账的流：记下 5 元组，恢复时若 clash 里
+		 * 出现同一条新连接（无旧基线），只采样不再重复加。 */
+		if (ctx.clash_outage_active)
+			outage_note(ctx, flow.proto, dev, peer, devport, peerport);
 
 		link_add(ctx, dev_link(ctx, ip), d_rx, d_tx);
 
@@ -1450,6 +2000,7 @@ function accumulate_conntrack(ctx, text) {
 	for (let key in keys(ctx.ct_prev)) {
 		if (seen[key] == null) delete ctx.ct_prev[key];
 	}
+	ctx.prime_missing_ct = false;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1459,6 +2010,28 @@ function accumulate_conntrack(ctx, text) {
 function local_day_str(ts) {
 	let t = localtime(ts);
 	return sprintf('%04d-%02d-%02d', t.year, t.mon, t.mday);
+}
+
+/** 严格校验 YYYY-MM-DD（含真实日历日）。daily / pending 的文件名都由它把关，
+ *  防止从 pending-daily.json 读到的 day 带 `../` 之类字符穿越 daily 目录。 */
+function is_day_str(s) {
+	s = str(s);
+	if (length(s) != 10) return false;
+	for (let i = 0; i < 10; i++) {
+		let ch = substr(s, i, 1);
+		if (i == 4 || i == 7) {
+			if (ch != '-') return false;
+		} else if (ch < '0' || ch > '9') {
+			return false;
+		}
+	}
+	let y = to_int(substr(s, 0, 4), 0);
+	let m = to_int(substr(s, 5, 2), 0);
+	let d = to_int(substr(s, 8, 2), 0);
+	if (y < 1970 || y > 9999 || m < 1 || m > 12 || d < 1) return false;
+	let leap = ((y % 4 == 0) && (y % 100 != 0 || y % 400 == 0));
+	let mdays = [ 31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 ];
+	return d <= mdays[m - 1];
 }
 
 function bucket_ts_of(ts) {
@@ -1561,7 +2134,10 @@ function day_summary(ctx) {
 	let apps = [];
 	for (let host in ctx.day_apps) {
 		let a = ctx.day_apps[host];
-		push(apps, { host: host, rx: a.rx, tx: a.tx, chain: a.chain, devices: length(a.devs) });
+		push(apps, {
+			host: host, rx: a.rx, tx: a.tx, chain: a.chain,
+			devices: (a.dev_count != null) ? a.dev_count : length(a.devs)
+		});
 	}
 	apps = sort(apps, function(a, b) { return (b.rx + b.tx) - (a.rx + a.tx); });
 
@@ -1583,16 +2159,205 @@ function day_summary(ctx) {
 	};
 }
 
+/**
+ * 从今天的 daily 文件恢复当日累计（跨软重启 / 进程重启）。
+ * 只认「文件名 == 今天」且文件内 day/ts 也指向今天的数据，坏文件/旧日文件
+ * 一律忽略 —— 绝不能把昨天的量读成今天。daily 格式保持原样（totals/devices/
+ * apps/nodes），老文件没有 apps.devices 明细也能只恢复计数。
+ */
+function daily_restore(ctx) {
+	let path = ctx.cfg.daily_dir + '/' + ctx.day + '.json';
+	ctx.daily_file_present = false;
+	try {
+		if (fs.stat(path) != null)
+			ctx.daily_file_present = true;
+	} catch (e) { }
+
+	let data = load_json(path);
+	if (data == null || type(data) != 'object') return false;
+
+	let file_day = str(data.day);
+	let ts = to_int(data.ts, 0);
+	if (file_day != '') {
+		if (file_day != ctx.day) return false;
+	} else if (ts > 0) {
+		if (local_day_str(ts) != ctx.day) return false;
+	} else {
+		return false;
+	}
+
+	let t = (type(data.totals) == 'object') ? data.totals : {};
+	let has_split = (t.direct_rx != null || t.direct_tx != null
+		|| t.proxy_rx != null || t.proxy_tx != null);
+	let drx, dtx, prx, ptx;
+	if (has_split) {
+		drx = max(0, to_int(t.direct_rx, 0));
+		dtx = max(0, to_int(t.direct_tx, 0));
+		prx = max(0, to_int(t.proxy_rx, 0));
+		ptx = max(0, to_int(t.proxy_tx, 0));
+	} else {
+		/* 老 daily 只有 rx/tx：保留总量，归入 direct（无法还原拆分时不丢数）。 */
+		drx = max(0, to_int(t.rx, 0));
+		dtx = max(0, to_int(t.tx, 0));
+		prx = 0; ptx = 0;
+	}
+	ctx.day_totals = { direct_rx: drx, direct_tx: dtx, proxy_rx: prx, proxy_tx: ptx };
+
+	ctx.day_devices = {};
+	if (type(data.devices) == 'array') {
+		let n = 0;
+		for (let dev in data.devices) {
+			if (type(dev) != 'object' || n >= MAX_OUT_DEVICES) continue;
+			let ip = str(dev.ip);
+			if (ip == '') continue;
+			ctx.day_devices[ip] = {
+				rx: max(0, to_int(dev.rx, 0)),
+				tx: max(0, to_int(dev.tx, 0))
+			};
+			n++;
+		}
+	}
+
+	ctx.day_apps = {};
+	if (type(data.apps) == 'array') {
+		let n = 0;
+		for (let app in data.apps) {
+			if (type(app) != 'object' || n >= MAX_OUT_APPS) continue;
+			let host = str(app.host);
+			if (host == '') continue;
+			let dc = max(0, to_int(app.devices, 0));
+			/* 只恢复计数，没有 IP 明细；用占位键保持 daily 的 devices 字段不变。 */
+			let devs = {};
+			for (let i = 0; i < dc && i < MAX_TRACK_DEVICES; i++) devs['~' + i] = 1;
+			ctx.day_apps[host] = {
+				rx: max(0, to_int(app.rx, 0)),
+				tx: max(0, to_int(app.tx, 0)),
+				chain: str(app.chain),
+				devs: devs,
+				dev_count: dc
+			};
+			n++;
+		}
+	}
+
+	ctx.day_nodes = {};
+	if (type(data.nodes) == 'object') {
+		let n = 0;
+		for (let name, node in data.nodes) {
+			if (type(node) != 'object' || n >= MAX_DAY_APPS) continue;
+			ctx.day_nodes[str(name)] = {
+				rx: max(0, to_int(node.rx, 0)),
+				tx: max(0, to_int(node.tx, 0))
+			};
+			n++;
+		}
+	}
+
+	dbg(ctx, 'daily restored: ' + path);
+	return true;
+}
+
+/** 写一份「已经定稿」的 daily 快照（日切时用；ctx.day 可能已经切到新的一天）。
+ *  文件名只接受严格合法的 YYYY-MM-DD：pending 文件来自磁盘，不能让它带着
+ *  `../` 之类的 day 穿越 daily 目录。 */
+function daily_snapshot_write(ctx, snap) {
+	if (snap == null || type(snap) != 'object' || !is_day_str(str(snap.day))) return false;
+	if (!mkpath(ctx.cfg.daily_dir)) return false;
+	return atomic_write(ctx.cfg.daily_dir + '/' + str(snap.day) + '.json', jenc(snap));
+}
+
+function pending_daily_path(ctx) {
+	return ctx.cfg.state_dir + '/pending-daily.json';
+}
+
+/**
+ * 日切 pending 快照持久化到 state_dir（/tmp tmpfs，原子写）。
+ * daily 目录（/etc，闪存）写失败时，进程重启不能丢掉跨天数据；启动时恢复后
+ * 按 DAILY_PENDING_RETRY_SECONDS 重试。文件结构 {v,ts,days:{day:snapshot}}。
+ */
+function pending_daily_persist(ctx) {
+	/* 只持久化合法日期：即使内存里混进坏 key（例如恢复前被外部写坏），
+	 * 也不会把带路径的 day 写回 pending 文件。 */
+	let days = {};
+	let n = 0;
+	for (let day in keys(ctx.pending_daily)) {
+		if (!is_day_str(day)) continue;
+		let snap = ctx.pending_daily[day];
+		if (snap == null || type(snap) != 'object' || str(snap.day) != day) continue;
+		days[day] = snap;
+		if (++n >= DAILY_PENDING_MAX_DAYS) break;
+	}
+	if (length(keys(days)) == 0) {
+		try { fs.unlink(pending_daily_path(ctx)); } catch (e) { }
+		return true;
+	}
+	mkpath(ctx.cfg.state_dir);
+	let out = { v: 1, ts: (ctx.now > 0) ? ctx.now : time(), days: days };
+	let ok = atomic_write(pending_daily_path(ctx), jenc(out));
+	if (!ok) dbg(ctx, 'write pending-daily.json failed: ' + str(fs.error()));
+	return ok;
+}
+
+/** 启动时恢复 pending 快照：只接受严格合法日期 + 结构完整的对象，
+ *  最多 DAILY_PENDING_MAX_DAYS 天。 */
+function pending_daily_restore(ctx) {
+	let o = load_json(pending_daily_path(ctx));
+	if (o == null || type(o) != 'object' || type(o.days) != 'object') return 0;
+	let n = 0;
+	for (let day, snap in o.days) {
+		let d = str(day);
+		if (!is_day_str(d)) {
+			dbg(ctx, 'pending daily rejected: invalid day');
+			continue;
+		}
+		if (type(snap) != 'object' || str(snap.day) != d) continue;
+		if (type(snap.totals) != 'object') continue;
+		ctx.pending_daily[d] = snap;
+		if (++n >= DAILY_PENDING_MAX_DAYS) break;
+	}
+	if (n > 0) {
+		/* 立刻重试：进程重启时用户通常已经修好 daily 目录。 */
+		ctx.pending_daily_ts = 0;
+		dbg(ctx, sprintf('pending daily restored: %d day(s)', n));
+	}
+	return n;
+}
+
+/**
+ * 日切时旧的一天写失败：保留快照，按 DAILY_PENDING_RETRY_SECONDS 重试。
+ * 绝不因为一次写失败就丢掉已经统计好的跨天数据。
+ */
+function daily_pending_retry(ctx, force) {
+	let days = keys(ctx.pending_daily);
+	if (length(days) == 0) return;
+	if (!force && ctx.pending_daily_ts > 0
+		&& ctx.now - ctx.pending_daily_ts < DAILY_PENDING_RETRY_SECONDS) return;
+
+	ctx.pending_daily_ts = ctx.now;
+	let changed = false;
+	for (let day in days) {
+		let snap = ctx.pending_daily[day];
+		if (snap == null) { delete ctx.pending_daily[day]; changed = true; continue; }
+		if (daily_snapshot_write(ctx, snap)) {
+			dbg(ctx, 'pending daily written: ' + day);
+			delete ctx.pending_daily[day];
+			changed = true;
+		} else {
+			/* 每一天独立重试：一天失败不跳过后面的天。 */
+			dbg(ctx, 'pending daily retry failed: ' + day + ' (' + str(fs.error()) + ')');
+		}
+	}
+	if (changed) pending_daily_persist(ctx);
+}
+
 function daily_write(ctx, force) {
+	daily_pending_retry(ctx, force);
 	if (!force) {
 		if (ctx.daily_fail_ts > 0 && ctx.now - ctx.daily_fail_ts < DAILY_RETRY_SECONDS) return;
 		if (ctx.last_daily_write > 0 && ctx.now - ctx.last_daily_write < DAILY_WRITE_SECONDS) return;
 	}
-	if (!mkpath(ctx.cfg.daily_dir)) {
-		ctx.daily_fail_ts = ctx.now;
-		return;
-	}
-	if (!atomic_write(ctx.cfg.daily_dir + '/' + ctx.day + '.json', jenc(day_summary(ctx)))) {
+	let snap = day_summary(ctx);
+	if (!daily_snapshot_write(ctx, snap)) {
 		ctx.daily_fail_ts = ctx.now;
 		return;
 	}
@@ -1635,7 +2400,16 @@ function day_rollover_check(ctx) {
 	let d = local_day_str(ctx.now);
 	if (ctx.day == d) return;
 	if (ctx.day != '') {
-		daily_write(ctx, true);      /* 先把前一天落盘（此时 ctx.day 仍是旧值） */
+		/* 先把前一天定稿成快照；写失败就把快照留在 pending_daily 里重试，
+		 * 并立刻持久化到 state_dir，保证进程重启后仍能恢复。 */
+		let snap = day_summary(ctx);
+		if (!daily_snapshot_write(ctx, snap)) {
+			ctx.pending_daily[snap.day] = snap;
+			pending_daily_persist(ctx);
+		} else {
+			delete ctx.pending_daily[snap.day];
+			pending_daily_persist(ctx);
+		}
 		ctx.buckets = [];
 	}
 	ctx.day = d;
@@ -1646,6 +2420,261 @@ function day_rollover_check(ctx) {
 	ctx.cur_bucket = null;
 	ctx.last_history_flush = 0;
 	daily_prune(ctx);
+}
+
+/* ------------------------------------------------------------------ *
+ * 跨软重启基线（state_dir/baseline.json）
+ * ------------------------------------------------------------------ *
+ * 只持久化「连接累计值快照」和采样时间，不持久化 totals（SPEC §3.1 明确
+ * totals 是进程启动以来累计）。恢复后：
+ *   - 已存在的 clash 连接 / conntrack 流按上次快照做差，不会首帧全量加；
+ *   - 基线时间戳同时作为首轮 dt 的锚点，避免出现虚高的瞬时速率；
+ *   - 缺文件 / 坏 JSON / 旧日期 / 过期 -> 对应数据源进入 prime 模式（只采样不记账）。
+ *   - baseline 条目有 8192 上限并记录 total/truncated：未覆盖条目恢复首轮只采样。
+ *   - v3 起额外持久化双源去重键集和 clash 故障账本（均有版本、上限、类型校验），
+ *     这样「故障中重启」后 conntrack 不会把既有代理流再按 direct 记一遍。
+ * 剩余限制（有意保守降级，不承诺完美恢复）：/tmp 被清空、baseline 超过 1 小时；
+ * 截断基线里未覆盖的连接也会少计恢复首轮的一次采样。
+ */
+function baseline_path(ctx) {
+	return ctx.cfg.state_dir + '/' + BASELINE_FILE;
+}
+
+/** 基线条目上限（测试钩子可降低阈值；生产恒为 BASELINE_MAX_ENTRIES=8192）。
+ *  同一个上限同时用于写入与读取，保证两边截断口径一致。 */
+function baseline_max_entries() {
+	let v = to_int(getenv('TRAFFIC_STATS_BASELINE_MAX_ENTRIES'), 0);
+	return (v > 0) ? v : BASELINE_MAX_ENTRIES;
+}
+
+/** 去重键格式：proto|dev|peer|devport|peerport。只接受可打印 ASCII、
+ *  恰好 4 个分隔符、长度有界；`../`、控制字符、超长键一律拒绝。 */
+function baseline_key_ok(k) {
+	if (type(k) != 'string') return false;
+	if (length(k) < 5 || length(k) > BASELINE_KEY_MAX_LEN) return false;
+	let bars = 0;
+	for (let i = 0; i < length(k); i++) {
+		let ch = substr(k, i, 1);
+		let n = ord(ch);
+		if (n < 0x21 || n > 0x7e) return false;
+		if (ch == '|') bars++;
+		else if (ch == '"' || ch == '\\') return false;
+	}
+	return bars == 4;
+}
+
+function baseline_map_load(raw, maxn) {
+	if (type(raw) != 'object') return null;
+	let out = {};
+	let n = 0;
+	let total = 0;
+	let truncated = 0;
+	for (let key, val in raw) {
+		total++;
+		if (type(val) != 'object') continue;
+		let rx = to_int(val.rx, null);
+		let tx = to_int(val.tx, null);
+		if (rx == null || tx == null || rx < 0 || tx < 0) continue;
+		if (n >= maxn) { truncated++; continue; }
+		out[str(key)] = { rx: rx, tx: tx };
+		n++;
+	}
+	return { map: out, total: total, kept: n, truncated: truncated };
+}
+
+/** 加载去重/故障账本：key 必须是字符串且结构合法，过期时间必须是正整数、
+ *  且不超过 now + BASELINE_EXP_MAX_AHEAD；条目数受 maxn 限制。
+ *  keep_expired=true 时保留已过期条目：故障期间需要它们续期，重启后第一次
+ *  成功 build 才会清过期；正常成功轮之前它们不会参与 dedup_lookup。 */
+function baseline_exp_map_load(raw, maxn, now, keep_expired) {
+	if (type(raw) != 'object') return { map: {}, total: 0, kept: 0, dropped: 0 };
+	let out = {}, n = 0, total = 0, dropped = 0;
+	for (let k, v in raw) {
+		total++;
+		if (!baseline_key_ok(k)) { dropped++; continue; }
+		if (type(v) != 'int' || v <= 0 || v > now + BASELINE_EXP_MAX_AHEAD) { dropped++; continue; }
+		if (!keep_expired && v < now) { dropped++; continue; }
+		if (n >= maxn) { dropped++; continue; }
+		out[str(k)] = v;
+		n++;
+	}
+	return { map: out, total: total, kept: n, dropped: dropped };
+}
+
+/** 写出去重/故障账本：只写类型/长度合法的条目，最多 maxn 条。 */
+function baseline_exp_map_out(map, maxn) {
+	let out = {}, n = 0, total = 0;
+	for (let k in keys(map)) {
+		total++;
+		let v = map[k];
+		if (!baseline_key_ok(k)) continue;
+		if (type(v) != 'int' || v <= 0) continue;
+		if (n >= maxn) continue;
+		out[str(k)] = v;
+		n++;
+	}
+	return { map: out, total: total, kept: n };
+}
+
+function baseline_write(ctx) {
+	if (ctx.cfg == null || ctx.cfg.state_dir == '') return false;
+
+	let maxn = baseline_max_entries();
+	let cp = {}, n = 0, clash_total = 0;
+	for (let id in ctx.clash_prev) {
+		clash_total++;
+		if (n >= maxn) continue;
+		cp[id] = { rx: ctx.clash_prev[id].rx, tx: ctx.clash_prev[id].tx };
+		n++;
+	}
+	let tp = {}, m = 0, ct_total = 0;
+	for (let key in ctx.ct_prev) {
+		ct_total++;
+		if (m >= maxn) continue;
+		tp[key] = { rx: ctx.ct_prev[key].rx, tx: ctx.ct_prev[key].tx };
+		m++;
+	}
+
+	/* 去重键/故障账本单独限长：即使测试钩子把 prev 上限调大，也不会超过
+	 * DEDUP_MAX_ENTRIES。 */
+	let dmax = min(maxn, DEDUP_MAX_ENTRIES);
+	let dd = baseline_exp_map_out(ctx.clash_dedup, dmax);
+	let oo = baseline_exp_map_out(ctx.clash_outage_ct, dmax);
+
+	/* 明确记录真实条数与被截断条数：只有写了 truncated 元数据，恢复时才能
+	 * 判断「某个连接没有基线」是因为它真的新建，还是因为 map 被截断了。
+	 * 没有这个元数据时，loader 对满 8192 条的旧基线按「可能截断」保守处理。 */
+	let out = {
+		v: BASELINE_VERSION,
+		ts: (ctx.now > 0) ? ctx.now : time(),
+		day: ctx.day,
+		clash_ts: ctx.clash_sample_ts,
+		ct_ts: ctx.ct_sample_ts,
+		clash_prev: cp,
+		ct_prev: tp,
+		clash_total: clash_total,
+		ct_total: ct_total,
+		clash_truncated: max(0, clash_total - n),
+		ct_truncated: max(0, ct_total - m),
+		/* v3：双源去重键集 + clash 故障账本，重启后仍能避免 direct/proxy 双计 */
+		clash_dedup: dd.map,
+		dedup_total: dd.total,
+		dedup_truncated: max(0, dd.total - dd.kept),
+		clash_outage: oo.map,
+		outage_total: oo.total,
+		outage_truncated: max(0, oo.total - oo.kept),
+		clash_outage_active: (ctx.clash_outage_active == true),
+		clash_outage_had: (ctx.clash_outage_had == true)
+	};
+	mkpath(ctx.cfg.state_dir);
+	let ok = atomic_write(baseline_path(ctx), jenc(out));
+	if (!ok) dbg(ctx, 'write baseline.json failed: ' + str(fs.error()));
+	if (clash_total > n || ct_total > m)
+		dbg(ctx, sprintf('baseline truncated: clash=%d/%d ct=%d/%d',
+			n, clash_total, m, ct_total));
+	return ok;
+}
+
+function baseline_load(ctx) {
+	ctx.prime_clash = true;
+	ctx.prime_ct = true;
+	ctx.prime_missing_clash = false;
+	ctx.prime_missing_ct = false;
+	ctx.baseline_file_present = false;
+	try {
+		if (fs.stat(baseline_path(ctx)) != null) ctx.baseline_file_present = true;
+	} catch (e) { }
+
+	/* 先看大小：损坏/伪造的超大文件不读进内存。 */
+	let st = null;
+	try { st = fs.stat(baseline_path(ctx)); } catch (e) { st = null; }
+	if (st != null && to_int(st.size, 0) > BASELINE_MAX_BYTES) {
+		dbg(ctx, sprintf('baseline too large: %d bytes', to_int(st.size, 0)));
+		return false;
+	}
+
+	let b = load_json(baseline_path(ctx));
+	if (b == null || type(b) != 'object') return false;
+	let bv = to_int(b.v, 1);
+	if (bv < 1 || bv > BASELINE_VERSION) {
+		dbg(ctx, sprintf('baseline version unsupported: %d', bv));
+		return false;
+	}
+	if (str(b.day) != ctx.day) return false;
+
+	let now = (ctx.now > 0) ? ctx.now : time();
+	let bts = to_int(b.ts, 0);
+	if (bts <= 0 || bts > now + 60 || now - bts > BASELINE_MAX_AGE) return false;
+
+	let maxn = baseline_max_entries();
+	let cp = baseline_map_load(b.clash_prev, maxn);
+	let tp = baseline_map_load(b.ct_prev, maxn);
+	let anchor = bts;
+	let cts = to_int(b.clash_ts, 0);
+	let tts = to_int(b.ct_ts, 0);
+	if (cts > now) cts = now;
+	if (tts > now) tts = now;
+
+	/* 数据源从未成功采样过（ts=0）时，空 map 不能当成「已知没有连接」：
+	 * 否则恢复后第一次成功拉取会把现存连接全量加一遍。 */
+	if (cp != null && cts > 0) {
+		ctx.clash_prev = cp.map;
+		ctx.prime_clash = false;
+		ctx.clash_sample_ts = cts;
+		if (cts < anchor) anchor = cts;
+		/* 截断标记 = 本次读取又截掉了一些，或写入方记录了被截断条数，
+		 * 或老版本 baseline 没有元数据但 map 已经顶到上限（可能被静默截断）。 */
+		let ctot = to_int(b.clash_total, cp.total);
+		let ctr = to_int(b.clash_truncated, 0);
+		ctx.prime_missing_clash = (ctr > 0 || cp.truncated > 0 || cp.total > cp.kept
+			|| (b.clash_total == null && cp.kept >= maxn));
+		if (ctx.prime_missing_clash && ctot < cp.kept) ctot = cp.kept;
+		if (ctx.prime_missing_clash)
+			dbg(ctx, sprintf('baseline clash truncated: kept=%d total=%d', cp.kept, ctot));
+	}
+	if (tp != null && tts > 0) {
+		ctx.ct_prev = tp.map;
+		ctx.prime_ct = false;
+		ctx.ct_sample_ts = tts;
+		if (tts < anchor) anchor = tts;
+		let ttot = to_int(b.ct_total, tp.total);
+		let ttr = to_int(b.ct_truncated, 0);
+		ctx.prime_missing_ct = (ttr > 0 || tp.truncated > 0 || tp.total > tp.kept
+			|| (b.ct_total == null && tp.kept >= maxn));
+		if (ctx.prime_missing_ct && ttot < tp.kept) ttot = tp.kept;
+		if (ctx.prime_missing_ct)
+			dbg(ctx, sprintf('baseline ct truncated: kept=%d total=%d', tp.kept, ttot));
+	}
+
+	/* v3：恢复去重键集和故障账本。dedup 保留过期项（故障续期/重启场景要用），
+	 * outage 账本在「故障活跃」时保留过期项；其它未过期项一律保留。 */
+	let oa = (type(b.clash_outage_active) == 'bool' && b.clash_outage_active == true);
+	let oh = (type(b.clash_outage_had) == 'bool' && b.clash_outage_had == true);
+	let dmax = min(maxn, DEDUP_MAX_ENTRIES);
+	let dd = baseline_exp_map_load(b.clash_dedup, dmax, now, true);
+	let oo = baseline_exp_map_load(b.clash_outage, dmax, now, oa);
+	if (dd.kept > 0 || oo.kept > 0 || oa) {
+		ctx.clash_dedup = dd.map;
+		ctx.clash_outage_ct = oo.map;
+		ctx.clash_outage_active = oa;
+		/* 进程在故障期间重启：即使 baseline 里只有 active 标记，也要把 had 置上，
+		 * 恢复成功轮才会用故障账本判断「新建连接是否已被 conntrack 计过」。 */
+		ctx.clash_outage_had = (oh || oa);
+		dbg(ctx, sprintf('baseline dedup restored: dedup=%d outage=%d active=%s had=%s',
+			dd.kept, oo.kept, oa ? '1' : '0', ctx.clash_outage_had ? '1' : '0'));
+	}
+	if (dd.dropped > 0 || oo.dropped > 0)
+		dbg(ctx, sprintf('baseline dedup sanitized: dropped=%d/%d total=%d/%d',
+			dd.dropped, oo.dropped, dd.total, oo.total));
+
+	/* 首轮速率的分母从基线采样时间算起，而不是固定 5s，避免「重启后一波大流量
+	 * 被除以 1 秒」这种虚高速率。 */
+	if (anchor > 0 && anchor <= now) ctx.last_poll_ts = anchor;
+	ctx.baseline_loaded = true;
+	dbg(ctx, sprintf('baseline restored: day=%s age=%ds clash=%s ct=%s',
+		ctx.day, now - bts,
+		ctx.prime_clash ? 'prime' : 'ok', ctx.prime_ct ? 'prime' : 'ok'));
+	return true;
 }
 
 /* ------------------------------------------------------------------ *
@@ -2009,6 +3038,7 @@ function build_state(ctx) {
 		conntrack_count: ctx.ct_count,
 		clash_connections: ctx.clash_count,
 		clash_poll_ms: ctx.clash_ms,
+		clash_deduped: ctx.clash_deduped,
 		poll_ms: ctx.poll_ms,
 		/* 接入方式判定的来源与状态（与 direct/proxy 完全独立） */
 		link_source: ctx.link_source,
@@ -2029,10 +3059,20 @@ function build_state(ctx) {
 function poll(ctx) {
 	let t0 = clock();
 	ctx.now = time();
+	/* 仅测试用：模拟「跑到第 N 轮时跨天」，用来验证日切写失败后的 pending 重试。
+	 * 正常生产环境不设置该环境变量，行为完全不变。 */
+	ctx.poll_no++;
 	let dt = ctx.now - ctx.last_poll_ts;
+	/* 全新启动的第一轮没有真实的上一次采样点：用配置间隔做分母，避免
+	 * 「启动瞬间跨秒」把首帧速率随机放大/缩小。恢复基线时仍用基线年龄。 */
+	if (ctx.poll_no == 1 && !ctx.baseline_loaded) dt = ctx.cfg.poll_interval;
 	if (dt <= 0) dt = 1;
 	ctx.last_poll_ts = ctx.now;
 	ctx.poll_dt = dt;
+
+	if (ctx.cfg.test_rollover_after > 0 && ctx.poll_no == ctx.cfg.test_rollover_after
+		&& ctx.day != '2000-01-01')
+		ctx.day = '2000-01-01';
 
 	day_rollover_check(ctx);
 
@@ -2059,6 +3099,9 @@ function poll(ctx) {
 	ctx.poll_apps = {};
 	ctx.poll_devs = {};
 	ctx.fakeip_skipped = 0;
+	ctx.clash_deduped = 0;
+	ctx.ct_lan_flows = 0;
+	ctx.ct_acct_flows = 0;
 
 	let before_direct_rx = ctx.totals.direct_rx;
 	let before_direct_tx = ctx.totals.direct_tx;
@@ -2076,10 +3119,30 @@ function poll(ctx) {
 	if (clash.ok) {
 		ctx.source.clash = 'ok';
 		ctx.clash_count = clash.n;
-		accumulate_clash(ctx, clash.conns);
+		ctx.clash_sample_ts = ctx.now;
+		/* 去重集合必须用「全部活跃连接」建（含 DIRECT），且先于 conntrack 累计。 */
+		ctx.clash_outage_active = false;
+		ctx.clash_recovering = ctx.clash_outage_had;
+		let recovered = ctx.clash_recovering;
+		build_clash_dedup(ctx, clash.conns);
+		accumulate_clash(ctx, clash.conns, ctx.prime_clash);
+		ctx.prime_clash = false;
+		/* 故障账本只在「恢复成功轮」消费完再清：故障全程（包括慢 curl 跨 TTL
+		 * 和进程重启）都必须保留，否则恢复时新连接会被 clash 全量再计一次。 */
+		if (recovered || length(keys(ctx.clash_outage_ct)) > 0) {
+			ctx.clash_outage_ct = {};
+			dbg(ctx, 'clash outage recovered: outage ledger cleared');
+		}
+		ctx.clash_recovering = false;
+		ctx.clash_outage_had = false;
 	} else {
 		ctx.source.clash = 'error';
 		ctx.clash_count = 0;
+		ctx.clash_outage_active = true;
+		ctx.clash_outage_had = true;
+		/* 故障期间续期已有去重键，并记录 conntrack 已记过的流；否则超过 TTL
+		 * 后 conntrack 先按 direct 计，恢复后 clash 又按旧基线算 proxy，双计。 */
+		renew_clash_dedup_on_failure(ctx);
 		push(reasons, clash.reason);
 	}
 
@@ -2087,7 +3150,11 @@ function poll(ctx) {
 	let ct = fetch_conntrack(ctx);
 	if (ct.ok) {
 		ctx.source.conntrack = 'ok';
-		accumulate_conntrack(ctx, ct.text);
+		ctx.ct_sample_ts = ctx.now;
+		accumulate_conntrack(ctx, ct.text, ctx.prime_ct);
+		ctx.prime_ct = false;
+		if (ctx.ct_lan_flows > 0 && ctx.ct_acct_flows == 0)
+			push(reasons, 'conntrack: LAN 流缺少 bytes 计数（nf_conntrack_acct 未启用），直连用量无法精确统计');
 	} else {
 		ctx.source.conntrack = 'error';
 		ctx.ct_count = 0;
@@ -2139,6 +3206,8 @@ function poll(ctx) {
 
 	history_flush(ctx, false);
 	daily_write(ctx, false);
+	/* 基线每轮原子落盘（/tmp，tmpfs）：软重启后直接按上次快照做差。 */
+	baseline_write(ctx);
 
 	/* 陌生设备标记（SPEC §10.4）：把首次出现的 MAC 时间落进 devices.json。
 	   只在新 MAC 出现时才写 /etc（闪存），任何失败都不影响主统计。 */
@@ -2151,39 +3220,7 @@ function poll(ctx) {
 	return st;
 }
 
-/* ------------------------------------------------------------------ *
- * 飞书日报（SPEC §7；默认 enabled=0）
- * ------------------------------------------------------------------ */
-
-function hmac_sign_b64(ts, secret) {
-	/* key = timestamp + "\n" + secret，对空串做 HMAC-SHA256，再 Base64 */
-	let key = str(ts) + '\n' + secret;
-	let cmd = "printf '%s' '' | openssl dgst -sha256 -hmac " + shell_quote(key)
-		+ ' -binary | openssl base64 -A';
-	let res = null;
-	try {
-		let p = fs.popen(cmd, 'r');
-		res = p.read('all');
-		p.close();
-	} catch (e) {
-		return null;
-	}
-	if (res == null) return null;
-	res = replace(res, '\n', '');
-	return res == '' ? null : res;
-}
-
-function fmt_bytes(n) {
-	n = to_int(n, 0);
-	if (n < 1024) return n + ' B';
-	if (n < 1048576) return sprintf('%d.%d KB', int(n / 1024), int(n % 1024 / 102));
-	if (n < 1073741824) return sprintf('%d.%d MB', int(n / 1048576), int(n % 1048576 / 104858));
-	return sprintf('%d.%d GB', int(n / 1073741824), int(n % 1073741824 / 107374183));
-}
-
-
-/** 发送日报/测试消息；返回 { ok, code, msg } */
-
+/* 飞书与节点推送由独立模块负责，守护进程不保存任何外部服务密钥。 */
 
 /* ------------------------------------------------------------------ *
  * 初始化 / 主循环
@@ -2225,6 +3262,27 @@ function new_ctx() {
 		cur_bucket: null,
 		clash_prev: {},
 		ct_prev: {},
+		clash_dedup: {},
+		clash_deduped: 0,
+		/* clash 故障期的去重续期 / conntrack 已记账流 / 恢复标记 */
+		clash_outage_ct: {},
+		clash_outage_active: false,
+		clash_outage_had: false,
+		clash_recovering: false,
+		clash_sample_ts: 0,
+		ct_sample_ts: 0,
+		ct_lan_flows: 0,
+		ct_acct_flows: 0,
+		/* 无基线首帧只采样不记账；baseline_load 成功时按数据源分别关闭。 */
+		prime_clash: true,
+		prime_ct: true,
+		/* 基线被截断时，未被覆盖的条目在恢复首轮只采样、不全量加。 */
+		prime_missing_clash: false,
+		prime_missing_ct: false,
+		baseline_loaded: false,
+		baseline_file_present: false,
+		daily_file_present: false,
+		poll_no: 0,
 		leases: {},
 		leases_ts: 0,
 		lan_cidrs: [],
@@ -2256,6 +3314,8 @@ function new_ctx() {
 		last_history_flush: 0,
 		daily_fail_ts: 0,
 		last_daily_write: 0,
+		pending_daily: {},
+		pending_daily_ts: 0,
 		stopping: false
 	};
 }
@@ -2326,6 +3386,20 @@ function boot() {
 
 	mkpath(ctx.cfg.state_dir);
 
+	/* 先恢复日切 pending（可能上次进程在 daily 写失败后重启），再恢复今日
+	 * daily 与连接基线；第一轮 poll 就会重试 pending。 */
+	pending_daily_restore(ctx);
+
+	/* 跨软重启恢复：先接上今日 daily，再恢复同检查点的连接基线。
+	 * 只有 daily 与 baseline 都不存在才是首次安装。已有日汇总但基线丢失时
+	 * 必须首轮只采样；否则现存连接全量会再次入账，daily 越新越可能双计。 */
+	daily_restore(ctx);
+	baseline_load(ctx);
+	if (!ctx.daily_file_present && !ctx.baseline_file_present) {
+		ctx.prime_clash = false;
+		ctx.prime_ct = false;
+	}
+
 	/* 测试钩子（生产环境不要设置）：启动时立刻跑一次 daily 清理判定。
 	 * 正常流程只在跨天（day_rollover_check）才清理，容器门禁等不到零点，
 	 * 所以给 tests/container-retention-inner.sh 一个入口来验证「谁负责清理 daily」。 */
@@ -2337,11 +3411,22 @@ function boot() {
 
 function flush_all(ctx, tag) {
 	ctx.now = time();
+	/* 三段各自独立 try：history 写失败不能连带跳过 daily / baseline，
+	 * 否则优雅停止时跨天数据和软重启基线都会丢。 */
 	try {
 		history_flush(ctx, true);
-		daily_write(ctx, true);
 	} catch (e) {
-		dbg(ctx, 'flush on ' + tag + ' failed: ' + str(e));
+		dbg(ctx, 'history flush on ' + tag + ' failed: ' + str(e));
+	}
+	try {
+		daily_write(ctx, true);       /* 内部会先强制重试 pending 日切快照 */
+	} catch (e) {
+		dbg(ctx, 'daily flush on ' + tag + ' failed: ' + str(e));
+	}
+	try {
+		baseline_write(ctx);          /* 优雅停止也保存连接基线 */
+	} catch (e) {
+		dbg(ctx, 'baseline flush on ' + tag + ' failed: ' + str(e));
 	}
 }
 

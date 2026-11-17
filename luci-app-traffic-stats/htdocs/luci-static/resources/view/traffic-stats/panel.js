@@ -10,18 +10,28 @@
  * 形态：从概览页「详细面板」按钮新窗口打开（admin/services/traffic-stats/panel），
  * 所以本页隐藏 LuCI 侧栏与页头，让内容铺满整个视口（applyFullscreen，沿用原逻辑）。
  *
- * 六个标签，共用同一份 state，切标签不重新请求后端：
- *   历史 / 设备 / 应用 / 节点 / 系统 / 设置
+ * 七个标签，共用同一份 state，切标签不重新请求后端：
+ *   历史 / 设备 / 应用 / 节点 / 拓扑 / 系统 / 设置
+ *
+ * 「拓扑」是只读的横向分层视图：互联网 → 出口 → 主路由 → AP → 在网设备。
+ * 出口卡 / AP 卡可点开下钻（最多 8 台在线设备，按速率降序），展开状态按出口名 /
+ * AP node_id 记忆并纳入 topoSignature，刷新不丢、数据没变不重建。
+ * 数据只来自已有的 get_state / get_nodes / get_stations（get_stations 失败只降级 AP 层）。
+ *
+ * 懒加载：首屏只请求 get_state（+ 今日 history）；get_nodes 在首次切到「节点」/「拓扑」
+ * 时补一次，get_stations 在首次切到「拓扑」时补一次，拿到后复用；
+ * 15s 轮询只刷新当前标签真正需要的那一份快照，其它标签不产生额外 RPC。
  *
  * 这里**没有**「概览」：那只是把 LuCI 概览页放大一遍（6 张 KPI + 趋势 + 比例条 + Top10），
  * 用户明确不要。健康状况改由顶部一行紧凑状态摘要表达（运行状态 / confidence /
  * 更新时间 / 在线设备数），不放 KPI 大卡、不放排行榜。
  *
- * 数据来源只有四个（不新增任何后端方法）：
- *   traffic-stats.get_state   —— totals / devices / apps / nodes / system / health
- *   traffic-stats.get_history —— 今日 5 分钟桶（days=1）；历史页切到「近 7 / 30 天」时才请求
- *   traffic-stats.get_nodes   —— 子节点快照（只在节点页 / 节点页刷新时拉取）
- *   uci('traffic-stats')      —— 设置页只读展示
+ * 数据来源只有五个（不新增任何后端方法）：
+ *   traffic-stats.get_state    —— totals / devices / apps / nodes / system / health
+ *   traffic-stats.get_history  —— 今日 5 分钟桶（days=1）；历史页切到「近 7 / 30 天」时才请求
+ *   traffic-stats.get_nodes    —— 子节点快照（首次切到「节点」/「拓扑」时拉取，之后共用）
+ *   traffic-stats.get_stations —— AP 上报快照（首次切到「拓扑」时拉取；失败降级不抛错）
+ *   uci('traffic-stats')       —— 设置页只读展示
  *
  * 降级约定（硬要求）：
  *   - 任何字段缺失都走文案，不显示 0 / NaN / undefined，也不白屏；
@@ -54,18 +64,36 @@ var callNodes = rpc.declare({
 	reject: true
 });
 
+/*
+ * AP 上报快照（只读）。老后端没有这个方法时 rpc 会 reject：
+ * 只把「AP 数据不可用」写进 stationsError，其它层照常渲染，绝不往上抛。
+ */
+var callStations = rpc.declare({
+	object: 'traffic-stats',
+	method: 'get_stations',
+	expect: { enabled: false, nodes: [], stations: [], count: 0 },
+	reject: true
+});
+
 var REFRESH_MS = 15000;
-var STALE_SEC = 300;             /* 节点超过 5 分钟未上报标黄；设备在线判定也用这个阈值 */
+var STALE_SEC = 300;             /* 节点超过 5 分钟未上报标黄 */
+var ONLINE_SEC = 600;            /* 设备在线口径：last_seen 在 10 分钟内（与概览一致） */
 var HISTORY_TIMEOUT_MS = 12000;  /* get_history 可能撑爆 ubus，给一个明确的超时降级点 */
 var HISTORY_REFRESH_LONG_MS = 300000; /* 近 30 天报文大，自动刷新降到 5 分钟一次 */
 var TREND_CHART_H = 360;         /* 大图高度下限，需求要求 ≥ 340px */
 var PANEL_MAX_W = 1680;
+
+/* 拓扑页：出口最多 6 张卡、设备每组最多 8 台；AP 上报 ≤5 分钟算在线（age_sec 0..300） */
+var TOPO_MAX_NODES = 6;
+var TOPO_MAX_DEVICES = 8;
+var TOPO_AP_ONLINE_SEC = 300;
 
 var TAB_DEFS = [
 	{ id: 'history',  label: '历史' },
 	{ id: 'devices',  label: '设备' },
 	{ id: 'apps',     label: '应用' },
 	{ id: 'nodes',    label: '节点' },
+	{ id: 'topology', label: '拓扑' },
 	{ id: 'system',   label: '系统' },
 	{ id: 'settings', label: '设置' }
 ];
@@ -619,6 +647,11 @@ function dailyRowOf(d) {
 		row.wifi = anyWifi ? wifi : null;
 		row.wired = anyWired ? wired : null;
 	}
+	/*
+	 * 历史日的 daily 文件没有 buckets，后端只保证 summary.totals 兼容
+	 * （devices/apps 可能因 ubus 体积预算被裁剪）。这里只读 totals 的
+	 * direct/proxy/rx/tx；wifi/wired 缺字段时保持 null → 显示 —，不补 0。
+	 */
 	else if (d != null && d.summary != null && typeof d.summary === 'object' &&
 		d.summary.totals != null && typeof d.summary.totals === 'object') {
 		var t = d.summary.totals;
@@ -658,7 +691,33 @@ function dailyRowsOf(payload) {
  * 所以趋势图自己用 SVG 画，零依赖、可缩放、支持明暗主题（用半透明中性色）。
  *
  * 尺寸：按宿主的实际像素宽高生成 viewBox（挂载后再画一次），这样文字不会被拉伸。
+ *
+ * 轴标签与图例可能来自后端（日期/数据集名称），所以全部用
+ * createElementNS + textContent 创建，不拼 HTML 字符串，避免被当成标记解析。
  * ------------------------------------------------------------------ */
+
+var SVG_NS = 'http://www.w3.org/2000/svg';
+
+function clearChildren(node) {
+	while (node != null && node.firstChild)
+		node.removeChild(node.firstChild);
+}
+
+function svgNode(name, attrs, text) {
+	var node = document.createElementNS(SVG_NS, name);
+
+	if (attrs != null) {
+		for (var key in attrs) {
+			if (attrs.hasOwnProperty(key))
+				node.setAttribute(key, '' + attrs[key]);
+		}
+	}
+
+	if (text != null) node.textContent = '' + text;
+
+	return node;
+}
+
 function tsRenderLine(host, data, opts) {
 	if (host == null) return null;
 
@@ -684,43 +743,83 @@ function tsRenderLine(host, data, opts) {
 	var x = function (i) { return PL + (n === 1 ? 0 : (W - PL - PR) * i / (n - 1)); };
 	var y = function (v) { return H - PB - (H - PT - PB) * (Math.max(0, +v) / max); };
 
-	var out = [];
-	var g, gy;
+	var svg = svgNode('svg', {
+		viewBox: '0 0 ' + W + ' ' + H,
+		preserveAspectRatio: 'none',
+		style: 'width:100%;height:100%;display:block'
+	});
+	var g, gy, i;
 
 	for (g = 0; g <= ticks; g++) {
 		gy = PT + (H - PT - PB) * g / ticks;
-		out.push('<line x1="' + PL + '" y1="' + gy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + gy.toFixed(1) +
-			'" stroke="rgba(127,127,127,.16)" stroke-width="1"/>');
-		out.push('<text x="' + (PL - 6) + '" y="' + (gy + 3).toFixed(1) +
-			'" font-size="10" fill="rgba(127,127,127,.85)" text-anchor="end">' + fmtY(max * (1 - g / ticks)) + '</text>');
+		svg.appendChild(svgNode('line', {
+			x1: PL, y1: gy.toFixed(1), x2: W - PR, y2: gy.toFixed(1),
+			stroke: 'rgba(127,127,127,.16)', 'stroke-width': 1
+		}));
+		svg.appendChild(svgNode('text', {
+			x: PL - 6, y: (gy + 3).toFixed(1), 'font-size': 10,
+			fill: 'rgba(127,127,127,.85)', 'text-anchor': 'end'
+		}, fmtY(max * (1 - g / ticks))));
 	}
 
 	sets.forEach(function (s) {
-		var d = s.data.map(function (v, i) { return (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1); }).join(' ');
+		var d = s.data.map(function (v, idx) {
+			return (idx ? 'L' : 'M') + x(idx).toFixed(1) + ' ' + y(v).toFixed(1);
+		}).join(' ');
 
-		out.push('<path d="' + d + '" fill="none" stroke="' + (s.strokeColor || '#1a73e8') +
-			'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>');
+		svg.appendChild(svgNode('path', {
+			d: d,
+			fill: 'none',
+			stroke: s.strokeColor || '#1a73e8',
+			'stroke-width': 2,
+			'stroke-linejoin': 'round',
+			'stroke-linecap': 'round',
+			'vector-effect': 'non-scaling-stroke'
+		}));
 	});
 
 	var step = Math.max(1, Math.ceil(n / 8));
 
-	for (var i = 0; i < n; i += step)
-		out.push('<text x="' + x(i).toFixed(1) + '" y="' + (H - 8) +
-			'" font-size="10" fill="rgba(127,127,127,.85)" text-anchor="middle">' + labels[i] + '</text>');
+	for (i = 0; i < n; i += step) {
+		svg.appendChild(svgNode('text', {
+			x: x(i).toFixed(1), y: H - 8, 'font-size': 10,
+			fill: 'rgba(127,127,127,.85)', 'text-anchor': 'middle'
+		}, labels[i]));
+	}
 
-	var legend = (opts.legend === false) ? '' : sets.map(function (s) {
-		return '<span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px">' +
-			'<i style="width:10px;height:3px;border-radius:2px;background:' + (s.strokeColor || '#1a73e8') + ';display:inline-block"></i>' +
-			(s.label || '') + '</span>';
-	}).join('');
+	var legend = null;
 
-	host.innerHTML = '<div style="width:100%;height:100%;display:flex;flex-direction:column">' +
-		'<div style="flex:1;min-height:0"><svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" ' +
-		'style="width:100%;height:100%;display:block">' + out.join('') + '</svg></div>' +
-		(legend ? '<div style="font-size:11px;opacity:.75;padding:6px 0 0 4px">' + legend + '</div>' : '') +
-		'</div>';
+	if (opts.legend !== false) {
+		legend = E('div', { style: 'font-size:11px;opacity:.75;padding:6px 0 0 4px' },
+			sets.map(function (s) {
+				return E('span', {
+					style: 'display:inline-flex;align-items:center;gap:5px;margin-right:14px'
+				}, [
+					E('i', {
+						style: 'width:10px;height:3px;border-radius:2px;display:inline-block;background:' +
+							(s.strokeColor || '#1a73e8')
+					}),
+					(s.label || '')
+				]);
+			}));
+	}
 
-	return { destroy: function () { try { host.innerHTML = ''; } catch (e) { } } };
+	var wrap = E('div', {
+		style: 'width:100%;height:100%;display:flex;flex-direction:column'
+	}, [
+		E('div', { style: 'flex:1;min-height:0' }, svg),
+		legend || ''
+	]);
+
+	clearChildren(host);
+	dom.content(host, wrap);
+
+	return {
+		destroy: function() {
+			try { clearChildren(host); }
+			catch (e) { }
+		}
+	};
 }
 
 function confLook(conf) {
@@ -756,6 +855,92 @@ function chip(label, active, color, onclick) {
 	}, label);
 }
 
+/* ---------------------------------------------------------------- 拓扑小件 */
+
+/*
+ * 层间连接件：1px 横线 + 圆点，纯 CSS 定位（不引图片、不拼字符）。
+ * align-self:center 让它落在整行高度的一半，视觉上把左右两层连起来。
+ */
+function topoConnector() {
+	return E('div', {
+		style: 'flex:0 0 24px;width:24px;align-self:center;height:16px;position:relative;' +
+			'display:flex;align-items:center;justify-content:center'
+	}, [
+		E('div', {
+			style: 'position:absolute;left:0;right:0;top:50%;height:1px;background:rgba(127,127,127,.45)'
+		}),
+		E('div', {
+			style: 'position:relative;width:7px;height:7px;border-radius:50%;background:#1a73e8;' +
+				'box-shadow:0 0 0 2px var(--background-color-high,#fff)'
+		})
+	]);
+}
+
+/* 拓扑层卡片：固定宽度 + 与其它页一致的卡片风格（暗色主题靠 LuCI 变量，不写死黑白） */
+function topoLayer(title, width, body, extra) {
+	return E('div', {
+		'class': 'ts-topo-layer',
+		style: 'box-sizing:border-box;flex:0 0 ' + width + 'px;width:' + width + 'px;min-width:0;' +
+			'background:var(--background-color-high,#fff);border:1px solid var(--border-color,#e5e7eb);' +
+			'border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;gap:8px'
+	}, [
+		E('div', { style: 'display:flex;align-items:center;justify-content:space-between;gap:6px;min-width:0' }, [
+			E('span', { style: 'font-size:11px;letter-spacing:.04em;opacity:.62;white-space:nowrap' }, title),
+			extra || E('span')
+		]),
+		E('div', { style: 'display:flex;flex-direction:column;gap:6px;min-width:0' }, body)
+	]);
+}
+
+/* 地球：文件内零依赖 SVG（与趋势图同一套 svgNode），不引外部资源 */
+function topoSvgGlobe(size) {
+	var c = '#1a73e8';
+	var svg = svgNode('svg', {
+		width: size,
+		height: size,
+		viewBox: '0 0 24 24',
+		role: 'img',
+		'aria-label': _('互联网'),
+		style: 'display:block'
+	});
+
+	svg.appendChild(svgNode('circle', { cx: 12, cy: 12, r: 9, fill: 'none', stroke: c, 'stroke-width': 1.6 }));
+	svg.appendChild(svgNode('ellipse', { cx: 12, cy: 12, rx: 9, ry: 4, fill: 'none', stroke: c, 'stroke-width': 1, opacity: .7 }));
+	svg.appendChild(svgNode('ellipse', { cx: 12, cy: 12, rx: 4.4, ry: 9, fill: 'none', stroke: c, 'stroke-width': 1, opacity: .7 }));
+	svg.appendChild(svgNode('line', { x1: 3, y1: 12, x2: 21, y2: 12, stroke: c, 'stroke-width': 1, opacity: .7 }));
+
+	return svg;
+}
+
+/*
+ * AP 上报新鲜度：age_sec 0..300 算在线；>300 显示「N 分钟前」；
+ * 负数 / 缺失一律「未上报」（不显示 -1，也不显示 NaN）。
+ */
+function topoFreshness(ageSec) {
+	var age = numOrNull(ageSec);
+
+	if (age == null || age < 0)
+		return { text: _('未上报'), color: '#9e9e9e', bg: 'rgba(158,158,158,.2)', dot: '#9e9e9e', stale: true };
+
+	if (age <= TOPO_AP_ONLINE_SEC)
+		return { text: _('在线'), color: '#137333', bg: 'rgba(52,168,83,.15)', dot: '#1e8e3e', stale: false };
+
+	var minutes = Math.max(1, Math.floor(age / 60));
+
+	return { text: minutes + ' 分钟前', color: '#b26a00', bg: 'rgba(249,171,0,.18)', dot: '#f0a020', stale: true };
+}
+
+/* 拓扑里的小号「标签 + 值」行 */
+function topoField(label, value, title) {
+	return E('div', { style: 'display:flex;align-items:baseline;justify-content:space-between;gap:8px;min-width:0' }, [
+		E('span', { style: 'font-size:11px;opacity:.6;white-space:nowrap' }, label),
+		E('span', {
+			style: 'font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right',
+			title: title || ''
+		}, value)
+	]);
+}
+
 /* ---------------------------------------------------------------- 页面 */
 
 return view.extend({
@@ -770,6 +955,11 @@ return view.extend({
 		this.histPending = {}; /* days → 该范围的请求是否进行中 */
 		this.nodes = [];
 		this.nodesError = null;
+		this.nodesPending = false;
+		this.nodesLoaded = false;   /* false = 还没成功拉过；空数组是合法结果，不反复重拉 */
+		this.stations = null;   /* get_stations 返回体；null = 未拿到（拓扑页显示「AP 数据不可用」） */
+		this.stationsError = null;
+		this.stationsPending = false;
 		this.uciOk = true;
 		this.uciError = null;
 
@@ -796,15 +986,6 @@ return view.extend({
 			}).catch(function (err) {
 				self.hist[1] = null;
 				self.histErr[1] = errText(err);
-			}),
-
-			/* 节点快照很轻（只有子节点上报的几个文件），但老后端可能没有这个方法 */
-			attempt(callNodes).then(function (r) {
-				self.nodes = (r != null && Array.isArray(r.nodes)) ? r.nodes : [];
-				self.nodesError = null;
-			}).catch(function (err) {
-				self.nodes = [];
-				self.nodesError = errText(err);
 			}),
 
 			/* 设置页只读展示；读不到 UCI 不影响其它标签 */
@@ -834,7 +1015,18 @@ return view.extend({
 			'  padding:0 0 10px 0;border-bottom:1px solid rgba(127,127,127,.22)}',
 			'#ts-panel-tabs button:hover{opacity:.88}',
 			'#ts-panel .table .th,#ts-panel .table .td{padding:6px 8px}',
-			'#ts-panel-status strong{font-weight:600}'
+			'#ts-panel-status strong{font-weight:600}',
+			/* 拓扑出口 / AP 卡可点：hover / 键盘焦点给个明确反馈 */
+			'#ts-panel .ts-topo-card:hover{background:rgba(127,127,127,.10)}',
+			'#ts-panel .ts-topo-card:focus-visible{outline:2px solid #1a73e8;outline-offset:1px}',
+			'#ts-panel .ts-topo-sub{background:rgba(127,127,127,.10);border-radius:6px}',
+			/* 深色主题：面板自己的中性色一律用 rgba，不写死白底 / 深色文字（卡内文字继承主题色） */
+			'@media (prefers-color-scheme:dark){',
+			'  #ts-panel .ts-topo-layer,#ts-panel .ts-topo-card{',
+			'    background:rgba(127,127,127,.12)!important;border-color:rgba(127,127,127,.34)!important}',
+			'  #ts-panel .ts-topo-card:hover,#ts-panel .ts-topo-sub{background:rgba(127,127,127,.18)!important}',
+			'  #ts-panel #ts-panel-status{background:rgba(127,127,127,.12)!important}',
+			'}'
 		].join('\n');
 
 		document.head.appendChild(E('style', { id: 'ts-panel-fs' }, css));
@@ -853,6 +1045,10 @@ return view.extend({
 		this.appChain = this.appChain || 'all';
 		this.expanded = this.expanded || {};
 		this.expandedApps = this.expandedApps || {};
+		this.topoOpen = this.topoOpen || {};   /* 拓扑页展开的应用明细 */
+		this.topoExitOpen = this.topoExitOpen || {}; /* 出口下钻：出口名 → true */
+		this.topoApOpen = this.topoApOpen || {};     /* AP 下钻：AP node_id → true */
+		this.topoCache = null;                 /* 拓扑整块 DOM 缓存：数据没变就不重建 */
 		this.refreshError = null;
 		this.busy = false;
 		this.histNotice = '';
@@ -938,7 +1134,9 @@ return view.extend({
 		if (this.statusRun == null) return;
 
 		var st = this.state;
-		var look = confLook(((st || {}).health || {}).accounting_confidence);
+		var health = (st != null && st.health != null) ? st.health : {};
+		var look = confLook(health.accounting_confidence);
+		var reasons = Array.isArray(health.reasons) ? health.reasons : [];
 		var devices = (st != null && Array.isArray(st.devices)) ? st.devices : [];
 		var nowSec = Math.floor(Date.now() / 1000);
 		var online = 0;
@@ -946,18 +1144,31 @@ return view.extend({
 		for (var i = 0; i < devices.length; i++) {
 			var seen = num(devices[i] && devices[i].last_seen);
 
-			if (seen > 0 && (nowSec - seen) <= STALE_SEC) online++;
+			/* 在线口径：last_seen 必须是正数且在 10 分钟内（与概览/feishu 一致）。 */
+			if (seen > 0 && seen <= nowSec + 60 && (nowSec - seen) <= ONLINE_SEC) online++;
 		}
 
 		var running = (st != null) ? st.running : null;
-		var color = (st == null) ? '#9e9e9e' : ((running === false) ? '#d93025' : '#1e8e3e');
+		var conf = '' + (health.accounting_confidence == null ? 'unknown' : health.accounting_confidence);
+		var color;
+
+		if (st == null)
+			color = '#9e9e9e';
+		else if (running === false || conf === 'unavailable')
+			color = '#d93025';
+		else if (conf === 'degraded' || reasons.length > 0)
+			color = '#b26a00';
+		else
+			color = '#1e8e3e';
 
 		this.statusDot.style.background = color;
 
 		if (st == null)
 			this.statusRun.textContent = _('读不到运行状态');
 		else if (running === true)
-			this.statusRun.textContent = _('运行中');
+			this.statusRun.textContent = (conf === 'exact' && reasons.length === 0)
+				? _('运行中')
+				: _('运行中（降级）');
 		else if (running === false)
 			this.statusRun.textContent = _('已停止');
 		else
@@ -965,6 +1176,7 @@ return view.extend({
 
 		this.statusRun.style.color = color;
 
+		/* 状态文字与颜色保持一致：unavailable 绝不显示成健康绿。 */
 		this.statusConf.textContent = look.text;
 		this.statusConf.style.color = look.color;
 
@@ -1029,6 +1241,16 @@ return view.extend({
 			return;
 
 		this.tab = id;
+
+		/* 懒加载：只有进到需要快照的标签才请求，拿到一次后复用（失败时下次切回来再试一次） */
+		if (id === 'topology') {
+			this.ensureStations();
+			this.ensureNodes();
+		}
+		else if (id === 'nodes') {
+			this.ensureNodes();
+		}
+
 		this.renderSection();
 	},
 
@@ -1053,6 +1275,7 @@ return view.extend({
 			else if (this.tab === 'devices') node = this.renderDevices();
 			else if (this.tab === 'apps') node = this.renderApps();
 			else if (this.tab === 'nodes') node = this.renderNodes();
+			else if (this.tab === 'topology') node = this.renderTopology();
 			else if (this.tab === 'system') node = this.renderSystem();
 			else if (this.tab === 'settings') node = this.renderSettings();
 			else node = this.renderHistory();
@@ -1063,7 +1286,14 @@ return view.extend({
 		}
 
 		try {
-			dom.content(this.sectionHost, node);
+			/* 拓扑页在数据没变时返回同一棵 DOM：已经在位就别整块重建（其它标签每次都是新节点） */
+			if (node != null && this.sectionHost.firstChild === node) {
+				/* 复用，不替换 */
+			}
+			else {
+				dom.content(this.sectionHost, node);
+			}
+
 			this.updateTabs();
 			this.updateStatus();
 			this.drawCurrentChart();
@@ -1676,11 +1906,12 @@ return view.extend({
 		]);
 	},
 
-	renderDeviceApps: function (d) {
+	/* 设备 apps → 归一化列表（拓扑页复用同一份提取逻辑，避免两处口径分叉） */
+	deviceAppsList: function (d) {
 		var apps = (d != null && d.apps != null && typeof d.apps === 'object') ? d.apps : null;
 
 		if (apps == null)
-			return E('div', { style: 'font-size:12px;opacity:.65' }, _('该设备暂无应用明细（后端未提供）'));
+			return null;
 
 		var list = [];
 
@@ -1695,10 +1926,16 @@ return view.extend({
 			});
 		}
 
-		if (!list.length)
-			return E('div', { style: 'font-size:12px;opacity:.65' }, _('该设备暂无应用明细（后端未提供）'));
-
 		list.sort(function (a, b) { return (b.rx + b.tx) - (a.rx + a.tx); });
+
+		return list;
+	},
+
+	renderDeviceApps: function (d) {
+		var list = this.deviceAppsList(d);
+
+		if (list == null || !list.length)
+			return E('div', { style: 'font-size:12px;opacity:.65' }, _('该设备暂无应用明细（后端未提供）'));
 
 		var top = list.slice(0, 10);
 
@@ -2084,6 +2321,14 @@ return view.extend({
 		var self = this;
 		var list = (Array.isArray(this.nodes) ? this.nodes.slice() : []);
 
+		/* 懒加载：首次切到本页时请求还在路上，先给加载提示，不误报「暂无节点」 */
+		if (!list.length && !this.nodesLoaded && !this.nodesError) {
+			return E('div', { 'data-page': 'nodes' }, [
+				E('div', { style: 'padding:22px 0;text-align:center;opacity:.6;font-size:13px' },
+					_('正在加载节点数据…'))
+			]);
+		}
+
 		if (!list.length) {
 			return E('div', { 'data-page': 'nodes' }, [
 				E('div', { 'class': 'alert-message warning', style: 'padding:12px 14px' }, [
@@ -2147,6 +2392,820 @@ return view.extend({
 				{ label: _('设备数'), right: true, width: '84px' }
 			], rows, _('暂无节点（多节点未启用或尚未上报）'))
 		]);
+	},
+
+	/* ------------------------------------------------------------ 拓扑 */
+
+	/*
+	 * 拓扑是「只读拼图」，不新增后端方法：
+	 *   互联网 ← state.totals.rx_rate/tx_rate（缺失时退回 system.wan_*_rate）
+	 *   出口   ← state.nodes（按 rx+tx 降序，最多 6 张卡，占比以全部出口为分母）
+	 *   主路由 ← system.hostname / health.link_bridge / 在线设备数与无线·有线·未知分组
+	 *   AP     ← get_stations().nodes（新鲜度 + 其下在线无线设备数）
+	 *   设备   ← get_state().devices 中在线的那些，按 link 三组，每组最多 8 台
+	 *
+	 * 任何一层缺数据都只出自己的占位文案，其余层照常；整页渲染还有外层 try/catch 兜底。
+	 *
+	 * 下钻：出口卡 → 该出口（apps[*].chain）下的在线设备；AP 卡 → stations 命中在线设备的
+	 * 无线终端。最多 8 台、按速率降序；展开状态存 topoExitOpen / topoApOpen 并进签名。
+	 */
+
+	/* 节点快照：首次进「节点」/「拓扑」时拉一次，之后复用；失败只影响节点页的提示 */
+	ensureNodes: function () {
+		var self = this;
+
+		if (this.nodesPending || this.nodesLoaded)
+			return Promise.resolve();
+
+		this.nodesPending = true;
+
+		return Promise.resolve().then(function () { return callNodes(); })
+			.then(function (r) {
+				self.nodes = (r != null && Array.isArray(r.nodes)) ? r.nodes : [];
+				self.nodesError = null;
+				self.nodesLoaded = true;
+			})
+			.catch(function (err) {
+				/* 失败保留旧列表（首次就是空数组），只在节点页提示，不抛错、不影响其它层 */
+				self.nodesError = errText(err);
+			})
+			.then(function () {
+				self.nodesPending = false;
+
+				/* 用户可能已经切走：只在这两份数据仍然有用时重绘 */
+				if (self.tab === 'nodes' || self.tab === 'topology') self.renderSection();
+			});
+	},
+
+	/* AP 数据拿不到（老后端没有 get_stations / rpc 失败）时补一次；绝不抛错 */
+	ensureStations: function () {
+		var self = this;
+
+		if (this.stationsPending || this.stations != null)
+			return Promise.resolve();
+
+		this.stationsPending = true;
+
+		return Promise.resolve().then(function () { return callStations(); })
+			.then(function (r) {
+				self.stations = (r != null && typeof r === 'object')
+					? r : { enabled: false, nodes: [], stations: [], count: 0 };
+				self.stationsError = null;
+			})
+			.catch(function (err) {
+				self.stationsError = errText(err);
+			})
+			.then(function () {
+				self.stationsPending = false;
+
+				/* 用户可能已经切走：只在拓扑页仍打开时重绘 */
+				if (self.tab === 'topology') self.renderSection();
+			});
+	},
+
+	/* 在线口径与状态摘要一致：last_seen > 0 且 10 分钟内（且不接受明显超前的时钟） */
+	isDeviceOnline: function (d) {
+		var nowSec = Math.floor(Date.now() / 1000);
+		var seen = num(d && d.last_seen);
+
+		return seen > 0 && seen <= nowSec + 60 && (nowSec - seen) <= ONLINE_SEC;
+	},
+
+	onlineDevices: function () {
+		var self = this;
+
+		return this.devices().filter(function (d) { return self.isDeviceOnline(d); });
+	},
+
+	topoRates: function () {
+		var totals = (this.state != null && this.state.totals != null && typeof this.state.totals === 'object')
+			? this.state.totals : {};
+		var sys = (this.state != null && this.state.system != null && typeof this.state.system === 'object')
+			? this.state.system : {};
+		var rx = numOrNull(totals.rx_rate);
+		var tx = numOrNull(totals.tx_rate);
+
+		if (rx == null) rx = numOrNull(sys.wan_rx_rate);
+		if (tx == null) tx = numOrNull(sys.wan_tx_rate);
+
+		return { rx: rx, tx: tx };
+	},
+
+	topoMeta: function () {
+		var st = this.state;
+		var health = (st != null && st.health != null && typeof st.health === 'object') ? st.health : {};
+		var sys = (st != null && st.system != null && typeof st.system === 'object') ? st.system : {};
+		var host = '';
+
+		if (sys.hostname != null && ('' + sys.hostname).trim().length)
+			host = ('' + sys.hostname).trim();
+		else if (st != null && st.hostname != null && ('' + st.hostname).trim().length)
+			host = ('' + st.hostname).trim();
+
+		var bridge = (health.link_bridge == null) ? '' : ('' + health.link_bridge).trim();
+
+		return {
+			host: host.length ? host : _('主路由'),
+			bridge: bridge,
+			linkSource: (health.link_source == null) ? '' : ('' + health.link_source)
+		};
+	},
+
+	/* 出口列：state.nodes（含 DIRECT），按 rx+tx 降序；total 是全部出口（不只 Top6）的和 */
+	topoExits: function () {
+		var raw = (this.state != null && this.state.nodes != null && typeof this.state.nodes === 'object')
+			? this.state.nodes : null;
+		var list = [];
+		var total = 0;
+
+		if (raw != null) {
+			for (var name in raw) {
+				if (!Object.prototype.hasOwnProperty.call(raw, name)) continue;
+
+				var v = (raw[name] != null && typeof raw[name] === 'object') ? raw[name] : {};
+				var rx = num(v.rx);
+				var tx = num(v.tx);
+
+				list.push({ name: '' + name, rx: rx, tx: tx, total: rx + tx });
+				total += rx + tx;
+			}
+		}
+
+		list.sort(function (a, b) { return b.total - a.total; });
+
+		return {
+			list: list.slice(0, TOPO_MAX_NODES),
+			count: list.length,
+			total: total,
+			available: (raw != null)
+		};
+	},
+
+	topoLinkCounts: function (online) {
+		var counts = { wifi: 0, wired: 0, unknown: 0 };
+
+		for (var i = 0; i < online.length; i++) {
+			var k = linkFilterKey(online[i]);
+
+			if (counts[k] == null) k = 'unknown';
+			counts[k]++;
+		}
+
+		return counts;
+	},
+
+	stationsNodes: function () {
+		return (this.stations != null && Array.isArray(this.stations.nodes)) ? this.stations.nodes : [];
+	},
+
+	stationsList: function () {
+		return (this.stations != null && Array.isArray(this.stations.stations)) ? this.stations.stations : [];
+	},
+
+	/* accounting_confidence 的中文状态与配色：沿用 confLook，颜色与顶部状态条一致 */
+	topoConfidence: function () {
+		var st = this.state;
+		var health = (st != null && st.health != null && typeof st.health === 'object') ? st.health : {};
+
+		return confLook(health.accounting_confidence);
+	},
+
+	/* 出口名匹配：apps[*].chain === 出口名；DIRECT 大小写不敏感（Clash 可能报 direct/DIRECT） */
+	exitChainMatch: function (chain, name) {
+		var c = (chain == null) ? '' : ('' + chain);
+		var n = (name == null) ? '' : ('' + name);
+
+		if (!c.length || !n.length) return false;
+		if (c.toUpperCase() === 'DIRECT' && n.toUpperCase() === 'DIRECT') return true;
+
+		return c === n;
+	},
+
+	/*
+	 * 出口下钻：该出口下在线的设备。
+	 * 口径 = state.devices 里在线、且 apps 中任一 chain 命中该出口名；
+	 * 按速率降序，最多 TOPO_MAX_DEVICES 台（不显示 0 台设备）。
+	 */
+	topoExitDevices: function (name) {
+		var self = this;
+		var list = this.onlineDevices().filter(function (d) {
+			var apps = (d != null && d.apps != null && typeof d.apps === 'object') ? d.apps : null;
+
+			if (apps == null) return false;
+
+			for (var host in apps) {
+				if (!Object.prototype.hasOwnProperty.call(apps, host)) continue;
+				if (self.exitChainMatch(apps[host] && apps[host].chain, name)) return true;
+			}
+
+			return false;
+		});
+
+		list.sort(function (a, b) { return deviceRate(b) - deviceRate(a); });
+
+		return list.slice(0, TOPO_MAX_DEVICES);
+	},
+
+	/*
+	 * AP 下钻：该 AP 下在线的无线终端。
+	 * 口径 = stations 中 node_id 命中、且 mac 命中在线 state.devices；
+	 * 返回 { device, station } 便于显示信号；按设备速率降序，最多 TOPO_MAX_DEVICES 台。
+	 */
+	topoApDevices: function (nodeId) {
+		var nid = (nodeId == null) ? '' : ('' + nodeId);
+		var byMac = {};
+		var online = this.onlineDevices();
+		var out = [];
+		var seen = {};
+		var i;
+
+		for (i = 0; i < online.length; i++) {
+			var m = ((online[i] && online[i].mac == null) ? '' : ('' + online[i].mac)).toLowerCase();
+
+			if (m.length) byMac[m] = online[i];
+		}
+
+		var list = this.stationsList();
+
+		for (i = 0; i < list.length; i++) {
+			var s = list[i];
+
+			if (s == null) continue;
+			if (nid.length && ('' + ((s.node_id == null) ? '' : s.node_id)) !== nid) continue;
+
+			var mac = ((s.mac == null) ? '' : ('' + s.mac)).toLowerCase();
+
+			if (!mac.length || !Object.prototype.hasOwnProperty.call(byMac, mac)) continue;
+			if (seen[mac]) continue;
+
+			seen[mac] = true;
+			out.push({ device: byMac[mac], station: s });
+		}
+
+		out.sort(function (a, b) { return deviceRate(b.device) - deviceRate(a.device); });
+
+		return out.slice(0, TOPO_MAX_DEVICES);
+	},
+
+	/* 某 AP 下「在线」的无线设备数：stations 的 mac 命中在线设备集合，按 mac 去重 */
+	apOnlineCount: function (nodeId, onlineKeys) {
+		var list = this.stationsList();
+		var nid = (nodeId == null) ? '' : ('' + nodeId);
+		var seen = {};
+		var count = 0;
+
+		for (var i = 0; i < list.length; i++) {
+			var s = list[i];
+
+			if (s == null) continue;
+			if (nid.length && ('' + ((s.node_id == null) ? '' : s.node_id)) !== nid) continue;
+
+			var mac = ((s.mac == null) ? '' : ('' + s.mac)).toLowerCase();
+
+			if (!mac.length || !Object.prototype.hasOwnProperty.call(onlineKeys, mac)) continue;
+			if (seen[mac]) continue;
+
+			seen[mac] = true;
+			count++;
+		}
+
+		return count;
+	},
+
+	/*
+	 * 整块签名：只包含真正画在屏幕上的字段（颜色/文案都由它们派生）。
+	 * 相同 → renderTopology 直接复用上次的 DOM，不重建整块。
+	 */
+	topoSignature: function () {
+		var st = this.state;
+		var parts = [];
+		var i;
+
+		parts.push(st == null ? 'state:0' : ('state:1:' + (st.running === true ? 1 : (st.running === false ? 0 : -1))));
+		parts.push('stateerr:' + ((this.stateError == null) ? '' : this.stateError));
+
+		var rates = this.topoRates();
+
+		parts.push('rate:' + ((rates.rx == null) ? '-' : rates.rx) + ':' + ((rates.tx == null) ? '-' : rates.tx));
+
+		var meta = this.topoMeta();
+
+		parts.push('meta:' + meta.host + ':' + meta.bridge);
+
+		/* 主路由卡上的「记账状态」徽标 */
+		parts.push('conf:' + this.topoConfidence().text);
+
+		var exits = this.topoExits();
+		var j;
+
+		parts.push('exitn:' + exits.count + ':' + exits.total + ':' + (exits.available ? 1 : 0));
+		for (i = 0; i < exits.list.length; i++) {
+			var en = exits.list[i].name;
+
+			parts.push(en + '=' + exits.list[i].rx + '/' + exits.list[i].tx + (this.topoExitOpen[en] ? '*' : ''));
+
+			/* 展开时把下钻出来的设备也写进签名：设备改名 / apps 变化也能触发重绘 */
+			if (this.topoExitOpen[en]) {
+				var ed = this.topoExitDevices(en);
+
+				parts.push('exdev:' + ed.length);
+
+				for (j = 0; j < ed.length; j++)
+					parts.push(deviceKey(ed[j]) + '=' + deviceRate(ed[j]));
+			}
+		}
+
+		var online = this.onlineDevices();
+
+		parts.push('devn:' + online.length + ':' + this.devices().length);
+		for (i = 0; i < online.length; i++) {
+			var dk = deviceKey(online[i]);
+
+			parts.push(dk + '=' + deviceRate(online[i]) + (this.topoOpen[dk] ? '*' : ''));
+		}
+
+		var ap = this.stationsNodes();
+
+		parts.push('ap:' + (this.stations == null ? 0 : 1) + ':' + ap.length + ':' +
+			((this.stationsError == null) ? '' : this.stationsError) + ':' +
+			((this.stations != null && this.stations.enabled === false) ? 0 : 1));
+
+		for (i = 0; i < ap.length; i++) {
+			var n = ap[i] || {};
+			var an = ((n.node_id == null) ? '' : ('' + n.node_id));
+
+			parts.push(an + '=' + num(n.age_sec) + '/' + num(n.count) + '/' + num(n.ts) +
+				(this.topoApOpen[an] ? '*' : ''));
+
+			if (this.topoApOpen[an]) {
+				var ad = this.topoApDevices(an);
+
+				parts.push('apdev:' + ad.length);
+
+				for (j = 0; j < ad.length; j++)
+					parts.push(deviceKey(ad[j].device) + '=' + numOrNull(ad[j].station.signal) + '/' + deviceRate(ad[j].device));
+			}
+		}
+
+		var sl = this.stationsList();
+
+		for (i = 0; i < sl.length; i++)
+			parts.push(((sl[i] && sl[i].mac) || '') + '@' + ((sl[i] && sl[i].node_id) || ''));
+
+		return parts.join('|');
+	},
+
+	renderTopology: function () {
+		var sig = this.topoSignature();
+
+		if (this.topoCache != null && this.topoCache.sig === sig)
+			return this.topoCache.node;
+
+		var node = this.buildTopology();
+
+		this.topoCache = { sig: sig, node: node };
+
+		return node;
+	},
+
+	buildTopology: function () {
+		var rates = this.topoRates();
+		var meta = this.topoMeta();
+		var exits = this.topoExits();
+		var online = this.onlineDevices();
+		var counts = this.topoLinkCounts(online);
+		var totalDevices = this.devices().length;
+		var i;
+
+		/* 互联网 */
+		var internet = topoLayer(_('互联网'), 104, [
+			E('div', { style: 'display:flex;flex-direction:column;align-items:center;gap:4px;min-width:0' }, [
+				topoSvgGlobe(30),
+				E('div', { style: 'font-size:11px;white-space:nowrap' }, '↓ ' + ((rates.rx == null) ? '—' : fmtRate(rates.rx))),
+				E('div', { style: 'font-size:11px;white-space:nowrap' }, '↑ ' + ((rates.tx == null) ? '—' : fmtRate(rates.tx)))
+			])
+		], E('span', { style: 'font-size:11px;opacity:.55;white-space:nowrap' }, _('实时')));
+
+		/* 出口 */
+		var exitBody = [];
+
+		if (!exits.available) {
+			exitBody.push(emptyBox(_('暂无出口节点数据（后端未提供 nodes）')));
+		}
+		else if (!exits.list.length) {
+			exitBody.push(emptyBox(_('暂无出口流量')));
+		}
+		else {
+			for (i = 0; i < exits.list.length; i++)
+				exitBody.push(this.topoExitCard(exits.list[i], exits.total));
+		}
+
+		var exitExtra = E('span', { style: 'font-size:11px;opacity:.55;white-space:nowrap' },
+			exits.count > exits.list.length ? (exits.list.length + '/' + exits.count) : (exits.count + ''));
+
+		var exitsLayer = topoLayer(_('出口'), 128, exitBody, exitExtra);
+
+		/* 主路由 */
+		var topoConf = this.topoConfidence();
+		var routerFields = [
+			topoField(_('主机名'), meta.host, meta.host),
+			topoField(_('网桥'), meta.bridge.length ? meta.bridge : '—', meta.linkSource ? (meta.linkSource + ' · ' + meta.bridge) : ''),
+			topoField(_('在线设备'), totalDevices ? (online.length + ' / ' + totalDevices) : '0'),
+			E('div', {
+				style: 'display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px;opacity:.72;min-width:0'
+			}, [
+				E('span', { style: 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis' },
+					_('共') + ' ' + totalDevices + ' ' + _('台')),
+				badge(topoConf.text, topoConf.color, topoConf.bg)
+			])
+		];
+
+		var linkMetaWifi = linkMeta({ link: 'wifi' });
+		var linkMetaWired = linkMeta({ link: 'wired' });
+		var linkMetaUnknown = linkMeta({ link: 'unknown' });
+
+		var router = topoLayer(_('主路由'), 168, [
+			E('div', { style: 'display:flex;flex-direction:column;gap:5px;min-width:0' }, routerFields),
+			E('div', { style: 'display:flex;flex-wrap:wrap;gap:4px' }, [
+				badge(_('无线') + ' ' + counts.wifi, linkMetaWifi.color, linkMetaWifi.bg),
+				badge(_('有线') + ' ' + counts.wired, linkMetaWired.color, linkMetaWired.bg),
+				badge(_('未知') + ' ' + counts.unknown, linkMetaUnknown.color, linkMetaUnknown.bg)
+			])
+		]);
+
+		/* AP */
+		var apNodes = this.stationsNodes();
+		var apBody = [];
+		var onlineKeys = {};
+
+		for (i = 0; i < online.length; i++) {
+			var om = ((online[i] && online[i].mac == null) ? '' : ('' + online[i].mac)).toLowerCase();
+
+			if (om.length) onlineKeys[om] = true;
+		}
+
+		if (this.stations == null) {
+			/* 首次切过来时请求还在路上：别把「正在加载」误报成不可用 */
+			apBody.push(this.stationsPending
+				? emptyBox(_('正在加载 AP 数据…'))
+				: emptyBox(_('AP 数据不可用'),
+					this.stationsError ? this.stationsError : _('get_stations 未返回数据')));
+		}
+		else if (!apNodes.length) {
+			apBody.push(this.stations.enabled === false
+				? emptyBox(_('AP 上报未启用'), _('需要 AP 侧开启 stations_enabled 并上报 get_stations'))
+				: emptyBox(_('暂无 AP 上报')));
+		}
+		else {
+			for (i = 0; i < apNodes.length; i++)
+				apBody.push(this.topoApCard(apNodes[i], onlineKeys));
+		}
+
+		var apExtra = E('span', { style: 'font-size:11px;opacity:.55;white-space:nowrap' },
+			this.stations == null ? '—' : (apNodes.length + ''));
+
+		var apLayer = topoLayer(_('AP'), 144, apBody, apExtra);
+
+		/* 在网设备 */
+		var devBody = [];
+
+		if (!online.length) {
+			devBody.push(emptyBox(_('暂无在线设备'), _('在线口径：最近 10 分钟内有流量')));
+		}
+		else {
+			var groups = [
+				{ key: 'wifi', label: _('无线') },
+				{ key: 'wired', label: _('有线') },
+				{ key: 'unknown', label: _('未知') }
+			];
+
+			for (i = 0; i < groups.length; i++) {
+				var g = groups[i];
+				var glist = online.filter(function (d) { return linkFilterKey(d) === g.key; });
+
+				if (!glist.length) continue;
+
+				devBody.push(this.topoDeviceGroup(g, glist));
+			}
+
+			/* 三组都空不可能走到这里（online.length > 0），但保底也留一行占位 */
+			if (!devBody.length)
+				devBody.push(emptyBox(_('暂无在线设备')));
+		}
+
+		var devExtra = E('span', { style: 'font-size:11px;opacity:.55;white-space:nowrap' }, online.length + '');
+
+		var devicesLayer = topoLayer(_('在网设备'), 208, devBody, devExtra);
+
+		/* 从左到右拼层 + 连接件（横向顺序即数据流方向） */
+		var layers = [ internet, exitsLayer, router, apLayer, devicesLayer ];
+		var row = [];
+
+		for (i = 0; i < layers.length; i++) {
+			if (i > 0) row.push(topoConnector());
+			row.push(layers[i]);
+		}
+
+		return E('div', { 'data-page': 'topology' }, [
+			this.renderStateBanner(),
+			E('div', {
+				/* 只让拓扑这块横向滚动，绝不撑破页面（1200 / 1000px 宽度下都不溢出） */
+				style: 'overflow-x:auto;overflow-y:hidden;padding-bottom:6px'
+			}, [
+				E('div', {
+					style: 'display:flex;align-items:flex-start;flex-wrap:nowrap;gap:0;' +
+						'min-width:min-content;width:max-content'
+				}, row)
+			]),
+			E('p', { style: 'margin:12px 0 0;font-size:12px;opacity:.65' }, [
+				_('从左到右：互联网 → 出口 → 主路由 → AP → 在网设备。'),
+				' ',
+				_('点设备行可展开该设备的应用 Top 5；点出口卡 / AP 卡可展开该出口 / 该 AP 下的在线设备。'),
+				exits.count > exits.list.length ? (' ' + _('出口只画流量最高的') + ' ' + TOPO_MAX_NODES + ' ' + _('个。')) : ''
+			])
+		]);
+	},
+
+	/* 出口卡：节点名（DIRECT 标「直连」）+ 流量 + 占比 + rx/tx；点击展开该出口下的在线设备 */
+	topoExitCard: function (n, total) {
+		var self = this;
+		/* 出口总流量为 0（或分母为 0）时占比显示「—」，绝不出现 NaN / 假的 0% */
+		var pct = (total > 0 && n.total > 0 && isFinite(n.total * 100 / total)) ? (n.total * 100 / total) : null;
+		var direct = (('' + n.name).toUpperCase() === 'DIRECT');
+		var label = direct ? _('直连') : shortText(n.name, 14);
+		var open = !!this.topoExitOpen[n.name];
+		var body = [
+			E('div', { style: 'display:flex;align-items:center;gap:5px;min-width:0' }, [
+				E('span', {
+					style: 'flex:0 0 6px;width:6px;height:6px;border-radius:50%;background:' +
+						(direct ? '#1e8e3e' : '#1a73e8')
+				}),
+				E('span', {
+					style: 'font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
+					title: n.name
+				}, label),
+				E('span', { style: 'flex:none;font-size:10px;opacity:.55' }, open ? '▾' : '▸')
+			]),
+			E('div', { style: 'font-size:11px;white-space:nowrap;opacity:.9' }, fmtBytes(n.total)),
+			E('div', {
+				style: 'height:4px;border-radius:2px;background:rgba(127,127,127,.2);overflow:hidden'
+			}, E('div', {
+				style: 'height:4px;border-radius:2px;width:' +
+					((pct == null) ? '0' : pctOf(pct).toFixed(1)) + '%;background:' + (direct ? '#1e8e3e' : '#1a73e8')
+			})),
+			E('div', {
+				style: 'font-size:11px;opacity:.62;white-space:nowrap;overflow:hidden;text-overflow:ellipsis',
+				title: ((pct == null) ? _('占比未知') : pct.toFixed(1) + '%') + ' · ↓' + fmtBytes(n.rx) + ' ↑' + fmtBytes(n.tx)
+			}, [
+				(pct == null) ? '—' : (pct.toFixed(1) + '%'),
+				' · ↓' + fmtBytes(n.rx) + ' ↑' + fmtBytes(n.tx)
+			])
+		];
+
+		/* 下钻：该出口下在线的设备；空列表给占位文案，不画空表 */
+		if (open) {
+			var devs = this.topoExitDevices(n.name);
+			var rows = [];
+
+			if (!devs.length) {
+				rows.push(E('div', { style: 'font-size:11px;opacity:.55;padding:2px 0' }, _('该出口暂无设备')));
+			}
+			else {
+				for (var i = 0; i < devs.length; i++) {
+					rows.push(E('div', {
+						style: 'display:flex;align-items:baseline;justify-content:space-between;gap:4px;min-width:0'
+					}, [
+						E('span', {
+							style: 'flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
+							title: deviceName(devs[i])
+						}, shortText(deviceName(devs[i]), 16)),
+						E('span', { style: 'font-size:11px;white-space:nowrap;opacity:.85' },
+							'↓' + fmtRate(num(devs[i].rx_rate)) + ' ↑' + fmtRate(num(devs[i].tx_rate)))
+					]));
+				}
+			}
+
+			body.push(E('div', {
+				'class': 'ts-topo-sub',
+				style: 'margin-top:2px;padding:4px 2px 1px;border-top:1px dashed rgba(127,127,127,.3);' +
+					'display:flex;flex-direction:column;gap:2px;min-width:0'
+			}, rows));
+		}
+
+		var el = E('div', {
+			'class': 'ts-topo-card',
+			'data-node': n.name,
+			'role': 'button',
+			'tabindex': 0,
+			'aria-expanded': open ? 'true' : 'false',
+			title: n.name + ' · ' + (open ? _('点击收起该出口下的在线设备') : _('点击展开该出口下的在线设备')) +
+				'（Enter / Space）',
+			style: 'border:1px solid rgba(127,127,127,.28);border-radius:8px;padding:7px 8px;' +
+				'display:flex;flex-direction:column;gap:3px;min-width:0;cursor:pointer'
+		}, body);
+
+		el.addEventListener('click', function () { self.toggleTopoExit(n.name); });
+		el.addEventListener('keydown', function (ev) {
+			if (ev == null) return;
+			if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+				if (ev.preventDefault) ev.preventDefault();
+				self.toggleTopoExit(n.name);
+			}
+		});
+
+		return el;
+	},
+
+	toggleTopoExit: function (name) {
+		var key = (name == null) ? '' : ('' + name);
+
+		if (this.topoExitOpen[key]) delete this.topoExitOpen[key];
+		else this.topoExitOpen[key] = true;
+
+		/* 签名里带了展开状态，重绘后 DOM 会重建；这是用户动作，不做缓存复用 */
+		this.renderSection();
+	},
+
+	/* AP 卡：名称 + 新鲜度 + 其下在线无线设备数；点击展开该 AP 下的在线设备 */
+	topoApCard: function (n, onlineKeys) {
+		var self = this;
+		var ap = (n != null && typeof n === 'object') ? n : {};
+		var fresh = topoFreshness(ap.age_sec);
+		var nid = (ap.node_id == null) ? '' : ('' + ap.node_id);
+		var name = (ap.name != null && ('' + ap.name).trim().length) ? ('' + ap.name).trim()
+			: (nid.length ? nid : _('未命名 AP'));
+		var online = this.apOnlineCount(nid, onlineKeys);
+		var reported = num(ap.count);
+		var open = !!this.topoApOpen[nid];
+		var body = [
+			E('div', { style: 'display:flex;align-items:center;gap:5px;min-width:0' }, [
+				E('span', { style: 'flex:0 0 6px;width:6px;height:6px;border-radius:50%;background:' + fresh.dot }),
+				E('span', {
+					style: 'font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
+					title: name
+				}, shortText(name, 14)),
+				E('span', { style: 'flex:none;font-size:10px;opacity:.55' }, open ? '▾' : '▸')
+			]),
+			E('div', { style: 'font-size:11px;white-space:nowrap' }, fresh.text),
+			E('div', { style: 'font-size:11px;opacity:.7;white-space:nowrap' },
+				_('在线无线') + ' ' + online + (reported > 0 ? (' / ' + reported) : ''))
+		];
+
+		/* 下钻：stations 命中在线设备的无线终端，显示名称 + 信号（无信号退回速率） */
+		if (open) {
+			var list = this.topoApDevices(nid);
+			var rows = [];
+
+			if (!list.length) {
+				rows.push(E('div', { style: 'font-size:11px;opacity:.55;padding:2px 0' }, _('该 AP 下暂无在线设备')));
+			}
+			else {
+				for (var i = 0; i < list.length; i++) {
+					var d = list[i].device;
+					var sig = numOrNull(list[i].station && list[i].station.signal);
+
+					if (sig == null) sig = signalValue(d);
+
+					rows.push(E('div', {
+						style: 'display:flex;align-items:baseline;justify-content:space-between;gap:4px;min-width:0'
+					}, [
+						E('span', {
+							style: 'flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
+							title: deviceName(d)
+						}, shortText(deviceName(d), 14)),
+						(sig != null)
+							? E('span', {
+								style: 'font-size:11px;white-space:nowrap;font-weight:600;color:' + signalColor(sig)
+							}, sig + ' dBm')
+							: E('span', { style: 'font-size:11px;white-space:nowrap;opacity:.85' },
+								'↓' + fmtRate(num(d.rx_rate)) + ' ↑' + fmtRate(num(d.tx_rate)))
+					]));
+				}
+			}
+
+			body.push(E('div', {
+				'class': 'ts-topo-sub',
+				style: 'margin-top:2px;padding:4px 2px 1px;border-top:1px dashed rgba(127,127,127,.3);' +
+					'display:flex;flex-direction:column;gap:2px;min-width:0'
+			}, rows));
+		}
+
+		var el = E('div', {
+			'class': 'ts-topo-card',
+			'data-ap': nid,
+			'role': 'button',
+			'tabindex': 0,
+			'aria-expanded': open ? 'true' : 'false',
+			title: name + ' · ' + (open ? _('点击收起该 AP 下的在线设备') : _('点击展开该 AP 下的在线设备')) +
+				'（Enter / Space）',
+			style: 'border:1px solid rgba(127,127,127,.28);border-radius:8px;padding:7px 8px;' +
+				'display:flex;flex-direction:column;gap:3px;min-width:0;cursor:pointer'
+		}, body);
+
+		el.addEventListener('click', function () { self.toggleTopoAp(nid); });
+		el.addEventListener('keydown', function (ev) {
+			if (ev == null) return;
+			if (ev.key === 'Enter' || ev.key === ' ' || ev.key === 'Spacebar') {
+				if (ev.preventDefault) ev.preventDefault();
+				self.toggleTopoAp(nid);
+			}
+		});
+
+		return el;
+	},
+
+	toggleTopoAp: function (nodeId) {
+		var key = (nodeId == null) ? '' : ('' + nodeId);
+
+		if (this.topoApOpen[key]) delete this.topoApOpen[key];
+		else this.topoApOpen[key] = true;
+
+		/* 签名里带了展开状态，重绘后 DOM 会重建；这是用户动作，不做缓存复用 */
+		this.renderSection();
+	},
+
+	/* 一组在网设备（无线 / 有线 / 未知）：表头徽标 + 最多 8 行，行可点开应用 Top 5 */
+	topoDeviceGroup: function (g, list) {
+		var shown = list.slice(0, TOPO_MAX_DEVICES);
+		var meta = linkMeta({ link: g.key });
+		var rows = [];
+
+		for (var i = 0; i < shown.length; i++)
+			rows = rows.concat(this.topoDeviceRow(shown[i]));
+
+		if (!rows.length)
+			rows.push(E('div', { style: 'font-size:11px;opacity:.55;padding:2px 2px 4px' }, _('无')));
+
+		return E('div', { style: 'display:flex;flex-direction:column;gap:1px;min-width:0' }, [
+			E('div', { style: 'display:flex;align-items:center;justify-content:space-between;gap:6px;margin:2px 0 3px' }, [
+				badge(g.label, meta.color, meta.bg),
+				E('span', { style: 'font-size:11px;opacity:.6;white-space:nowrap' },
+					shown.length + (list.length > shown.length ? ('/' + list.length) : ''))
+			])
+		].concat(rows));
+	},
+
+	topoDeviceRow: function (d) {
+		var self = this;
+		var key = deviceKey(d);
+		var open = !!this.topoOpen[key];
+		var rate = fmtRate(deviceRate(d));
+		var rows = [
+			E('div', {
+				'class': 'ts-topo-row',
+				'data-device': key,
+				style: 'display:flex;align-items:center;gap:4px;padding:3px 4px;border-radius:6px;cursor:pointer;min-width:0',
+				title: deviceName(d) + ' · ' + rate + ' · ' + _('点击展开/收起应用 Top 5')
+			}, [
+				E('span', { style: 'flex:0 0 9px;font-size:10px;opacity:.6' }, open ? '▾' : '▸'),
+				E('span', {
+					style: 'flex:1;min-width:0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'
+				}, shortText(deviceName(d), 16)),
+				E('span', { style: 'font-size:11px;white-space:nowrap;opacity:.85' }, rate)
+			])
+		];
+
+		rows[0].addEventListener('click', function () { self.toggleTopoDevice(key); });
+
+		if (open) {
+			rows.push(E('div', {
+				style: 'margin:0 0 6px 12px;padding:6px 8px;border-radius:8px;background:rgba(127,127,127,.08);' +
+					'overflow:hidden'
+			}, this.renderTopoDeviceApps(d)));
+		}
+
+		return rows;
+	},
+
+	toggleTopoDevice: function (key) {
+		if (this.topoOpen[key]) delete this.topoOpen[key];
+		else this.topoOpen[key] = true;
+
+		/* 签名里带了展开状态，重绘后 DOM 会重建；这是用户动作，不做缓存复用 */
+		this.renderSection();
+	},
+
+	/* 拓扑列窄，复用设备页同一份应用数据（deviceAppsList），只画紧凑的 Top 5 */
+	renderTopoDeviceApps: function (d) {
+		var list = this.deviceAppsList(d);
+
+		if (list == null || !list.length)
+			return E('div', { style: 'font-size:11px;opacity:.6;padding:2px 0' }, _('该设备暂无应用明细（后端未提供）'));
+
+		var top = list.slice(0, 5);
+
+		return E('div', { style: 'display:flex;flex-direction:column;gap:2px' }, [
+			E('div', { style: 'font-size:10px;opacity:.6;margin-bottom:1px' },
+				_('应用 Top 5') + ' · ' + _('共') + ' ' + list.length + ' ' + _('项'))
+		].concat(top.map(function (a) {
+			return E('div', { style: 'display:flex;align-items:baseline;justify-content:space-between;gap:4px;min-width:0' }, [
+				E('span', {
+					style: 'flex:1;min-width:0;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
+					title: appLabel(a.host) + (a.chain ? (' · ' + a.chain) : '')
+				}, appLabel(a.host)),
+				E('span', { style: 'font-size:11px;white-space:nowrap;opacity:.8' }, fmtBytes(a.rx + a.tx))
+			]);
+		})));
 	},
 
 	/* ------------------------------------------------------------ 系统 */
@@ -2524,16 +3583,32 @@ return view.extend({
 				})
 		];
 
-		if (this.tab === 'nodes') {
+		/* 节点快照只对「节点」/「拓扑」有意义：其它标签下不发这个 RPC；请求在途时也不叠加 */
+		if ((this.tab === 'nodes' || this.tab === 'topology') && !this.nodesPending) {
 			tasks.push(Promise.resolve().then(function () { return callNodes(); })
 				.then(function (r) {
 					if (r != null && Array.isArray(r.nodes)) {
 						self.nodes = r.nodes;
 						self.nodesError = null;
+						self.nodesLoaded = true;
 					}
 				})
 				.catch(function (err) {
 					self.nodesError = errText(err);
+				}));
+		}
+
+		/* 拓扑页才补拉 AP 快照；失败保留上一次数据，只把错误写进 AP 层 */
+		if (this.tab === 'topology' && !this.stationsPending) {
+			tasks.push(Promise.resolve().then(function () { return callStations(); })
+				.then(function (r) {
+					if (r != null && typeof r === 'object') {
+						self.stations = r;
+						self.stationsError = null;
+					}
+				})
+				.catch(function (err) {
+					self.stationsError = errText(err);
 				}));
 		}
 
