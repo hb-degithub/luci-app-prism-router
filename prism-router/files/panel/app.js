@@ -1377,10 +1377,10 @@
 		return null;
 	}
 
-	function scrollToNode(node) {
+	function scrollToNode(node, block) {
 		if (!node) return;
 		try {
-			node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+			node.scrollIntoView({ behavior: 'smooth', block: block || 'center' });
 		} catch (e) {
 			try { node.scrollIntoView(); } catch (e2) { /* 忽略 */ }
 		}
@@ -1422,7 +1422,7 @@
 			}
 
 			var devicesPanel = panelOf(dom.devicesBody);
-			scrollToNode(devicesPanel || dom.devicesBody);
+			scrollToNode(devicesPanel || dom.devicesBody, 'start');
 			flashNode(devicesPanel);
 			announce('已定位到设备榜。');
 			return;
@@ -1430,14 +1430,14 @@
 
 		if (target.type === 'nodes') {
 			var nodesPanel = panelOf(dom.nodesList);
-			scrollToNode(nodesPanel || dom.nodesList);
+			scrollToNode(nodesPanel || dom.nodesList, 'start');
 			flashNode(nodesPanel);
 			announce('已定位到节点 / 出口。');
 			return;
 		}
 
 		var healthPanel = panelOf(dom.healthSources);
-		scrollToNode(healthPanel || dom.healthSources);
+		scrollToNode(healthPanel || dom.healthSources, 'start');
 		flashNode(healthPanel);
 		announce('已定位到健康与告警。');
 	}
