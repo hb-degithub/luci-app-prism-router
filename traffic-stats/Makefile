@@ -29,7 +29,8 @@ define Package/traffic-stats
   TITLE:=Traffic statistics daemon (OpenClash API + conntrack)
   # curl：push.uc / feishu.uc 的 HTTP 发送；openssl-util：飞书 HMAC 签名、push 签名、
   # ingest.uc / feishu.uc 的 openssl 验签。两者都是运行时真实 exec 的依赖，不能删。
-  DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-uloop +curl +openssl-util
+  # uhttpd：独立面板服务（traffic-panel.init）需要系统自带的 uhttpd（不是 LuCI）。
+  DEPENDS:=+ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-uloop +curl +openssl-util +uhttpd
   PKGARCH:=all
 endef
 
@@ -76,6 +77,18 @@ define Package/traffic-stats/install
 	$(if $(wildcard ./files/ingest-stations.uc),$(INSTALL_BIN) ./files/ingest-stations.uc $(1)/www/cgi-bin/traffic-stats-stations)
 	# Prometheus 指标导出（只读 CGI；token 认证，未启用/未配 token 一律 403，见 SPEC §10.3）
 	$(if $(wildcard ./files/traffic-stats-metrics.uc),$(INSTALL_BIN) ./files/traffic-stats-metrics.uc $(1)/www/cgi-bin/traffic-stats-metrics)
+
+	# 独立面板 HTTP 服务（与 LuCI 解耦的只读面板，默认关闭；见 SPEC「独立面板服务」）
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/traffic-panel.init $(1)/etc/init.d/traffic-panel
+
+	# 面板 CGI（ucode，必须可执行：uhttpd -x /cgi-bin 直接 exec）
+	$(INSTALL_DIR) $(1)/www/traffic-panel/cgi-bin
+	$(if $(wildcard ./files/panel-api.uc),$(INSTALL_BIN) ./files/panel-api.uc $(1)/www/traffic-panel/cgi-bin/panel-api)
+
+	# 面板静态页面（index.html / app.js / style.css；由前端任务提供，存在才装，不因缺文件失败）
+	$(INSTALL_DIR) $(1)/www/traffic-panel
+	$(if $(wildcard ./files/panel/*),$(foreach f,$(wildcard ./files/panel/*),$(INSTALL_DATA) $(f) $(1)/www/traffic-panel/$(notdir $(f));))
 endef
 
 define Package/traffic-stats/postinst
@@ -83,6 +96,12 @@ define Package/traffic-stats/postinst
 [ -n "$${IPKG_INSTROOT}" ] || {
 	/etc/init.d/traffic-statsd enable
 	/etc/init.d/traffic-statsd restart
+	# 独立面板默认关闭：只跟随 panel.enabled 决定是否开机自启，绝不强制启动。
+	if [ "$$(uci -q get traffic-stats.panel.enabled)" = "1" ]; then
+		/etc/init.d/traffic-panel enable >/dev/null 2>&1
+	else
+		/etc/init.d/traffic-panel disable >/dev/null 2>&1
+	fi
 }
 exit 0
 endef
@@ -90,6 +109,8 @@ endef
 define Package/traffic-stats/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
+	/etc/init.d/traffic-panel stop >/dev/null 2>&1
+	/etc/init.d/traffic-panel disable >/dev/null 2>&1
 	/etc/init.d/traffic-statsd stop
 	/etc/init.d/traffic-statsd disable
 }

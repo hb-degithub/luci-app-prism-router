@@ -65,11 +65,14 @@ pack() { # $1=dir $2=basename（不带扩展名）
   find "$d/data" -type d -exec chmod 755 {} +
   find "$d/data" -type f -exec chmod 644 {} +
   # 可执行条目单独 755：守护进程 / init / 测试脚本 / 接收子节点上报的 CGI / 接收 AP 站点元数据的 CGI
+  # / 独立面板的 init 与只读 CGI（静态页面仍是 644）
   chmod 755 "$d/data/usr/bin/traffic-statsd" "$d/data/etc/init.d/traffic-statsd" \
     "$d/data/usr/share/traffic-stats/feishu-test.sh" \
     "$d/data/www/cgi-bin/traffic-stats-ingest" \
     "$d/data/www/cgi-bin/traffic-stats-stations" \
-    "$d/data/www/cgi-bin/traffic-stats-metrics" 2>/dev/null || true
+    "$d/data/www/cgi-bin/traffic-stats-metrics" \
+    "$d/data/etc/init.d/traffic-panel" \
+    "$d/data/www/traffic-panel/cgi-bin/panel-api" 2>/dev/null || true
   # control 归档：目录 755，control/conffiles 644，维护脚本 755（opkg 会直接 exec）
   find "$d/control" -type d -exec chmod 755 {} +
   chmod 644 "$d/control/control"
@@ -106,12 +109,13 @@ hook() { printf '%s\n' "$@" > "$W/_h"; chmod 644 "$W/_h"; }
 # ================= traffic-stats =================
 D="$W/ts"; mkdir -p "$D/data/usr/bin" "$D/data/usr/share/traffic-stats" \
   "$D/data/etc/init.d" "$D/data/etc/config" "$D/data/etc/traffic-stats/daily" \
-  "$D/data/www/cgi-bin" "$D/control"
+  "$D/data/www/cgi-bin" "$D/data/www/traffic-panel/cgi-bin" "$D/control"
 chmod 755 "$D" "$D/control" "$D/data" "$D/data/usr" "$D/data/usr/bin" \
   "$D/data/usr/share" "$D/data/usr/share/traffic-stats" \
   "$D/data/etc" "$D/data/etc/init.d" "$D/data/etc/config" \
   "$D/data/etc/traffic-stats" "$D/data/etc/traffic-stats/daily" \
-  "$D/data/www" "$D/data/www/cgi-bin"
+  "$D/data/www" "$D/data/www/cgi-bin" \
+  "$D/data/www/traffic-panel" "$D/data/www/traffic-panel/cgi-bin"
 install -m 755 "$ROOT/traffic-stats/files/traffic-statsd.uc"  "$D/data/usr/bin/traffic-statsd"
 install -m 644 "$ROOT/traffic-stats/files/feishu.uc"          "$D/data/usr/share/traffic-stats/feishu.uc"
 install -m 755 "$ROOT/traffic-stats/files/feishu-test.sh"     "$D/data/usr/share/traffic-stats/feishu-test.sh"
@@ -135,13 +139,37 @@ install -m 755 "$ROOT/traffic-stats/files/ingest-stations.uc" "$D/data/www/cgi-b
 install -m 755 "$ROOT/traffic-stats/files/traffic-stats-metrics.uc" "$D/data/www/cgi-bin/traffic-stats-metrics"
 install -m 755 "$ROOT/traffic-stats/files/traffic-statsd.init" "$D/data/etc/init.d/traffic-statsd"
 install -m 644 "$ROOT/traffic-stats/files/traffic-stats.config" "$D/data/etc/config/traffic-stats"
-# openssl-util 是飞书 HMAC-SHA256 与子母节点签名的真实运行时依赖，必须声明。
-ctl "$D" traffic-stats net "ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util" \
+# 独立面板服务：procd 管理的独立 uhttpd 实例（init）+ 只读 ucode CGI。
+# 静态页面由前端任务放在 traffic-stats/files/panel/，存在才装（空目录不失败）。
+install -m 755 "$ROOT/traffic-stats/files/traffic-panel.init" "$D/data/etc/init.d/traffic-panel"
+if [ -f "$ROOT/traffic-stats/files/panel-api.uc" ]; then
+  install -m 755 "$ROOT/traffic-stats/files/panel-api.uc" \
+    "$D/data/www/traffic-panel/cgi-bin/panel-api"
+fi
+if [ -d "$ROOT/traffic-stats/files/panel" ]; then
+  for f in "$ROOT"/traffic-stats/files/panel/*; do
+    [ -f "$f" ] || continue
+    install -m 644 "$f" "$D/data/www/traffic-panel/$(basename "$f")"
+  done
+fi
+# openssl-util 是飞书 HMAC-SHA256 与子母节点签名的真实运行时依赖，必须声明；
+# uhttpd 是独立面板服务（traffic-panel.init）的运行时依赖。
+ctl "$D" traffic-stats net "ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util, uhttpd" \
   "Traffic statistics daemon: per-device/per-app usage with proxy-vs-direct split (OpenClash API + conntrack)."
 printf '/etc/config/traffic-stats\n' > "$D/control/conffiles"; chmod 644 "$D/control/conffiles"
-hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' '/etc/init.d/traffic-statsd enable >/dev/null 2>&1' '/etc/init.d/traffic-statsd restart >/dev/null 2>&1' 'exit 0'
+# 独立面板默认关闭：postinst 只跟随 panel.enabled 决定是否开机自启，绝不强制启动。
+hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
+  '/etc/init.d/traffic-statsd enable >/dev/null 2>&1' \
+  '/etc/init.d/traffic-statsd restart >/dev/null 2>&1' \
+  'if [ "$(uci -q get traffic-stats.panel.enabled)" = "1" ]; then /etc/init.d/traffic-panel enable >/dev/null 2>&1; else /etc/init.d/traffic-panel disable >/dev/null 2>&1; fi' \
+  'exit 0'
 install -m 755 "$W/_h" "$D/control/postinst"
-hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' '/etc/init.d/traffic-statsd stop >/dev/null 2>&1' '/etc/init.d/traffic-statsd disable >/dev/null 2>&1' 'exit 0'
+hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
+  '/etc/init.d/traffic-panel stop >/dev/null 2>&1' \
+  '/etc/init.d/traffic-panel disable >/dev/null 2>&1' \
+  '/etc/init.d/traffic-statsd stop >/dev/null 2>&1' \
+  '/etc/init.d/traffic-statsd disable >/dev/null 2>&1' \
+  'exit 0'
 install -m 755 "$W/_h" "$D/control/prerm"
 pack "$D" "traffic-stats_${VER}-${REL}_all"
 

@@ -108,7 +108,8 @@ is_exec_name() {
     ./usr/bin/traffic-statsd|./etc/init.d/traffic-statsd|\
     ./usr/share/traffic-stats/feishu-test.sh|\
     ./www/cgi-bin/traffic-stats-ingest|./www/cgi-bin/traffic-stats-stations|\
-    ./www/cgi-bin/traffic-stats-metrics) return 0 ;;
+    ./www/cgi-bin/traffic-stats-metrics|\
+    ./etc/init.d/traffic-panel|./www/traffic-panel/cgi-bin/panel-api) return 0 ;;
   esac
   return 1
 }
@@ -167,7 +168,9 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
              p == "./usr/share/traffic-stats/feishu-test.sh" ||
              p == "./www/cgi-bin/traffic-stats-ingest" ||
              p == "./www/cgi-bin/traffic-stats-stations" ||
-             p == "./www/cgi-bin/traffic-stats-metrics"
+             p == "./www/cgi-bin/traffic-stats-metrics" ||
+             p == "./etc/init.d/traffic-panel" ||
+             p == "./www/traffic-panel/cgi-bin/panel-api"
     }
     {
       mode=$1; owner=$2; name=$NF;
@@ -242,11 +245,21 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
       "./usr/share/traffic-stats/stations.uc:traffic-stats/files/stations.uc" \
       "./www/cgi-bin/traffic-stats-ingest:traffic-stats/files/ingest.uc" \
       "./www/cgi-bin/traffic-stats-stations:traffic-stats/files/ingest-stations.uc" \
-      "./www/cgi-bin/traffic-stats-metrics:traffic-stats/files/traffic-stats-metrics.uc"; do
+      "./www/cgi-bin/traffic-stats-metrics:traffic-stats/files/traffic-stats-metrics.uc" \
+      "./etc/init.d/traffic-panel:traffic-stats/files/traffic-panel.init" \
+      "./www/traffic-panel/cgi-bin/panel-api:traffic-stats/files/panel-api.uc"; do
       local t="${entry%%:*}" s="${entry#*:}"
       [ -f "$ROOT/$s" ] || continue
       grep -qxF "$t" "$data_list" || fail "$pkg payload 缺少 $t（源 $s）"
       cmp -s "$data/${t#./}" "$ROOT/$s" || fail "$pkg payload $t 与源码 $s 不一致"
+    done
+    # 独立面板静态页面（前端任务提供；存在才要求进包，逐字节一致、权限 644）
+    local f b rel
+    for f in "$ROOT"/traffic-stats/files/panel/*; do
+      [ -f "$f" ] || continue
+      b=$(basename "$f"); rel="www/traffic-panel/$b"
+      grep -qxF "./$rel" "$data_list" || fail "traffic-stats payload 缺面板静态文件 $rel"
+      cmp -s "$data/$rel" "$f" || fail "panel 静态文件 $rel 与源码不一致"
     done
     if [ -f "$ROOT/traffic-stats/files/traffic-stats-node-auth.uc" ]; then
       grep -qxF "./usr/share/traffic-stats/traffic-stats-node-auth.uc" "$data_list" \
