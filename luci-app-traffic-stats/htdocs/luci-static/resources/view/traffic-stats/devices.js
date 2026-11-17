@@ -17,8 +17,9 @@
  * 设备识别（纯本地，不联网、不加 RPC）：
  *   - 厂商：内置 OUI_TABLE（MAC 前 3 字节 → 厂商标识），vendorOf() 查表；
  *     第 0/1 位（组播/本地管理）为 1 的随机 MAC 一律不认厂商，显示「未知厂商」。
- *   - 类型：deviceKindOf() 按 hostname/alias 关键词推断（手机/电脑/电视/平板/
- *     智能设备），短词用词边界匹配；deviceKindSvg() 生成 24px 线性图标。
+ *   - 类型：deviceKindOf() 先按 IP 判网络类（本机/容器/网关/服务器），再按
+ *     hostname/alias/ip 关键词推断（手机/电脑/电视/平板/智能设备），
+ *     原有关键词的短词用词边界匹配；deviceKindSvg() 生成 24px 线性图标。
  *   - 主机名列 = 类型图标 + 名称 + 厂商小字；表头可按厂商排序，工具栏有厂商筛选。
  *
  * 设备元数据 / 配额 / 导出（SPEC §10）：
@@ -716,7 +717,11 @@ function matchesVendorFilter(dev, filter) {
 	return vendorKeyOf(dev) === filter;
 }
 
-/* ---- 设备类型：hostname/alias 关键词推断（短词用边界匹配，mini 不会命中 mi）---- */
+/* ---- 设备类型：网络类先看 IP，再看 hostname/alias 关键词 ----
+ * 顺序：本机 → 容器 → 网关 → 服务器 → 手机/电脑/电视/平板/智能设备 → 未知，先命中先返回。
+ * 网络类关键词按子串匹配（NAS01 / docker0 / 主路由 这类写法也能命中）；
+ * 原有的短词（mi/pc/tv/pad/mac/win）继续走词边界，避免 mini / optimize 误判。
+ */
 
 var DEVICE_KIND_LABELS = {
 	phone: '手机',
@@ -724,6 +729,10 @@ var DEVICE_KIND_LABELS = {
 	tv: '电视',
 	tablet: '平板',
 	iot: '智能设备',
+	local: '本机',
+	container: '容器',
+	gateway: '网关',
+	server: '服务器',
 	unknown: '未知'
 };
 
@@ -771,9 +780,108 @@ function hasKindWord(text, word) {
 	return false;
 }
 
+/* IPv4 点分十进制 → [a,b,c,d]；格式不对（含空串、只有两段、越界）返回 null。 */
+function ipv4Octets(ip) {
+	var parts = ('' + (ip == null ? '' : ip)).split('.');
+
+	if (parts.length !== 4) return null;
+
+	var out = [];
+
+	for (var i = 0; i < 4; i++) {
+		if (!/^[0-9]{1,3}$/.test(parts[i])) return null;
+
+		var n = parseInt(parts[i], 10);
+
+		if (!(n >= 0 && n <= 255)) return null;
+
+		out.push(n);
+	}
+
+	return out;
+}
+
+/* 归一化 IP 文本：去空白、去 [IPv6] 方括号、去 CIDR 前缀、转小写。 */
+function normIp(ip) {
+	var s = ('' + (ip == null ? '' : ip)).replace(/^\s+|\s+$/g, '').toLowerCase();
+
+	if (s.charAt(0) === '[') {
+		var end = s.indexOf(']');
+
+		if (end > 0) s = s.slice(1, end);
+	}
+
+	var slash = s.indexOf('/');
+
+	if (slash > 0) s = s.slice(0, slash);
+
+	return s;
+}
+
+/* 私有 IPv4 段：10/8、172.16/12、192.168/16。 */
+function isPrivateIpv4(o) {
+	if (o == null) return false;
+	if (o[0] === 10) return true;
+	if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true;
+
+	return o[0] === 192 && o[1] === 168;
+}
+
+/* 回环 / 未指定地址。ip 为空串时不会走到这里，也不会被当成网关。 */
+function isLocalIp(ip) {
+	return ip === '127.0.0.1' || ip === '0.0.0.0' || ip === '::1';
+}
+
+/* 网络类关键词：按子串匹配。 */
+var NET_KIND_WORDS = [
+	[ 'local', [ 'localhost', '本机' ] ],
+	[ 'container', [ 'docker', 'container', 'podman', 'k8s' ] ],
+	[ 'gateway', [ 'router', 'gateway', '主路由', '路由' ] ],
+	[ 'server', [ 'nas', 'synology', 'qnap', 'server', '群晖', '服务器', '机架', 'rack' ] ]
+];
+
+function hasAnyWord(text, words) {
+	var t = ('' + (text == null ? '' : text)).toLowerCase();
+
+	if (!t.length) return false;
+
+	for (var i = 0; i < words.length; i++) {
+		if (t.indexOf(('' + words[i]).toLowerCase()) >= 0) return true;
+	}
+
+	return false;
+}
+
+/*
+ * 网络类设备判定：先看 IP，再看 hostname/alias 关键词；不认识返回 ''，
+ * 交给后面的原有关键词，绝不默认成网关。
+ */
+function netKindOf(text, ip) {
+	var o = ipv4Octets(ip);
+
+	if (isLocalIp(ip) || hasAnyWord(text, NET_KIND_WORDS[0][1])) return 'local';
+
+	/* Docker 默认 172.17，整段 172.16.0.0/12；172.15 / 172.32 不在段内。 */
+	if ((o != null && o[0] === 172 && o[1] >= 16 && o[1] <= 31) ||
+		hasAnyWord(text, NET_KIND_WORDS[1][1])) return 'container';
+
+	/* 网关 = 私有网段 + 末段为 1；IP 缺失/空串、192.168.100.3、10.1.2.3 都不命中。 */
+	if ((isPrivateIpv4(o) && o[3] === 1) || hasAnyWord(text, NET_KIND_WORDS[2][1])) return 'gateway';
+
+	if (hasAnyWord(text, NET_KIND_WORDS[3][1])) return 'server';
+
+	return '';
+}
+
 function deviceKindOf(dev) {
-	var text = ((dev != null && dev.hostname != null) ? ('' + dev.hostname) : '') + ' ' +
-		((dev != null && dev.alias != null) ? ('' + dev.alias) : '');
+	var hostname = (dev != null && dev.hostname != null) ? ('' + dev.hostname) : '';
+	var alias = (dev != null && dev.alias != null) ? ('' + dev.alias) : '';
+	var ip = normIp(dev != null ? dev.ip : '');
+	/* IP 也纳入关键词判定（原函数只看 hostname/alias）。 */
+	var text = hostname + ' ' + alias + ' ' + ip;
+	var net = netKindOf(text, ip);
+
+	if (net.length) return net;
 
 	for (var i = 0; i < DEVICE_KIND_HINTS.length; i++) {
 		var words = DEVICE_KIND_HINTS[i][1];
@@ -790,7 +898,7 @@ function deviceKindLabel(kind) {
 	return _(DEVICE_KIND_LABELS[kind] || DEVICE_KIND_LABELS.unknown);
 }
 
-/* 6 个 24px 线性图标，只用 rect/path/circle，全部 createElementNS 生成，不拼字符串。 */
+/* 10 个 24px 线性图标，只用 rect/path/circle，全部 createElementNS 生成，不拼字符串。 */
 var SVG_NS = 'http://www.w3.org/2000/svg';
 
 var DEVICE_KIND_SHAPES = {
@@ -814,6 +922,30 @@ var DEVICE_KIND_SHAPES = {
 		[ 'rect', { x: '6.2', y: '2.6', width: '11.6', height: '18.8', rx: '3.2' } ],
 		[ 'path', { d: 'M9 6.6h6' } ],
 		[ 'circle', { cx: '12', cy: '14.2', r: '2.8' } ]
+	],
+	/* 路由器：圆角矩形机身 + 两根天线 + 两颗指示灯。 */
+	gateway: [
+		[ 'rect', { x: '3', y: '9.4', width: '18', height: '8', rx: '2' } ],
+		[ 'path', { d: 'M7.6 9.4V5.8M16.4 9.4V5.8' } ],
+		[ 'circle', { cx: '8', cy: '13.4', r: '0.8' } ],
+		[ 'circle', { cx: '11.4', cy: '13.4', r: '0.8' } ]
+	],
+	/* 容器：立方体轮廓（外轮廓 + 三条棱）。 */
+	container: [
+		[ 'path', { d: 'M12 2.8l7.6 4.2v9.6L12 20.8 4.4 16.6V7z' } ],
+		[ 'path', { d: 'M4.4 7l7.6 4.2L19.6 7M12 11.2v9.6' } ]
+	],
+	/* 本机：显示器 + 底座。 */
+	local: [
+		[ 'rect', { x: '3', y: '4.4', width: '18', height: '12', rx: '1.8' } ],
+		[ 'path', { d: 'M12 16.4v3.4M8.6 20.2h6.8' } ]
+	],
+	/* 服务器：上下两格机架 + 每格一颗状态灯。 */
+	server: [
+		[ 'rect', { x: '3.2', y: '4.2', width: '17.6', height: '6.2', rx: '1.6' } ],
+		[ 'rect', { x: '3.2', y: '13.6', width: '17.6', height: '6.2', rx: '1.6' } ],
+		[ 'circle', { cx: '7', cy: '7.3', r: '0.85' } ],
+		[ 'circle', { cx: '7', cy: '16.7', r: '0.85' } ]
 	],
 	unknown: [
 		[ 'circle', { cx: '12', cy: '12', r: '8.6' } ],

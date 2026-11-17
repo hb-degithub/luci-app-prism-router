@@ -514,6 +514,7 @@ const HOOK_NAMES = [
 	'isGuestDevice',
 	'deviceKindOf',
 	'deviceKindSvg',
+	'deviceKindLabel',
 	'classifyDevice',
 	'groupDevices',
 	'sortDevices',
@@ -1912,6 +1913,207 @@ async function testDeviceKindOf() {
 		'icons=' + repr(kinds));
 }
 
+// ---------------------------------------------------------------- 7d2. 网络类设备（本机/容器/网关/服务器）
+
+/* 图标标签序列：渲染结果里用它区分类型，不依赖颜色或外层文案。 */
+function deviceIconSvg(node) {
+	return findAll(node, function (n) { return n.tag === 'svg'; })[0] || null;
+}
+
+function deviceIconTags(node) {
+	const svg = deviceIconSvg(node);
+
+	return svg == null ? [] : svg.children.map(function (child) { return child.tag; });
+}
+
+/* 24px 画布自检：shape 的坐标与 path 数字都必须落在 0..24。 */
+function svgCoordsInsideBox(svg) {
+	const boxed = [ 'x', 'y', 'cx', 'cy', 'r', 'width', 'height' ];
+
+	return svg.children.every(function (child) {
+		const attrsOk = boxed.every(function (name) {
+			const value = child.attrs[name];
+
+			return value == null || (Number(value) >= 0 && Number(value) <= 24);
+		});
+
+		if (!attrsOk) return false;
+
+		const nums = (String(child.attrs.d || '')).match(/-?\d+(\.\d+)?/g) || [];
+
+		return nums.every(function (n) { return Number(n) >= 0 && Number(n) <= 24; });
+	});
+}
+
+async function testNetworkDeviceKinds() {
+	console.log('\n[7d2] 网络类设备：本机/容器/网关/服务器 识别 + 4 个新线条图标');
+
+	const booted = await boot({ state: baseState() });
+	const kindOf = booted.hooks.deviceKindOf;
+	const labelOf = booted.hooks.deviceKindLabel;
+
+	/* 本机：回环/未指派地址，或 hostname 关键词（大小写不敏感）。 */
+	same('127.0.0.1 → local', kindOf({ ip: '127.0.0.1' }), 'local');
+	same('0.0.0.0 → local', kindOf({ ip: '0.0.0.0' }), 'local');
+	same('::1 → local', kindOf({ ip: '::1' }), 'local');
+	same('localhost 主机名 → local', kindOf({ hostname: 'localhost' }), 'local');
+	same('LocalHost-01 混合大小写 → local', kindOf({ hostname: 'LocalHost-01' }), 'local');
+	same('中文「本机」→ local', kindOf({ hostname: '本机' }), 'local');
+
+	/* 容器：172.16/12 整段（Docker 默认 172.17），以及容器关键词。 */
+	same('172.16.0.2 → container', kindOf({ ip: '172.16.0.2' }), 'container');
+	same('172.17.0.2（Docker 默认段）→ container', kindOf({ ip: '172.17.0.2' }), 'container');
+	same('172.31.255.9（172.16/12 上界）→ container', kindOf({ ip: '172.31.255.9' }), 'container');
+	same('172.15.0.2（不在 172.16/12）→ unknown', kindOf({ ip: '172.15.0.2' }), 'unknown');
+	same('172.32.0.2（超出 172.16/12）→ unknown', kindOf({ ip: '172.32.0.2' }), 'unknown');
+	same('Docker-01 主机名 → container', kindOf({ hostname: 'Docker-01' }), 'container');
+	same('K8S-NODE 大写 → container', kindOf({ hostname: 'K8S-NODE' }), 'container');
+	same('podman 主机名 → container', kindOf({ hostname: 'podman-host' }), 'container');
+	same('172.17.0.1 先判容器（容器判定在网关之前）', kindOf({ ip: '172.17.0.1' }), 'container');
+
+	/* 网关：私有网段且末段为 1；不是 .1 的私有地址仍是普通设备。 */
+	same('10.0.0.1 → gateway', kindOf({ ip: '10.0.0.1' }), 'gateway');
+	same('10.1.2.1 → gateway', kindOf({ ip: '10.1.2.1' }), 'gateway');
+	same('192.168.1.1 → gateway', kindOf({ ip: '192.168.1.1' }), 'gateway');
+	same('192.168.100.1 → gateway', kindOf({ ip: '192.168.100.1' }), 'gateway');
+	same('192.168.100.3（不是 .1）→ unknown', kindOf({ ip: '192.168.100.3' }), 'unknown');
+	same('10.1.2.3（不是 .1）→ unknown', kindOf({ ip: '10.1.2.3' }), 'unknown');
+	same('8.8.8.1（公网 .1）→ unknown', kindOf({ ip: '8.8.8.1' }), 'unknown');
+	same('Router-01 主机名 → gateway', kindOf({ hostname: 'Router-01' }), 'gateway');
+	same('GATEWAY 大写 → gateway', kindOf({ hostname: 'GATEWAY' }), 'gateway');
+	same('中文「主路由」→ gateway', kindOf({ hostname: '主路由' }), 'gateway');
+	same('中文「路由」→ gateway', kindOf({ hostname: '路由' }), 'gateway');
+
+	/* 服务器：NAS/机架等关键词。 */
+	same('NAS-01 主机名 → server', kindOf({ hostname: 'NAS-01' }), 'server');
+	same('nas 别名 → server', kindOf({ alias: 'home nas' }), 'server');
+	same('Synology-DS920 → server', kindOf({ hostname: 'Synology-DS920' }), 'server');
+	same('QNAP-TS → server', kindOf({ hostname: 'QNAP-TS' }), 'server');
+	same('server 大写 → server', kindOf({ hostname: 'Server-A' }), 'server');
+	same('中文「群晖」→ server', kindOf({ hostname: '群晖DS220' }), 'server');
+	same('中文「服务器」→ server', kindOf({ hostname: '服务器-01' }), 'server');
+	same('中文「机架」→ server', kindOf({ hostname: '机架02' }), 'server');
+	same('rack-3 → server', kindOf({ hostname: 'rack-3' }), 'server');
+	same('canvas 里的 nas 不命中 → unknown', kindOf({ hostname: 'canvas-device' }), 'unknown');
+
+	/* 判定顺序 + 边界：缺 ip / 空 hostname / hostname 里带 IP 字面量。 */
+	same('localhost 先于网关 IP 判定', kindOf({ hostname: 'localhost', ip: '192.168.1.1' }), 'local');
+	same('容器关键词先于网关 IP 判定', kindOf({ hostname: 'docker-host', ip: '10.0.0.1' }), 'container');
+	same('网关关键词先于服务器关键词', kindOf({ hostname: 'Router-NAS', ip: '192.168.100.3' }), 'gateway');
+	same('服务器关键词先于手机关键词', kindOf({ hostname: 'NAS-01', alias: 'iPhone' }), 'server');
+	same('容器 IP 先于手机关键词', kindOf({ ip: '172.17.0.2', hostname: 'iPhone-15' }), 'container');
+	same('普通私有 IP 不误判，仍按原关键词 → phone', kindOf({ ip: '192.168.100.3', hostname: 'iPhone-15' }), 'phone');
+	same('空 hostname + 空 ip → unknown', kindOf({ hostname: '', ip: '' }), 'unknown');
+	same('空 hostname 不误判成 gateway', kindOf({ hostname: '', alias: '' }), 'unknown');
+	same('hostname 含 IP 字面量但不解析成网关', kindOf({ hostname: '192.168.100.1' }), 'unknown');
+	same('ip 非法文本不影响关键词判定', kindOf({ hostname: 'iPad-Air', ip: 'not-an-ip' }), 'tablet');
+	same('短词词边界保留（MI-11 仍 phone）', kindOf({ hostname: 'MI-11', ip: '192.168.100.3' }), 'phone');
+	same('短词词边界保留（HomePod mini 仍 iot）', kindOf({ hostname: 'HomePod mini', ip: '10.0.0.5' }), 'iot');
+
+	/* 中文类型文案。 */
+	same('文案 local = 本机', labelOf('local'), '本机');
+	same('文案 container = 容器', labelOf('container'), '容器');
+	same('文案 gateway = 网关', labelOf('gateway'), '网关');
+	same('文案 server = 服务器', labelOf('server'), '服务器');
+	same('文案 phone 仍是手机', labelOf('phone'), '手机');
+	same('未知类型文案兜底', labelOf('bogus'), '未知');
+
+	/* 4 个新图标：24px 画布、仅 rect/path/circle、stroke 透传。 */
+	const expectedTags = {
+		gateway: [ 'rect', 'path', 'path', 'path', 'circle' ],
+		container: [ 'path', 'path', 'path' ],
+		local: [ 'rect', 'path', 'path' ],
+		server: [ 'rect', 'rect', 'circle', 'circle' ]
+	};
+
+	Object.keys(expectedTags).forEach(function (kind) {
+		const svg = booted.hooks.deviceKindSvg(kind, '#2b7de9');
+
+		check('deviceKindSvg(' + kind + ') 结构：' + expectedTags[kind].join('+'),
+			svg != null && svg.tag === 'svg' && svg.attrs.viewBox === '0 0 24 24' &&
+			svg.children.map(function (c) { return c.tag; }).join(',') === expectedTags[kind].join(',') &&
+			svgCoordsInsideBox(svg),
+			'tags=' + repr(svg && svg.children.map(function (c) { return c.tag; })));
+
+		check('deviceKindSvg(' + kind + ') 只用 rect/path/circle 且 stroke 透传',
+			svg.children.every(function (child) {
+				return child.namespace === 'http://www.w3.org/2000/svg' &&
+					[ 'rect', 'path', 'circle' ].indexOf(child.tag) >= 0 &&
+					(child.attrs.stroke === '#2b7de9' || child.attrs.fill === '#2b7de9');
+			}) &&
+			findAll(svg, function (n) { return n.tag === 'text'; }).length === 0,
+			'svg=' + repr(svg.children.map(function (c) { return c.tag; })));
+
+		const plain = booted.hooks.deviceKindSvg(kind);
+
+		check('deviceKindSvg(' + kind + ') 默认 currentColor（深色主题跟随）',
+			plain.children.every(function (child) {
+				return child.attrs.stroke === 'currentColor' || child.attrs.fill === 'currentColor';
+			}),
+			'stroke=' + repr(plain.children.map(function (c) { return c.attrs.stroke || c.attrs.fill; })));
+	});
+
+	/* 渲染：概览拓扑节点图标 + 设备行类型文案。 */
+	const netDevices = [
+		{ mac: 'ND1', ip: '172.17.0.2', hostname: '', link: 'wired', last_seen: NOW - 10, rx_rate: 1200, tx_rate: 600 },
+		{ mac: 'ND2', ip: '192.168.100.1', hostname: '', link: 'wired', last_seen: NOW - 20, rx_rate: 2200, tx_rate: 700 },
+		{ mac: 'ND3', ip: '192.168.100.3', hostname: '', link: 'wifi', last_seen: NOW - 30, rx_rate: 3200, tx_rate: 800 }
+	];
+	const rendered = await boot({ state: topoState({ devices: netDevices }) });
+	const rctx = rendered.ctx;
+	const containerNode = ovTopoRowByName(rctx, '172.17.0.2');
+	const gatewayNode = ovTopoRowByName(rctx, '192.168.100.1');
+	const unknownNode = ovTopoRowByName(rctx, '192.168.100.3');
+
+	check('概览拓扑渲染出 3 个 IP 设备节点',
+		containerNode != null && gatewayNode != null && unknownNode != null,
+		'names=' + repr(ovTopoRows(rctx).map(function (n) {
+			return textOf(findByClass(n, 'tsm-dnode-name'));
+		})));
+
+	check('172.17.0.2 显示容器图标（立方体三路径）',
+		containerNode != null && deviceIconTags(containerNode).join(',') === 'path,path,path',
+		'tags=' + repr(containerNode && deviceIconTags(containerNode)));
+	check('192.168.100.1 显示网关图标（圆角矩形 + 天线 + 指示灯）',
+		gatewayNode != null && deviceIconTags(gatewayNode).join(',') === 'rect,path,path,path,circle',
+		'tags=' + repr(gatewayNode && deviceIconTags(gatewayNode)));
+	check('192.168.100.3 仍是 unknown 问号（不瞎猜）',
+		unknownNode != null && deviceIconTags(unknownNode).join(',') === 'circle,path,circle',
+		'tags=' + repr(unknownNode && deviceIconTags(unknownNode)));
+	check('172.17.0.2 节点仍是 is-wired（类型不改链路环色）',
+		containerNode != null && hasClass(containerNode, 'is-wired'),
+		'class=' + repr(containerNode && containerNode.attrs['class']));
+	check('节点图标默认 currentColor（320px/深色主题不硬编码颜色）',
+		containerNode != null && deviceIconSvg(containerNode).children.every(function (child) {
+			return child.attrs.stroke === 'currentColor' || child.attrs.fill === 'currentColor';
+		}),
+		'attrs=' + repr(containerNode && deviceIconSvg(containerNode).children.map(function (c) {
+			return c.attrs.stroke || c.attrs.fill;
+		})));
+
+	check('设备行文案：172.17.0.2 显示「容器」',
+		deviceRowByName(rctx, '172.17.0.2') != null &&
+			textOf(deviceRowByName(rctx, '172.17.0.2')).indexOf('容器 · 有线') >= 0,
+		'row=' + repr(deviceRowByName(rctx, '172.17.0.2') && textOf(deviceRowByName(rctx, '172.17.0.2'))));
+	check('设备行文案：192.168.100.1 显示「网关」',
+		deviceRowByName(rctx, '192.168.100.1') != null &&
+			textOf(deviceRowByName(rctx, '192.168.100.1')).indexOf('网关 · 有线') >= 0,
+		'row=' + repr(deviceRowByName(rctx, '192.168.100.1') && textOf(deviceRowByName(rctx, '192.168.100.1'))));
+	check('设备行文案：192.168.100.3 显示「未知」',
+		deviceRowByName(rctx, '192.168.100.3') != null &&
+			textOf(deviceRowByName(rctx, '192.168.100.3')).indexOf('未知 · 无线') >= 0,
+		'row=' + repr(deviceRowByName(rctx, '192.168.100.3') && textOf(deviceRowByName(rctx, '192.168.100.3'))));
+
+	/* L5 设备层复用 renderDeviceNode，图标/类型自动跟随。 */
+	check('L5 renderDeviceNode 对 172.17.0.2 同样用容器图标',
+		deviceIconTags(rctx.renderDeviceNode({ ip: '172.17.0.2', mac: 'L5A', last_seen: NOW })).join(',') === 'path,path,path',
+		'tags=' + repr(deviceIconTags(rctx.renderDeviceNode({ ip: '172.17.0.2', mac: 'L5A', last_seen: NOW }))));
+	check('L5 节点 title 带类型文案',
+		String(rctx.renderDeviceNode({ ip: '192.168.100.1', mac: 'L5B', last_seen: NOW }).attrs.title)
+			.indexOf('网关') === 0,
+		'title=' + repr(rctx.renderDeviceNode({ ip: '192.168.100.1', mac: 'L5B', last_seen: NOW }).attrs.title));
+}
+
 function overviewTopoDevices(list) {
 	return list.map(function (item, index) {
 		return {
@@ -3178,6 +3380,7 @@ async function testTouchTargets() {
 		await testNodeScreen();
 		await testTopology();
 		await testDeviceKindOf();
+		await testNetworkDeviceKinds();
 		await testOverviewTopo();
 		await testTopoTree();
 		await testTopologyDegrade();

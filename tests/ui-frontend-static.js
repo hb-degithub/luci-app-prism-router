@@ -631,6 +631,11 @@ async function testSemantics() {
 	check('概览页有流量日历与需要关注卡片',
 		/日历/.test(overview) && /需要关注/.test(overview) &&
 		/get_daily/.test(overview));
+	/* 网络类设备（本机/容器/网关/服务器）在手机版与桌面设备页都要有识别与图标。 */
+	check('手机版与设备页都识别网络类设备',
+		/'gateway'/.test(mobile) && /'container'/.test(mobile) &&
+		/'gateway'/.test(devicesPage) && /'container'/.test(devicesPage) &&
+		/本机/.test(mobile) && /网关/.test(mobile) && /容器/.test(mobile));
 	check('诊断页只读且包含关键检查项',
 		/method:\s*'status'/.test(diagnosticsPage) &&
 		!/set_config|set_device_meta|method:\s*'restart'|uci\.set\s*\(/.test(diagnosticsPage) &&

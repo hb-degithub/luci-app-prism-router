@@ -1516,8 +1516,9 @@ var DEVICE_KIND_RULES = [
 function deviceKindText(dev) {
 	var hostname = (dev != null && dev.hostname != null) ? ('' + dev.hostname) : '';
 	var alias = (dev != null && dev.alias != null) ? ('' + dev.alias) : '';
+	var ip = (dev != null && dev.ip != null) ? ('' + dev.ip) : '';
 
-	return (hostname + ' ' + alias).toLowerCase();
+	return (hostname + ' ' + alias + ' ' + ip).toLowerCase();
 }
 
 /*
@@ -1531,13 +1532,84 @@ function deviceKindHit(text, word) {
 	return new RegExp('(^|[^a-z0-9])' + word + '([^a-z0-9]|$)').test(text);
 }
 
+/* 网络类设备（本机/容器/网关/服务器）关键词；先于消费类关键词判定。 */
+var DEVICE_KIND_NET_RULES = [
+	{ kind: 'local', words: [ 'localhost', '本机' ] },
+	{ kind: 'container', words: [ 'docker', 'container', 'podman', 'k8s' ] },
+	{ kind: 'gateway', words: [ 'router', 'gateway', '主路由', '路由' ] },
+	{ kind: 'server', words: [ 'nas', 'synology', 'qnap', 'server', '群晖', '服务器', '机架', 'rack' ] }
+];
+
+/* 回环/未指派地址：直接算本机（不参与私有网段推断）。 */
+var DEVICE_KIND_LOCAL_IPS = [ '127.0.0.1', '0.0.0.0', '::1' ];
+
+/* IPv4 字面量 → [a,b,c,d]；缺失或非法返回 null（IPv6 只认上面的回环字面量）。 */
+function deviceKindIpv4(ip) {
+	var parts = ('' + ip).split('.');
+	var out = [];
+	var i, n;
+
+	if (parts.length !== 4) return null;
+
+	for (i = 0; i < 4; i++) {
+		if (!/^[0-9]{1,3}$/.test(parts[i])) return null;
+
+		n = parseInt(parts[i], 10);
+		if (!(n <= 255)) return null;
+
+		out.push(n);
+	}
+
+	return out;
+}
+
+/* RFC1918：10/8、172.16/12、192.168/16。 */
+function deviceKindPrivateIpv4(v4) {
+	if (v4 == null) return false;
+
+	return v4[0] === 10 ||
+		(v4[0] === 172 && v4[1] >= 16 && v4[1] <= 31) ||
+		(v4[0] === 192 && v4[1] === 168);
+}
+
+function deviceKindTextHit(text, words) {
+	var i;
+
+	for (i = 0; i < words.length; i++) {
+		if (deviceKindHit(text, words[i])) return true;
+	}
+
+	return false;
+}
+
 /*
- * 设备类型：只按 hostname/alias 关键词猜（大小写不敏感），猜不出返回 unknown。
+ * 设备类型：先判网络类设备（本机 → 容器 → 网关 → 服务器），再按 hostname/alias/ip
+ * 关键词猜消费类（大小写不敏感）；猜不出返回 unknown。
  * 纯函数，供拓扑节点选图标；不做任何网络/宿主探测。
  */
 function deviceKindOf(dev) {
+	var ip = (dev != null && dev.ip != null) ? ('' + dev.ip).replace(/^\s+|\s+$/g, '') : '';
 	var text = deviceKindText(dev);
+	var v4 = deviceKindIpv4(ip);
 	var i, j;
+
+	/* 本机：回环/未指派地址，或 hostname 里写明 localhost/本机。 */
+	if (DEVICE_KIND_LOCAL_IPS.indexOf(ip) >= 0 ||
+		deviceKindTextHit(text, DEVICE_KIND_NET_RULES[0].words))
+		return 'local';
+
+	/* 容器：Docker 默认 172.17，整个 172.16/12 都算；或 hostname 命中容器关键词。 */
+	if ((v4 != null && v4[0] === 172 && v4[1] >= 16 && v4[1] <= 31) ||
+		deviceKindTextHit(text, DEVICE_KIND_NET_RULES[1].words))
+		return 'container';
+
+	/* 网关：私有网段且末段为 1（.1 才是网关，.3 仍是普通设备），或 hostname 命中路由关键词。 */
+	if ((deviceKindPrivateIpv4(v4) && v4[3] === 1) ||
+		deviceKindTextHit(text, DEVICE_KIND_NET_RULES[2].words))
+		return 'gateway';
+
+	if (deviceKindTextHit(text, DEVICE_KIND_NET_RULES[3].words))
+		return 'server';
 
 	for (i = 0; i < DEVICE_KIND_RULES.length; i++) {
 		for (j = 0; j < DEVICE_KIND_RULES[i].words.length; j++) {
@@ -1547,6 +1619,26 @@ function deviceKindOf(dev) {
 	}
 
 	return 'unknown';
+}
+
+/* 类型中文文案：拓扑 title / 设备行等直接复用，新增类型不必各自加分支。 */
+var DEVICE_KIND_LABELS = {
+	phone: '手机',
+	laptop: '电脑',
+	tv: '电视',
+	tablet: '平板',
+	iot: '智能设备',
+	local: '本机',
+	container: '容器',
+	gateway: '网关',
+	server: '服务器',
+	unknown: '未知'
+};
+
+function deviceKindLabel(kind) {
+	var label = DEVICE_KIND_LABELS[kind];
+
+	return _(label != null ? label : DEVICE_KIND_LABELS.unknown);
 }
 
 /* 类型图标：20-24px 线条风格（与 globe/router 一致），不用 emoji、不引外部图片。 */
@@ -1599,6 +1691,31 @@ function deviceKindSvg(kind, color) {
 		add('circle', { cx: '12', cy: '10.2', r: '5' });
 		add('path', { d: 'M9.6 17.4h4.8' });
 		add('path', { d: 'M10.6 19.9h2.8' });
+	}
+	else if (kind == 'gateway') {
+		add('rect', { x: '2.8', y: '10.6', width: '18.4', height: '8.2', rx: '2' });
+		add('path', { d: 'M7 10.6V5.6' });
+		add('path', { d: 'M17 10.6V5.6' });
+		add('path', { d: 'M9.4 15.6L17.6 15.6' });
+		add('circle', { cx: '5.9', cy: '15.6', r: '0.9', fill: stroke, stroke: 'none' });
+	}
+	else if (kind == 'container') {
+		add('path', {
+			d: 'M12 2.8L20.4 7.5L20.4 16.5L12 21.2L3.6 16.5L3.6 7.5Z'
+		});
+		add('path', { d: 'M3.6 7.5L12 12.2L20.4 7.5' });
+		add('path', { d: 'M12 12.2L12 21.2' });
+	}
+	else if (kind == 'local') {
+		add('rect', { x: '3.2', y: '4.2', width: '17.6', height: '12', rx: '1.8' });
+		add('path', { d: 'M12 16.2v3.6' });
+		add('path', { d: 'M8.6 19.8h6.8' });
+	}
+	else if (kind == 'server') {
+		add('rect', { x: '3.4', y: '3.4', width: '17.2', height: '7.2', rx: '1.4' });
+		add('rect', { x: '3.4', y: '13.4', width: '17.2', height: '7.2', rx: '1.4' });
+		add('circle', { cx: '6.9', cy: '7', r: '0.85', fill: stroke, stroke: 'none' });
+		add('circle', { cx: '6.9', cy: '17', r: '0.85', fill: stroke, stroke: 'none' });
 	}
 	else {
 		add('circle', { cx: '12', cy: '12', r: '8.6' });
@@ -1662,7 +1779,8 @@ function deviceNodeTitle(dev) {
 	var rx = rateText(dev != null ? dev.rx_rate : null);
 	var tx = rateText(dev != null ? dev.tx_rate : null);
 
-	return name + ' · ' + _('下行') + ' ' + rx + ' · ' + _('上行') + ' ' + tx;
+	return deviceKindLabel(deviceKindOf(dev)) + ' · ' + name + ' · ' +
+		_('下行') + ' ' + rx + ' · ' + _('上行') + ' ' + tx;
 }
 
 // ---------------------------------------------------------------- 视图
@@ -3523,6 +3641,7 @@ return view.extend({
 				E('div', { 'class': 'tsm-dname' }, deviceName(dev)),
 				E('div', { 'class': 'tsm-dmeta' }, _('连接节点') + '：' + deviceChainLabel(dev)),
 				E('div', { 'class': 'tsm-dmeta' },
+					deviceKindLabel(deviceKindOf(dev)) + ' · ' +
 					_(link.label) + ' · ' + deviceSeenLabel(dev, this.devNow))
 			]),
 			E('div', { 'class': 'tsm-drates' }, [
