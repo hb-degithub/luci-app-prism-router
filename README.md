@@ -55,6 +55,29 @@ uci set prism-router.settings.fake_ip_ranges='198.18.0.0/16'
 uci commit prism-router
 ```
 
+## 从旧版 `traffic-stats` 迁移
+
+项目已更名为 **棱镜路由 / PRISM Router**，包名也随之变更：
+
+| 旧 | 新 |
+| --- | --- |
+| `traffic-stats` | `prism-router` |
+| `luci-app-traffic-stats` | `luci-app-prism-router` |
+| `/etc/config/traffic-stats` | `/etc/config/prism-router` |
+| `/etc/traffic-stats/` | `/etc/prism-router/` |
+| ubus `traffic-stats` | ubus `prism-router` |
+| `/www/traffic-panel` | `/www/prism-router-panel` |
+
+安装新包时 postinst 会自动迁移（幂等）：
+
+- 旧配置优先复制为新配置，缺少 `panel` 段时补默认值；
+- `/etc/traffic-stats/` 下的 `daily/`、`devices.json`、`stations/` 整份复制到 `/etc/prism-router/`；
+- 停用旧服务 `traffic-statsd`，避免新旧守护进程同时写数据。
+
+旧包与旧目录**保留不删除**（作为回滚备份）。确认新面板与数据正常后，可以执行
+`opkg remove luci-app-traffic-stats traffic-stats` 清理旧包；`/etc/config/traffic-stats`
+与 `/etc/traffic-stats/` 不会被自动删除，需要手动清理。
+
 ## 独立面板服务（脱离 LuCI）
 
 `prism-router` 会安装一个**独立**的 uhttpd 实例（procd 管理，不占用 LuCI 的 web 端口，
