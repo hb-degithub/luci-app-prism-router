@@ -3,7 +3,7 @@
  * LuCI 前端静态 / 轻量测试（无需路由器、不启动服务器）
  *
  * 覆盖：
- *   1. 七个 view 的 JS 语法：用 vm.Script 包一层函数解析，避免 LuCI 的
+ *   1. 八个 view 的 JS 语法：用 vm.Script 包一层函数解析，避免 LuCI 的
  *      'require xxx' 字符串被 Node 当成模块加载（也不执行任何浏览器 API）。
  *   2. 新增 RPC 声明：devices -> set_device_meta / export_csv，
  *      settings/apps -> export_csv，settings -> set_config。
@@ -32,7 +32,7 @@ const vm = require('vm');
 
 const ROOT = path.resolve(__dirname, '..');
 const VIEW_DIR = path.join(ROOT, 'luci-app-traffic-stats/htdocs/luci-static/resources/view/traffic-stats');
-const VIEWS = [ 'overview', 'devices', 'apps', 'nodes', 'settings', 'mobile', 'panel' ];
+const VIEWS = [ 'overview', 'devices', 'apps', 'nodes', 'settings', 'mobile', 'panel', 'diagnostics' ];
 
 let passed = 0;
 let failed = 0;
@@ -282,7 +282,7 @@ function containsText(root, needle) {
 // ---------------------------------------------------------------- 1. 语法
 
 async function testSyntax() {
-	console.log('\n[1] 七个 view 的 JS 语法（vm.Script 包装后解析）');
+	console.log('\n[1] 八个 view 的 JS 语法（vm.Script 包装后解析）');
 
 	for (const name of VIEWS) {
 		try {
@@ -567,6 +567,7 @@ async function testSemantics() {
 	const devicesPage = readView('devices');
 	const appsPage = readView('apps');
 	const nodesPage = readView('nodes');
+	const diagnosticsPage = readView('diagnostics');
 
 	check('概览「昨日全天」按 day 查找，不写死 days[1]',
 		!/days\[1\]/.test(overview) && /findYesterdayDay/.test(overview) &&
@@ -619,6 +620,25 @@ async function testSemantics() {
 	check('概览页有在线/离线/访客摘要与刷新开关',
 		/deviceCounts/.test(overview) && /在线/.test(overview) &&
 		/访客/.test(overview) && /autoRefresh|autoInput/.test(overview));
+
+	/* 新增功能：设备厂商识别、流量日历/关注卡片、诊断中心。 */
+	check('设备页内置 OUI 厂商表并处理随机 MAC',
+		/OUI_TABLE/.test(devicesPage) && /vendorOf/.test(devicesPage) &&
+		/随机|本地管理/.test(devicesPage));
+	check('设备页有厂商筛选与设备类型图标',
+		/vendorFilter|厂商/.test(devicesPage) && /deviceKind/.test(devicesPage) &&
+		/deviceKindSvg|svg/i.test(devicesPage));
+	check('概览页有流量日历与需要关注卡片',
+		/日历/.test(overview) && /需要关注/.test(overview) &&
+		/get_daily/.test(overview));
+	check('诊断页只读且包含关键检查项',
+		/method:\s*'status'/.test(diagnosticsPage) &&
+		!/set_config|set_device_meta|method:\s*'restart'|uci\.set\s*\(/.test(diagnosticsPage) &&
+		/数据源/.test(diagnosticsPage) && /未更新|新鲜/.test(diagnosticsPage));
+	check('menu.d 含诊断页且 order 在手机版与面板之间',
+		/"admin\/services\/traffic-stats\/diagnostics"/.test(readView('diagnostics')) === false &&
+		/"path": "traffic-stats\/diagnostics"/.test(
+			require('fs').readFileSync(path.join(ROOT, 'luci-app-traffic-stats/root/usr/share/luci/menu.d/luci-app-traffic-stats.json'), 'utf8')));
 
 	/* ---- 拓扑：懒加载 / 下钻 / 可读性（静态断言，不启动浏览器） ---- */
 	const loadBody = (panel.match(/load:\s*function\s*\(\)\s*\{([\s\S]*?)\n\t\},/) || [])[1] || '';
@@ -1092,7 +1112,7 @@ async function testMenu() {
 			return menu['admin/services/traffic-stats/' + name];
 		});
 
-		check('menu.d 含七个 view 路径',
+		check('menu.d 含全部 view 路径',
 			paths.every(function (item) { return item && item.action && item.action.type === 'view'; }));
 
 		const root = menu['admin/services/traffic-stats'];

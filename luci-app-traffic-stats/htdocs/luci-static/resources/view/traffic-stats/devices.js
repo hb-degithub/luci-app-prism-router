@@ -14,6 +14,13 @@
  * 200 台设备也不会在加载时把几千个节点塞进页面。
  * 页面每 15s 拉一次 get_state 刷新；「暂停刷新」会停掉轮询。
  *
+ * 设备识别（纯本地，不联网、不加 RPC）：
+ *   - 厂商：内置 OUI_TABLE（MAC 前 3 字节 → 厂商标识），vendorOf() 查表；
+ *     第 0/1 位（组播/本地管理）为 1 的随机 MAC 一律不认厂商，显示「未知厂商」。
+ *   - 类型：deviceKindOf() 按 hostname/alias 关键词推断（手机/电脑/电视/平板/
+ *     智能设备），短词用词边界匹配；deviceKindSvg() 生成 24px 线性图标。
+ *   - 主机名列 = 类型图标 + 名称 + 厂商小字；表头可按厂商排序，工具栏有厂商筛选。
+ *
  * 设备元数据 / 配额 / 导出（SPEC §10）：
  *   - 别名、分组：`set_device_meta {mac, alias, group}`（空串 = 清除该字段）。
  *     弹窗里的改动按 MAC 存进内存草稿，RPC 失败或点「取消」都不会丢，
@@ -394,8 +401,15 @@ function clearNode(node) {
 /* 这个页面的表格在窄屏隐藏次要列并允许容器内横向滚动；CSS 只作用于本页容器。 */
 var CSS = [
 	'#ts-devices .tsd-tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}',
-	'#ts-devices table{min-width:1040px}',
+	'#ts-devices table{min-width:1080px}',
 	'#ts-devices .tsd-sub{font-size:11px;opacity:.65;line-height:1.5;white-space:nowrap}',
+	/* 主机名列：类型图标（圆形底 + 24px SVG）+ 名称/厂商/子信息；图标固定宽度，不挤名称。 */
+	'#ts-devices .tsd-host{display:flex;align-items:flex-start;gap:8px;min-width:190px}',
+	'#ts-devices .tsd-host-text{min-width:0;flex:1 1 auto}',
+	'#ts-devices .tsd-kind{display:flex;align-items:center;justify-content:center;flex:0 0 auto;',
+	'width:30px;height:30px;border-radius:50%;box-sizing:border-box}',
+	'#ts-devices .tsd-vendor{font-size:11px;line-height:1.5;opacity:.72;margin-top:1px;',
+	'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}',
 	'#ts-devices .tsd-alias-name{font-weight:600;word-break:break-word}',
 	'#ts-devices .tsd-edit{padding:1px 7px;font-size:11px;line-height:1.6;margin-left:6px;white-space:nowrap}',
 	'#ts-devices .tsd-new{display:inline-block;margin-left:5px;padding:0 5px;border-radius:6px;font-size:10px;',
@@ -452,8 +466,10 @@ var CSS = [
 	'.tsd-drawer-note{font-size:11.5px;opacity:.7;line-height:1.6;margin:6px 0 0 0}',
 	'@media (max-width:760px){',
 	'#ts-devices .tsd-opt{display:none}',
-	'#ts-devices table{min-width:600px}',
+	'#ts-devices table{min-width:620px}',
 	'#ts-devices .tsd-tablewrap{overflow-x:auto}',
+	'#ts-devices .tsd-host{min-width:160px}',
+	'#ts-devices .tsd-vendor{max-width:150px}',
 	'.tsd-drawer-panel{width:100%;max-width:100%;padding:14px}',
 	'}'
 ].join('\n');
@@ -499,6 +515,340 @@ function linkOf(dev) {
 	var v = dev.link.toLowerCase();
 
 	return (v == 'wifi' || v == 'wired' || v == 'unknown') ? v : '';
+}
+
+/* ---- 设备识别：OUI 厂商 + 设备类型（纯本地查表，不联网、不新增 RPC）---- */
+
+/*
+ * 常见厂商 OUI（MAC 前 3 字节）。只收 IEEE 真实分配块，键统一为小写冒号格式；
+ * 查不到（含随机 MAC）就返回 ''，由调用方显示「未知厂商」。
+ */
+var OUI_TABLE = {
+	'00:00:DD': 'TCL',
+	'00:05:B5': '博通',
+	'00:0C:E7': '联发科',
+	'00:0E:1F': 'TCL',
+	'00:10:18': '博通',
+	'00:11:32': '群晖',
+	'00:15:EB': '中兴',
+	'00:16:7A': '创维',
+	'00:17:88': '飞利浦',
+	'00:1A:11': 'Google',
+	'00:1A:95': '海信',
+	'00:1A:9A': '创维',
+	'00:1B:21': 'Intel',
+	'00:22:DE': 'OPPO',
+	'00:66:4B': '华为',
+	'00:74:9C': '锐捷',
+	'00:A0:C6': '高通',
+	'00:CA:E0': 'OPPO',
+	'00:E0:4C': 'Realtek',
+	'04:79:75': '荣耀',
+	'04:D4:C4': '华硕',
+	'08:67:4E': '海信',
+	'0C:90:43': 'realme',
+	'0C:96:BF': '华为',
+	'10:D5:61': '涂鸦',
+	'10:F9:6F': 'LG',
+	'14:FE:B5': '戴尔',
+	'18:69:D8': '涂鸦',
+	'18:DB:F2': '戴尔',
+	'1C:F2:9A': 'Google',
+	'20:4E:7F': '网件',
+	'24:0A:C4': 'Espressif',
+	'24:A4:3C': 'Ubiquiti',
+	'28:18:78': '微软',
+	'2C:56:DC': '华硕',
+	'2C:CF:67': 'Raspberry Pi',
+	'30:19:66': '三星',
+	'30:AE:A4': 'Espressif',
+	'30:F9:ED': '索尼',
+	'34:13:E8': 'Intel',
+	'34:23:BA': '三星',
+	'3C:07:54': 'Apple',
+	'3C:5A:B4': 'Google',
+	'3C:D9:2B': '惠普',
+	'3C:EF:8C': '大华',
+	'40:D4:F6': '荣耀',
+	'44:19:B6': '海康威视',
+	'44:65:0D': 'Amazon',
+	'48:46:FB': '华为',
+	'48:A6:B8': 'Sonos',
+	'4C:11:BF': '大华',
+	'50:2B:73': 'Tenda',
+	'50:C7:BF': 'TP-Link',
+	'54:60:09': 'Google',
+	'58:A2:B5': 'LG',
+	'58:BD:A3': '任天堂',
+	'5C:AA:FD': 'Sonos',
+	'5C:CF:7F': 'Espressif',
+	'64:CC:2E': '小米',
+	'64:EC:65': 'vivo',
+	'68:54:FD': 'Amazon',
+	'68:57:2D': '涂鸦',
+	'68:F7:28': '联想',
+	'6C:40:08': 'Apple',
+	'6C:D1:99': 'vivo',
+	'70:54:F5': '华为',
+	'70:5A:0F': '惠普',
+	'74:75:48': 'Amazon',
+	'78:84:3C': '索尼',
+	'78:8A:20': 'Ubiquiti',
+	'7C:1D:D9': '小米',
+	'7C:1E:52': '微软',
+	'80:BE:05': 'Apple',
+	'84:F3:EB': 'Espressif',
+	'88:DE:A9': 'Roku',
+	'8C:16:45': '联想',
+	'8C:77:12': '三星',
+	'8C:BE:BE': '小米',
+	'8C:FD:F0': '高通',
+	'90:02:A9': '大华',
+	'90:09:D0': '群晖',
+	'94:57:A5': '惠普',
+	'94:65:2D': '一加',
+	'98:B6:E9': '任天堂',
+	'9C:99:A0': '小米',
+	'A0:40:A0': '网件',
+	'A4:2B:B0': 'TP-Link',
+	'A4:83:E7': 'Apple',
+	'A8:16:B2': 'LG',
+	'AC:E2:15': '华为',
+	'B0:83:FE': '戴尔',
+	'B4:3A:28': '三星',
+	'B8:27:EB': 'Raspberry Pi',
+	'BC:46:99': 'TP-Link',
+	'BC:92:6B': 'Apple',
+	'BC:AD:28': '海康威视',
+	'C0:3F:0E': '网件',
+	'C0:56:E3': '海康威视',
+	'C0:EE:FB': '一加',
+	'C4:6E:1F': 'TP-Link',
+	'C8:19:F7': '三星',
+	'C8:3A:35': 'Tenda',
+	'C8:7B:5B': '中兴',
+	'CC:6D:A0': 'Roku',
+	'D8:31:34': 'Roku',
+	'DC:A6:32': 'Raspberry Pi',
+	'E4:5F:01': 'Raspberry Pi',
+	'E8:94:F6': 'TP-Link',
+	'EC:B5:FA': '飞利浦',
+	'F0:18:98': 'Apple',
+	'F0:27:2D': 'Amazon',
+	'F0:9F:C2': 'Ubiquiti',
+	'F0:B4:29': '小米',
+	'F4:29:81': 'vivo',
+	'F4:F5:E8': 'Google',
+	'F8:59:71': 'Intel',
+	'F8:E0:79': '摩托罗拉',
+	'FC:0F:E6': '索尼',
+	'FC:59:9F': '锐捷',
+};
+
+/* MAC 归一化成小写冒号格式；非法返回 ''（兼容 aa-bb-cc、aabb.ccdd.eeff、12 位裸串）。 */
+function normalizeMac(mac) {
+	var s = (mac == null) ? '' : ('' + mac).trim().toLowerCase();
+
+	if (!s.length) return '';
+
+	s = s.replace(/-/g, ':').replace(/\./g, '');
+
+	if (/^[0-9a-f]{12}$/.test(s))
+		s = s.substr(0, 2) + ':' + s.substr(2, 2) + ':' + s.substr(4, 2) + ':' +
+			s.substr(6, 2) + ':' + s.substr(8, 2) + ':' + s.substr(10, 2);
+
+	if (!/^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(s)) return '';
+
+	return s;
+}
+
+/* 第 0 位组播、第 1 位本地管理：任一为 1 就不是厂商烧录的全球唯一地址（随机/虚拟 MAC）。 */
+function isRandomMac(mac) {
+	var norm = normalizeMac(mac);
+
+	if (!norm.length) return false;
+
+	return (parseInt(norm.substr(0, 2), 16) & 0x03) !== 0;
+}
+
+/* 未知厂商返回 ''；随机 MAC 一律不认厂商，避免把 02/06/0A/0E 这类地址误判成某家厂商。 */
+function vendorOf(mac) {
+	var norm = normalizeMac(mac);
+
+	if (!norm.length || isRandomMac(norm)) return '';
+
+	var oui = norm.substr(0, 8);
+
+	/* 表键按 IEEE 习惯写成大写；归一后的小写 MAC 在这里再转成表键大小写，两种写法都能查。 */
+	if (!Object.prototype.hasOwnProperty.call(OUI_TABLE, oui))
+		oui = oui.toUpperCase();
+
+	return Object.prototype.hasOwnProperty.call(OUI_TABLE, oui) ? OUI_TABLE[oui] : '';
+}
+
+/* 与语言环境无关的字符串排序：统一小写后按码点比较，刷新/测试结果稳定。 */
+function compareText(a, b) {
+	var x = ('' + (a == null ? '' : a)).toLowerCase();
+	var y = ('' + (b == null ? '' : b)).toLowerCase();
+
+	return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
+/* 厂商筛选用的键：识别不出统一归到 VENDOR_UNKNOWN，和「未知厂商」分组一致。 */
+var VENDOR_UNKNOWN = '__unknown__';
+
+function vendorKeyOf(dev) {
+	var name = vendorOf(dev != null ? dev.mac : '');
+
+	return name.length ? name : VENDOR_UNKNOWN;
+}
+
+function vendorLabelOf(dev) {
+	var name = vendorOf(dev != null ? dev.mac : '');
+
+	return name.length ? name : _('未知厂商');
+}
+
+function matchesVendorFilter(dev, filter) {
+	if (filter == null || !filter.length) return true;
+
+	return vendorKeyOf(dev) === filter;
+}
+
+/* ---- 设备类型：hostname/alias 关键词推断（短词用边界匹配，mini 不会命中 mi）---- */
+
+var DEVICE_KIND_LABELS = {
+	phone: '手机',
+	laptop: '电脑',
+	tv: '电视',
+	tablet: '平板',
+	iot: '智能设备',
+	unknown: '未知'
+};
+
+/* 关键词按优先级排列：平板 → 电视 → 电脑 → 手机 → 智能设备，先命中先返回。 */
+var DEVICE_KIND_HINTS = [
+	[ 'tablet', [ 'ipad', 'tablet', 'pad' ] ],
+	[ 'tv', [ 'tv', 'tvbox', 'smarttv', 'androidtv', 'firetv', 'appletv', 'apple tv',
+		'chromecast', 'roku', 'bravia', 'shield', 'mitv' ] ],
+	[ 'laptop', [ 'pc', 'laptop', 'notebook', 'macbook', 'imac', 'mac', 'thinkpad',
+		'desktop', 'workstation', 'linux', 'windows', 'win' ] ],
+	[ 'phone', [ 'iphone', 'ipod', 'phone', 'mobile', 'smartphone', 'android', 'galaxy',
+		'pixel', 'redmi', 'xiaomi', 'huawei', 'honor', 'samsung', 'oneplus', 'oppo',
+		'vivo', 'realme', 'meizu', 'mi' ] ],
+	[ 'iot', [ 'esp', 'esp32', 'esp8266', 'esphome', 'tasmota', 'shelly', 'camera',
+		'speaker', 'echo', 'homepod', 'bulb', 'plug', 'iot', 'sensor', 'socket',
+		'light', 'lamp', 'doorbell', 'thermostat', 'vacuum', 'robot', 'watch',
+		'band', 'printer', 'nas' ] ]
+];
+
+/*
+ * 前后都必须是非字母数字（结尾也算），所以 pc 不会命中 optimize，
+ * mi 不会命中 mini，tv 不会命中 smarttv 以外的词（smarttv 单独收录）。
+ */
+function hasKindWord(text, word) {
+	var t = ('' + (text == null ? '' : text)).toLowerCase();
+	var w = ('' + (word == null ? '' : word)).toLowerCase();
+
+	if (!t.length || !w.length) return false;
+
+	var from = 0;
+
+	while (from <= t.length) {
+		var at = t.indexOf(w, from);
+
+		if (at < 0) return false;
+
+		var before = (at > 0) ? t.charAt(at - 1) : '';
+		var after = t.charAt(at + w.length);
+
+		if (!/[a-z0-9]/.test(before) && !/[a-z0-9]/.test(after)) return true;
+
+		from = at + 1;
+	}
+
+	return false;
+}
+
+function deviceKindOf(dev) {
+	var text = ((dev != null && dev.hostname != null) ? ('' + dev.hostname) : '') + ' ' +
+		((dev != null && dev.alias != null) ? ('' + dev.alias) : '');
+
+	for (var i = 0; i < DEVICE_KIND_HINTS.length; i++) {
+		var words = DEVICE_KIND_HINTS[i][1];
+
+		for (var j = 0; j < words.length; j++) {
+			if (hasKindWord(text, words[j])) return DEVICE_KIND_HINTS[i][0];
+		}
+	}
+
+	return 'unknown';
+}
+
+function deviceKindLabel(kind) {
+	return _(DEVICE_KIND_LABELS[kind] || DEVICE_KIND_LABELS.unknown);
+}
+
+/* 6 个 24px 线性图标，只用 rect/path/circle，全部 createElementNS 生成，不拼字符串。 */
+var SVG_NS = 'http://www.w3.org/2000/svg';
+
+var DEVICE_KIND_SHAPES = {
+	phone: [
+		[ 'rect', { x: '7', y: '2.3', width: '10', height: '19.4', rx: '2.4' } ],
+		[ 'path', { d: 'M10.6 18.4h2.8' } ]
+	],
+	laptop: [
+		[ 'rect', { x: '3.2', y: '5', width: '17.6', height: '11', rx: '1.6' } ],
+		[ 'path', { d: 'M2 19.4h20' } ]
+	],
+	tv: [
+		[ 'rect', { x: '3', y: '6.2', width: '18', height: '11.6', rx: '1.8' } ],
+		[ 'path', { d: 'M8.4 21h7.2M9.4 3.2l2.6 3 2.6-3' } ]
+	],
+	tablet: [
+		[ 'rect', { x: '4.4', y: '3', width: '15.2', height: '18', rx: '2.2' } ],
+		[ 'path', { d: 'M10.8 18.2h2.4' } ]
+	],
+	iot: [
+		[ 'rect', { x: '6.2', y: '2.6', width: '11.6', height: '18.8', rx: '3.2' } ],
+		[ 'path', { d: 'M9 6.6h6' } ],
+		[ 'circle', { cx: '12', cy: '14.2', r: '2.8' } ]
+	],
+	unknown: [
+		[ 'circle', { cx: '12', cy: '12', r: '8.6' } ],
+		[ 'path', { d: 'M9.6 9.5a2.6 2.6 0 0 1 4.9.9c0 1.7-2.5 1.9-2.5 3.5' } ],
+		[ 'circle', { cx: '12', cy: '17.2', r: '0.9' } ]
+	]
+};
+
+function deviceKindSvg(kind, color) {
+	var svg = document.createElementNS(SVG_NS, 'svg');
+	var shapes = DEVICE_KIND_SHAPES[kind] || DEVICE_KIND_SHAPES.unknown;
+
+	svg.setAttribute('viewBox', '0 0 24 24');
+	svg.setAttribute('width', '24');
+	svg.setAttribute('height', '24');
+	svg.setAttribute('fill', 'none');
+	svg.setAttribute('stroke', color || 'currentColor');
+	svg.setAttribute('stroke-width', '1.6');
+	svg.setAttribute('stroke-linecap', 'round');
+	svg.setAttribute('stroke-linejoin', 'round');
+	svg.setAttribute('aria-hidden', 'true');
+	svg.setAttribute('focusable', 'false');
+
+	for (var i = 0; i < shapes.length; i++) {
+		var node = document.createElementNS(SVG_NS, shapes[i][0]);
+		var attrs = shapes[i][1] || {};
+
+		for (var name in attrs) {
+			if (Object.prototype.hasOwnProperty.call(attrs, name))
+				node.setAttribute(name, attrs[name]);
+		}
+
+		svg.appendChild(node);
+	}
+
+	return svg;
 }
 
 /* ---- 无线信号（来自哑桥 AP 的元数据，按 MAC 索引）---- */
@@ -552,14 +902,23 @@ function isDeviceOnline(dev, now) {
 	return ls > 0 && ls <= t + 60 && (t - ls) <= ONLINE_SEC;
 }
 
-/* 表头排序的取值：与列表里显示的字节 / 速率列一一对应。 */
+/* 表头排序的取值：与列表里显示的字节 / 速率 / 厂商列一一对应。 */
 function sortMetric(dev, key) {
 	if (key === 'direct') return num(dev.direct_rx) + num(dev.direct_tx);
 	if (key === 'proxy') return num(dev.proxy_rx) + num(dev.proxy_tx);
 	if (key === 'rate') return num(dev.rx_rate) + num(dev.tx_rate);
 	if (key === 'last_seen') return num(dev.last_seen);
+	/* 厂商列是字符串，排序统一走 compareText（compareDevices 里按类型分支）。 */
+	if (key === 'vendor') return vendorSortName(dev);
 
 	return deviceTotal(dev);
+}
+
+/* 未识别厂商也参与排序，用「未知厂商」这个名字，避免空串全排到最前面。 */
+function vendorSortName(dev) {
+	var name = vendorOf(dev != null ? dev.mac : '');
+
+	return name.length ? name : _('未知厂商');
 }
 
 /* 搜索覆盖主机名 / 别名 / 分组 / IP / MAC；大小写不敏感。 */
@@ -752,6 +1111,8 @@ return view.extend({
 		this.sortDir = (this.sortDir === 'asc') ? 'asc' : 'desc';
 		this.search = (typeof this.search === 'string') ? this.search : '';
 		this.linkFilter = (typeof this.linkFilter === 'string') ? this.linkFilter : '';
+		this.vendorFilter = (typeof this.vendorFilter === 'string') ? this.vendorFilter : '';
+		this.vendorSig = null;
 		this.paused = (this.paused === true);
 		this.refreshError = null;
 		this.sortArrows = {};
@@ -816,6 +1177,18 @@ return view.extend({
 			self.renderRows();
 		});
 
+		/* 厂商筛选：选项来自当前 state.devices 的识别结果，全部本地过滤，不发 RPC。 */
+		this.vendorSelect = E('select', {
+			'class': 'tsd-select',
+			'aria-label': _('厂商筛选')
+		}, E('option', { value: '' }, _('全部厂商')));
+		this.vendorSelect.addEventListener('change', function(ev) {
+			var v = (ev != null && ev.target != null) ? ev.target.value : self.vendorSelect.value;
+
+			self.vendorFilter = ('' + (v == null ? '' : v));
+			self.renderRows();
+		});
+
 		this.refreshBtn = E('button', {
 			'class': 'cbi-button',
 			type: 'button',
@@ -826,6 +1199,7 @@ return view.extend({
 		var toolbar = E('div', { 'class': 'tsd-toolbar' }, [
 			this.searchInput,
 			this.linkSelect,
+			this.vendorSelect,
 			E('button', {
 				'class': 'cbi-button cbi-button-action',
 				type: 'button',
@@ -837,7 +1211,8 @@ return view.extend({
 		]);
 
 		var head = E('tr', { 'class': 'tr table-titles' }, [
-			E('th', { 'class': 'th' }, _('主机名')),
+			this.sortHead('vendor', _('主机名 / 厂商'),
+				_('设备名称在图标右侧，小字为按 MAC 前 3 字节（OUI）识别的厂商；点击按厂商名排序'), 'left'),
 			E('th', { 'class': 'th' }, _('别名 / 分组')),
 			E('th', { 'class': 'th tsd-opt', title: _('守护进程首次看到该 MAC 的时间（本地时区）') }, _('首次出现')),
 			E('th', {
@@ -884,12 +1259,12 @@ return view.extend({
 		return this.root;
 	},
 
-	sortHead: function(key, label, title) {
+	sortHead: function(key, label, title, align) {
 		var self = this;
 		var arrow = E('span', { 'class': 'tsd-arrow' }, '');
 		var th = E('th', {
 			'class': 'th',
-			style: 'text-align:right;cursor:pointer',
+			style: 'text-align:' + (align === 'left' ? 'left' : 'right') + ';cursor:pointer',
 			title: title || _('点击切换排序'),
 			click: function(ev) {
 				if (ev != null && ev.preventDefault) ev.preventDefault();
@@ -921,8 +1296,8 @@ return view.extend({
 		}
 		else {
 			this.sortKey = key;
-			/* 数值列默认从大到小，和“用量最高的设备在最上面”一致。 */
-			this.sortDir = 'desc';
+			/* 数值列默认从大到小，和“用量最高的设备在最上面”一致；厂商名按 A→Z / 拼音顺序。 */
+			this.sortDir = (key === 'vendor') ? 'asc' : 'desc';
 		}
 
 		this.renderRows();
@@ -936,12 +1311,15 @@ return view.extend({
 	compareDevices: function(a, b) {
 		var av = sortMetric(a, this.sortKey);
 		var bv = sortMetric(b, this.sortKey);
+		var dir = (this.sortDir === 'asc') ? 1 : -1;
+		var cmp;
 
-		if (av !== bv) {
-			var dir = (this.sortDir === 'asc') ? 1 : -1;
+		if (typeof av === 'string' || typeof bv === 'string')
+			cmp = compareText(av, bv);
+		else
+			cmp = (av < bv) ? -1 : ((av > bv) ? 1 : 0);
 
-			return (av < bv ? -1 : 1) * dir;
-		}
+		if (cmp !== 0) return cmp * dir;
 
 		var an = ('' + deviceName(a)).toLowerCase();
 		var bn = ('' + deviceName(b)).toLowerCase();
@@ -966,6 +1344,57 @@ return view.extend({
 			if (typeof btn.setAttribute == 'function')
 				btn.setAttribute('aria-pressed', active ? 'true' : 'false');
 		}
+	},
+
+	/*
+	 * 厂商下拉：按当前 state.devices 的识别结果去重（未知厂商一项始终在最后）。
+	 * 选项集合没变时只同步 value，避免刷新把用户正在选的项重建成新节点。
+	 */
+	syncVendorOptions: function() {
+		var sel = this.vendorSelect;
+
+		if (sel == null) return;
+
+		var all = (this.state != null && Array.isArray(this.state.devices)) ? this.state.devices : [];
+		var seen = {};
+		var keys = [];
+		var i;
+
+		for (i = 0; i < all.length; i++) {
+			var key = vendorKeyOf(all[i]);
+
+			if (seen[key] !== true) {
+				seen[key] = true;
+				keys.push(key);
+			}
+		}
+
+		keys.sort(function(a, b) {
+			var an = (a === VENDOR_UNKNOWN) ? _('未知厂商') : a;
+			var bn = (b === VENDOR_UNKNOWN) ? _('未知厂商') : b;
+
+			return compareText(an, bn);
+		});
+
+		var sig = keys.join('\u0001');
+
+		if (sig !== this.vendorSig) {
+			var options = [ E('option', { value: '' }, _('全部厂商')) ];
+
+			for (i = 0; i < keys.length; i++) {
+				options.push(E('option', { value: keys[i] },
+					keys[i] === VENDOR_UNKNOWN ? _('未知厂商') : keys[i]));
+			}
+
+			dom.content(sel, options);
+			this.vendorSig = sig;
+		}
+
+		/* 选中的厂商已经不在列表里（设备掉线/列表刷新）时回到「全部厂商」。 */
+		if (this.vendorFilter.length && seen[this.vendorFilter] !== true)
+			this.vendorFilter = '';
+
+		sel.value = this.vendorFilter;
 	},
 
 	syncSortArrows: function() {
@@ -999,6 +1428,7 @@ return view.extend({
 		var offline = all.length - online;
 
 		this.syncSegmentButtons({ all: all.length, online: online, offline: offline });
+		this.syncVendorOptions();
 
 		var monthSum = 0;
 		var monthKnown = false;
@@ -1019,7 +1449,8 @@ return view.extend({
 		var filtered = [];
 
 		for (i = 0; i < all.length; i++) {
-			if (deviceMatches(all[i], q) && matchesLinkFilter(all[i], this.linkFilter))
+			if (deviceMatches(all[i], q) && matchesLinkFilter(all[i], this.linkFilter) &&
+				matchesVendorFilter(all[i], this.vendorFilter))
 				filtered.push(all[i]);
 		}
 
@@ -1109,7 +1540,7 @@ return view.extend({
 
 		return E('div', {}, [
 			E('strong', {}, _('没有匹配的设备')),
-			E('p', { style: 'margin:6px 0 0 0' }, _('当前分段、搜索或接入筛选下没有设备。')),
+			E('p', { style: 'margin:6px 0 0 0' }, _('当前分段、搜索、接入或厂商筛选下没有设备。')),
 			E('button', {
 				'class': 'cbi-button',
 				type: 'button',
@@ -1125,9 +1556,11 @@ return view.extend({
 		this.segment = 'all';
 		this.search = '';
 		this.linkFilter = '';
+		this.vendorFilter = '';
 
 		if (this.searchInput != null) this.searchInput.value = '';
 		if (this.linkSelect != null) this.linkSelect.value = '';
+		if (this.vendorSelect != null) this.vendorSelect.value = '';
 
 		this.renderRows();
 	},
@@ -1436,6 +1869,15 @@ return view.extend({
 		var st = stationFor(this.stations, dev);
 		var alias = aliasOf(dev);
 		var group = groupOf(dev);
+		var vendor = vendorOf(dev != null ? dev.mac : '');
+		var vendorNode = vendor.length
+			? E('span', {}, vendor)
+			: E('span', {}, [
+				_('未知厂商'),
+				isRandomMac(dev != null ? dev.mac : '')
+					? E('span', { style: 'font-size:11px;opacity:.7' }, '（' + _('随机 MAC') + '）')
+					: ''
+			]);
 
 		var header = E('div', {}, [
 			E('div', { 'class': 'tsd-drawer-h', id: 'tsd-drawer-title' }, shorten(name, 60)),
@@ -1467,6 +1909,8 @@ return view.extend({
 		var basic = this.drawerInfo([
 			[ _('IP'), (dev.ip != null && ('' + dev.ip).length) ? E('code', {}, '' + dev.ip) : '—' ],
 			[ _('MAC'), mac.length ? E('code', {}, mac) : '—' ],
+			[ _('厂商'), vendorNode ],
+			[ _('设备类型'), deviceKindLabel(deviceKindOf(dev)) ],
 			[ _('接入方式'), this.linkBadge(dev) ],
 			[ _('信号'), this.renderDrawerSignal(st) ],
 			[ _('首次出现'), num(dev.first_seen) > 0 ? fmtDate(dev.first_seen) : '—' ],
@@ -1731,6 +2175,18 @@ return view.extend({
 		]);
 	},
 
+	/* 主机名前的设备类型图标：圆形底 + 24px 线性图标，颜色沿用接入方式（无线紫/有线青/未知灰）。 */
+	renderKindBadge: function(dev) {
+		var kind = deviceKindOf(dev);
+		var style = LINK_STYLE[linkOf(dev)] || LINK_STYLE.unknown;
+
+		return E('span', {
+			'class': 'tsd-kind',
+			style: 'background:' + style.bg,
+			title: _('设备类型') + '：' + deviceKindLabel(kind) + ' · ' + _('接入') + '：' + _(style.label)
+		}, deviceKindSvg(kind, style.color));
+	},
+
 	renderDeviceRow: function(dev) {
 		var self = this;
 		var direct = num(dev.direct_rx) + num(dev.direct_tx);
@@ -1782,22 +2238,34 @@ return view.extend({
 		});
 
 		var firstSeen = num(dev.first_seen);
+		var vendorName = vendorLabelOf(dev);
+		var vendorTitle = _('按 MAC 前 3 字节（OUI）识别的厂商') +
+			(isRandomMac(dev != null ? dev.mac : '')
+				? ' · ' + _('该 MAC 是本地管理地址（随机 MAC），无法识别厂商')
+				: '');
 
 		var row = E('tr', {
 			'class': 'tr',
 			style: 'cursor:pointer',
 			title: _('点击查看设备详情')
 		}, [
-			E('td', { 'class': 'td' }, [
+			E('td', { 'class': 'td' }, E('div', { 'class': 'tsd-host' }, [
 				marker,
-				' ',
-				E('strong', {}, shorten(name, 30)),
-				isNewDevice(dev) ? E('span', { 'class': 'tsd-new', title: _('first_seen 在 24 小时内') }, _('新')) : '',
-				dev.mac ? E('div', { 'class': 'tsd-sub' }, E('code', {}, '' + dev.mac)) : '',
-				dev.ip ? E('div', { 'class': 'tsd-sub' }, E('code', {}, '' + dev.ip)) : '',
-				/* 首次出现也放在主列的小字里：窄屏隐藏独立列后仍然看得到。 */
-				firstSeen > 0 ? E('div', { 'class': 'tsd-sub' }, _('首次') + ' ' + fmtDate(firstSeen)) : ''
-			]),
+				this.renderKindBadge(dev),
+				E('div', { 'class': 'tsd-host-text' }, [
+					E('div', {}, [
+						E('strong', {}, shorten(name, 30)),
+						isNewDevice(dev)
+							? E('span', { 'class': 'tsd-new', title: _('first_seen 在 24 小时内') }, _('新'))
+							: ''
+					]),
+					E('div', { 'class': 'tsd-vendor', title: vendorTitle }, vendorName),
+					dev.mac ? E('div', { 'class': 'tsd-sub' }, E('code', {}, '' + dev.mac)) : '',
+					dev.ip ? E('div', { 'class': 'tsd-sub' }, E('code', {}, '' + dev.ip)) : '',
+					/* 首次出现也放在主列的小字里：窄屏隐藏独立列后仍然看得到。 */
+					firstSeen > 0 ? E('div', { 'class': 'tsd-sub' }, _('首次') + ' ' + fmtDate(firstSeen)) : ''
+				])
+			])),
 			aliasCell,
 			E('td', { 'class': 'td tsd-opt', title: firstSeen > 0 ? fmtDate(firstSeen) : _('后端尚未记录 first_seen') },
 				firstSeen > 0 ? fmtDate(firstSeen) : '—'),

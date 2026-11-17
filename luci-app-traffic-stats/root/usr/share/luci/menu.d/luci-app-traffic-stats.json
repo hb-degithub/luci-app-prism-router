@@ -64,6 +64,14 @@
 			"path": "traffic-stats/mobile"
 		}
 	},
+	"admin/services/traffic-stats/diagnostics": {
+		"title": "诊断",
+		"order": 55,
+		"action": {
+			"type": "view",
+			"path": "traffic-stats/diagnostics"
+		}
+	},
 	"admin/services/traffic-stats/panel": {
 		"title": "详细面板",
 		"order": 60,

@@ -28,9 +28,11 @@
  *     文案里直接写不可用，绝不用 now-86400 去混时区分组或硬凑 0%。
  *
  * rpc 预算（硬约束）：
- *   进入页面 get_state ×1 + get_history ×1（days=2：今天桶 + 昨天日汇总，只为「昨日全天」；
- *   后端已对每个桶做瘦身，两天实测约 120 KiB，仍在 ubus 单条 262144B 以内）；
- *   之后每 5s 只复用 get_state 刷新数字，不重画图表、不重排布局、不加新请求。
+ *   进入页面 get_state ×1 + get_history(2) ×1（今天桶 + 昨天日汇总，只为趋势与「昨日全天」；
+ *   后端已对每个桶做瘦身，两天实测约 120 KiB，仍在 ubus 单条 262144B 以内）
+ *   + get_history(28) ×1（只为「流量日历」，与上面独立失败；不多取今天桶之外的明细）；
+ *   之后每 5s 只复用 get_state 刷新数字，不重画图表、不重排布局、不加新请求；
+ *   28 天日历只在 30s 周期或手动刷新时重取（见 loadCalendar），点开某天才 get_daily(day)。
  *
  * 陌生设备（只读，绝不执行任何命令）：
  *   - Top 5 设备里，first_seen 在 24 小时内的设备打「新」标记；
@@ -64,7 +66,20 @@ var callHistory = rpc.declare({
 	reject: true
 });
 
+/*
+ * 流量日历点开某天时才读该天明细（daily/<日期>.json，只读）。
+ * 与 get_history(28) 的每日 summary 分开：summary 只够画格子，点开才要 devices/apps。
+ */
+var callDaily = rpc.declare({
+	object: 'traffic-stats',
+	method: 'get_daily',
+	params: [ 'day' ],
+	expect: {},
+	reject: true
+});
+
 var REFRESH_MS = 5000;      /* 数字刷新间隔（与现状一致） */
+var CAL_DAYS = 28;          /* 流量日历：近 28 天（含今天，get_history 的 days 单位是天） */
 var TOPS_EVERY = 6;         /* 每 6 个周期（30s）重建一次 Top / 节点块 */
 var STALE_SEC = 90;         /* state.ts 超过 90s 没动 → 标黄提示 */
 var ONLINE_SEC = 600;       /* 在线口径：last_seen 10 分钟内（同 feishu.uc ONLINE_WINDOW） */
@@ -708,6 +723,309 @@ function appHref(host) {
 	return base + '#host=' + encodeURIComponent(h);
 }
 
+function panelHref() {
+	return L.url('admin/services/traffic-stats/panel');
+}
+
+// ---------------------------------------------------------------- 流量日历 / 需要关注（纯数据）
+
+/*
+ * 一天的总量：优先 summary.totals（daily 文件整天汇总），
+ * 没有 summary 时用当天 buckets 现场求和（今天的 history.json 只有桶）。
+ * 两者都没有 → null，调用方必须当成「没有数据」，绝不补 0。
+ */
+function dayTotalsOf(entry) {
+	if (entry == null || typeof entry != 'object') return null;
+
+	var sum = null;
+
+	if (entry.summary != null && typeof entry.summary == 'object')
+		sum = summaryTotalOf(entry.summary.totals);
+
+	if (sum != null) return sum;
+
+	var buckets = Array.isArray(entry.buckets) ? entry.buckets : [];
+
+	if (!buckets.length) return null;
+
+	var rx = 0, tx = 0, i, b;
+
+	for (i = 0; i < buckets.length; i++) {
+		b = buckets[i];
+
+		if (b == null || typeof b != 'object') continue;
+
+		rx += num(b.direct_rx) + num(b.proxy_rx);
+		tx += num(b.direct_tx) + num(b.proxy_tx);
+	}
+
+	return { rx: rx, tx: tx, total: rx + tx };
+}
+
+/*
+ * get_history(days=28) → 固定 28 个日历格（左旧右新，最后一格是今天）。
+ * 后端没给的天 has=false，不补 0；后端明确给了 0 的天 has=true、zero=true。
+ */
+function calendarDays(history, nowSec) {
+	var days = (history != null && Array.isArray(history.days)) ? history.days : [];
+	var now = num(nowSec) > 0 ? num(nowSec) : Math.floor(Date.now() / 1000);
+	var today = localDayKey(now);
+	var map = {}, rows = [], i, key, d, sum;
+
+	for (i = 0; i < days.length; i++) {
+		d = days[i];
+
+		if (d == null || typeof d != 'object') continue;
+
+		key = (typeof d.day == 'string') ? d.day : '';
+
+		if (parseDayKey(key) == null || map[key] != null) continue;
+
+		sum = dayTotalsOf(d);
+
+		map[key] = {
+			has: (sum != null),
+			rx: sum ? sum.rx : 0,
+			tx: sum ? sum.tx : 0,
+			total: sum ? sum.total : 0,
+			buckets: (Array.isArray(d.buckets) ? d.buckets.length : 0)
+		};
+	}
+
+	for (i = CAL_DAYS - 1; i >= 0; i--) {
+		key = shiftDayKey(today, -i);
+		d = (key.length && map[key] != null) ? map[key] : null;
+
+		rows.push({
+			day: key,
+			dom: key.length ? parseInt(key.slice(8, 10), 10) : 0,
+			has: (d != null && d.has),
+			rx: d ? d.rx : 0,
+			tx: d ? d.tx : 0,
+			total: d ? d.total : 0,
+			buckets: d ? d.buckets : 0,
+			zero: (d != null && d.has && d.total === 0),
+			today: (key === today)
+		});
+	}
+
+	return rows;
+}
+
+/* 日历去重签名：日期、是否有数据、用量、桶数、今天标记。数据没变就不重建 DOM。 */
+function calSigOf(rows) {
+	var parts = [], i, r;
+
+	for (i = 0; i < (rows || []).length; i++) {
+		r = rows[i];
+		parts.push(r.day + ':' + (r.has ? '1' : '0') + ':' + r.rx + ':' + r.tx + ':' +
+			r.buckets + ':' + (r.today ? 't' : ''));
+	}
+
+	return parts.join('|');
+}
+
+/* daily 的设备 / 应用数组 → Top N（按 rx+tx 降序，脏条目直接跳过）。 */
+function topDailyList(list, max) {
+	var out = [], i, item;
+
+	if (!Array.isArray(list)) return out;
+
+	for (i = 0; i < list.length; i++) {
+		item = list[i];
+
+		if (item == null || typeof item != 'object') continue;
+
+		out.push({ item: item, bytes: num(item.rx) + num(item.tx) });
+	}
+
+	out.sort(function(a, b) { return b.bytes - a.bytes; });
+
+	return out.slice(0, (max > 0) ? max : 3);
+}
+
+/*
+ * get_daily 的返回体归一化：daily 文件是 {day,totals,devices[],apps[]}，
+ * 当天兜底是 {day,direct_rx..,buckets[]}（没有 totals、没有 devices/apps）。
+ * sum 为 null 表示这一天没有任何可用合计，调用方不要显示 0。
+ */
+function dailyViewOf(payload) {
+	var p = (payload != null && typeof payload == 'object') ? payload : {};
+	var totals = (p.totals != null && typeof p.totals == 'object') ? p.totals : null;
+	var sum = summaryTotalOf(totals);
+
+	if (sum == null) sum = summaryTotalOf(p);
+
+	return {
+		day: (typeof p.day === 'string') ? p.day : '',
+		rx: sum ? sum.rx : null,
+		tx: sum ? sum.tx : null,
+		total: sum ? sum.total : null,
+		hasTotals: (sum != null),
+		buckets: (Array.isArray(p.buckets) ? p.buckets.length : 0),
+		devices: (Array.isArray(p.devices) ? p.devices : []),
+		apps: (Array.isArray(p.apps) ? p.apps : [])
+	};
+}
+
+function toneColor(tone) {
+	if (tone === 'bad') return '#c62828';
+	if (tone === 'warn') return '#e65100';
+	if (tone === 'info') return '#1565c0';
+
+	return '#2e7d32';
+}
+
+/*
+ * 「需要关注」：纯本地计算，不发 RPC。
+ * 严重度（sev，越大越靠前）：配额 ≥100% > 数据源异常 > 记账降级 > 数据陈旧
+ *   > 配额 ≥80% > 设备离线。最多 6 条，由调用方 slice。
+ */
+function attentionItems(state, nowSec) {
+	var items = [];
+
+	if (state == null || typeof state != 'object') return items;
+
+	var now = num(nowSec) > 0 ? num(nowSec) : Math.floor(Date.now() / 1000);
+	var health = (state.health != null && typeof state.health == 'object') ? state.health : {};
+	var conf = '' + (health.accounting_confidence == null ? 'unknown' : health.accounting_confidence);
+	var devices = Array.isArray(state.devices) ? state.devices : [];
+	var i, j, dev, name, tag, v;
+
+	/* 1. 记账状态非 exact：原因短标签复用 reasonTag，未知原文截断后原样展示 */
+	if (conf !== 'exact') {
+		var look = healthLook(conf);
+		var reasons = Array.isArray(health.reasons) ? health.reasons : [];
+		var tags = [];
+
+		for (j = 0; j < reasons.length && tags.length < 4; j++) {
+			tag = reasonTag(reasons[j]);
+
+			if (!tag.length) tag = shorten('' + (reasons[j] == null ? '' : reasons[j]), 48);
+
+			if (tag.length && tags.indexOf(tag) < 0) tags.push(tag);
+		}
+
+		items.push({
+			sev: (conf === 'unavailable') ? 64 : 60,
+			tone: (conf === 'unavailable') ? 'bad' : 'warn',
+			title: _('记账状态') + ' · ' + look.label,
+			detail: tags.length ? tags.join('、') : (_('accounting_confidence = ') + conf),
+			href: panelHref()
+		});
+	}
+
+	/* 2. 数据源：clash / conntrack 任一不是 ok（error 或 unknown） */
+	var src = (state.source != null && typeof state.source == 'object') ? state.source : null;
+
+	if (src != null) {
+		var bad = [];
+
+		for (i = 0; i < 2; i++) {
+			var key = (i === 0) ? 'clash' : 'conntrack';
+
+			v = (src[key] == null) ? 'unknown' : ('' + src[key]);
+
+			if (v === 'ok') continue;
+
+			bad.push(key + ' ' + ((v === 'unknown') ? _('状态未知') : _('不可用')));
+		}
+
+		if (bad.length)
+			items.push({
+				sev: 58, tone: 'bad', title: _('数据源异常'), detail: bad.join('、'),
+				href: panelHref()
+			});
+	}
+
+	/* 3. 配额：quota_limit > 0 且已用 ≥80%；≥100% 标红并排到最前 */
+	for (i = 0; i < devices.length; i++) {
+		dev = devices[i];
+
+		if (dev == null || typeof dev != 'object') continue;
+
+		var limit = num(dev.quota_limit);
+
+		if (!(limit > 0)) continue;
+
+		var used = num(dev.month_total);
+		var p = used * 100 / limit;
+
+		if (!(p >= 80)) continue;
+
+		name = deviceName(dev);
+
+		items.push({
+			sev: (p >= 100) ? 70 : 40,
+			tone: (p >= 100) ? 'bad' : 'warn',
+			title: _('配额告警') + ' · ' + shorten(name, 16),
+			detail: name + _(' 已用 ') + p.toFixed(1) + '%（' + fmtBytes(used) + ' / ' + fmtBytes(limit) + '）',
+			href: deviceHref(macOf(dev))
+		});
+	}
+
+	/* 4. 数据陈旧：state.ts 超过 90 秒没动；ts 缺失时不拿 1970 年算出一个荒谬的时长 */
+	var ts = num(state.ts);
+
+	if (ts > 0 && now - ts > STALE_SEC)
+		items.push({
+			sev: 50, tone: 'warn', title: _('数据陈旧'),
+			detail: _('数据已 ') + fmtAge(now - ts) + _(' 未更新'),
+			href: panelHref()
+		});
+	else if (ts <= 0)
+		items.push({
+			sev: 50, tone: 'warn', title: _('数据陈旧'),
+			detail: _('数据已很久未更新（state.ts 缺失）'),
+			href: panelHref()
+		});
+
+	/* 5. 设备离线：last_seen>0 且超过 10 分钟，或 last_seen<=0 */
+	var offline = [];
+
+	for (i = 0; i < devices.length; i++) {
+		dev = devices[i];
+
+		if (dev == null || typeof dev != 'object') continue;
+
+		var ls = num(dev.last_seen);
+
+		if (ls <= 0 || (now - ls) > ONLINE_SEC) offline.push(dev);
+	}
+
+	if (offline.length) {
+		var names = [], extra = 0;
+
+		for (i = 0; i < offline.length; i++) {
+			if (names.length >= 3) { extra++; continue; }
+
+			names.push(shorten(deviceName(offline[i]), 20));
+		}
+
+		items.push({
+			sev: 20, tone: 'info',
+			title: _('设备离线') + ' · ' + offline.length + ' ' + _('台'),
+			detail: names.join('、') + (extra > 0 ? ' ' + _('等') + ' ' + offline.length + ' ' + _('台') : ''),
+			href: deviceHref('')
+		});
+	}
+
+	items.sort(function(a, b) { return b.sev - a.sev; });
+
+	return items.slice(0, 6);
+}
+
+function attentionSigOf(items) {
+	var parts = [], i, it;
+
+	for (i = 0; i < (items || []).length; i++) {
+		it = items[i];
+		parts.push(it.sev + '|' + it.tone + '|' + it.title + '|' + it.detail + '|' + it.href);
+	}
+
+	return parts.join('||');
+}
+
 /* 整行下钻：鼠标点行内空白处也能跳；行内 <a>/<button> 自己处理，不重复触发 */
 function navTo(href) {
 	return function(ev) {
@@ -977,6 +1295,67 @@ var CSS = [
 	'#ts-overview .tso-help summary{cursor:pointer;font-size:11.5px;opacity:.9}',
 	'#ts-overview .tso-help ul{margin:4px 0 0 0;padding-left:18px}',
 
+	/* 「需要关注」：短标题 + 详情 + 整项可点（设备/配额跳设备页，其余跳详细面板） */
+	'#ts-overview .tso-attn{margin:0 0 12px 0;padding:8px 12px 10px 12px}',
+	'#ts-overview .tso-attn-h{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:12px;font-weight:600}',
+	'#ts-overview .tso-attn-list{list-style:none;margin:6px 0 0 0;padding:0;display:grid;',
+	'grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 10px}',
+	'#ts-overview .tso-attn-item{min-width:0;border-radius:6px;border-left:3px solid #9e9e9e;',
+	'background:rgba(127,127,127,.06)}',
+	'#ts-overview .tso-attn-link{display:block;padding:5px 8px;color:inherit;text-decoration:none;min-width:0}',
+	'#ts-overview .tso-attn-link:hover{text-decoration:none;background:rgba(127,127,127,.08);border-radius:6px}',
+	'#ts-overview .tso-attn-link:focus-visible{outline:2px solid rgba(43,125,233,.65);outline-offset:-2px;border-radius:6px}',
+	'#ts-overview .tso-attn-t{display:block;font-size:11.5px;font-weight:600;line-height:1.5;',
+	'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+	'#ts-overview .tso-attn-d{display:block;font-size:10.5px;line-height:1.55;opacity:.78;word-break:break-word}',
+	'#ts-overview .tso-attn-bad{border-left-color:#c62828;background:rgba(198,40,40,.08)}',
+	'#ts-overview .tso-attn-bad .tso-attn-t{color:#c62828}',
+	'#ts-overview .tso-attn-warn{border-left-color:#e65100;background:rgba(255,152,0,.08)}',
+	'#ts-overview .tso-attn-warn .tso-attn-t{color:#e65100}',
+	'#ts-overview .tso-attn-info{border-left-color:#1565c0}',
+
+	/* 流量日历：28 个可聚焦按钮，窄屏外层横向滚动，不撑破页面 */
+	'#ts-overview .tso-cal-panel{margin:0 0 12px 0}',
+	'#ts-overview .tso-cal-scroll{width:100%;min-width:0;overflow-x:auto;overflow-y:hidden;padding:2px 0 4px 0;',
+	'-webkit-overflow-scrolling:touch}',
+	'#ts-overview .tso-cal{display:grid;grid-template-columns:repeat(28,minmax(18px,1fr));gap:3px;min-width:560px}',
+	'#ts-overview .tso-cal-d{position:relative;display:flex;align-items:flex-end;justify-content:center;',
+	'height:46px;min-width:0;padding:0;border:1px solid rgba(127,127,127,.22);border-radius:4px;',
+	'background:rgba(127,127,127,.05);color:inherit;font:inherit;font-size:10px;line-height:1.4;',
+	'cursor:pointer;overflow:hidden}',
+	'#ts-overview .tso-cal-d:hover{background:rgba(127,127,127,.14)}',
+	'#ts-overview .tso-cal-d:focus-visible{outline:2px solid rgba(43,125,233,.7);outline-offset:1px}',
+	'#ts-overview .tso-cal-fill{position:absolute;left:0;right:0;bottom:0;background:rgba(25,118,210,.38);pointer-events:none}',
+	'#ts-overview .tso-cal-n{position:relative;z-index:1;padding:0 1px;font-variant-numeric:tabular-nums;opacity:.9}',
+	'#ts-overview .tso-cal-miss{border-style:dashed;opacity:.55}',
+	'#ts-overview .tso-cal-miss .tso-cal-n{opacity:.7}',
+	'#ts-overview .tso-cal-zero .tso-cal-fill{display:none}',
+	'#ts-overview .tso-cal-today{border-color:rgba(25,118,210,.85);box-shadow:inset 0 0 0 1px rgba(25,118,210,.5)}',
+	'#ts-overview .tso-cal-today .tso-cal-n{font-weight:700;opacity:1}',
+	'#ts-overview .tso-cal-sel{background:rgba(43,125,233,.18);border-color:rgba(43,125,233,.9)}',
+	'#ts-overview .tso-cal-empty{grid-column:1/-1;display:flex;flex-direction:column;align-items:flex-start;',
+	'gap:3px;padding:8px 2px;font-size:11.5px;line-height:1.6;opacity:.78}',
+	'#ts-overview .tso-cal-detail{margin-top:8px;padding:8px 10px;border-radius:7px;',
+	'background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.16);font-size:11.5px;line-height:1.65}',
+	'#ts-overview .tso-cal-det-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+	'#ts-overview .tso-cal-det-t{font-size:12px;font-weight:600}',
+	'#ts-overview .tso-cal-det-h .tso-btn{margin-left:auto}',
+	'#ts-overview .tso-cal-metrics{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-top:3px}',
+	'#ts-overview .tso-cal-metrics span{white-space:nowrap;font-variant-numeric:tabular-nums}',
+	'#ts-overview .tso-cal-cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:7px}',
+	'#ts-overview .tso-cal-list-h{font-size:11px;font-weight:600;opacity:.85}',
+	'#ts-overview .tso-cal-list{list-style:none;margin:3px 0 0 0;padding:0;display:flex;flex-direction:column;gap:2px}',
+	'#ts-overview .tso-cal-list li{display:flex;align-items:baseline;justify-content:space-between;gap:8px;',
+	'font-size:11px;line-height:1.6;min-width:0}',
+	'#ts-overview .tso-cal-list a{color:inherit;text-decoration:none;min-width:0;overflow:hidden;',
+	'text-overflow:ellipsis;white-space:nowrap}',
+	'#ts-overview .tso-cal-list a:hover{text-decoration:underline}',
+	'#ts-overview .tso-cal-list a:focus-visible{outline:2px solid rgba(43,125,233,.65);outline-offset:1px;border-radius:3px}',
+	'#ts-overview .tso-cal-list .tso-lnum{flex:none;font-size:11px}',
+	'#ts-overview .tso-cal-note{font-size:10.5px;line-height:1.6;opacity:.68;margin-top:5px}',
+	'#ts-overview .tso-cal-err{color:#c62828;opacity:1}',
+	'#ts-overview .tso-cal-err .tso-btn{margin-left:8px}',
+
 	/* 窄屏：KPI 2×2、两列变一列、状态条允许换行 */
 	'@media (max-width:1000px){',
 	'#ts-overview .tso-cols-main,#ts-overview .tso-cols-top{grid-template-columns:minmax(0,1fr)}',
@@ -985,6 +1364,8 @@ var CSS = [
 	'#ts-overview .tso-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}',
 	'#ts-overview .tso-head{flex-wrap:wrap}',
 	'#ts-overview .tso-pills{margin-left:0;justify-content:flex-start}',
+	'#ts-overview .tso-attn-list{grid-template-columns:minmax(0,1fr)}',
+	'#ts-overview .tso-cal-cols{grid-template-columns:minmax(0,1fr)}',
 	'}'
 ].join('\n');
 
@@ -1126,15 +1507,19 @@ return view.extend({
 	},
 
 	/*
-	 * 统一数据拉取（首屏与手动刷新共用）：两个 rpc 并行，各自独立失败。
+	 * 统一数据拉取（首屏与手动刷新共用）：三个 rpc 并行，各自独立失败。
 	 *   - get_state 失败：保留上一次成功的数据，只置 stateError（错误条 + 重试）；
-	 *   - get_history 失败：保留上一次趋势与「昨日全天」，只降级这两块，其它卡照常。
+	 *   - get_history(2) 失败：保留上一次趋势与「昨日全天」，只降级这两块，其它卡照常；
+	 *   - get_history(28) 只给流量日历：失败只把日历降级为「日历数据不可用」，
+	 *     趋势 / 昨日全天 / 需要关注都不受影响（独立 promise 与独立错误字段）。
+	 * 28 天只在首屏、手动刷新和 30s 周期重取（见 loadCalendar），5s 轮询只调 get_state。
 	 */
 	loadData: function() {
 		var self = this;
 
 		this.stateError = '';
 		this.historyError = '';
+		this.calError = '';
 
 		return Promise.all([
 			callState().catch(function(err) {
@@ -1144,11 +1529,16 @@ return view.extend({
 			callHistory(2).catch(function(err) {
 				self.historyError = errText(err);
 				return null;
+			}),
+			callHistory(CAL_DAYS).catch(function(err) {
+				self.calError = errText(err);
+				return null;
 			})
 		]).then(function(res) {
 			var nowSec = Math.floor(Date.now() / 1000);
 			var state = (res[0] != null && typeof res[0] == 'object' && res[0].totals != null) ? res[0] : null;
 			var history = (res[1] != null && typeof res[1] == 'object') ? res[1] : null;
+			var cal = (res[2] != null && typeof res[2] == 'object') ? res[2] : null;
 
 			if (state != null) {
 				self.state = state;
@@ -1166,6 +1556,11 @@ return view.extend({
 			else if (self.trend == null || self.compare == null) {
 				self.trend = trendOf(null, nowSec);
 				self.compare = yesterdayCompare(null, nowSec);
+			}
+
+			if (cal != null) {
+				self.calHistory = cal;
+				self.calError = '';
 			}
 
 			/* history 失败时把 rpc 错误写进 title，比“没有历史数据”更好排查 */
@@ -1190,6 +1585,14 @@ return view.extend({
 		this.tick = 0;
 		this.renderSeq = 0;
 		this.bootFailed = (state == null);
+
+		/* 流量日历：格子签名 / 选中天 / 该天明细（get_daily 按需取） */
+		this.calSig = '';
+		this.calSelected = '';
+		this.calDetail = null;
+		this.calDetailError = '';
+		this.calDetailLoading = false;
+		this.calScrolled = false;
 		this.trend = (this.trend != null) ? this.trend : trendOf(null, 0);
 		this.compare = (this.compare != null) ? this.compare
 			: yesterdayCompare(null, Math.floor(Date.now() / 1000));
@@ -1219,10 +1622,12 @@ return view.extend({
 			empty ? this.renderEmptyNotice(state) : '',
 			this.renderKpis(state),
 			this.renderHealth(state),
+			this.renderAttention(state),
 			E('div', { 'class': 'tso-cols tso-cols-main' }, [
 				this.renderTrendPanel(state),
 				this.renderRail(state)
 			]),
+			this.renderCalendar(state),
 			E('div', { 'class': 'tso-cols tso-cols-top' }, [
 				this.renderTopDevices(state),
 				this.renderTopApps(state)
@@ -1627,6 +2032,479 @@ return view.extend({
 		dom.content(this.healthBox, [ head, body ]);
 	},
 
+	// ------------------------------------------------------------ 需要关注（纯本地计算）
+
+	renderAttention: function(state) {
+		this.attnBox = E('div', { 'class': 'tso-panel tso-attn' });
+		this.renderAttentionInto(state);
+
+		return this.attnBox;
+	},
+
+	renderAttentionInto: function(state) {
+		var items = attentionItems(state, Math.floor(Date.now() / 1000));
+		var worst = items.length ? items[0].tone : 'ok';
+
+		this.attnSig = attentionSigOf(items);
+
+		var head = E('div', { 'class': 'tso-attn-h' }, [
+			E('i', { 'class': 'tso-dot', style: 'background:' + toneColor(worst) }),
+			E('span', {}, _('需要关注')),
+			E('span', { 'class': 'tso-ph-n', style: 'margin-left:auto' },
+				items.length ? (items.length + ' ' + _('项')) : '')
+		]);
+
+		var body;
+
+		if (!items.length) {
+			body = E('div', { 'class': 'tso-ok' },
+				_('一切正常') + '：' + _('记账状态、设备在线、配额与数据新鲜度均未发现问题。'));
+		}
+		else {
+			body = E('ul', { 'class': 'tso-attn-list' }, items.map(function(it) {
+				var content = [
+					E('span', { 'class': 'tso-attn-t' }, it.title),
+					E('span', { 'class': 'tso-attn-d' }, it.detail)
+				];
+				var link = it.href
+					? E('a', { 'class': 'tso-attn-link', href: it.href, title: it.detail }, content)
+					: E('span', { 'class': 'tso-attn-link' }, content);
+
+				return E('li', { 'class': 'tso-attn-item tso-attn-' + it.tone }, [ link ]);
+			}));
+		}
+
+		dom.content(this.attnBox, [ head, body ]);
+	},
+
+	/* 5s 刷新：只有条目 / 严重度 / 文案变化才重建 DOM，避免每 5s 闪一次 */
+	syncAttention: function(state) {
+		if (this.attnBox == null) return;
+
+		var items = attentionItems(state, Math.floor(Date.now() / 1000));
+
+		if (attentionSigOf(items) === this.attnSig) return;
+
+		this.renderAttentionInto(state);
+	},
+
+	// ------------------------------------------------------------ 流量日历（近 28 天）
+
+	renderCalendar: function() {
+		this.calCaption = E('span', { 'class': 'tso-ph-n' }, '');
+		this.calGrid = E('div', {
+			'class': 'tso-cal',
+			role: 'group',
+			'aria-label': _('近 28 天每日流量')
+		});
+		this.calScroll = E('div', { 'class': 'tso-cal-scroll' }, [ this.calGrid ]);
+		this.calDetailHost = E('div', { 'class': 'tso-cal-detail', style: 'display:none' });
+		this.calNote = E('div', { 'class': 'tso-cal-note' }, '');
+
+		this.calBox = E('div', { 'class': 'tso-panel tso-cal-panel' }, [
+			E('div', { 'class': 'tso-ph' }, [
+				E('span', { 'class': 'tso-ph-t' }, _('流量日历')),
+				this.calCaption,
+				E('span', { 'class': 'tso-ph-a' }, E('span', { 'class': 'tso-legend' }, [
+					E('span', { 'class': 'tso-lg' }, [
+						E('i', { style: 'background:rgba(25,118,210,.38)' }), _('每日用量')
+					]),
+					E('span', { 'class': 'tso-lg' }, [
+						E('i', { style: 'background:transparent;border:1px dashed rgba(127,127,127,.6)' }),
+						_('无数据')
+					])
+				]))
+			]),
+			this.calScroll,
+			this.calDetailHost,
+			this.calNote,
+			E('div', { 'class': 'tso-note' },
+				_('左旧右新，今天在最右并高亮；点某天查看当天摘要，再点一次收起。'))
+		]);
+
+		this.syncCalendar(true);
+
+		return this.calBox;
+	},
+
+	/* 用 calHistory（get_history(28)）重算 28 格；签名没变就不重建 DOM */
+	syncCalendar: function(force) {
+		if (this.calBox == null) return;
+
+		var rows = calendarDays(this.calHistory, Math.floor(Date.now() / 1000));
+		var sig = calSigOf(rows) + '|' + (this.calError ? '1' : '0');
+
+		this.calRows = rows;
+
+		if (this.calSig === sig && force !== true) return;
+
+		this.calSig = sig;
+		this.renderCalendarGrid();
+	},
+
+	renderCalendarGrid: function() {
+		var self = this;
+		var rows = this.calRows || [];
+		var hasAny = false, covered = 0, max = 0, i, r;
+		var activeDay = '';
+		var keepScroll = (this.calScroll != null) ? num(this.calScroll.scrollLeft) : 0;
+
+		for (i = 0; i < rows.length; i++) {
+			r = rows[i];
+
+			if (!r.has) continue;
+
+			hasAny = true;
+			covered++;
+
+			if (r.total > max) max = r.total;
+		}
+
+		/* 30s 重建时保住键盘焦点所在的日期格（否则每 30s 焦点会掉回 body） */
+		try {
+			if (typeof document !== 'undefined' && document.activeElement != null &&
+				typeof document.activeElement.getAttribute === 'function')
+				activeDay = '' + (document.activeElement.getAttribute('data-day') || '');
+		}
+		catch (e) { }
+
+		clearChildren(this.calGrid);
+		this.calCells = [];
+
+		if (!hasAny) {
+			var failed = ('' + this.calError).length > 0;
+
+			this.calGrid.appendChild(E('div', { 'class': 'tso-cal-empty' }, [
+				E('strong', {}, failed ? _('日历数据不可用') : _('近 28 天没有每日汇总')),
+				E('span', {}, failed
+					? shorten(this.calError, 150)
+					: _('get_history 还没有返回近 28 天的每日汇总；等守护进程跨过第一个整天后再看。')),
+				failed ? E('button', {
+					'class': 'tso-btn', type: 'button',
+					click: function(ev) { ev.preventDefault(); self.loadCalendar(); }
+				}, [ _('重试') ]) : ''
+			]));
+
+			this.calCaption.textContent = failed ? _('近 28 天 · 日历数据不可用')
+				: _('近 28 天 · 暂无记录');
+		}
+		else {
+			for (i = 0; i < rows.length; i++)
+				this.calGrid.appendChild(this.renderCalendarCell(rows[i], max));
+
+			this.calCaption.textContent = _('近 28 天 · 有数据 ') + covered + ' / ' + CAL_DAYS + _(' 天') +
+				(this.calError ? ' · ' + _('刷新失败') : '');
+		}
+
+		this.calNote.textContent = this.calError
+			? (_('日历数据不可用（刷新失败）：') + shorten(this.calError, 130) +
+				(hasAny ? _('；下面显示上次成功的数据。') : ''))
+			: _('今天的格用当天 5 分钟桶汇总，其它天用 daily 的 summary.totals；没有记录的天保持浅色，不补 0。');
+
+		/* 重建后恢复滚动位置与键盘焦点 */
+		try {
+			if (this.calScroll != null) {
+				if (this.calScrolled === true && keepScroll > 0)
+					this.calScroll.scrollLeft = keepScroll;
+				else if (this.calScrolled !== true)
+					this.calScroll.scrollLeft = this.calScroll.scrollWidth;
+			}
+
+			if (activeDay.length) {
+				for (i = 0; i < this.calCells.length; i++) {
+					if (this.calCells[i].day !== activeDay) continue;
+
+					if (typeof this.calCells[i].node.focus === 'function')
+						this.calCells[i].node.focus();
+
+					break;
+				}
+			}
+		}
+		catch (e) { }
+
+		this.renderCalendarDetail();
+	},
+
+	renderCalendarCell: function(r, max) {
+		var self = this;
+		var ratio = (max > 0 && r.has) ? Math.min(1, r.total / max) : 0;
+		var height = r.has ? (r.zero ? 0 : Math.max(5, Math.round(ratio * 100))) : 0;
+		var text = r.has ? fmtBytes(r.total) : _('无数据');
+		var title = r.day + ' · ' + text + (r.today ? ' · ' + _('今天') : '');
+		var cls = 'tso-cal-d';
+
+		if (!r.has) cls += ' tso-cal-miss';
+		else if (r.zero) cls += ' tso-cal-zero';
+		if (r.today) cls += ' tso-cal-today';
+		if (this.calSelected === r.day) cls += ' tso-cal-sel';
+
+		var node = E('button', {
+			type: 'button',
+			'class': cls,
+			'data-day': r.day,
+			title: title,
+			'aria-label': title,
+			'aria-pressed': (this.calSelected === r.day) ? 'true' : 'false',
+			click: function(ev) {
+				ev.preventDefault();
+
+				/* 键盘 Enter 已由 keydown 处理并 preventDefault；这里再挡一次重复触发 */
+				if (self.calKeyAt && (Date.now() - self.calKeyAt) < 400) return;
+
+				self.toggleCalendarDay(r.day);
+			},
+			keydown: function(ev) {
+				var k = ev.key;
+
+				if (k !== 'Enter' && k !== ' ' && k !== 'Spacebar') return;
+
+				ev.preventDefault();
+				self.calKeyAt = Date.now();
+				self.toggleCalendarDay(r.day);
+			}
+		}, [
+			E('span', { 'class': 'tso-cal-fill', style: 'height:' + height + '%' }),
+			E('span', { 'class': 'tso-cal-n' }, '' + r.dom)
+		]);
+
+		this.calCells.push({ day: r.day, node: node });
+
+		return node;
+	},
+
+	syncCalSelection: function() {
+		var i, cell, on;
+
+		for (i = 0; i < (this.calCells || []).length; i++) {
+			cell = this.calCells[i];
+			on = (cell.day === this.calSelected);
+
+			if (cell.node.classList != null) {
+				if (on) cell.node.classList.add('tso-cal-sel');
+				else cell.node.classList.remove('tso-cal-sel');
+			}
+
+			cell.node.setAttribute('aria-pressed', on ? 'true' : 'false');
+		}
+	},
+
+	toggleCalendarDay: function(day) {
+		var key = '' + (day == null ? '' : day);
+
+		if (!key.length) return;
+
+		/* 再点一次同一天 = 收起 */
+		if (this.calSelected === key) {
+			this.calSelected = '';
+			this.calDetail = null;
+			this.calDetailError = '';
+			this.calDetailLoading = false;
+			this.calDetailSeq = (this.calDetailSeq || 0) + 1;  /* 作废还在飞的 get_daily */
+			this.syncCalSelection();
+			this.renderCalendarDetail();
+
+			return;
+		}
+
+		this.calSelected = key;
+		this.calDetail = null;
+		this.calDetailError = '';
+		this.syncCalSelection();
+		this.loadCalendarDetail(key);
+	},
+
+	/* 30s / 手动刷新：只重取 get_history(28)，不动趋势与其它卡 */
+	loadCalendar: function() {
+		var self = this;
+
+		if (this.calLoading === true) return this.calPromise || Promise.resolve();
+
+		this.calLoading = true;
+
+		this.calPromise = Promise.resolve().then(function() {
+			return callHistory(CAL_DAYS);
+		}).then(function(history) {
+			self.calLoading = false;
+			self.calPromise = null;
+
+			if (history == null || typeof history != 'object') return;
+
+			self.calHistory = history;
+			self.calError = '';
+			self.syncCalendar();
+		}).catch(function(err) {
+			self.calLoading = false;
+			self.calPromise = null;
+			self.calError = errText(err);
+			self.syncCalendar();
+		});
+
+		return this.calPromise;
+	},
+
+	loadCalendarDetail: function(day) {
+		var self = this;
+		var key = '' + (day == null ? '' : day);
+		var seq = (this.calDetailSeq || 0) + 1;
+
+		this.calDetailSeq = seq;
+		this.calDetail = null;
+		this.calDetailError = '';
+		this.calDetailLoading = true;
+		this.renderCalendarDetail();
+
+		/* 用 Promise.resolve().then 包一层：即使 rpc 封装同步抛错也能落到 catch */
+		Promise.resolve().then(function() {
+			return callDaily(key);
+		}).then(function(payload) {
+			if (seq !== self.calDetailSeq || self.calSelected !== key) return;
+
+			self.calDetailLoading = false;
+			self.calDetail = dailyViewOf(payload);
+			self.renderCalendarDetail();
+		}).catch(function(err) {
+			if (seq !== self.calDetailSeq || self.calSelected !== key) return;
+
+			self.calDetailLoading = false;
+			self.calDetailError = errText(err);
+			self.renderCalendarDetail();
+		});
+	},
+
+	calRowOf: function(day) {
+		var rows = this.calRows || [], i;
+
+		for (i = 0; i < rows.length; i++)
+			if (rows[i].day === day) return rows[i];
+
+		return null;
+	},
+
+	calTopBlock: function(title, lis) {
+		return E('div', {}, [
+			E('div', { 'class': 'tso-cal-list-h' }, title),
+			lis.length ? E('ul', { 'class': 'tso-cal-list' }, lis)
+				: E('div', { 'class': 'tso-cal-note' }, _('无明细'))
+		]);
+	},
+
+	renderCalendarDetail: function() {
+		var host = this.calDetailHost;
+
+		if (host == null) return;
+
+		if (!this.calSelected) {
+			host.style.display = 'none';
+			clearChildren(host);
+
+			return;
+		}
+
+		var self = this;
+		var day = this.calSelected;
+		var row = this.calRowOf(day);
+		var det = this.calDetail;
+		var nodes = [], notes = [], devLis = [], appLis = [];
+		var devTop = (det != null) ? topDailyList(det.devices, 3) : [];
+		var appTop = (det != null) ? topDailyList(det.apps, 3) : [];
+		var i, dev, app, name, mac, host2;
+
+		host.style.display = '';
+
+		nodes.push(E('div', { 'class': 'tso-cal-det-h' }, [
+			E('strong', { 'class': 'tso-cal-det-t' },
+				day + ((row != null && row.today) ? ' · ' + _('今天') : '')),
+			E('button', {
+				'class': 'tso-btn', type: 'button', title: _('收起这一天'),
+				click: function(ev) { ev.preventDefault(); self.toggleCalendarDay(day); }
+			}, [ _('收起') ])
+		]));
+
+		var hasSum = (det != null && det.hasTotals) || (row != null && row.has);
+		var rx = (det != null && det.rx != null) ? det.rx : (row ? row.rx : 0);
+		var tx = (det != null && det.tx != null) ? det.tx : (row ? row.tx : 0);
+
+		nodes.push(E('div', { 'class': 'tso-cal-metrics' }, [
+			E('span', {}, [ _('下载') + ' ', E('strong', {}, hasSum ? fmtBytes(rx) : '—') ]),
+			E('span', {}, [ _('上传') + ' ', E('strong', {}, hasSum ? fmtBytes(tx) : '—') ]),
+			E('span', {}, [ _('合计') + ' ', E('strong', {}, hasSum ? fmtBytes(rx + tx) : '—') ])
+		]));
+
+		if (this.calDetailLoading) {
+			notes.push(_('正在读取 ') + day + _(' 的明细…'));
+			nodes.push(E('div', { 'class': 'tso-cal-note' }, notes[0]));
+			dom.content(host, nodes);
+
+			return;
+		}
+
+		if (this.calDetailError) {
+			nodes.push(E('div', { 'class': 'tso-cal-note tso-cal-err' }, [
+				_('明细读取失败：') + shorten(this.calDetailError, 120) + _('；下面显示日历里的日汇总。'),
+				E('button', {
+					'class': 'tso-btn', type: 'button',
+					click: function(ev) { ev.preventDefault(); self.loadCalendarDetail(day); }
+				}, [ _('重试') ])
+			]));
+		}
+
+		for (i = 0; i < devTop.length; i++) {
+			dev = devTop[i].item;
+			name = deviceName(dev);
+			mac = macOf(dev);
+			devLis.push(E('li', {}, [
+				E('a', {
+					href: deviceHref(mac),
+					title: name + ' · ' + fmtBytes(devTop[i].bytes) + (mac.length ? ' · ' + mac : '')
+				}, [ shorten(name, 22) ]),
+				E('span', { 'class': 'tso-lnum' }, fmtBytes(devTop[i].bytes))
+			]));
+		}
+
+		for (i = 0; i < appTop.length; i++) {
+			app = appTop[i].item;
+			host2 = '' + ((app.host == null) ? '' : app.host);
+			appLis.push(E('li', {}, [
+				E('a', {
+					href: appHref(host2),
+					title: (host2.length ? host2 + ' · ' : '') + fmtBytes(appTop[i].bytes)
+				}, [ shorten(host2.length ? host2 : _('未知应用'), 22) ]),
+				E('span', { 'class': 'tso-lnum' }, fmtBytes(appTop[i].bytes))
+			]));
+		}
+
+		if (devLis.length || appLis.length) {
+			nodes.push(E('div', { 'class': 'tso-cal-cols' }, [
+				this.calTopBlock(_('设备 Top 3'), devLis),
+				this.calTopBlock(_('应用 Top 3'), appLis)
+			]));
+		}
+
+		if (det != null) {
+			var noDetail = (devLis.length === 0 && appLis.length === 0);
+
+			if (!det.hasTotals && row != null && row.has)
+				notes.push(_('该天没有可用的 totals（daily 文件缺失或损坏），上面是日历里的日汇总。'));
+
+			if (noDetail) {
+				if (!hasSum)
+					notes.push(_('该天没有记录（daily 与 get_history 都没有这一天的数据）。'));
+				else if (det.buckets > 0)
+					notes.push(_('该天没有设备/应用明细；只有 ') + det.buckets +
+						_(' 个 5 分钟桶的汇总。'));
+				else if (det.hasTotals)
+					notes.push(_('该天只有日汇总，没有设备/应用明细，也没有 5 分钟明细。'));
+			}
+		}
+
+		if (notes.length)
+			nodes.push(E('div', { 'class': 'tso-cal-note' },
+				notes.map(function(t) { return E('div', {}, t); })));
+
+		dom.content(host, nodes);
+	},
+
 	syncCompare: function() {
 		if (this.cmpNode == null) return;
 
@@ -1742,12 +2620,29 @@ return view.extend({
 			window.addEventListener('resize', this.resizeHandler);
 		}
 
+		/* 28 格在窄屏会横向滚动：首屏滚到最右（今天），之后保留用户滚动位置 */
+		window.setTimeout(function() {
+			if (run == self.renderSeq) self.scrollCalendarToToday();
+		}, 0);
+
 		if (this.trend.points.length == 0) return;
 
 		/* 内置 SVG 无外部图表库；等节点进 DOM 后再量宽度。 */
 		window.setTimeout(function() {
 			if (run == self.renderSeq) self.drawTrend();
 		}, 0);
+	},
+
+	scrollCalendarToToday: function() {
+		if (this.calScroll == null || this.calScrolled === true) return;
+		if (!document.body.contains(this.calScroll)) return;
+
+		this.calScrolled = true;
+
+		try {
+			this.calScroll.scrollLeft = this.calScroll.scrollWidth;
+		}
+		catch (e) { }
 	},
 
 	onResize: function() {
@@ -2496,6 +3391,7 @@ return view.extend({
 
 		this.syncStatus(state);
 		this.syncCompare();
+		this.syncAttention(state);
 	},
 
 	/* 30s 重建一次动态块（Top 列表 / 节点块 / 健康原因）：比每 5s 重建省事，也不会闪 */
@@ -2513,7 +3409,7 @@ return view.extend({
 			this.renderHealthInto(state);
 	},
 
-	/* 手动「刷新」与「恢复自动刷新」共用：两个 rpc 都重拉，失败保留旧数据并出错误条 */
+	/* 手动「刷新」与「恢复自动刷新」共用：三个 rpc 都重拉，失败保留旧数据并出错误条 */
 	refreshNow: function(manual) {
 		var self = this;
 
@@ -2548,6 +3444,7 @@ return view.extend({
 			self.syncAll(self.state);
 			self.syncErrorBar();
 			self.rebuildDynamic(self.state);
+			self.syncCalendar();
 			self.refreshTrend();
 
 			if (self.state.running !== true)
@@ -2639,8 +3536,12 @@ return view.extend({
 				self.syncAll(state);
 				self.syncErrorBar();
 
-				if (++self.tick % TOPS_EVERY == 0)
+				if (++self.tick % TOPS_EVERY == 0) {
 					self.rebuildDynamic(state);
+
+					/* 日历的 28 天数据只在 30s 周期重取，避免每 5s 拉一次 */
+					self.loadCalendar();
+				}
 
 				/* 守护进程停了就不必再轮询（服务重启后手动刷新或重开开关即可） */
 				if (state.running !== true)
