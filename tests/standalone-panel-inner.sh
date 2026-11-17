@@ -165,6 +165,10 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=settings")
   && ok "settings 含 settings/panel 字段" || bad "settings 结构异常"
 [ "$(json_expr 'd.write!=null && d.write.enabled==false')" = "1" ] \
   && ok "settings.write.enabled=false（写能力未开放）" || bad "settings.write 异常"
+[ "$(json_expr 'd.settings.feishu_enabled!=null')" = "1" ] \
+  && ok "settings 含 feishu_enabled（映射自 feishu.enabled）" || bad "settings 缺 feishu_enabled 映射"
+[ "$(json_expr 'd.settings.retention_daily_days!=null')" = "1" ] \
+  && ok "settings 含 retention_daily_days（映射自 retention.daily_days）" || bad "settings 缺 retention_daily_days 映射"
 code=$(req "$PANEL/cgi-bin/panel-api?what=bad")
 [ "$code" = "400" ] && [ "$(json_expr 'd?.error=="bad_request"')" = "1" ] \
   && ok "what=bad -> 400 bad_request" || bad "what=bad -> $code / $(head -c 120 "$B")"

@@ -59,8 +59,8 @@ let SENT = false;
 
 /* settings 只读投影：只回传非敏感的配置项，绝不回传 token/密钥原值。 */
 const SETTINGS_FIELDS = [
-	'poll_interval', 'history_days', 'retention_daily_days',
-	'metrics_enabled', 'feishu_enabled', 'mother_enabled', 'stations_enabled',
+	'enabled', 'poll_interval', 'history_days', 'metrics_enabled',
+	'mother_enabled', 'stations_enabled',
 	'legacy_shared_secret', 'legacy_stations_token'
 ];
 
@@ -72,6 +72,13 @@ function read_settings() {
 		const v = c.get(UCI_CONFIG, 'settings', k);
 		if (type(v) == 'string') out.settings[k] = v;
 	}
+
+	/* 飞书与保留策略不在 settings 段：映射成扁平字段给前端，保持只读契约不变。 */
+	const fe = c.get(UCI_CONFIG, 'feishu', 'enabled');
+	if (type(fe) == 'string') out.settings.feishu_enabled = fe;
+
+	const rd = c.get(UCI_CONFIG, 'retention', 'daily_days');
+	if (type(rd) == 'string') out.settings.retention_daily_days = rd;
 
 	const enabled = c.get(UCI_CONFIG, 'panel', 'enabled');
 	const port = c.get(UCI_CONFIG, 'panel', 'port');
