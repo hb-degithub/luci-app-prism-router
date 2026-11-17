@@ -2331,15 +2331,15 @@ async function testTopoTree() {
 		treeRule[0].indexOf('flex-direction:column') >= 0 &&
 		treeRule[0].indexOf('align-items:center') >= 0,
 		'tree=' + repr(treeRule));
-	check('树干 12px、行间竖干 10px、都是不缩放的 1px',
+	check('树干 12px、行间竖干 10px、线宽 1.5px',
 		SOURCE.indexOf('.tsm-ttrunk{height:12px}') >= 0 &&
 		SOURCE.indexOf('.tsm-tstem{height:10px}') >= 0 &&
-		SOURCE.indexOf('.tsm-ttrunk,.tsm-tstem{flex:none;width:1px;') >= 0,
+		SOURCE.indexOf('.tsm-ttrunk,.tsm-tstem{flex:none;width:1.5px;') >= 0,
 		'trunk=' + repr(trunkRule) + ' stem=' + repr(stemRule));
-	check('每行一条总线：absolute top:0 left:25% width:50% 1px',
+	check('每行一条总线：absolute top:0 left:25% width:50% 1.5px',
 		busRule != null && busRule[0].indexOf('position:absolute') >= 0 &&
 		busRule[0].indexOf('top:0') >= 0 && busRule[0].indexOf('left:25%') >= 0 &&
-		busRule[0].indexOf('width:50%') >= 0 && busRule[0].indexOf('height:1px') >= 0,
+		busRule[0].indexOf('width:50%') >= 0 && busRule[0].indexOf('height:1.5px') >= 0,
 		'bus=' + repr(busRule));
 	check('节点从自身顶部向上 12px 连到本行总线（不画进节点内部）',
 		nodeLineRule != null && nodeLineRule[0].indexOf('top:-12px') >= 0 &&
@@ -2410,6 +2410,12 @@ async function testTopoTree() {
 	/* 320px：两列不降级、没有固定像素宽度 */
 	const small = SOURCE.match(/@media \(max-width:320px\)\{[\s\S]*?\}\}/);
 
+	check('拓扑线条加粗到 1.5px 并使用更明显的 --tsm-wire',
+		/\.tsm-ttrunk,\.tsm-tstem\{[^}]*width:1\.5px[^}]*--tsm-wire/.test(SOURCE) &&
+		/\.tsm-trow-bus\{[^}]*height:1\.5px[^}]*--tsm-wire/.test(SOURCE) &&
+		/--tsm-wire:rgba\(0,0,0,\.26\)/.test(SOURCE) &&
+		/--tsm-wire:rgba\(255,255,255,\.34\)/.test(SOURCE),
+		'wire=' + (SOURCE.match(/--tsm-wire[^;}]*/g) || []).join('|'));
 	check('320px 下 .tsm-trow 仍是两列',
 		small != null && small[0].indexOf('.tsm-trow{grid-template-columns:repeat(2,minmax(0,1fr))}') >= 0,
 		'small=' + repr(small && small[0].match(/\.tsm-trow\{[^}]*\}/g)));
@@ -2563,25 +2569,25 @@ async function testTopoStyles() {
 		!/\.tsm-dnode\{[^}]*\bwidth:\s*\d+px/.test(SOURCE) &&
 		/\.tsm-dnode\{[^}]*min-width:0/.test(SOURCE),
 		'node=' + repr(SOURCE.match(/\.tsm-dnode\{[^}]*\}/)));
-	check('状态环 1.5px、连接线 1px（线宽符合要求）',
+	check('状态环 1.5px、连接线 1.5px（线宽符合要求）',
 		ringRule != null && ringRule[0].indexOf('border:1.5px solid') >= 0 &&
-		busRule != null && busRule[0].indexOf('height:1px') >= 0 &&
-		nodeLineRule != null && nodeLineRule[0].indexOf('width:1px') >= 0 &&
+		busRule != null && busRule[0].indexOf('height:1.5px') >= 0 &&
+		nodeLineRule != null && nodeLineRule[0].indexOf('width:1.5px') >= 0 &&
 		nodeLineRule[0].indexOf('height:12px') >= 0,
 		'ring=' + repr(ringRule) + ' bus=' + repr(busRule) + ' node=' + repr(nodeLineRule));
-	check('连接线统一用 --tsm-line-strong（不再按 link 给线条上色）',
-		busRule != null && busRule[0].indexOf('background:var(--tsm-line-strong)') >= 0 &&
-		nodeLineRule != null && nodeLineRule[0].indexOf('background:var(--tsm-line-strong)') >= 0 &&
+	check('连接线统一用 --tsm-wire（不再按 link 给线条上色）',
+		busRule != null && busRule[0].indexOf('background:var(--tsm-wire)') >= 0 &&
+		nodeLineRule != null && nodeLineRule[0].indexOf('background:var(--tsm-wire)') >= 0 &&
 		!/\.tsm-tline/.test(SOURCE) && SOURCE.indexOf('tsm-tbus') < 0,
 		'bus=' + repr(busRule) + ' node=' + repr(nodeLineRule));
 	check('320px 媒体查询仍把节点行钉成两列',
 		small != null &&
 		small[0].indexOf('.tsm-trow{grid-template-columns:repeat(2,minmax(0,1fr))}') >= 0,
 		'small=' + repr(small && small[0].slice(0, 300)));
-	check('深色主题下连接线仍走变量（--tsm-line-strong 由深色块覆盖）',
-		dark != null && dark[0].indexOf('--tsm-line-strong:rgba(255,255,255,.18)') >= 0 &&
-		busRule != null && busRule[0].indexOf('var(--tsm-line-strong)') >= 0 &&
-		nodeLineRule != null && nodeLineRule[0].indexOf('var(--tsm-line-strong)') >= 0,
+	check('深色主题下连接线仍走变量（--tsm-wire 由深色块覆盖）',
+		dark != null && dark[0].indexOf('--tsm-wire:rgba(255,255,255,.34)') >= 0 &&
+		busRule != null && busRule[0].indexOf('var(--tsm-wire)') >= 0 &&
+		nodeLineRule != null && nodeLineRule[0].indexOf('var(--tsm-wire)') >= 0,
 		'dark=' + repr(dark && dark[0].slice(0, 160)));
 
 	const booted = await boot({ state: topoState(), stations: topoStations() });

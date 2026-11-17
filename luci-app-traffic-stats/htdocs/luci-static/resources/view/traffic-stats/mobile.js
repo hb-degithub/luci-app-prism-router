@@ -822,7 +822,7 @@ var CSS = [
 	 * 第 3 步：网络拓扑屏 + 主题变量
 	 * 卡片/分隔线/次级文字统一走变量，深色主题只改变量，强调色不动。
 	 * ================================================================ */
-	'#ts-mobile{--tsm-card-bg:#fff;--tsm-line:rgba(0,0,0,.06);--tsm-line-strong:rgba(0,0,0,.1);--tsm-text:#1b1f24;--tsm-sub:#8a8f98;--tsm-accent:#ff6f00;--tsm-green:#00b96b;--tsm-blue:#2b7de9;--tsm-soft:rgba(0,0,0,.03);--tsm-dots-bg:linear-gradient(to top,rgba(255,255,255,.99) 55%,rgba(255,255,255,.86))}',
+	'#ts-mobile{--tsm-card-bg:#fff;--tsm-line:rgba(0,0,0,.06);--tsm-line-strong:rgba(0,0,0,.1);--tsm-wire:rgba(0,0,0,.26);--tsm-text:#1b1f24;--tsm-sub:#8a8f98;--tsm-accent:#ff6f00;--tsm-green:#00b96b;--tsm-blue:#2b7de9;--tsm-soft:rgba(0,0,0,.03);--tsm-dots-bg:linear-gradient(to top,rgba(255,255,255,.99) 55%,rgba(255,255,255,.86))}',
 	'.tsm-card,.tsm-rows,.tsm-ncard,.tsm-install-card,.tsm-fpanel,.tsm-pill,.tsm-inet,.tsm-exit,.tsm-router-card,.tsm-ap,.tsm-tgroup{background:var(--tsm-card-bg);border-color:var(--tsm-line)}',
 	'.tsm-tabs,.tsm-dtabs{background:var(--tsm-card-bg);border-color:var(--tsm-line)}',
 	'.tsm-dots{background:var(--tsm-dots-bg)}',
@@ -886,11 +886,11 @@ var CSS = [
 	'.tsm-tgroup-body{min-width:0}',
 	/* 树：父节点 → 每行一条总线 → 总线向下连到本行每个节点；连接线不跨行、不跨节点 */
 	'.tsm-ttree{position:relative;display:flex;flex-direction:column;align-items:center;width:100%;min-width:0}',
-	'.tsm-ttrunk,.tsm-tstem{flex:none;width:1px;background:var(--tsm-line-strong)}',
+	'.tsm-ttrunk,.tsm-tstem{flex:none;width:1.5px;background:var(--tsm-wire)}',
 	'.tsm-ttrunk{height:12px}',
 	'.tsm-tstem{height:10px}',
 	'.tsm-trow{position:relative;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:8px;row-gap:0;width:100%;min-width:0;padding-top:12px}',
-	'.tsm-trow-bus{position:absolute;top:0;left:25%;width:50%;height:1px;background:var(--tsm-line-strong);pointer-events:none}',
+	'.tsm-trow-bus{position:absolute;top:0;left:25%;width:50%;height:1.5px;background:var(--tsm-wire);pointer-events:none}',
 	'.tsm-trow.is-single .tsm-trow-bus{display:none}',
 	'.tsm-trow.is-single .tsm-dnode{grid-column:1 / -1}',
 	'.tsm-ttree>.tsm-dmore{align-self:stretch;margin-top:8px}',
@@ -898,7 +898,7 @@ var CSS = [
 	'.tsm-dnode{position:relative;display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0;padding:4px 2px;border-radius:10px;cursor:pointer;text-align:center}',
 	'.tsm-dnode:active{background:var(--tsm-soft)}',
 	/* 节点到本行总线的竖线：从节点顶部向上 12px（正好是 .tsm-trow 的 padding-top） */
-	'.tsm-dnode::before{content:"";position:absolute;top:-12px;left:50%;width:1px;height:12px;background:var(--tsm-line-strong);transform:translateX(-50%);pointer-events:none}',
+	'.tsm-dnode::before{content:"";position:absolute;top:-12px;left:50%;width:1.5px;height:12px;background:var(--tsm-wire);transform:translateX(-50%);pointer-events:none}',
 	'.tsm-dnode-ring{flex:none;width:46px;height:46px;border-radius:50%;border:1.5px solid var(--tsm-line-strong);display:flex;align-items:center;justify-content:center;background:var(--tsm-card-bg);color:var(--tsm-sub)}',
 	'.tsm-dnode.is-wifi .tsm-dnode-ring{border-color:var(--tsm-blue);color:var(--tsm-blue)}',
 	'.tsm-dnode.is-wired .tsm-dnode-ring{border-color:var(--tsm-green);color:var(--tsm-green)}',
@@ -921,7 +921,7 @@ var CSS = [
 	'@media (max-width:359px){.tsm-exits{grid-template-columns:1fr 1fr}.tsm-exit{padding:8px}.tsm-exit-name{font-size:12px}.tsm-aps{grid-template-columns:1fr}.tsm-tl-h{margin-bottom:4px}.tsm-conn{height:16px}.tsm-dnode-name{font-size:11px}}',
 	'@media (max-width:320px){.tsm-topo .tsm-exits{grid-template-columns:1fr}.tsm-topo .tsm-exit{padding:7px 8px}.tsm-topo .tsm-exit-name,.tsm-topo .tsm-ap-name,.tsm-topo .tsm-router-name,.tsm-topo .tsm-inet-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-topo .tsm-conn{height:14px}.tsm-topo .tsm-tl-h{margin-bottom:4px}.tsm-topo .tsm-ap{padding:8px}.tsm-topo .tsm-router-card{gap:8px;padding:10px}.tsm-topo .tsm-router-ico{width:38px;height:38px}.tsm-topo .tsm-router-ico svg{width:24px;height:24px}.tsm-topo .tsm-xname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-trow{grid-template-columns:repeat(2,minmax(0,1fr))}.tsm-dnode-ring{width:40px;height:40px}.tsm-dnode-ico,.tsm-dnode-ico svg{width:20px;height:20px}.tsm-otopo{padding:10px 8px 8px}.tsm-dsearch{padding:0 8px;gap:4px;margin-left:0;margin-right:0}}',
 	/* 深色主题：只改背景/分隔线/次级文字，橙/绿/蓝强调色保持不变；不用纯黑 */
-	'@media (prefers-color-scheme: dark){#ts-mobile{--tsm-card-bg:#1c2026;--tsm-line:rgba(255,255,255,.1);--tsm-line-strong:rgba(255,255,255,.18);--tsm-text:#e7eaee;--tsm-sub:#a4abb5;--tsm-soft:rgba(255,255,255,.06);--tsm-dots-bg:linear-gradient(to top,rgba(20,23,27,.99) 55%,rgba(20,23,27,.86));background:#14171b;color:#e7eaee}#ts-mobile .tsm-tabs,#ts-mobile .tsm-dtabs{background:#1c2026}#ts-mobile .tsm-dot-i{background:rgba(255,255,255,.22)}#ts-mobile .tsm-dot-i.on{background:#e7eaee}#ts-mobile .tsm-nhero{background:linear-gradient(180deg,rgba(255,111,0,.14) 0%,rgba(255,111,0,.05) 60%,rgba(20,23,27,0) 100%)}#ts-mobile .tsm-tab.on{color:#e7eaee}#ts-mobile .tsm-health{background:rgba(255,255,255,.05)}}'
+	'@media (prefers-color-scheme: dark){#ts-mobile{--tsm-card-bg:#1c2026;--tsm-line:rgba(255,255,255,.1);--tsm-line-strong:rgba(255,255,255,.18);--tsm-wire:rgba(255,255,255,.34);--tsm-text:#e7eaee;--tsm-sub:#a4abb5;--tsm-soft:rgba(255,255,255,.06);--tsm-dots-bg:linear-gradient(to top,rgba(20,23,27,.99) 55%,rgba(20,23,27,.86));background:#14171b;color:#e7eaee}#ts-mobile .tsm-tabs,#ts-mobile .tsm-dtabs{background:#1c2026}#ts-mobile .tsm-dot-i{background:rgba(255,255,255,.22)}#ts-mobile .tsm-dot-i.on{background:#e7eaee}#ts-mobile .tsm-nhero{background:linear-gradient(180deg,rgba(255,111,0,.14) 0%,rgba(255,111,0,.05) 60%,rgba(20,23,27,0) 100%)}#ts-mobile .tsm-tab.on{color:#e7eaee}#ts-mobile .tsm-health{background:rgba(255,255,255,.05)}}'
 ].join('\n');
 
 // ---------------------------------------------------------------- 设备屏 / 节点屏（第 2 步）
