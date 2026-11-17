@@ -748,18 +748,20 @@ function dayTotalsOf(entry) {
 
 	if (!buckets.length) return null;
 
-	var rx = 0, tx = 0, i, b;
+	var rx = 0, tx = 0, count = 0, i, b;
 
 	for (i = 0; i < buckets.length; i++) {
 		b = buckets[i];
 
 		if (b == null || typeof b != 'object') continue;
 
+		count++;
 		rx += num(b.direct_rx) + num(b.proxy_rx);
 		tx += num(b.direct_tx) + num(b.proxy_tx);
 	}
 
-	return { rx: rx, tx: tx, total: rx + tx };
+	/* 只有 null / 脏桶的「一天」等同于没有数据，不能当成真实的 0 B */
+	return count ? { rx: rx, tx: tx, total: rx + tx } : null;
 }
 
 /*
@@ -1309,7 +1311,8 @@ var CSS = [
 	'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
 	'#ts-overview .tso-attn-d{display:block;font-size:10.5px;line-height:1.55;opacity:.78;word-break:break-word}',
 	'#ts-overview .tso-attn-bad{border-left-color:#c62828;background:rgba(198,40,40,.08)}',
-	'#ts-overview .tso-attn-bad .tso-attn-t{color:#c62828}',
+	'#ts-overview .tso-attn-bad .tso-attn-t,#ts-overview .tso-attn-bad .tso-attn-d{color:#c62828}',
+	'#ts-overview .tso-attn-bad .tso-attn-d{opacity:.9}',
 	'#ts-overview .tso-attn-warn{border-left-color:#e65100;background:rgba(255,152,0,.08)}',
 	'#ts-overview .tso-attn-warn .tso-attn-t{color:#e65100}',
 	'#ts-overview .tso-attn-info{border-left-color:#1565c0}',
@@ -2132,7 +2135,7 @@ return view.extend({
 		if (this.calBox == null) return;
 
 		var rows = calendarDays(this.calHistory, Math.floor(Date.now() / 1000));
-		var sig = calSigOf(rows) + '|' + (this.calError ? '1' : '0');
+		var sig = calSigOf(rows) + '|' + (this.calError ? shorten(this.calError, 80) : '');
 
 		this.calRows = rows;
 
