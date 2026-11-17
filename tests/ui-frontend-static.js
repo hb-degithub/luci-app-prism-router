@@ -641,11 +641,12 @@ async function testSemantics() {
 		!/set_config|set_device_meta|method:\s*'restart'|uci\.set\s*\(/.test(diagnosticsPage) &&
 		/数据源/.test(diagnosticsPage) && /未更新|新鲜/.test(diagnosticsPage));
 
-	/* 详细面板是独立页面：概览/手机版/诊断都用真链接 + 新标签，不走 window.open。 */
-	check('三处入口都用新标签链接打开详细面板',
-		/prism-router\/panel/.test(overview) && /target: '_blank'/.test(overview) &&
-		/prism-router\/panel/.test(mobile) && /target: '_blank'/.test(mobile) &&
-		/prism-router\/panel/.test(diagnosticsPage) && /target: '_blank'/.test(diagnosticsPage));
+	/* LuCI 精简为只读：详细面板由独立控制台（默认 8099）承接。 */
+	check('三处入口都指向独立控制台并新标签打开',
+		(/CONSOLE_PORT = 8099/.test(overview) || /:8099\//.test(overview)) &&
+		/target: '_blank'/.test(overview) &&
+		/:8099\//.test(mobile) && /target: '_blank'/.test(mobile) &&
+		/:8099\//.test(diagnosticsPage) && /target: '_blank'/.test(diagnosticsPage));
 	check('概览不用 window.open 打开详细面板',
 		!/window\.open\(\s*L\.url\('admin\/services\/prism-router\/panel'\)/.test(overview));
 	check('menu.d 含诊断页且 order 在手机版与面板之间',
@@ -1072,7 +1073,7 @@ async function testDevicesMetaPermissions() {
 
 	delete env.L.env;
 	env.L.env = { prismRouterCanManage: true };
-	check('无 ACL 列表时用只读 RPC 的 can_manage 能力', tests.isAdmin() === true);
+	check('LuCI 精简为只读后编辑入口始终隐藏', tests.isAdmin() === false);
 	env.L.env.prismRouterCanManage = false;
 	check('RPC 明确非管理员时隐藏写入口', tests.isAdmin() === false);
 
@@ -1121,12 +1122,17 @@ async function testMenu() {
 
 		check('menu.d JSON 可解析', menu != null && typeof menu === 'object');
 
-		const paths = VIEWS.map(function (name) {
+		const readOnlyViews = [ 'overview', 'devices', 'apps', 'nodes', 'mobile', 'diagnostics' ];
+		const paths = readOnlyViews.map(function (name) {
 			return menu['admin/services/prism-router/' + name];
 		});
 
-		check('menu.d 含全部 view 路径',
-			paths.every(function (item) { return item && item.action && item.action.type === 'view'; }));
+		check('menu.d 只保留只读视图',
+			paths.every(function (item) { return item && item.action && item.action.type === 'view'; }),
+			JSON.stringify(paths.map(function (x) { return x && x.action && x.action.path; })));
+		check('menu.d 不再暴露设置与内嵌详细面板',
+			menu['admin/services/prism-router/settings'] == null &&
+			menu['admin/services/prism-router/panel'] == null);
 
 		const root = menu['admin/services/prism-router'];
 		const rootAcl = root && root.depends && root.depends.acl;
@@ -1135,13 +1141,8 @@ async function testMenu() {
 			Array.isArray(rootAcl) && rootAcl.length === 1 && rootAcl[0] === 'luci-app-prism-router',
 			JSON.stringify(rootAcl));
 
-		const settings = menu['admin/services/prism-router/settings'];
-		const settingsAcl = settings && settings.depends && settings.depends.acl;
-
-		check('设置页子路由 depends.acl=luci-app-prism-router-admin',
-			Array.isArray(settingsAcl) && settingsAcl.length === 1 &&
-			settingsAcl[0] === 'luci-app-prism-router-admin',
-			JSON.stringify(settingsAcl));
+		check('设置页已从 LuCI 菜单移除（写配置走独立控制台）',
+			menu['admin/services/prism-router/settings'] == null);
 
 		/*
 		 * LuCI 的 JS View 基类（luci.js 的 LuCI.view）没有 depends 成员，

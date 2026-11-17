@@ -621,7 +621,11 @@ grep -q '"csv"' "$ROOT/csv_dev.json" && ok "CSV 文本随返回值下发（前�
 echo "=== 17. ACL 与 set_config 白名单 ==="
 ACL=/usr/share/rpcd/acl.d/luci-app-prism-router.json
 grep -q '"export_csv"' "$ACL" && ok "ACL read 含 export_csv" || bad "ACL read 缺 export_csv"
-grep -q '"set_device_meta"' "$ACL" && ok "ACL write 含 set_device_meta" || bad "ACL write 缺 set_device_meta"
+if grep -q '"set_device_meta"' "$ACL"; then
+  bad "LuCI ACL 仍含写方法 set_device_meta（应已精简为只读）"
+else
+  ok "LuCI ACL 只读（不再下发 set_device_meta）"
+fi
 ucode -e 'let fs=require("fs"); json(fs.readfile("/usr/share/rpcd/acl.d/luci-app-prism-router.json"));' 2>/dev/null \
   && ok "ACL 是合法 JSON" || bad "ACL JSON 坏了"
 SC=$(rpc set_config '{"section":"settings","options":"{\"quota_mode\":\"device\",\"quota_monthly_gb\":\"20\",\"quota_total_gb\":\"200\",\"metrics_enabled\":\"1\",\"metrics_token\":\"tok2\"}"}')

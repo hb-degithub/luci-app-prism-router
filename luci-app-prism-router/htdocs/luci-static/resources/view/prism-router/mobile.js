@@ -1892,11 +1892,11 @@ return view.extend({
 		/* 详细面板是独立页面：用真链接 + 新标签，手机上也能直接打开宽屏面板。 */
 		this.panelLink = E('a', {
 			'class': 'tsm-refresh',
-			href: L.url('admin/services/prism-router/panel'),
+			href: 'http://' + ((typeof window !== 'undefined' && window.location) ? window.location.hostname : '') + ':8099/',
 			target: '_blank',
 			rel: 'noopener noreferrer',
 			title: _('在新标签页打开详细面板')
-		}, _('详细面板 ↗'));
+		}, _('独立控制台 ↗'));
 
 		return E('div', { 'class': 'tsm-head' }, [
 			E('h2', {}, _('棱镜路由')),

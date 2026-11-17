@@ -815,11 +815,11 @@ return view.extend({
 					_('只读检查，不会修改任何配置。'),
 					E('a', {
 						'class': 'tsd-panel-link',
-						href: L.url('admin/services/prism-router/panel'),
+						href: 'http://' + ((typeof window !== 'undefined' && window.location) ? window.location.hostname : '') + ':8099/',
 						target: '_blank',
 						rel: 'noopener noreferrer',
 						title: _('在新标签页打开详细面板')
-					}, _('详细面板 ↗'))
+					}, _('独立控制台 ↗'))
 				])
 			]),
 			E('div', { 'class': 'tsd-toolbar' }, [ this.sumEl, this.timeEl, this.btn ]),

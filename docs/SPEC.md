@@ -933,3 +933,12 @@ config panel 'panel'
 - 停掉 rpcd → 500 `{"error":"internal"}` 且响应不含路径/堆栈；
 - init 不读 token、CGI 无写文件/日志调用、临时日志里没有 token、系统目录权限不变。
 
+
+
+## LuCI 只读化
+
+- 菜单：`overview / devices / apps / nodes / mobile / diagnostics`（不含 settings 与内嵌 panel）。
+- ACL：只保留 `luci-app-prism-router` 只读组；管理组 `luci-app-prism-router-admin` 已移除，
+  写方法（set_config / set_device_meta / restart / test_feishu / feishu_chats）不再暴露给 LuCI。
+- 设备页编辑入口：`isAdmin()` 仅按 ACL 判断（管理组不存在即隐藏）。
+- 独立控制台：`http://<LAN>:8099/`，由 `prism-router-panel` 提供，只读 API 见「独立面板服务」。

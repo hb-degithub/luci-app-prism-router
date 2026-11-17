@@ -55,6 +55,20 @@ uci set prism-router.settings.fake_ip_ranges='198.18.0.0/16'
 uci commit prism-router
 ```
 
+## LuCI 与独立控制台的分工
+
+LuCI 已精简为**只读入口**：概览、设备、应用、节点、诊断、手机版；菜单里不再有
+「设置」与内嵌「详细面板」，只读 ACL（`luci-app-prism-router`）不再下发任何写方法。
+
+写配置与完整控制台走独立服务（默认 `http://<LAN>:8099/`）：
+
+- 概览/手机版/诊断页的「独立控制台 ↗」按钮直接新标签打开它；
+- 端口默认 8099；`panel.port` 改动时需同步前端常量 `CONSOLE_PORT`（见 `overview.js`）；
+- 设备页在 LuCI 里只读（编辑/配额按钮隐藏），管理动作由独立控制台承担。
+
+这样 LuCI 侧不再持有写权限，即使 LuCI 会话被借用也无法改配置；只有独立控制台的
+token 能触发写操作（写入能力在后续版本逐步开放）。
+
 ## 从旧版 `traffic-stats` 迁移
 
 项目已更名为 **棱镜路由 / PRISM Router**，包名也随之变更：

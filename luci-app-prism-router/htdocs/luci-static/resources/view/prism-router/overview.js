@@ -723,8 +723,12 @@ function appHref(host) {
 	return base + '#host=' + encodeURIComponent(h);
 }
 
-function panelHref() {
-	return L.url('admin/services/prism-router/panel');
+/* 独立控制台：单独端口的服务，不在 LuCI 内嵌；端口默认 8099（见 README）。 */
+var CONSOLE_PORT = 8099;
+function consoleUrl() {
+	var host = (typeof window !== 'undefined' && window.location) ? window.location.hostname : '';
+
+	return 'http://' + host + ':' + CONSOLE_PORT + '/';
 }
 
 // ---------------------------------------------------------------- 流量日历 / 需要关注（纯数据）
@@ -1764,11 +1768,11 @@ return view.extend({
 		   也不会被浏览器的弹窗拦截规则挡掉。 */
 		var panelBtn = E('a', {
 			'class': 'tso-btn',
-			href: L.url('admin/services/prism-router/panel'),
+			href: consoleUrl(),
 			target: '_blank',
 			rel: 'noopener noreferrer',
 			title: _('在新标签页打开详细面板（铺满整屏，隐藏侧栏）')
-		}, _('详细面板 ↗'));
+		}, _('独立控制台 ↗'));
 
 		this.syncAutoLook();
 
