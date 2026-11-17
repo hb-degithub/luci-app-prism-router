@@ -826,8 +826,8 @@ var CSS = [
 	'.tsm-card,.tsm-rows,.tsm-ncard,.tsm-install-card,.tsm-fpanel,.tsm-pill,.tsm-inet,.tsm-exit,.tsm-router-card,.tsm-ap,.tsm-tgroup{background:var(--tsm-card-bg);border-color:var(--tsm-line)}',
 	'.tsm-tabs,.tsm-dtabs{background:var(--tsm-card-bg);border-color:var(--tsm-line)}',
 	'.tsm-dots{background:var(--tsm-dots-bg)}',
-	'.tsm-meta,.tsm-rate-cap,.tsm-nodesub,.tsm-card-t,.tsm-card-s,.tsm-row-s,.tsm-note,.tsm-sub,.tsm-h3-n,.tsm-dev-sub,.tsm-marker,.tsm-apps-t,.tsm-dmeta,.tsm-drates,.tsm-dcount,.tsm-dnote,.tsm-nhero-t,.tsm-nnote,.tsm-ndetail,.tsm-tab,.tsm-tab-n,.tsm-flabel,.tsm-tl-h,.tsm-tl-empty,.tsm-ap-dev,.tsm-ap-meta,.tsm-trate,.tsm-tmore,.tsm-exit-bytes,.tsm-ndrow-k,.tsm-empty,.tsm-empty-s{color:var(--tsm-sub)}',
-	'.tsm-row-l,.tsm-row-num,.tsm-ndrow-v,.tsm-url,.tsm-chip,.tsm-tab.on,.tsm-pill,.tsm-health,.tsm-router-name,.tsm-exit-name,.tsm-ap-name,.tsm-tname{color:var(--tsm-text)}',
+	'.tsm-meta,.tsm-rate-cap,.tsm-nodesub,.tsm-card-t,.tsm-card-s,.tsm-row-s,.tsm-note,.tsm-sub,.tsm-h3-n,.tsm-dev-sub,.tsm-marker,.tsm-apps-t,.tsm-dmeta,.tsm-drates,.tsm-dcount,.tsm-dnote,.tsm-nhero-t,.tsm-nnote,.tsm-ndetail,.tsm-tab,.tsm-tab-n,.tsm-flabel,.tsm-tl-h,.tsm-tl-empty,.tsm-ap-dev,.tsm-ap-meta,.tsm-exit-bytes,.tsm-ndrow-k,.tsm-empty,.tsm-empty-s{color:var(--tsm-sub)}',
+	'.tsm-row-l,.tsm-row-num,.tsm-ndrow-v,.tsm-url,.tsm-chip,.tsm-tab.on,.tsm-pill,.tsm-health,.tsm-router-name,.tsm-exit-name,.tsm-ap-name{color:var(--tsm-text)}',
 
 	/* ---- 拓扑屏：纵向 5 层 + CSS 竖线/圆点连接 ---- */
 	'.tsm-topo-page{padding-bottom:8px}',
@@ -879,20 +879,46 @@ var CSS = [
 	'.tsm-xname{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--tsm-text)}',
 	'.tsm-xrate{flex:none;white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--tsm-sub)}',
 	'.tsm-xempty{margin:4px 0 0;font-size:11px;line-height:1.5;color:var(--tsm-sub)}',
-	/* L5 设备：三组，每组最多 5 行 */
+	/* L5 设备：三组；组内是两列「设备节点」网格，节点用 SVG 父子细线连到组头 */
 	'.tsm-tgroups{display:flex;flex-direction:column;gap:10px;min-width:0}',
-	'.tsm-tgroup{min-width:0;padding:2px 10px;border-radius:12px;border:1px solid var(--tsm-line)}',
+	'.tsm-tgroup{min-width:0;padding:2px 10px 8px;border-radius:12px;border:1px solid var(--tsm-line)}',
 	'.tsm-tgroup-h{font-size:11.5px;padding:6px 0 4px;border-bottom:1px solid var(--tsm-line);color:var(--tsm-sub)}',
-	'.tsm-trow{display:flex;align-items:center;gap:8px;min-height:40px;padding:6px 0;border-bottom:1px solid var(--tsm-line);cursor:pointer;min-width:0}',
-	'.tsm-trow:last-child{border-bottom:none}',
-	'.tsm-trow:active{background:var(--tsm-soft)}',
-	'.tsm-tava{flex:none;width:28px;height:28px;border-radius:50%;color:#fff;font-size:12px;font-weight:600;line-height:28px;text-align:center;overflow:hidden}',
-	'.tsm-tname{flex:1 1 auto;min-width:0;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-	'.tsm-trate{flex:none;font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--tsm-sub)}',
-	'.tsm-tmore{font-size:11px;line-height:1.5;padding:5px 0;color:var(--tsm-sub)}',
+	'.tsm-tgroup-body,.tsm-tnodes,.tsm-otop-grid{position:relative;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 8px;min-width:0}',
+	'.tsm-tgroup-body{padding-top:10px}',
+	'.tsm-otop-grid{padding-top:8px}',
+	/* 父子连线：absolute SVG 覆盖层，百分比坐标 + 1px 非缩放描边 */
+	'.tsm-tbus{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;overflow:visible}',
+	'.tsm-tline{fill:none;stroke:var(--tsm-line-strong);stroke-width:1;vector-effect:non-scaling-stroke;stroke-linecap:round}',
+	'.tsm-tline-wifi{stroke:var(--tsm-blue)}',
+	'.tsm-tline-wired{stroke:var(--tsm-green)}',
+	'.tsm-tline-unknown{stroke:var(--tsm-sub)}',
+	/* 设备节点：状态环 + 类型图标 + 名称（2 行省略）+ 速率 */
+	'.tsm-dnode{position:relative;display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0;padding:4px 2px;border-radius:10px;cursor:pointer;text-align:center}',
+	'.tsm-dnode:active{background:var(--tsm-soft)}',
+	'.tsm-dnode-ring{flex:none;width:46px;height:46px;border-radius:50%;border:1.5px solid var(--tsm-line-strong);display:flex;align-items:center;justify-content:center;background:var(--tsm-card-bg);color:var(--tsm-sub)}',
+	'.tsm-dnode.is-wifi .tsm-dnode-ring{border-color:var(--tsm-blue);color:var(--tsm-blue)}',
+	'.tsm-dnode.is-wired .tsm-dnode-ring{border-color:var(--tsm-green);color:var(--tsm-green)}',
+	'.tsm-dnode.is-unknown .tsm-dnode-ring{border-color:var(--tsm-line-strong);color:var(--tsm-sub)}',
+	'.tsm-dnode.is-off{opacity:.65}',
+	'.tsm-dnode.is-off .tsm-dnode-ring{border-color:var(--tsm-line-strong);color:var(--tsm-sub)}',
+	'.tsm-dnode-ico{display:flex;align-items:center;justify-content:center;width:22px;height:22px}',
+	'.tsm-dnode-ico svg{display:block;width:22px;height:22px}',
+	'.tsm-dnode-name{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;font-size:11.5px;line-height:1.35;overflow-wrap:break-word;color:var(--tsm-text);max-width:100%}',
+	'.tsm-dnode-rate{font-size:10.5px;line-height:1.3;color:var(--tsm-sub);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}',
+	'.tsm-dmore{display:flex;align-items:center;justify-content:center;min-height:46px;padding:2px 4px;border-radius:10px;border:1px dashed var(--tsm-line-strong);font-size:11px;line-height:1.4;color:var(--tsm-sub);text-align:center}',
+	/* 只有一个节点时居中铺满两列，和单根分叉线对齐 */
+	'.tsm-tgroup-body>.tsm-dnode:only-of-type,.tsm-otop-grid>.tsm-dnode:only-of-type{grid-column:1 / -1}',
+	/* 概览屏「设备拓扑」：主路由根节点 → 树干 → 两列节点 */
+	'.tsm-otopo{margin:10px 0 0;padding:12px 10px 10px;border-radius:14px;border:1px solid var(--tsm-line);background:var(--tsm-card-bg);min-width:0}',
+	'.tsm-otop-root{display:flex;flex-direction:column;align-items:center;gap:5px;min-width:0}',
+	'.tsm-otop-ico{flex:none;width:46px;height:46px;border-radius:50%;background:var(--tsm-green);display:flex;align-items:center;justify-content:center}',
+	'.tsm-otop-ico svg{display:block;width:28px;height:28px}',
+	'.tsm-otop-name{max-width:100%;font-size:11.5px;line-height:1.4;color:var(--tsm-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+	'.tsm-otop-stem{width:1px;height:10px;margin:0 auto;background:var(--tsm-line-strong)}',
+	'.tsm-otop-empty{margin:6px 0 0;text-align:center;font-size:12px;line-height:1.5;color:var(--tsm-sub)}',
 	/* 320px 窄屏：拓扑卡片全部省略号 + 收紧层间距，绝不横向溢出 */
-	'@media (max-width:359px){.tsm-exits{grid-template-columns:1fr 1fr}.tsm-exit{padding:8px}.tsm-exit-name{font-size:12px}.tsm-aps{grid-template-columns:1fr}.tsm-tl-h{margin-bottom:4px}.tsm-conn{height:16px}.tsm-trow{gap:6px}}',
-	'@media (max-width:320px){.tsm-topo .tsm-exits{grid-template-columns:1fr}.tsm-topo .tsm-exit{padding:7px 8px}.tsm-topo .tsm-exit-name,.tsm-topo .tsm-ap-name,.tsm-topo .tsm-router-name,.tsm-topo .tsm-inet-txt,.tsm-topo .tsm-tname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-topo .tsm-conn{height:14px}.tsm-topo .tsm-tl-h{margin-bottom:4px}.tsm-topo .tsm-ap{padding:8px}.tsm-topo .tsm-router-card{gap:8px;padding:10px}.tsm-topo .tsm-router-ico{width:38px;height:38px}.tsm-topo .tsm-router-ico svg{width:24px;height:24px}.tsm-topo .tsm-xname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-dsearch{padding:0 8px;gap:4px;margin-left:0;margin-right:0}}',
+	'@media (max-width:359px){.tsm-exits{grid-template-columns:1fr 1fr}.tsm-exit{padding:8px}.tsm-exit-name{font-size:12px}.tsm-aps{grid-template-columns:1fr}.tsm-tl-h{margin-bottom:4px}.tsm-conn{height:16px}.tsm-dnode-name{font-size:11px}}',
+	'@media (max-width:320px){.tsm-topo .tsm-exits{grid-template-columns:1fr}.tsm-topo .tsm-exit{padding:7px 8px}.tsm-topo .tsm-exit-name,.tsm-topo .tsm-ap-name,.tsm-topo .tsm-router-name,.tsm-topo .tsm-inet-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-topo .tsm-conn{height:14px}.tsm-topo .tsm-tl-h{margin-bottom:4px}.tsm-topo .tsm-ap{padding:8px}.tsm-topo .tsm-router-card{gap:8px;padding:10px}.tsm-topo .tsm-router-ico{width:38px;height:38px}.tsm-topo .tsm-router-ico svg{width:24px;height:24px}.tsm-topo .tsm-xname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-tgroup-body,.tsm-otop-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.tsm-dnode-ring{width:40px;height:40px}.tsm-dnode-ico,.tsm-dnode-ico svg{width:20px;height:20px}.tsm-otopo{padding:10px 8px 8px}.tsm-dsearch{padding:0 8px;gap:4px;margin-left:0;margin-right:0}}',
 	/* 深色主题：只改背景/分隔线/次级文字，橙/绿/蓝强调色保持不变；不用纯黑 */
 	'@media (prefers-color-scheme: dark){#ts-mobile{--tsm-card-bg:#1c2026;--tsm-line:rgba(255,255,255,.1);--tsm-line-strong:rgba(255,255,255,.18);--tsm-text:#e7eaee;--tsm-sub:#a4abb5;--tsm-soft:rgba(255,255,255,.06);--tsm-dots-bg:linear-gradient(to top,rgba(20,23,27,.99) 55%,rgba(20,23,27,.86));background:#14171b;color:#e7eaee}#ts-mobile .tsm-tabs,#ts-mobile .tsm-dtabs{background:#1c2026}#ts-mobile .tsm-dot-i{background:rgba(255,255,255,.22)}#ts-mobile .tsm-dot-i.on{background:#e7eaee}#ts-mobile .tsm-nhero{background:linear-gradient(180deg,rgba(255,111,0,.14) 0%,rgba(255,111,0,.05) 60%,rgba(20,23,27,0) 100%)}#ts-mobile .tsm-tab.on{color:#e7eaee}#ts-mobile .tsm-health{background:rgba(255,255,255,.05)}}'
 ].join('\n');
@@ -1473,6 +1499,170 @@ function topoHostname(state) {
 	var name = (system.hostname != null) ? ('' + system.hostname).replace(/^\s+|\s+$/g, '') : '';
 
 	return name.length ? name : _('主路由');
+}
+
+// ---------------------------------------------------------------- 设备类型图标（拓扑节点）
+
+/* 类型关键词；顺序有意义（「平板电脑」先判平板，Android TV 先判电视，IoT 先于手机）。 */
+var DEVICE_KIND_RULES = [
+	{ kind: 'tablet', words: [ 'ipad', 'tablet', 'pad', '平板' ] },
+	{ kind: 'tv', words: [ 'apple tv', 'smarttv', 'smart tv', 'tvbox', 'roku', '电视', 'tv' ] },
+	{ kind: 'laptop', words: [ 'macbook', 'notebook', 'laptop', 'desktop', 'windows', 'linux', '电脑', 'pc', 'win' ] },
+	{ kind: 'iot', words: [ 'camera', 'speaker', 'homepod', 'echo', 'bulb', 'plug', 'sensor', '摄像', '音箱', '插座', '灯泡', 'iot' ] },
+	{ kind: 'phone', words: [ 'iphone', 'android', 'oneplus', 'redmi', 'pixel', 'huawei', 'xiaomi', 'vivo', 'oppo', 'phone', '手机', 'mi' ] }
+];
+
+function deviceKindText(dev) {
+	var hostname = (dev != null && dev.hostname != null) ? ('' + dev.hostname) : '';
+	var alias = (dev != null && dev.alias != null) ? ('' + dev.alias) : '';
+
+	return (hostname + ' ' + alias).toLowerCase();
+}
+
+/*
+ * 关键词命中：≥4 字符或含中文的关键词直接子串匹配；
+ * 短 ASCII 关键词（mi/pc/win/tv/pad/iot）按词边界匹配，避免 mini 里命中 mi。
+ */
+function deviceKindHit(text, word) {
+	if (!word.length) return false;
+	if (word.length >= 4 || !/^[a-z0-9]+$/.test(word)) return text.indexOf(word) >= 0;
+
+	return new RegExp('(^|[^a-z0-9])' + word + '([^a-z0-9]|$)').test(text);
+}
+
+/*
+ * 设备类型：只按 hostname/alias 关键词猜（大小写不敏感），猜不出返回 unknown。
+ * 纯函数，供拓扑节点选图标；不做任何网络/宿主探测。
+ */
+function deviceKindOf(dev) {
+	var text = deviceKindText(dev);
+	var i, j;
+
+	for (i = 0; i < DEVICE_KIND_RULES.length; i++) {
+		for (j = 0; j < DEVICE_KIND_RULES[i].words.length; j++) {
+			if (deviceKindHit(text, DEVICE_KIND_RULES[i].words[j]))
+				return DEVICE_KIND_RULES[i].kind;
+		}
+	}
+
+	return 'unknown';
+}
+
+/* 类型图标：20-24px 线条风格（与 globe/router 一致），不用 emoji、不引外部图片。 */
+function deviceKindSvg(kind, color) {
+	var svg = svgEl('svg', {
+		viewBox: '0 0 24 24', width: '22', height: '22',
+		'aria-hidden': 'true', focusable: 'false'
+	});
+	var stroke = (color != null && ('' + color).length) ? ('' + color) : 'currentColor';
+	var line = {
+		fill: 'none', stroke: stroke, 'stroke-width': '1.6',
+		'stroke-linecap': 'round', 'stroke-linejoin': 'round'
+	};
+
+	function add(tag, attrs) {
+		var merged = {}, key;
+
+		for (key in line) {
+			if (line.hasOwnProperty(key)) merged[key] = line[key];
+		}
+
+		if (attrs != null) {
+			for (key in attrs) {
+				if (attrs.hasOwnProperty(key)) merged[key] = attrs[key];
+			}
+		}
+
+		svg.appendChild(svgEl(tag, merged));
+	}
+
+	if (kind == 'phone') {
+		add('rect', { x: '7', y: '2.6', width: '10', height: '18.8', rx: '2.4' });
+		add('path', { d: 'M10.6 5.2h2.8' });
+		add('circle', { cx: '12', cy: '18.4', r: '0.9', fill: stroke, stroke: 'none' });
+	}
+	else if (kind == 'tablet') {
+		add('rect', { x: '4.4', y: '3', width: '15.2', height: '18', rx: '2.2' });
+		add('path', { d: 'M10.8 18.2h2.4' });
+	}
+	else if (kind == 'laptop') {
+		add('rect', { x: '5', y: '4.4', width: '14', height: '9.8', rx: '1.6' });
+		add('path', { d: 'M3 17.6h18l-1.6 2.2H4.6z' });
+	}
+	else if (kind == 'tv') {
+		add('rect', { x: '2.8', y: '4.8', width: '18.4', height: '12.2', rx: '2' });
+		add('path', { d: 'M8.4 20.4h7.2' });
+		add('path', { d: 'M12 17v3.4' });
+	}
+	else if (kind == 'iot') {
+		add('circle', { cx: '12', cy: '10.2', r: '5' });
+		add('path', { d: 'M9.6 17.4h4.8' });
+		add('path', { d: 'M10.6 19.9h2.8' });
+	}
+	else {
+		add('circle', { cx: '12', cy: '12', r: '8.6' });
+		add('path', { d: 'M9.5 9.5c.1-1.4 1.2-2.4 2.6-2.4 1.5 0 2.5 1 2.5 2.3 0 2-2.5 2.2-2.5 4.1' });
+		add('circle', { cx: '12', cy: '17.2', r: '0.9', fill: stroke, stroke: 'none' });
+	}
+
+	return svg;
+}
+
+var TOPO_NODE_COLS = 2;      /* 设备节点网格固定两列（320px 也不降级） */
+var OVERVIEW_TOPO_MAX = 8;   /* 概览屏设备拓扑最多 8 个节点 */
+
+/*
+ * 父子细线：在 position:relative 容器里铺一张 absolute SVG，
+ * 用 0..100 百分比坐标从顶部中点画出「树干 → 每行分叉 → 每个节点」。
+ * preserveAspectRatio=none + non-scaling-stroke，线条始终 1px 不随屏幕拉伸。
+ */
+function topoBusSvg(count, cols, links, cls) {
+	var n = Math.max(0, Math.floor(num(count)));
+	/* 只有 1 个节点时不占两列（节点本身会横向铺满，线从正中下来）。 */
+	var c = (n <= 1) ? 1 : ((typeof cols === 'number' && cols > 0) ? Math.floor(cols) : TOPO_NODE_COLS);
+	var rows = Math.max(1, Math.ceil(n / c));
+	var drop = Math.min(6, 100 / rows / 2);
+	var list = Array.isArray(links) ? links : [];
+	var fallback = (typeof links === 'string') ? links : '';
+	var svg = svgEl('svg', {
+		'class': 'tsm-tbus' + ((cls != null && ('' + cls).length) ? ' ' + cls : ''),
+		viewBox: '0 0 100 100', preserveAspectRatio: 'none',
+		'aria-hidden': 'true', focusable: 'false'
+	});
+	var i, link, x, rowTop;
+
+	function line(d, kind) {
+		svg.appendChild(svgEl('path', {
+			d: d,
+			'class': 'tsm-tline' + (kind ? ' tsm-tline-' + kind : ''),
+			'vector-effect': 'non-scaling-stroke'
+		}));
+	}
+
+	/* 树干：从父节点/组头正下方一路到最后一行的分叉高度。 */
+	line('M50 0V' + ((rows - 1) * 100 / rows + drop).toFixed(2), '');
+
+	for (i = 0; i < n; i++) {
+		link = list[i] || fallback;
+		x = (((i % c) + 0.5) * 100 / c).toFixed(2);
+		rowTop = (Math.floor(i / c) * 100 / rows).toFixed(2);
+		line('M50 ' + rowTop + 'H' + x + 'V' + (Number(rowTop) + drop).toFixed(2), link);
+	}
+
+	return svg;
+}
+
+/* 节点速率小字：一格只放一行，下行优先；上行放在 title 里。 */
+function deviceNodeRateText(dev) {
+	return '↓ ' + rateText(dev != null ? dev.rx_rate : null);
+}
+
+function deviceNodeTitle(dev) {
+	var name = deviceName(dev);
+	var rx = rateText(dev != null ? dev.rx_rate : null);
+	var tx = rateText(dev != null ? dev.tx_rate : null);
+
+	return name + ' · ' + _('下行') + ' ' + rx + ' · ' + _('上行') + ' ' + tx;
 }
 
 // ---------------------------------------------------------------- 视图
@@ -2417,7 +2607,10 @@ return view.extend({
 		return this.topoLayer(4, _('AP / 接入点'), rows);
 	},
 
-	/* L5：在线设备按 link 分三组，每组最多 5 台，超出显示「还有 N 台」。 */
+	/*
+	 * L5：在线设备按 link 分三组（组标题保留数量），每组最多 5 台。
+	 * 组内不再是文字行，而是两列「设备节点」网格 + 从组头聚合点分叉的 SVG 细线。
+	 */
 	renderTopoDevices: function(data) {
 		var self = this;
 		var blocks = [];
@@ -2438,41 +2631,53 @@ return view.extend({
 
 			var shown = list.slice(0, TOPO_MAX_DEVICES);
 			var rest = list.length - shown.length;
-			var rows = shown.map(function(dev) { return self.renderTopoDeviceRow(dev); });
+			var nodes = shown.map(function(dev) { return self.renderDeviceNode(dev); });
 
 			if (rest > 0)
-				rows.push(E('div', { 'class': 'tsm-tmore' }, _('还有') + ' ' + rest + ' ' + _('台')));
+				nodes.push(E('div', { 'class': 'tsm-dmore' }, _('还有') + ' ' + rest + ' ' + _('台')));
 
-			blocks.push(E('div', { 'class': 'tsm-tgroup tsm-tgroup-' + id },
-				[ E('div', { 'class': 'tsm-tgroup-h' }, _(LINK_STYLE[id].label) + ' ' + list.length) ].concat(rows)));
+			blocks.push(E('div', { 'class': 'tsm-tgroup tsm-tgroup-' + id }, [
+				E('div', { 'class': 'tsm-tgroup-h' }, _(LINK_STYLE[id].label) + ' ' + list.length),
+				E('div', { 'class': 'tsm-tgroup-body' },
+					[ topoBusSvg(shown.length, TOPO_NODE_COLS, id) ].concat(nodes))
+			]));
 		});
 
 		return this.topoLayer(5, _('设备'), E('div', { 'class': 'tsm-tgroups' }, blocks));
 	},
 
-	/* 设备行：圆形首字 + 名称 + 速率；整行可点/可回车 → 设备屏并展开。 */
-	renderTopoDeviceRow: function(dev) {
+	/*
+	 * 设备节点：状态环 + 类型图标 + 名称（2 行省略）+ 速率小字。
+	 * 单个节点即 role=button；点击/Enter/Space → 设备屏并展开（复用 openDeviceFromTopo）。
+	 */
+	renderDeviceNode: function(dev, now) {
 		var self = this;
-		var link = LINK_STYLE[linkOf(dev)] || LINK_STYLE.unknown;
+		var link = linkOf(dev);
+		var kind = deviceKindOf(dev);
 		var name = deviceName(dev);
-		var row = E('div', {
-			'class': 'tsm-trow',
+		var online = isDeviceOnline(dev, ((typeof now === 'number') && isFinite(now)) ? now : deviceNow());
+		var tone = LINK_STYLE[link] || LINK_STYLE.unknown;
+		var node = E('div', {
+			'class': 'tsm-dnode is-' + link + (online ? '' : ' is-off'),
 			role: 'button',
 			tabindex: '0',
-			'aria-label': name + '，' + _(link.label),
-			title: name
+			'aria-label': name + '，' + _(tone.label) + '，' +
+				(online ? _('在线') : _('离线')) + '，' + _('点击查看设备详情'),
+			title: deviceNodeTitle(dev)
 		}, [
-			E('span', { 'class': 'tsm-tava', style: 'background:' + link.color }, deviceInitial(dev)),
-			E('span', { 'class': 'tsm-tname' }, name),
-			E('span', { 'class': 'tsm-trate' }, '↓ ' + rateText(dev != null ? dev.rx_rate : null))
+			E('span', { 'class': 'tsm-dnode-ring' }, [
+				E('span', { 'class': 'tsm-dnode-ico' }, deviceKindSvg(kind))
+			]),
+			E('span', { 'class': 'tsm-dnode-name' }, name),
+			E('span', { 'class': 'tsm-dnode-rate' }, deviceNodeRateText(dev))
 		]);
 
 		function open() {
 			self.openDeviceFromTopo(dev);
 		}
 
-		row.addEventListener('click', open);
-		row.addEventListener('keydown', function(ev) {
+		node.addEventListener('click', open);
+		node.addEventListener('keydown', function(ev) {
 			var k = (ev != null) ? ev.key : null;
 
 			if (k == 'Enter' || k == ' ' || k == 'Spacebar') {
@@ -2482,7 +2687,7 @@ return view.extend({
 			}
 		});
 
-		return row;
+		return node;
 	},
 
 	/*
@@ -2542,6 +2747,11 @@ return view.extend({
 		this.exitName = E('div', { 'class': 'tsm-nodename' }, _('直连'));
 		this.exitSub = E('div', { 'class': 'tsm-nodesub' }, _('出口节点'));
 		this.devPill = E('div', { 'class': 'tsm-pill' }, '—');
+		this.ovTopoHost = E('div', {
+			'class': 'tsm-otopo',
+			role: 'group',
+			'aria-label': _('设备拓扑：主路由与在线终端')
+		}, '');
 		this.plusBtn = E('button', {
 			type: 'button',
 			'class': 'tsm-plus',
@@ -2570,6 +2780,8 @@ return view.extend({
 				this.exitSub
 			]),
 			E('div', { 'class': 'tsm-foot' }, [ this.plusBtn, this.devPill ]),
+			/* 「N 台终端」胶囊之后、「累计口径」说明之前：设备拓扑区块 */
+			this.ovTopoHost,
 			this.renderMore()
 		]);
 	},
@@ -3035,11 +3247,12 @@ return view.extend({
 		node.style.display = truncated ? 'block' : 'none';
 	},
 
-	/* 概览屏：上传/下载速率、出口节点、在线终端数 */
+	/* 概览屏：上传/下载速率、出口节点、在线终端数、设备拓扑 */
 	syncOverview: function(totals, nodes, health, devices) {
 		this.syncRateBig(totals);
 		this.syncExitNode(nodes, health);
 		this.syncDevicePill(devices);
+		this.syncOverviewTopo(devices);
 	},
 
 	syncRateBig: function(totals) {
@@ -3092,6 +3305,61 @@ return view.extend({
 
 		this.devPill.textContent = online + ' ' + _('台终端');
 		this.devPill.title = _('最近 10 分钟内有记录的终端');
+	},
+
+	/*
+	 * 概览屏设备拓扑：主路由根节点 + 最多 8 个在线终端节点（2 列网格 + SVG 细线）。
+	 * 与设备屏同一在线口径；sig 未变不重建 DOM（15s 轮询不闪动、不丢点击焦点）。
+	 */
+	syncOverviewTopo: function(devices) {
+		var host = this.ovTopoHost;
+		var now, online, shown, rest, name, sig;
+
+		if (host == null) return;
+
+		now = deviceNow();
+		online = topoOnlineDevices(devices, now);
+		shown = online.slice(0, OVERVIEW_TOPO_MAX);
+		rest = online.length - shown.length;
+		name = topoHostname(this.state);
+		sig = name + '|' + rest + '|' + sigOf(shown, function(dev) {
+			return deviceKey(dev) + ':' + deviceName(dev) + ':' + linkOf(dev) + ':' +
+				num(dev.rx_rate) + ':' + num(dev.tx_rate);
+		});
+
+		if (sig === this.ovTopoSig) return;
+
+		this.ovTopoSig = sig;
+		dom.content(host, this.renderOverviewTopo(shown, rest, name, now));
+	},
+
+	/* 主路由根节点 + 树干 + 两列节点；0 台在线时只给占位，不造假节点。 */
+	renderOverviewTopo: function(shown, rest, hostname, now) {
+		var self = this;
+		var root = E('div', { 'class': 'tsm-otop-root' }, [
+			E('span', { 'class': 'tsm-otop-ico' }, routerSvg()),
+			E('span', { 'class': 'tsm-otop-name', title: hostname }, hostname)
+		]);
+		var nodes;
+
+		if (!shown.length) {
+			return E('div', {}, [
+				root,
+				E('p', { 'class': 'tsm-otop-empty' }, _('暂无在线设备'))
+			]);
+		}
+
+		nodes = shown.map(function(dev) { return self.renderDeviceNode(dev, now); });
+
+		if (rest > 0)
+			nodes.push(E('div', { 'class': 'tsm-dmore' }, _('还有') + ' ' + rest + ' ' + _('台')));
+
+		return E('div', {}, [
+			root,
+			E('div', { 'class': 'tsm-otop-stem' }, ''),
+			E('div', { 'class': 'tsm-otop-grid' },
+				[ topoBusSvg(shown.length, TOPO_NODE_COLS, shown.map(linkOf)) ].concat(nodes))
+		]);
 	},
 
 	setUpdated: function(ts) {

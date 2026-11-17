@@ -617,6 +617,129 @@ function onlineCount(state, nowSec) {
 	return n;
 }
 
+/*
+ * 访客口径与 mobile.js 保持一致（纯前端判定，不新增接口）：
+ * 设备 group 或 alias 文本里含「访客」或 guest（大小写不敏感）。
+ */
+function isGuestDevice(dev) {
+	if (dev == null) return false;
+
+	var text = ('' + (dev.group != null ? dev.group : '') + ' ' +
+		(dev.alias != null ? dev.alias : '')).toLowerCase();
+
+	return text.indexOf('访客') >= 0 || text.indexOf('guest') >= 0;
+}
+
+/*
+ * 状态条的一行计数：在线口径与 onlineCount 完全一致（last_seen 在 10 分钟内）。
+ * 访客只统计「在线访客」——离线设备不占访客位，避免顶部数字与设备页分段对不上。
+ */
+function deviceCounts(state, nowSec) {
+	var devices = (state != null && Array.isArray(state.devices)) ? state.devices : [];
+	var out = { total: 0, online: 0, offline: 0, guest: 0 };
+	var i, dev, ls;
+
+	for (i = 0; i < devices.length; i++) {
+		dev = devices[i];
+
+		if (dev == null) continue;
+
+		out.total++;
+		ls = num(dev.last_seen);
+
+		if (ls > 0 && ls <= nowSec + 60 && (nowSec - ls) <= ONLINE_SEC) {
+			out.online++;
+
+			if (isGuestDevice(dev)) out.guest++;
+		}
+		else {
+			out.offline++;
+		}
+	}
+
+	return out;
+}
+
+/*
+ * health.reasons 的短标签：只认后端已知前缀（traffic-statsd.uc 里 push 的文案），
+ * 未知原因返回 ''，由调用方把原文原样显示，绝不丢掉后端的原始信息。
+ */
+function reasonTag(reason) {
+	var s = ('' + (reason == null ? '' : reason)).trim().toLowerCase();
+	var m, head;
+
+	if (!s.length) return '';
+
+	/* 后端文案都有 `前缀: 说明`；先按前缀判，避免「lan: …conntrack…」被误判成 conntrack 故障 */
+	m = /^([a-z_]+)\s*:/.exec(s);
+	head = m ? m[1] : '';
+
+	if (head == 'clash' || (!head && s.indexOf('clash') >= 0)) return _('clash 不可达');
+	if (head == 'conntrack' || (!head && s.indexOf('conntrack') >= 0)) {
+		if (s.indexOf('bytes') >= 0 || s.indexOf('acct') >= 0) return _('conntrack 缺计数');
+		return _('conntrack 不可读');
+	}
+	if (head == 'lan') return _('LAN 未识别');
+	if (head == 'link' || head == 'fdb' || head == 'brctl') return _('FDB 读取失败');
+	if (head == 'fake_ip') return _('fake_ip 无效');
+	if (!head) {
+		if (s.indexOf('lan') >= 0) return _('LAN 未识别');
+		if (s.indexOf('link') >= 0 || s.indexOf('fdb') >= 0 ||
+			s.indexOf('brctl') >= 0 || s.indexOf('ap_macs') >= 0) return _('FDB 读取失败');
+	}
+
+	return '';
+}
+
+/* 下钻地址：设备页将来可用 #mac=... 定位，应用页用 #host=...；这里只生成链接，不改其它页面 */
+function deviceHref(mac) {
+	var base = L.url('admin/services/traffic-stats/devices');
+	var m = '' + ((mac == null) ? '' : mac);
+
+	return m.length ? (base + '#mac=' + encodeURIComponent(m)) : base;
+}
+
+function appHref(host) {
+	var base = L.url('admin/services/traffic-stats/apps');
+	var h = '' + ((host == null) ? '' : host);
+
+	if (!h.length || h == '__other__') return base;
+
+	return base + '#host=' + encodeURIComponent(h);
+}
+
+/* 整行下钻：鼠标点行内空白处也能跳；行内 <a>/<button> 自己处理，不重复触发 */
+function navTo(href) {
+	return function(ev) {
+		if (ev == null) return;
+
+		var node = ev.target, guard = 0;
+
+		while (node != null && node !== ev.currentTarget && guard++ < 8) {
+			var tag = ('' + (node.tagName || '')).toUpperCase();
+
+			if (tag == 'A' || tag == 'BUTTON' || tag == 'INPUT' || tag == 'SELECT' || tag == 'TEXTAREA')
+				return;
+
+			node = node.parentNode;
+		}
+
+		if (ev.type == 'keydown' && ev.key != 'Enter' && ev.key != ' ' && ev.key != 'Spacebar') return;
+
+		if (typeof ev.preventDefault == 'function') ev.preventDefault();
+
+		if (href) window.location.href = href;
+	};
+}
+
+function errText(err) {
+	if (err == null) return '';
+
+	if (err.message) return '' + err.message;
+
+	return '' + err;
+}
+
 // ---------------------------------------------------------------- 趋势数据
 
 /* 趋势图只要最近一天：多取的昨天日汇总只给「昨日全天」用，不进图表 */
@@ -731,6 +854,11 @@ var CSS = [
 	'#ts-overview .tso-dot{width:7px;height:7px;border-radius:50%;flex:none;display:inline-block;background:#9e9e9e}',
 	'#ts-overview .tso-meta{font-size:11.5px;opacity:.75;white-space:nowrap}',
 	'#ts-overview .tso-meta.warn{opacity:1;color:#e65100}',
+	'#ts-overview .tso-meta.rate{font-variant-numeric:tabular-nums}',
+	'#ts-overview .tso-auto{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;line-height:1.7;',
+	'padding:0 8px;border-radius:9px;border:1px solid rgba(127,127,127,.22);white-space:nowrap;cursor:pointer}',
+	'#ts-overview .tso-auto input{margin:0;width:12px;height:12px;flex:none;cursor:pointer}',
+	'#ts-overview .tso-auto.paused{border-color:rgba(230,81,0,.5);background:rgba(255,152,0,.12);color:#e65100}',
 	'#ts-overview .tso-btn{font:inherit;font-size:11.5px;line-height:1.7;padding:0 9px;border-radius:9px;cursor:pointer;',
 	'color:inherit;background:rgba(127,127,127,.1);border:1px solid rgba(127,127,127,.26);white-space:nowrap}',
 	'#ts-overview .tso-tech{display:none;margin:0 0 10px 0;padding:8px 11px;border-radius:8px;',
@@ -742,6 +870,18 @@ var CSS = [
 	'#ts-overview .tso-alert{margin:0 0 10px 0;padding:9px 12px;border-radius:8px;',
 	'background:rgba(255,152,0,.12);border-left:3px solid #e65100;font-size:12px;line-height:1.7}',
 	'#ts-overview .tso-alert ul{margin:4px 0 0 0;padding-left:18px}',
+	'#ts-overview .tso-errbar{border-left-color:#c62828;background:rgba(198,40,40,.1)}',
+	'#ts-overview .tso-errbar .tso-btn{margin-left:8px}',
+
+	/* 记账健康卡：reasons 逐条列出，已知原因给短标签，未知原因原样展示 */
+	'#ts-overview .tso-health{margin:0 0 12px 0;padding:8px 12px 9px 12px}',
+	'#ts-overview .tso-health-h{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:12px;font-weight:600}',
+	'#ts-overview .tso-ok{font-size:12px;opacity:.72;margin-top:3px}',
+	'#ts-overview .tso-reasons{list-style:none;margin:5px 0 0 0;padding:0;display:flex;flex-direction:column;gap:4px}',
+	'#ts-overview .tso-reasons li{display:flex;align-items:baseline;gap:6px;font-size:11.5px;line-height:1.6;min-width:0}',
+	'#ts-overview .tso-rtag{flex:none;font-size:10px;line-height:1.6;padding:0 5px;border-radius:5px;',
+	'background:rgba(198,40,40,.14);color:#c62828;white-space:nowrap}',
+	'#ts-overview .tso-rtext{min-width:0;opacity:.78;word-break:break-word}',
 
 	/* ② KPI 磁贴 */
 	'#ts-overview .tso-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 12px 0}',
@@ -798,6 +938,15 @@ var CSS = [
 	'#ts-overview .tso-lrow{display:grid;grid-template-columns:minmax(0,1fr) 86px 76px;gap:9px;',
 	'align-items:center;padding:5px 0;border-bottom:1px solid rgba(127,127,127,.12)}',
 	'#ts-overview .tso-lrow:last-child{border-bottom:0}',
+	'#ts-overview a.tso-lrow{text-decoration:none;color:inherit}',
+	'#ts-overview .tso-lname-a{color:inherit;text-decoration:none;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+	'#ts-overview .tso-lname-a:focus-visible{outline:2px solid rgba(43,125,233,.65);outline-offset:1px;border-radius:3px}',
+	'#ts-overview .tso-lrow-nav{cursor:pointer;transition:background .12s}',
+	'#ts-overview .tso-lrow-nav:hover{background:rgba(127,127,127,.08)}',
+	'#ts-overview .tso-lrow-nav:focus-visible{outline:2px solid rgba(43,125,233,.65);outline-offset:-2px;border-radius:6px}',
+	'#ts-overview .tso-sec-empty{display:flex;flex-direction:column;gap:2px;padding:10px 0 8px 0;',
+	'font-size:12px;line-height:1.6;opacity:.72}',
+	'#ts-overview .tso-sec-empty strong{font-size:12.5px;opacity:1}',
 	'#ts-overview .tso-lname{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
 	'#ts-overview .tso-lsub{display:flex;align-items:center;gap:5px;flex-wrap:wrap;font-size:10.5px;opacity:.7;',
 	'margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
@@ -822,6 +971,11 @@ var CSS = [
 	/* 「昨日全天」小字（总流量卡最后一行） */
 	'#ts-overview .tso-cmp{font-size:11px;line-height:1.55;margin-top:1px;white-space:nowrap;',
 	'overflow:hidden;text-overflow:ellipsis}',
+
+	/* 页脚「数据口径说明」（折叠，避免把 totals 误读成当日用量） */
+	'#ts-overview .tso-help{margin:2px 0 0 0;font-size:11px;line-height:1.7;opacity:.72}',
+	'#ts-overview .tso-help summary{cursor:pointer;font-size:11.5px;opacity:.9}',
+	'#ts-overview .tso-help ul{margin:4px 0 0 0;padding-left:18px}',
 
 	/* 窄屏：KPI 2×2、两列变一列、状态条允许换行 */
 	'@media (max-width:1000px){',
@@ -966,39 +1120,67 @@ function tsRenderLine(host, data, opts) {
 
 return view.extend({
 	load: function() {
+		if (this.autoRefresh !== false) this.autoRefresh = true;
+
+		return this.loadData();
+	},
+
+	/*
+	 * 统一数据拉取（首屏与手动刷新共用）：两个 rpc 并行，各自独立失败。
+	 *   - get_state 失败：保留上一次成功的数据，只置 stateError（错误条 + 重试）；
+	 *   - get_history 失败：保留上一次趋势与「昨日全天」，只降级这两块，其它卡照常。
+	 */
+	loadData: function() {
 		var self = this;
 
 		this.stateError = '';
 		this.historyError = '';
 
-		/* 两个 rpc 并行发；任何一个失败都不影响另一个（history 失败只让趋势图/昨日全天降级） */
 		return Promise.all([
 			callState().catch(function(err) {
-				self.stateError = (err != null && err.message) ? ('' + err.message) : '' + err;
+				self.stateError = errText(err);
 				return null;
 			}),
 			callHistory(2).catch(function(err) {
-				self.historyError = (err != null && err.message) ? ('' + err.message) : '' + err;
+				self.historyError = errText(err);
 				return null;
 			})
 		]).then(function(res) {
 			var nowSec = Math.floor(Date.now() / 1000);
+			var state = (res[0] != null && typeof res[0] == 'object' && res[0].totals != null) ? res[0] : null;
+			var history = (res[1] != null && typeof res[1] == 'object') ? res[1] : null;
 
-			self.state = (res[0] != null && typeof res[0] == 'object' && res[0].totals != null) ? res[0] : null;
-			self.history = (res[1] != null && typeof res[1] == 'object') ? res[1] : null;
-			/* 趋势图仍然只画最近的一天（days[0]）；多取的昨天只给「昨日全天」用 */
-			self.trend = trendOf(newestDay(self.history), nowSec);
-			self.compare = yesterdayCompare(self.history, nowSec);
+			if (state != null) {
+				self.state = state;
+			}
+			else if (!self.stateError) {
+				self.stateError = _('get_state 返回的数据缺少 totals 字段');
+			}
 
-			/* history 整个失败时把 rpc 错误写进 title，比“没有历史数据”更好排查 */
-			if (self.history == null && self.historyError)
-				self.compare.title = _('读取 get_history 失败：') + shorten(self.historyError, 120) + _('，无法显示昨日全天。');
+			if (history != null) {
+				self.history = history;
+				/* 趋势图仍然只画最近的一天（days[0]）；多取的昨天只给「昨日全天」用 */
+				self.trend = trendOf(newestDay(history), nowSec);
+				self.compare = yesterdayCompare(history, nowSec);
+			}
+			else if (self.trend == null || self.compare == null) {
+				self.trend = trendOf(null, nowSec);
+				self.compare = yesterdayCompare(null, nowSec);
+			}
+
+			/* history 失败时把 rpc 错误写进 title，比“没有历史数据”更好排查 */
+			if (self.historyError && self.compare != null) {
+				self.compare.title = _('读取 get_history 失败：') + shorten(self.historyError, 120) +
+					_('，无法显示昨日全天。');
+			}
 		});
 	},
 
 	render: function() {
 		var state = this.state;
 		var self = this;
+
+		if (this.autoRefresh !== false) this.autoRefresh = true;
 
 		this.cells = [];
 		this.bars = [];
@@ -1007,6 +1189,7 @@ return view.extend({
 		this.canvas = null;
 		this.tick = 0;
 		this.renderSeq = 0;
+		this.bootFailed = (state == null);
 		this.trend = (this.trend != null) ? this.trend : trendOf(null, 0);
 		this.compare = (this.compare != null) ? this.compare
 			: yesterdayCompare(null, Math.floor(Date.now() / 1000));
@@ -1031,9 +1214,11 @@ return view.extend({
 				E('h2', { 'class': 'tso-title' }, _('流量统计 · 总览')),
 				this.renderPills(state)
 			]),
+			this.renderErrorBar(),
 			this.renderTech(state),
 			empty ? this.renderEmptyNotice(state) : '',
 			this.renderKpis(state),
+			this.renderHealth(state),
 			E('div', { 'class': 'tso-cols tso-cols-main' }, [
 				this.renderTrendPanel(state),
 				this.renderRail(state)
@@ -1041,16 +1226,65 @@ return view.extend({
 			E('div', { 'class': 'tso-cols tso-cols-top' }, [
 				this.renderTopDevices(state),
 				this.renderTopApps(state)
-			])
+			]),
+			this.renderFootnotes()
 		]);
 
 		this.syncAll(state);
+		this.syncErrorBar();
 		this.afterRender();
 
-		if (state.running === true)
+		if (state.running === true && this.autoRefresh !== false)
 			this.startRefresh();
 
 		return this.root;
+	},
+
+	/* get_state 失败时的错误条：保留旧数据 + 「重试」；成功时自动隐藏 */
+	renderErrorBar: function() {
+		var self = this;
+
+		this.errText = E('span', {}, '');
+		this.errBar = E('div', { 'class': 'tso-alert tso-errbar', style: 'display:none' }, [
+			E('strong', {}, _('数据读取失败') + '：'),
+			this.errText,
+			E('button', {
+				'class': 'tso-btn',
+				type: 'button',
+				title: _('重新读取 get_state / get_history'),
+				click: function(ev) {
+					ev.preventDefault();
+					self.refreshNow(true);
+				}
+			}, _('重试'))
+		]);
+
+		return this.errBar;
+	},
+
+	syncErrorBar: function() {
+		if (this.errBar == null || this.errText == null) return;
+
+		if (this.stateError) {
+			this.errBar.style.display = '';
+			this.errText.textContent = _('get_state 失败：') + shorten(this.stateError, 160) +
+				_('；当前显示上一次成功读取的数据。');
+			this.errBar.title = '' + this.stateError;
+		}
+		else {
+			this.errBar.style.display = 'none';
+			this.errText.textContent = '';
+			this.errBar.title = '';
+		}
+	},
+
+	/* 首屏错误块里的原因文字：重试失败时也要就地更新，而不是停在旧错误上 */
+	syncBootMsg: function() {
+		if (this.bootMsg == null) return;
+
+		this.bootMsg.textContent = this.stateError
+			? (_('get_state 失败：') + shorten(this.stateError, 160))
+			: _('rpcd 对象 traffic-stats 不可用，或者后端尚未安装。');
 	},
 
 	// ------------------------------------------------------------ ① 状态行
@@ -1076,7 +1310,35 @@ return view.extend({
 			this.dotConn = E('i', { 'class': 'tso-dot' }),
 			E('span', {}, 'conntrack')
 		]);
-		this.metaOnline = E('span', { 'class': 'tso-meta' }, '');
+
+		/* 一行状态：在线/离线/访客 + 当前速率（都随 5s 轮询更新） */
+		this.metaCount = E('span', { 'class': 'tso-meta' }, '');
+		this.metaRate = E('span', { 'class': 'tso-meta rate' }, '');
+
+		/* 「自动刷新」开关：默认开；关掉只停定时器，手动「刷新」仍可用 */
+		this.autoInput = E('input', {
+			type: 'checkbox',
+			title: _('每 5 秒自动刷新一次数字'),
+			change: function(ev) {
+				self.setAutoRefresh(ev != null && ev.target != null && ev.target.checked === true);
+			}
+		});
+		this.autoInput.checked = (this.autoRefresh !== false);
+		this.autoText = E('span', {}, _('自动刷新'));
+		this.autoBox = E('label', {
+			'class': 'tso-auto',
+			title: _('关闭后停止 5 秒轮询；手动刷新仍然可用')
+		}, [ this.autoInput, this.autoText ]);
+
+		this.btnRefresh = E('button', {
+			'class': 'tso-btn',
+			type: 'button',
+			title: _('重新读取 get_state / get_history（暂停自动刷新时也可用）'),
+			click: function(ev) {
+				ev.preventDefault();
+				self.refreshNow(true);
+			}
+		}, _('刷新'));
 
 		var more = E('button', {
 			'class': 'tso-btn',
@@ -1100,14 +1362,19 @@ return view.extend({
 			}
 		}, _('详细面板 ↗'));
 
+		this.syncAutoLook();
+
 		return E('div', { 'class': 'tso-pills' }, [
 			this.pillRun,
 			this.pillConf,
+			this.metaCount,
+			this.metaRate,
 			this.metaTime,
 			this.metaStale,
 			this.srcClash,
 			this.srcConn,
-			this.metaOnline,
+			this.autoBox,
+			this.btnRefresh,
 			more,
 			panelBtn
 		]);
@@ -1187,21 +1454,34 @@ return view.extend({
 			this.dotConn.style.background = (k == 'ok') ? COLOR_DIRECT : ((k == 'unknown') ? COLOR_UNKNOWN : '#c62828');
 		}
 
-		if (this.metaOnline != null) {
-			var devices = (state != null && Array.isArray(state.devices)) ? state.devices : [];
-			var on = onlineCount(state, now);
+		if (this.metaCount != null) {
+			var counts = deviceCounts(state, now);
 
-			this.metaOnline.textContent = devices.length
-				? (on + ' / ' + devices.length + ' ' + _('台在线'))
-				: '';
-			this.metaOnline.title = _('在线口径：last_seen 在 10 分钟内');
+			this.metaCount.textContent = (counts.total > 0)
+				? (_('在线') + ' ' + counts.online + ' · ' + _('离线') + ' ' + counts.offline +
+					' · ' + _('访客') + ' ' + counts.guest + ' ' + _('台设备'))
+				: _('暂无设备');
+			this.metaCount.title = _('在线＝last_seen 在 10 分钟内；访客＝在线且 group/alias 含「访客」或 guest');
+		}
+
+		if (this.metaRate != null) {
+			var totals = (state != null && state.totals != null) ? state.totals : {};
+
+			this.metaRate.textContent = _('当前') + ' ↓ ' + fmtRateBits(num(totals.rx_rate)) +
+				' ↑ ' + fmtRateBits(num(totals.tx_rate));
+			this.metaRate.title = _('速率取最近一次采样值，不是整日平均');
 		}
 
 		if (this.techReasons != null) {
 			var reasons = Array.isArray(health.reasons) ? health.reasons : [];
 
 			dom.content(this.techReasons, reasons.map(function(reason) {
-				return E('li', {}, [ '' + reason ]);
+				var tag = reasonTag(reason);
+
+				return E('li', {}, [
+					tag ? E('span', { 'class': 'tso-rtag' }, tag) : '',
+					E('span', { 'class': 'tso-rtext' }, [ '' + (reason == null ? '' : reason) ])
+				]);
 			}));
 		}
 	},
@@ -1209,6 +1489,8 @@ return view.extend({
 	// ------------------------------------------------------------ ② KPI 磁贴
 
 	renderKpis: function(state) {
+		var self = this;
+
 		function sub(nodes) {
 			return E('div', { 'class': 'tso-kpi-s' }, nodes);
 		}
@@ -1227,12 +1509,17 @@ return view.extend({
 			]);
 		}
 
-		/* 「昨日全天」：按 day 字段找到昨天的 summary.totals，明确不是同截止时间环比。 */
-		var cmp = (this.compare != null) ? this.compare
-			: { text: _('昨日全天') + ' —', title: _('没有可用的昨日每日汇总。'), color: '' };
-		var cmpNode = E('div', { 'class': 'tso-cmp', title: cmp.title }, cmp.text);
+		/* 「昨日全天」：按 day 字段找到昨天的 summary.totals，明确不是同截止时间环比。
+		 * 文本走 cell 注册，手动刷新拿到新 history 后能同步更新。 */
+		var cmpNode = E('div', { 'class': 'tso-cmp' }, [
+			this.cell(function() {
+				var c = (self.compare != null) ? self.compare : null;
 
-		if (cmp.color) cmpNode.style.color = cmp.color;
+				return (c != null && c.text) ? c.text : (_('昨日全天') + ' —');
+			})
+		]);
+
+		this.cmpNode = cmpNode;
 
 		/* 总流量：代理 + 直连（rx+tx），口径是"进程启动以来累计" */
 		var totalCard = card(_('总流量'),
@@ -1297,6 +1584,65 @@ return view.extend({
 		]);
 	},
 
+	// ------------------------------------------------------------ ②b 记账健康
+
+	/* 健康卡：reasons 非空时逐条列出（短标签 + 原文）；无异常时明确写「未发现记账异常」 */
+	renderHealth: function(state) {
+		this.healthBox = E('div', { 'class': 'tso-panel tso-health' });
+		this.renderHealthInto(state);
+
+		return this.healthBox;
+	},
+
+	renderHealthInto: function(state) {
+		var health = (state != null && state.health) ? state.health : {};
+		var reasons = Array.isArray(health.reasons) ? health.reasons : [];
+		var look = healthLook(health.accounting_confidence);
+
+		var head = E('div', { 'class': 'tso-health-h' }, [
+			E('i', { 'class': 'tso-dot', style: 'background:' + look.color }),
+			E('span', {}, _('记账健康')),
+			E('span', { 'class': 'tso-chip', style: 'color:' + look.color }, look.label),
+			E('span', { 'class': 'tso-ph-n', style: 'margin-left:auto' },
+				reasons.length ? (_('发现') + ' ' + reasons.length + ' ' + _('项异常')) : '')
+		]);
+
+		var body;
+
+		if (reasons.length == 0) {
+			body = E('div', { 'class': 'tso-ok' }, _('未发现记账异常'));
+		}
+		else {
+			body = E('ul', { 'class': 'tso-reasons' }, reasons.map(function(reason) {
+				var tag = reasonTag(reason);
+				var text = '' + (reason == null ? '' : reason);
+
+				return E('li', {}, [
+					tag ? E('span', { 'class': 'tso-rtag' }, tag) : '',
+					E('span', { 'class': 'tso-rtext', title: text }, [ text ])
+				]);
+			}));
+		}
+
+		dom.content(this.healthBox, [ head, body ]);
+	},
+
+	syncCompare: function() {
+		if (this.cmpNode == null) return;
+
+		var cmp = this.compare;
+
+		if (cmp == null) {
+			this.cmpNode.title = _('没有可用的昨日每日汇总。');
+			this.cmpNode.style.color = '';
+
+			return;
+		}
+
+		this.cmpNode.title = cmp.title || '';
+		this.cmpNode.style.color = cmp.color || '';
+	},
+
 	// ------------------------------------------------------------ ③ 趋势图
 
 	renderTrendPanel: function(state) {
@@ -1355,6 +1701,7 @@ return view.extend({
 		var t = this.trend;
 		var n = t.points.length;
 
+		if (this.historyError && n == 0) return _('读取 get_history 失败：') + shorten(this.historyError, 80);
 		if (n == 0) return _('暂无历史数据');
 
 		var stepMin = Math.max(1, Math.round(t.step / 60));
@@ -1364,9 +1711,10 @@ return view.extend({
 		var prefix = (d.getDate() != today.getDate() || d.getMonth() != today.getMonth())
 			? (pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ')
 			: '';
+		var stale = this.historyError ? (' · ' + _('get_history 失败，图为上次数据')) : '';
 
 		return (prefix + fmtHM(from) + '–' + fmtHM(to) + ' · ' + n + ' ' + _('个桶') + ' · ' +
-			_('每') + ' ' + stepMin + ' ' + _('分钟'));
+			_('每') + ' ' + stepMin + ' ' + _('分钟') + stale);
 	},
 
 	axisUnit: function() {
@@ -1430,15 +1778,16 @@ return view.extend({
 		}, 60);
 	},
 
-	/* 内置 SVG 不依赖 canvas 或外部图表库，容器宽度由 CSS 自适应。 */
+	/* 内置 SVG 不依赖外部图表库，容器宽度由 CSS 自适应。 */
 	drawTrend: function() {
 		var host = this.plotHost;
 
 		if (host == null) return;
 		if (this.trend == null || this.trend.points.length == 0) return;
-		if (!document.body.contains(canvas)) return;
+		if (!document.body.contains(host)) return;
 
 		var w = Math.floor(host.clientWidth || host.offsetWidth || 0);
+		var h = Math.floor(host.clientHeight || host.offsetHeight || 0);
 
 		if (!(w >= 120)) w = 640;      /* 布局还没生效时给一个兜底宽度 */
 		if (!(h >= 120)) h = TREND_H;
@@ -1520,12 +1869,30 @@ return view.extend({
 		}
 
 		try {
-			this.trendChart = tsRenderLine(this.plotHost || (canvas.parentNode), data, { fmtY: fmtMbps });
+			this.trendChart = tsRenderLine(host, data, { fmtY: fmtMbps });
 		}
 		catch (e) {
 			if (window.console) console.warn('traffic-stats: 趋势图绘制失败', e);
 			this.chartFailed(_('图表绘制失败：') + ('' + e));
 		}
+	},
+
+	/* 手动刷新 / 恢复自动刷新后重画趋势；history 失败且无缓存时回落空态（其它卡片不受影响） */
+	refreshTrend: function() {
+		if (this.plotHost == null) return;
+
+		if (this.trend == null || this.trend.points.length == 0) {
+			if (this.trendChart != null) {
+				try { this.trendChart.destroy(); } catch (e) { }
+				this.trendChart = null;
+			}
+
+			dom.content(this.plotHost, this.renderTrendEmpty());
+
+			return;
+		}
+
+		this.drawTrend();
 	},
 
 	chartFailed: function(message) {
@@ -1776,7 +2143,10 @@ return view.extend({
 		var seen = this.syncFirstSeen(devices, now);
 
 		if (top.length == 0)
-			return E('div', { 'class': 'tso-note', style: 'padding:12px 0' }, _('暂无设备数据'));
+			return E('div', { 'class': 'tso-sec-empty' }, [
+				E('strong', {}, _('暂无数据')),
+				E('span', {}, _('state.json 的 devices 为空：守护进程还没识别到 LAN 设备（或刚启动、首个采样周期未到）。'))
+			]);
 
 		return E('div', {}, top.map(function(dev) {
 			var proxy = num(dev.proxy_rx) + num(dev.proxy_tx);
@@ -1789,13 +2159,18 @@ return view.extend({
 			var age = now - fs;
 			var isNew = (fs > 0) && age <= NEW_DEVICE_SEC && age > -600;
 			var fromBackend = backendFirstSeen(dev) > 0;
+			var href = deviceHref(mac);
+			var nav = navTo(href);
 
-			return E('div', { 'class': 'tso-lrow' }, [
+			/* 整行可点；行内姓名是 <a>（键盘 Tab/Enter 可下钻），MAC 按钮仍独立可操作 */
+			return E('div', {
+				'class': 'tso-lrow tso-lrow-nav',
+				title: mac ? (_('打开设备页定位 ') + mac) : _('打开设备页'),
+				click: nav
+			}, [
 				E('div', {}, [
 					E('div', { 'class': 'tso-lname', title: name, style: 'display:flex;align-items:center;gap:4px' }, [
-						E('span', {
-							style: 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap'
-						}, [ shorten(name, 26) ]),
+						E('a', { 'class': 'tso-lname-a', href: href }, [ shorten(name, 26) ]),
 						isNew ? firstSeenBadge(fs, fromBackend) : '',
 						mac ? E('button', {
 							'class': 'tso-btn',
@@ -1804,7 +2179,11 @@ return view.extend({
 							title: _('生成针对该设备 MAC 的 nftables 阻断规则（只显示，不执行）'),
 							click: function(ev) {
 								ev.preventDefault();
+								ev.stopPropagation();
 								self.showBlockAdvice(dev);
+							},
+							keydown: function(ev) {
+								ev.stopPropagation();
 							}
 						}, [ _('阻断建议') ]) : ''
 					]),
@@ -1968,14 +2347,23 @@ return view.extend({
 		var max = appBytes(top[0] || null);
 
 		if (top.length == 0)
-			return E('div', { 'class': 'tso-note', style: 'padding:12px 0' }, _('暂无应用数据'));
+			return E('div', { 'class': 'tso-sec-empty' }, [
+				E('strong', {}, _('暂无数据')),
+				E('span', {}, _('state.json 的 apps 为空：还没有可归类的域名记录（clash / conntrack 解析出域名后才会出现）。'))
+			]);
 
 		return E('div', {}, top.map(function(app) {
 			var total = appBytes(app);
 			var look = chainLook(app.chain);
-			var host = (app.host == '__other__') ? _('其他（合并）') : app.host;
+			var rawHost = (app.host == null) ? '' : ('' + app.host);
+			var host = (rawHost == '__other__') ? _('其他（合并）') : rawHost;
 
-			return E('div', { 'class': 'tso-lrow' }, [
+			/* 应用行用原生 <a>：键盘 Tab + Enter 天然可用，host 为空（合并项）时不带 hash */
+			return E('a', {
+				'class': 'tso-lrow tso-lrow-nav',
+				href: appHref(rawHost),
+				title: rawHost ? (_('打开应用页定位 ') + rawHost) : _('打开应用页')
+			}, [
 				E('div', {}, [
 					E('div', { 'class': 'tso-lname', title: '' + (app.host || '') }, [ shorten(host || _('未知'), 30) ]),
 					E('div', { 'class': 'tso-lsub' }, [
@@ -1989,6 +2377,20 @@ return view.extend({
 				E('div', { 'class': 'tso-lnum' }, [ fmtBytes(total) ])
 			]);
 		}));
+	},
+
+	// ------------------------------------------------------------ 数据口径页脚
+
+	renderFootnotes: function() {
+		return E('details', { 'class': 'tso-help' }, [
+			E('summary', {}, _('数据口径说明')),
+			E('ul', {}, [
+				E('li', {}, _('「总流量」是 traffic-statsd 进程启动以来累计，进程重启归零；不能当作当日用量。')),
+				E('li', {}, _('「昨日全天」与月度数据来自 daily / get_history 的每日汇总，不是实时值。')),
+				E('li', {}, _('「实时速率」是最近一次采样得到的瞬时速率，不是整日平均。')),
+				E('li', {}, _('在线＝last_seen 在 10 分钟内；离线＝其余设备；访客＝在线且 group/alias 含「访客」或 guest。'))
+			])
+		]);
 	},
 
 	// ------------------------------------------------------------ 空态 / 不可用
@@ -2013,20 +2415,37 @@ return view.extend({
 	},
 
 	renderUnavailable: function() {
+		var self = this;
+
+		this.bootFailed = true;
+		this.autoRefresh = (this.autoRefresh !== false);
+
+		this.bootMsg = E('span', {}, this.stateError
+			? (_('get_state 失败：') + shorten(this.stateError, 160))
+			: _('rpcd 对象 traffic-stats 不可用，或者后端尚未安装。'));
+
 		this.root = E('div', { 'id': 'ts-overview' }, [
 			E('style', {}, CSS),
 			E('h2', { 'class': 'tso-title', style: 'margin-bottom:10px' }, _('流量统计 · 总览')),
 			E('div', { 'class': 'tso-alert' }, [
 				E('strong', {}, _('读取不到统计数据') + '：'),
 				' ',
-				this.stateError
-					? (_('get_state 失败：') + shorten(this.stateError, 160))
-					: _('rpcd 对象 traffic-stats 不可用，或者后端尚未安装。'),
+				this.bootMsg,
 				E('div', { 'class': 'tso-note' }, [
 					_('已安装 traffic-statsd 的话，请确认 rpcd 已重载：') + ' ',
 					E('code', {}, '/etc/init.d/rpcd reload'),
 					' · ',
-					E('a', { href: L.url('admin/services/traffic-stats/settings') }, _('前往设置页'))
+					E('a', { href: L.url('admin/services/traffic-stats/settings') }, _('前往设置页')),
+					' ',
+					E('button', {
+						'class': 'tso-btn',
+						type: 'button',
+						title: _('重新读取 get_state / get_history'),
+						click: function(ev) {
+							ev.preventDefault();
+							self.refreshNow(true);
+						}
+					}, _('重试'))
 				])
 			])
 		]);
@@ -2076,9 +2495,10 @@ return view.extend({
 		}
 
 		this.syncStatus(state);
+		this.syncCompare();
 	},
 
-	/* 30s 重建一次动态块（Top 列表 / 节点块）：比每 5s 重建省事，也不会闪 */
+	/* 30s 重建一次动态块（Top 列表 / 节点块 / 健康原因）：比每 5s 重建省事，也不会闪 */
 	rebuildDynamic: function(state) {
 		if (this.nodeBox != null)
 			dom.content(this.nodeBox, this.renderNodeRows(state));
@@ -2088,12 +2508,121 @@ return view.extend({
 
 		if (this.topAppBox != null)
 			dom.content(this.topAppBox, this.renderAppRows(state));
+
+		if (this.healthBox != null)
+			this.renderHealthInto(state);
+	},
+
+	/* 手动「刷新」与「恢复自动刷新」共用：两个 rpc 都重拉，失败保留旧数据并出错误条 */
+	refreshNow: function(manual) {
+		var self = this;
+
+		if (this.refreshing === true) return this.refreshPromise || Promise.resolve();
+
+		this.refreshing = true;
+
+		if (manual === true && this.btnRefresh != null) {
+			this.btnRefresh.disabled = true;
+			this.btnRefresh.textContent = _('刷新中…');
+		}
+
+		this.refreshPromise = this.loadData().then(function() {
+			self.refreshing = false;
+			self.refreshPromise = null;
+			self.restoreRefreshButton();
+			self.syncBootMsg();
+
+			if (self.state == null) {
+				self.syncErrorBar();
+
+				return;
+			}
+
+			/* 首屏 get_state 失败、现在恢复了：整页重建一次（错误块 → 正常卡片） */
+			if (self.bootFailed === true) {
+				self.remount();
+
+				return;
+			}
+
+			self.syncAll(self.state);
+			self.syncErrorBar();
+			self.rebuildDynamic(self.state);
+			self.refreshTrend();
+
+			if (self.state.running !== true)
+				self.stopTimer();
+			else if (self.autoRefresh !== false)
+				self.startRefresh();
+		}).catch(function() {
+			self.refreshing = false;
+			self.refreshPromise = null;
+			self.restoreRefreshButton();
+			self.syncErrorBar();
+			self.syncBootMsg();
+		});
+
+		return this.refreshPromise;
+	},
+
+	restoreRefreshButton: function() {
+		if (this.btnRefresh == null) return;
+
+		this.btnRefresh.disabled = false;
+		this.btnRefresh.textContent = _('刷新');
+	},
+
+	/* 首屏拿不到 state 时整个 root 只是错误块；重试成功后换成正常页面 */
+	remount: function() {
+		var old = this.root;
+		var fresh;
+
+		if (old == null || old.parentNode == null) return;
+
+		this.bootFailed = false;
+		fresh = this.render();
+
+		try { old.parentNode.replaceChild(fresh, old); }
+		catch (e) { }
+	},
+
+	/* 自动刷新开关：关 → 只停定时器（显示「已暂停」）；开 → 立即刷新一次再恢复轮询 */
+	setAutoRefresh: function(on) {
+		var want = (on === true);
+
+		this.autoRefresh = want;
+		this.syncAutoLook();
+
+		if (want) {
+			this.refreshNow(false);
+		}
+		else {
+			this.stopTimer();
+		}
+	},
+
+	syncAutoLook: function() {
+		var on = (this.autoRefresh !== false);
+
+		if (this.autoInput != null) this.autoInput.checked = on;
+
+		if (this.autoText != null) this.autoText.textContent = on ? _('自动刷新') : _('已暂停');
+
+		if (this.autoBox != null) {
+			if (on) this.autoBox.classList.remove('paused');
+			else this.autoBox.classList.add('paused');
+
+			this.autoBox.title = on
+				? _('每 5 秒自动刷新一次数字；关闭后停止轮询，手动刷新仍然可用')
+				: _('已暂停自动刷新；可点「刷新」手动更新，或重新打开开关');
+		}
 	},
 
 	startRefresh: function() {
 		var self = this;
 
 		if (this.timer != null) return;
+		if (this.autoRefresh === false) return;
 
 		this.timer = window.setInterval(function() {
 			/* 离开页面后 #view 会被清空，这里把定时器停掉，避免后台一直轮询 */
@@ -2106,23 +2635,34 @@ return view.extend({
 				if (state == null || typeof state != 'object' || state.totals == null) return;
 
 				self.state = state;
+				self.stateError = '';
 				self.syncAll(state);
+				self.syncErrorBar();
 
 				if (++self.tick % TOPS_EVERY == 0)
 					self.rebuildDynamic(state);
 
-				/* 守护进程停了就不必再轮询（服务重启后刷新页面即可） */
+				/* 守护进程停了就不必再轮询（服务重启后手动刷新或重开开关即可） */
 				if (state.running !== true)
-					self.stopRefresh();
-			}).catch(function() { });
+					self.stopTimer();
+			}).catch(function(err) {
+				/* 轮询失败：保留旧数据，只亮错误条（下一次成功会自动清掉） */
+				self.stateError = errText(err);
+				self.syncErrorBar();
+			});
 		}, REFRESH_MS);
 	},
 
-	stopRefresh: function() {
+	/* 只停 5s 定时器（暂停自动刷新用），保留 resize 监听等页面级资源 */
+	stopTimer: function() {
 		if (this.timer != null) {
 			window.clearInterval(this.timer);
 			this.timer = null;
 		}
+	},
+
+	stopRefresh: function() {
+		this.stopTimer();
 
 		if (this.resizeTimer != null) {
 			window.clearTimeout(this.resizeTimer);

@@ -8,8 +8,11 @@
  * 流量统计 · 设备
  *
  * 只消费 state.devices（不碰顶层 apps），一次 rpc 调用。
- * 点行展开该设备的应用分布：明细按需构建（首次展开时才生成 DOM），
+ * 列表按商用 App 的浏览逻辑组织：全部/在线/离线分段 + 摘要，表头本地排序，
+ * 搜索与接入筛选，全部只过滤内存数据、不额外发 RPC。
+ * 点设备行打开右侧详情抽屉（明细按需构建）；行首「▸」仍可展开行内应用分布，
  * 200 台设备也不会在加载时把几千个节点塞进页面。
+ * 页面每 15s 拉一次 get_state 刷新；「暂停刷新」会停掉轮询。
  *
  * 设备元数据 / 配额 / 导出（SPEC §10）：
  *   - 别名、分组：`set_device_meta {mac, alias, group}`（空串 = 清除该字段）。
@@ -17,10 +20,12 @@
  *     再次打开同一台设备会带出草稿；只有保存成功或显式「放弃修改」才清掉。
  *   - 本月用量：后端 `month_rx/month_tx/month_total`；`quota_limit` 只在
  *     quota_mode=device 时出现，剩余量 = limit - used（分母 0 时显示 —）。
- *   - CSV：`export_csv {what:'devices'}` 返回带 BOM/CRLF 的字符串，原样存盘。
+ *   - CSV：`export_csv {what:'devices'}` 返回带 BOM/CRLF 的字符串，原样存盘；
+ *     详情抽屉里的「导出该设备 CSV」按后端同样的列在前端拼一行下载。
+ *   - 阻断建议只是只读 nft 命令文本（与概览页一致），不执行、不新增 RPC。
  *
- * 所有动态值都走 E()/textContent，不拼 HTML 字符串。窄屏隐藏次要列（MAC/IP/
- * 首次出现/信号），剩余列在表格容器内横向滚动，页面本身不会横向失控。
+ * 所有动态值都走 E()/textContent，不拼 HTML 字符串。窄屏隐藏次要列（首次出现/
+ * 信号），表格容器内横向滚动，页面本身不会横向失控；抽屉在 <760px 时全宽。
  *
  * 单位：流量二进制（GiB/MiB），速率十进制 Mb/s（bits），括号/悬浮为十进制 MB/s。
  */
@@ -386,20 +391,70 @@ function clearNode(node) {
 		node.removeChild(node.firstChild);
 }
 
-/* 这个页面的表格在窄屏隐藏次要列；CSS 只作用于本页容器。 */
+/* 这个页面的表格在窄屏隐藏次要列并允许容器内横向滚动；CSS 只作用于本页容器。 */
 var CSS = [
 	'#ts-devices .tsd-tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}',
-	'#ts-devices table{min-width:940px}',
+	'#ts-devices table{min-width:1040px}',
 	'#ts-devices .tsd-sub{font-size:11px;opacity:.65;line-height:1.5;white-space:nowrap}',
 	'#ts-devices .tsd-alias-name{font-weight:600;word-break:break-word}',
 	'#ts-devices .tsd-edit{padding:1px 7px;font-size:11px;line-height:1.6;margin-left:6px;white-space:nowrap}',
 	'#ts-devices .tsd-new{display:inline-block;margin-left:5px;padding:0 5px;border-radius:6px;font-size:10px;',
 	'line-height:1.6;background:rgba(198,40,40,.14);color:#c62828;vertical-align:middle}',
 	'#ts-devices .tsd-quota{min-width:92px;text-align:right}',
+	'#ts-devices .tsd-seg{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px 0}',
+	'#ts-devices .tsd-seg-btn{font:inherit;font-size:12.5px;line-height:1.5;padding:5px 12px;border-radius:15px;',
+	'cursor:pointer;color:inherit;background:rgba(127,127,127,.08);border:1px solid rgba(127,127,127,.35)}',
+	'#ts-devices .tsd-seg-btn.tsd-on{background:#2b7de9;border-color:#2b7de9;color:#fff}',
+	'#ts-devices .tsd-sum{font-size:12px;opacity:.85;line-height:1.8;margin:0 0 8px 0}',
+	'#ts-devices .tsd-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px 0}',
+	'#ts-devices .tsd-search{font:inherit;font-size:12.5px;padding:4px 8px;min-width:0;flex:1 1 180px;max-width:280px;',
+	'border:1px solid rgba(127,127,127,.4);border-radius:6px;background:transparent;color:inherit}',
+	'#ts-devices .tsd-select{font:inherit;font-size:12.5px;padding:4px 6px;border-radius:6px;',
+	'border:1px solid rgba(127,127,127,.4);background:transparent;color:inherit}',
+	'#ts-devices .tsd-alert{padding:8px 12px;border-radius:8px;background:rgba(198,40,40,.12);color:#c62828;',
+	'font-size:12.5px;line-height:1.6;margin:0 0 10px 0}',
+	'#ts-devices .tsd-empty{padding:14px 16px;border:1px dashed rgba(127,127,127,.4);border-radius:10px;',
+	'font-size:13px;line-height:1.8;margin:10px 0 0 0}',
+	'#ts-devices .tsd-sort{font:inherit;font-weight:inherit;color:inherit;background:none;border:0;padding:0;',
+	'margin:0;cursor:pointer;white-space:nowrap}',
+	'#ts-devices .tsd-arrow{display:inline-block;min-width:9px;margin-left:3px;font-size:10px;opacity:.55}',
+	'#ts-devices .tsd-arrow.tsd-arrow-on{opacity:1;color:#2b7de9}',
+	'#ts-devices .tsd-appbtn{font:inherit;font-size:11px;line-height:1.6;padding:0 5px;margin-right:4px;',
+	'border:1px solid rgba(127,127,127,.4);border-radius:5px;background:transparent;color:inherit;cursor:pointer}',
+	'#ts-devices .tsd-detail-btn{white-space:nowrap}',
+	'#ts-devices .tsd-pill{display:inline-block;font-size:11px;line-height:1.7;padding:1px 9px;border-radius:10px;',
+	'white-space:nowrap;font-weight:600}',
+	'#ts-devices .tsd-pill-on{background:rgba(76,175,80,.18);color:#2e7d32}',
+	'#ts-devices .tsd-pill-off{background:rgba(127,127,127,.2);color:#616161}',
+	'.tsd-drawer-overlay{position:fixed;inset:0;z-index:10000;display:flex;justify-content:flex-end;',
+	'background:rgba(0,0,0,.42)}',
+	'.tsd-drawer-panel{width:440px;max-width:100%;height:100%;box-sizing:border-box;overflow:auto;',
+	'background:var(--background-color-high,#fff);color:var(--text-color,#222);padding:16px 18px 24px 18px;',
+	'box-shadow:-12px 0 32px rgba(0,0,0,.24);transform:translateX(100%);transition:transform .22s ease;',
+	'will-change:transform}',
+	'.tsd-drawer-close{float:right;width:32px;height:32px;padding:0;font:inherit;font-size:20px;line-height:1;',
+	'border-radius:50%;border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;cursor:pointer}',
+	'.tsd-drawer-h{font-size:17px;font-weight:600;line-height:1.4;margin:0 0 2px 0;padding-right:38px;',
+	'word-break:break-word}',
+	'.tsd-drawer-sub{font-size:12px;opacity:.7;line-height:1.6;margin:0 0 8px 0;word-break:break-all}',
+	'.tsd-drawer-sec{margin:16px 0 0 0}',
+	'.tsd-drawer-sec h5{font-size:12.5px;font-weight:600;margin:0 0 8px 0;opacity:.8}',
+	'.tsd-info{display:grid;grid-template-columns:86px minmax(0,1fr);gap:6px 10px;font-size:12.5px;line-height:1.55}',
+	'.tsd-info-k{opacity:.65}',
+	'.tsd-info-v{word-break:break-all}',
+	'.tsd-drawer-bar{height:7px;border-radius:4px;background:rgba(127,127,127,.2);overflow:hidden;margin:4px 0 2px 0}',
+	'.tsd-drawer-bar>div{height:7px;border-radius:4px}',
+	'.tsd-drawer-apps{width:100%;border-collapse:collapse;font-size:12px}',
+	'.tsd-drawer-apps td{padding:3px 4px;vertical-align:middle}',
+	'.tsd-drawer-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}',
+	'.tsd-drawer-code{font-size:11px;line-height:1.6;background:rgba(127,127,127,.12);padding:8px;border-radius:6px;',
+	'white-space:pre-wrap;word-break:break-all;margin:6px 0 0 0}',
+	'.tsd-drawer-note{font-size:11.5px;opacity:.7;line-height:1.6;margin:6px 0 0 0}',
 	'@media (max-width:760px){',
 	'#ts-devices .tsd-opt{display:none}',
-	'#ts-devices table{min-width:0}',
-	'#ts-devices .tsd-tablewrap{overflow-x:visible}',
+	'#ts-devices table{min-width:600px}',
+	'#ts-devices .tsd-tablewrap{overflow-x:auto}',
+	'.tsd-drawer-panel{width:100%;max-width:100%;padding:14px}',
 	'}'
 ].join('\n');
 
@@ -480,7 +535,184 @@ function signalColor(dbm) {
 	return '#d3302f';
 }
 
+/* ---- 商用路由器 App 式浏览：分段 / 排序 / 详情抽屉 / 自动刷新 ---- */
+
+/* 在线口径与概览、移动端一致：last_seen > 0 且距今 ≤ 10 分钟（未来时间戳留 60s 容差）。 */
+var ONLINE_SEC = 600;
+var REFRESH_MS = 15000;
+
+function nowSec() {
+	return Math.floor(Date.now() / 1000);
+}
+
+function isDeviceOnline(dev, now) {
+	var ls = num(dev != null ? dev.last_seen : 0);
+	var t = (now == null) ? nowSec() : num(now);
+
+	return ls > 0 && ls <= t + 60 && (t - ls) <= ONLINE_SEC;
+}
+
+/* 表头排序的取值：与列表里显示的字节 / 速率列一一对应。 */
+function sortMetric(dev, key) {
+	if (key === 'direct') return num(dev.direct_rx) + num(dev.direct_tx);
+	if (key === 'proxy') return num(dev.proxy_rx) + num(dev.proxy_tx);
+	if (key === 'rate') return num(dev.rx_rate) + num(dev.tx_rate);
+	if (key === 'last_seen') return num(dev.last_seen);
+
+	return deviceTotal(dev);
+}
+
+/* 搜索覆盖主机名 / 别名 / 分组 / IP / MAC；大小写不敏感。 */
+function deviceMatches(dev, q) {
+	if (q == null || !q.length) return true;
+
+	var fields = [
+		dev != null ? dev.hostname : '', dev != null ? dev.alias : '',
+		dev != null ? dev.group : '', dev != null ? dev.ip : '',
+		dev != null ? dev.mac : '', deviceName(dev)
+	];
+
+	for (var i = 0; i < fields.length; i++) {
+		if (fields[i] != null && ('' + fields[i]).toLowerCase().indexOf(q) >= 0)
+			return true;
+	}
+
+	return false;
+}
+
+/* 接入筛选：unknown 同时收「未知」和字段缺失（老后端没有 link）。 */
+function matchesLinkFilter(dev, filter) {
+	if (filter == null || !filter.length) return true;
+
+	var kind = linkOf(dev);
+
+	if (filter === 'unknown')
+		return kind === '' || kind === 'unknown';
+
+	return kind === filter;
+}
+
+/* 应用分布：按该设备流量降序；抽屉取前 10，展开行仍显示全部。 */
+function deviceAppList(dev) {
+	var apps = (dev != null && dev.apps != null && typeof dev.apps === 'object') ? dev.apps : {};
+	var list = [];
+
+	for (var host in apps) {
+		if (!apps.hasOwnProperty(host)) continue;
+
+		var row = (apps[host] != null && typeof apps[host] === 'object') ? apps[host] : {};
+		var rx = num(row.rx);
+		var tx = num(row.tx);
+
+		list.push({
+			host: host,
+			rx: rx,
+			tx: tx,
+			total: rx + tx,
+			chain: row.chain ? ('' + row.chain) : ''
+		});
+	}
+
+	list.sort(function(a, b) { return b.total - a.total; });
+
+	return list;
+}
+
+function appListTotal(list) {
+	var sum = 0;
+
+	for (var i = 0; i < (list || []).length; i++)
+		sum += num(list[i].total);
+
+	return sum;
+}
+
+/* 单设备 CSV：后端 export_csv 只支持整页 devices，这里按后端同样的列拼一行由前端下载。 */
+var DEVICE_CSV_HEADER = [ '主机名', 'IP', 'MAC', '别名', '分组', '接入',
+	'直连下载', '直连上传', '代理下载', '代理上传', '合计',
+	'本月下载', '本月上传', '本月合计', '首次出现' ];
+
+function csvField(value) {
+	var s = (value == null) ? '' : ('' + value);
+
+	if (/[",\r\n]/.test(s))
+		return '"' + s.replace(/"/g, '""') + '"';
+
+	return s;
+}
+
+function deviceCsv(dev) {
+	var link = LINK_STYLE[linkOf(dev)];
+	var known = monthAvailable(dev);
+	var row = [
+		dev.hostname, dev.ip, macKey(dev), aliasOf(dev), groupOf(dev),
+		(link != null) ? link.label : '—',
+		num(dev.direct_rx), num(dev.direct_tx), num(dev.proxy_rx), num(dev.proxy_tx),
+		deviceTotal(dev),
+		known ? num(dev.month_rx) : '', known ? num(dev.month_tx) : '',
+		known ? monthTotal(dev) : '',
+		num(dev.first_seen) > 0 ? fmtDate(dev.first_seen) : ''
+	];
+
+	return '\ufeff' + DEVICE_CSV_HEADER.map(csvField).join(',') + '\r\n' +
+		row.map(csvField).join(',') + '\r\n';
+}
+
+function deviceCsvFilename(dev) {
+	var now = new Date();
+	var tag = macKey(dev).replace(/[^A-Za-z0-9]/g, '') ||
+		(('' + (dev != null && dev.ip ? dev.ip : '')).replace(/[^A-Za-z0-9]/g, '')) || 'device';
+
+	return 'traffic-stats-device-' + tag + '-' + now.getFullYear() + '-' +
+		pad2(now.getMonth() + 1) + '-' + pad2(now.getDate()) + '.csv';
+}
+
+/* 阻断建议：与概览页同一段只读 nft 文本，只显示不执行。 */
+function blockCommand(mac) {
+	return 'nft add rule inet fw4 forward ether saddr ' + mac + ' counter drop';
+}
+
+function nextFrame(fn) {
+	if (typeof window != 'undefined' && typeof window.requestAnimationFrame == 'function')
+		window.requestAnimationFrame(fn);
+	else if (typeof window != 'undefined' && typeof window.setTimeout == 'function')
+		window.setTimeout(fn, 0);
+	else
+		fn();
+}
+
 return view.extend({
+	/*
+	 * 概览页「Top 设备」链接带 #mac=<编码 MAC>：渲染后自动打开该设备抽屉，
+	 * 然后清掉 hash，避免刷新/切回时重复弹出。只认合法 MAC，其余忽略。
+	 */
+	applyHashTarget: function() {
+		var self = this;
+		var hash = (typeof window != 'undefined' && window.location != null)
+			? ('' + (window.location.hash || '')) : '';
+		var m = /^#mac=(.+)$/.exec(hash);
+
+		if (m == null) return;
+
+		var want = '';
+
+		try { want = decodeURIComponent(m[1]); } catch (e) { want = m[1]; }
+
+		want = ('' + want).replace(/-/g, ':').toUpperCase();
+
+		if (!/^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/.test(want)) return;
+
+		window.setTimeout(function() {
+			var list = (self.state != null && Array.isArray(self.state.devices)) ? self.state.devices : [];
+
+			for (var i = 0; i < list.length; i++) {
+				if (macKey(list[i]) === want) { self.openDrawer(list[i]); break; }
+			}
+
+			try { window.history.replaceState(null, '', window.location.pathname + window.location.search); } catch (e) { }
+		}, 0);
+	},
+
 	load: function() {
 		var self = this;
 
@@ -508,91 +740,941 @@ return view.extend({
 	},
 
 	render: function() {
-		var state = this.state;
+		var self = this;
 
 		this.drafts = this.drafts || {};
 		this.dialog = null;
 		this.aliasCells = {};
-		this.exportStatus = E('span', { style: 'font-size:12px;margin-left:8px;opacity:.85' }, '');
+		if (this.timer != null) this.stopRefresh();
+		if (this.drawerOverlay != null) this.closeDrawer();
+		this.segment = (this.segment === 'online' || this.segment === 'offline') ? this.segment : 'all';
+		this.sortKey = this.sortKey || 'total';
+		this.sortDir = (this.sortDir === 'asc') ? 'asc' : 'desc';
+		this.search = (typeof this.search === 'string') ? this.search : '';
+		this.linkFilter = (typeof this.linkFilter === 'string') ? this.linkFilter : '';
+		this.paused = (this.paused === true);
+		this.refreshError = null;
+		this.sortArrows = {};
+		this.sortHeads = {};
+		this.segmentBtns = {};
+		this.exportStatus = E('span', { style: 'font-size:12px;opacity:.85' }, '');
 
-		if (state == null || !Array.isArray(state.devices) || state.devices.length == 0) {
-			this.root = E('div', { 'id': 'ts-devices' }, [
-				E('style', {}, CSS),
-				E('h2', {}, _('流量统计 · 设备')),
-				this.renderEmpty()
-			]);
+		this.alertBox = E('div', { 'class': 'tsd-alert', style: 'display:none' }, '');
+		this.summaryNode = E('div', { 'class': 'tsd-sum' }, '');
 
-			return this.root;
+		var segDefs = [ [ 'all', _('全部') ], [ 'online', _('在线') ], [ 'offline', _('离线') ] ];
+		var segChildren = [];
+
+		for (var s = 0; s < segDefs.length; s++) {
+			(function(key, label) {
+				var btn = E('button', {
+					'class': 'tsd-seg-btn',
+					type: 'button',
+					'aria-pressed': 'false',
+					click: function(ev) {
+						if (ev != null && ev.preventDefault) ev.preventDefault();
+						self.setSegment(key);
+					}
+				}, label);
+
+				self.segmentBtns[key] = btn;
+				segChildren.push(btn);
+			})(segDefs[s][0], segDefs[s][1]);
 		}
 
-		var devices = state.devices.slice().sort(function(a, b) {
-			return deviceTotal(b) - deviceTotal(a);
+		var segmentBox = E('div', { 'class': 'tsd-seg' }, segChildren);
+
+		/* 搜索只过滤内存里的 state.devices，不发 RPC。 */
+		this.searchInput = E('input', {
+			'class': 'tsd-search',
+			type: 'search',
+			placeholder: _('搜索主机名 / 别名 / 分组 / IP / MAC'),
+			'aria-label': _('搜索设备')
+		});
+		this.searchInput.value = this.search;
+		this.searchInput.addEventListener('input', function(ev) {
+			var v = (ev != null && ev.target != null) ? ev.target.value : self.searchInput.value;
+
+			self.search = ('' + (v == null ? '' : v)).trim().toLowerCase();
+			self.renderRows();
 		});
 
-		var rows = [];
-
-		for (var i = 0; i < devices.length; i++)
-			/* renderDeviceRow 返回 [主行, 详情行]，必须 concat 展开；push 会变成嵌套数组，
-			   被 E() 当成字符串渲染成 [object HTMLTableRowElement]。 */
-			rows = rows.concat(this.renderDeviceRow(devices[i]));
-
-		var quota = totalQuota(state);
-		var summary = E('div', { style: 'margin:0 0 12px 0;font-size:12px;opacity:.85;line-height:1.8' }, [
-			E('div', {}, [
-				_('共') + ' ' + devices.length + ' ' + _('台设备'),
-				state.truncated === true ? ' · ' + _('数据过大，后端已裁剪（仅显示使用量最高的部分）') : '',
-				' · ',
-				this.linkSummary(state),
-				_('点击任意一行展开该设备的应用分布')
-			]),
-			quota == null ? '' : E('div', { style: 'white-space:normal' }, [
-				_('全屋本月配额') + '（' + (quota.period || _('本月')) + _('）') + '：',
-				_('已用') + ' ' + fmtBytes(quota.used) + ' / ' + fmtBytes(quota.limit) + ' · ',
-				_('剩余') + ' ' + fmtBytes(Math.max(0, quota.remaining)) + '（' + quota.pct.toFixed(1) + '%）'
-			])
-		]);
-
-		var actions = E('div', {
-			style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px 0'
+		this.linkSelect = E('select', {
+			'class': 'tsd-select',
+			'aria-label': _('接入方式筛选')
 		}, [
+			E('option', { value: '' }, _('全部接入')),
+			E('option', { value: 'wifi' }, _('无线')),
+			E('option', { value: 'wired' }, _('有线')),
+			E('option', { value: 'unknown' }, _('未知'))
+		]);
+		this.linkSelect.value = this.linkFilter;
+		this.linkSelect.addEventListener('change', function(ev) {
+			var v = (ev != null && ev.target != null) ? ev.target.value : self.linkSelect.value;
+
+			self.linkFilter = ('' + (v == null ? '' : v));
+			self.renderRows();
+		});
+
+		this.refreshBtn = E('button', {
+			'class': 'cbi-button',
+			type: 'button',
+			click: ui.createHandlerFn(this, function() { this.toggleRefresh(); })
+		}, _('暂停刷新'));
+		this.refreshHint = E('span', { style: 'font-size:11.5px;opacity:.7' }, '');
+
+		var toolbar = E('div', { 'class': 'tsd-toolbar' }, [
+			this.searchInput,
+			this.linkSelect,
 			E('button', {
 				'class': 'cbi-button cbi-button-action',
+				type: 'button',
 				click: ui.createHandlerFn(this, function() { return this.exportCsv('devices'); })
 			}, _('导出设备 CSV')),
+			this.refreshBtn,
+			this.refreshHint,
 			this.exportStatus
 		]);
+
+		var head = E('tr', { 'class': 'tr table-titles' }, [
+			E('th', { 'class': 'th' }, _('主机名')),
+			E('th', { 'class': 'th' }, _('别名 / 分组')),
+			E('th', { 'class': 'th tsd-opt', title: _('守护进程首次看到该 MAC 的时间（本地时区）') }, _('首次出现')),
+			E('th', {
+				'class': 'th',
+				title: _('接入方式：主路由桥 FDB 里该设备 MAC 学在哪个端口（无线/有线），与代理/直连无关')
+			}, _('接入')),
+			this.sortHead('direct', _('直连'), _('按直连下载 + 上传排序')),
+			this.sortHead('proxy', _('代理'), _('按代理下载 + 上传排序')),
+			this.sortHead('total', _('合计'), _('按直连 + 代理合计排序')),
+			E('th', { 'class': 'th', style: 'text-align:right', title: _('本月 1 号至今的 rx+tx（只读 daily/，跨月自动归零）') }, _('本月')),
+			E('th', { 'class': 'th tsd-quota', title: _('剩余 = 配额 - 本月用量；未配置配额时显示 —') }, _('配额剩余')),
+			this.sortHead('rate', _('速率'), _('按当前下载 + 上传速率排序')),
+			this.sortHead('last_seen', _('上次活跃'), _('按 last_seen 时间排序')),
+			E('th', {
+				'class': 'th tsd-opt',
+				style: 'text-align:right',
+				title: _('来自哑桥 AP 的无线信号（仅元数据，不含流量）')
+			}, _('信号')),
+			E('th', { 'class': 'th', style: 'text-align:right' }, _('操作'))
+		]);
+
+		this.tbody = E('tbody', {}, '');
+		this.tableWrap = E('div', { 'class': 'tsd-tablewrap' },
+			E('table', { 'class': 'table' }, [ head, this.tbody ]));
+		this.emptyBox = E('div', { 'class': 'tsd-empty', style: 'display:none' }, '');
 
 		this.root = E('div', { 'id': 'ts-devices' }, [
 			E('style', {}, CSS),
 			E('h2', {}, _('流量统计 · 设备')),
-			summary,
-			actions,
-			E('div', { 'class': 'tsd-tablewrap' }, E('table', { 'class': 'table' }, [
-				E('tr', { 'class': 'tr table-titles' }, [
-					E('th', { 'class': 'th' }, _('主机名')),
-					E('th', { 'class': 'th' }, _('别名 / 分组')),
-					E('th', { 'class': 'th tsd-opt', title: _('守护进程首次看到该 MAC 的时间（本地时区）') }, _('首次出现')),
-					E('th', {
-						'class': 'th',
-						title: _('接入方式：主路由桥 FDB 里该设备 MAC 学在哪个端口（无线/有线），与代理/直连无关')
-					}, _('接入')),
-					E('th', { 'class': 'th', style: 'text-align:right' }, _('直连')),
-					E('th', { 'class': 'th', style: 'text-align:right' }, _('代理')),
-					E('th', { 'class': 'th', style: 'text-align:right' }, _('合计')),
-					E('th', { 'class': 'th', style: 'text-align:right', title: _('本月 1 号至今的 rx+tx（只读 daily/，跨月自动归零）') }, _('本月')),
-					E('th', { 'class': 'th tsd-quota', title: _('剩余 = 配额 - 本月用量；未配置配额时显示 —') }, _('配额剩余')),
-					E('th', { 'class': 'th', style: 'text-align:right', title: _('Mb/s（bits），悬浮显示十进制 MB/s') }, _('速率')),
-					E('th', { 'class': 'th', style: 'text-align:right' }, _('最后在线')),
-					E('th', {
-						'class': 'th tsd-opt',
-						style: 'text-align:right',
-						title: _('来自哑桥 AP 的无线信号（仅元数据，不含流量）')
-					}, _('信号'))
-				])
-			].concat(rows)))
+			this.alertBox,
+			segmentBox,
+			this.summaryNode,
+			toolbar,
+			this.tableWrap,
+			this.emptyBox
 		]);
 
+		this.renderRows();
+		this.syncRefreshHint();
+		this.startRefresh();
+
+		this.applyHashTarget();
+
 		return this.root;
+	},
+
+	sortHead: function(key, label, title) {
+		var self = this;
+		var arrow = E('span', { 'class': 'tsd-arrow' }, '');
+		var th = E('th', {
+			'class': 'th',
+			style: 'text-align:right;cursor:pointer',
+			title: title || _('点击切换排序'),
+			click: function(ev) {
+				if (ev != null && ev.preventDefault) ev.preventDefault();
+				self.toggleSort(key);
+			}
+		}, E('button', {
+			'class': 'tsd-sort',
+			type: 'button',
+			click: function(ev) {
+				if (ev != null) {
+					if (ev.preventDefault) ev.preventDefault();
+					/* 表头单元格本身也有 click：按钮里阻止冒泡，避免点一次排两次。 */
+					if (ev.stopPropagation) ev.stopPropagation();
+				}
+
+				self.toggleSort(key);
+			}
+		}, [ label, arrow ]));
+
+		this.sortArrows[key] = arrow;
+		this.sortHeads[key] = th;
+
+		return th;
+	},
+
+	toggleSort: function(key) {
+		if (this.sortKey === key) {
+			this.sortDir = (this.sortDir === 'desc') ? 'asc' : 'desc';
+		}
+		else {
+			this.sortKey = key;
+			/* 数值列默认从大到小，和“用量最高的设备在最上面”一致。 */
+			this.sortDir = 'desc';
+		}
+
+		this.renderRows();
+	},
+
+	setSegment: function(key) {
+		this.segment = (key === 'online' || key === 'offline') ? key : 'all';
+		this.renderRows();
+	},
+
+	compareDevices: function(a, b) {
+		var av = sortMetric(a, this.sortKey);
+		var bv = sortMetric(b, this.sortKey);
+
+		if (av !== bv) {
+			var dir = (this.sortDir === 'asc') ? 1 : -1;
+
+			return (av < bv ? -1 : 1) * dir;
+		}
+
+		var an = ('' + deviceName(a)).toLowerCase();
+		var bn = ('' + deviceName(b)).toLowerCase();
+
+		if (an !== bn) return (an < bn) ? -1 : 1;
+
+		return ('' + (a != null ? a.mac : '')).localeCompare('' + (b != null ? b.mac : ''));
+	},
+
+	syncSegmentButtons: function(counts) {
+		var labels = { all: _('全部'), online: _('在线'), offline: _('离线') };
+
+		for (var key in this.segmentBtns) {
+			if (!this.segmentBtns.hasOwnProperty(key)) continue;
+
+			var btn = this.segmentBtns[key];
+			var active = (key === this.segment);
+
+			btn.textContent = labels[key] + ' ' + num(counts != null ? counts[key] : 0);
+			btn.className = 'tsd-seg-btn' + (active ? ' tsd-on' : '');
+
+			if (typeof btn.setAttribute == 'function')
+				btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+		}
+	},
+
+	syncSortArrows: function() {
+		for (var key in this.sortArrows) {
+			if (!this.sortArrows.hasOwnProperty(key)) continue;
+
+			var arrow = this.sortArrows[key];
+			var active = (key === this.sortKey);
+
+			arrow.textContent = active ? (this.sortDir === 'asc' ? '▲' : '▼') : '↕';
+			arrow.className = 'tsd-arrow' + (active ? ' tsd-arrow-on' : '');
+
+			if (this.sortHeads[key] != null && typeof this.sortHeads[key].setAttribute == 'function')
+				this.sortHeads[key].setAttribute('aria-sort',
+					active ? (this.sortDir === 'asc' ? 'ascending' : 'descending') : 'none');
+		}
+	},
+
+	renderRows: function() {
+		var self = this;
+		var state = this.state;
+		var all = (state != null && Array.isArray(state.devices)) ? state.devices : [];
+		var now = nowSec();
+		var online = 0;
+		var i;
+
+		for (i = 0; i < all.length; i++) {
+			if (isDeviceOnline(all[i], now)) online++;
+		}
+
+		var offline = all.length - online;
+
+		this.syncSegmentButtons({ all: all.length, online: online, offline: offline });
+
+		var monthSum = 0;
+		var monthKnown = false;
+
+		for (i = 0; i < all.length; i++) {
+			if (monthAvailable(all[i])) {
+				monthSum += monthTotal(all[i]);
+				monthKnown = true;
+			}
+		}
+
+		if (!monthKnown && state != null && state.totals != null && state.totals.month_total != null) {
+			monthSum = num(state.totals.month_total);
+			monthKnown = true;
+		}
+
+		var q = ('' + (this.search || '')).toLowerCase();
+		var filtered = [];
+
+		for (i = 0; i < all.length; i++) {
+			if (deviceMatches(all[i], q) && matchesLinkFilter(all[i], this.linkFilter))
+				filtered.push(all[i]);
+		}
+
+		var rows = [];
+
+		for (i = 0; i < filtered.length; i++) {
+			var on = isDeviceOnline(filtered[i], now);
+
+			if (this.segment === 'online' && !on) continue;
+			if (this.segment === 'offline' && on) continue;
+
+			rows.push(filtered[i]);
+		}
+
+		rows.sort(function(a, b) { return self.compareDevices(a, b); });
+
+		var summary;
+
+		if (state == null) {
+			/* 首次读取失败：不要用 0 台冒充“没有设备”，摘要也显示不可用。 */
+			summary = _('在线') + ' — · ' + _('离线') + ' — · ' + _('本月合计') + ' —';
+		}
+		else {
+			summary = _('在线') + ' ' + online + ' · ' + _('离线') + ' ' + offline +
+				' · ' + _('本月合计') + ' ' + (monthKnown ? fmtBytes(monthSum) : '—') +
+				' · ' + _('共') + ' ' + all.length + ' ' + _('台设备');
+
+			if (rows.length !== all.length)
+				summary += ' · ' + _('匹配') + ' ' + rows.length + ' ' + _('台');
+
+			if (state.truncated === true)
+				summary += ' · ' + _('数据过大，后端已裁剪（仅显示使用量最高的部分）');
+
+			if (state.running !== true)
+				summary += ' · ' + _('traffic-statsd 未运行，数据可能已过期');
+
+			/* 保留原来的「全屋本月配额」信息，但收进同一行摘要。 */
+			var houseQuota = totalQuota(state);
+
+			if (houseQuota != null)
+				summary += ' · ' + _('全屋本月配额') + ' ' + _('剩余') + ' ' +
+					fmtBytes(Math.max(0, houseQuota.remaining)) + ' / ' + fmtBytes(houseQuota.limit) +
+					'（' + houseQuota.pct.toFixed(1) + '%）';
+
+			summary += ' · ' + this.linkSummary(state);
+			summary += _('点击设备行查看详情');
+		}
+
+		this.summaryNode.textContent = summary;
+
+		this.syncSortArrows();
+		this.syncAlert();
+		this.aliasCells = {};
+
+		if (state == null || !Array.isArray(state.devices) || all.length === 0) {
+			this.tableWrap.style.display = 'none';
+			this.emptyBox.style.display = '';
+			clearNode(this.tbody);
+			dom.content(this.emptyBox, this.renderEmpty());
+
+			return;
+		}
+
+		if (rows.length === 0) {
+			this.tableWrap.style.display = 'none';
+			this.emptyBox.style.display = '';
+			clearNode(this.tbody);
+			dom.content(this.emptyBox, this.renderFilterEmpty());
+
+			return;
+		}
+
+		this.tableWrap.style.display = '';
+		this.emptyBox.style.display = 'none';
+		clearNode(this.emptyBox);
+
+		var frags = [];
+
+		for (i = 0; i < rows.length; i++)
+			frags = frags.concat(this.renderDeviceRow(rows[i]));
+
+		dom.content(this.tbody, frags);
+	},
+
+	renderFilterEmpty: function() {
+		var self = this;
+
+		return E('div', {}, [
+			E('strong', {}, _('没有匹配的设备')),
+			E('p', { style: 'margin:6px 0 0 0' }, _('当前分段、搜索或接入筛选下没有设备。')),
+			E('button', {
+				'class': 'cbi-button',
+				type: 'button',
+				click: function(ev) {
+					if (ev != null && ev.preventDefault) ev.preventDefault();
+					self.clearFilters();
+				}
+			}, _('清除筛选'))
+		]);
+	},
+
+	clearFilters: function() {
+		this.segment = 'all';
+		this.search = '';
+		this.linkFilter = '';
+
+		if (this.searchInput != null) this.searchInput.value = '';
+		if (this.linkSelect != null) this.linkSelect.value = '';
+
+		this.renderRows();
+	},
+
+	syncAlert: function() {
+		if (this.alertBox == null) return;
+
+		if (this.refreshError != null) {
+			this.alertBox.style.display = '';
+			this.alertBox.textContent = (this.state == null)
+				? _('加载失败：') + this.refreshError
+				: _('刷新失败：') + this.refreshError + _('（下面显示的是上次成功的数据）');
+
+			return;
+		}
+
+		this.alertBox.style.display = 'none';
+		this.alertBox.textContent = '';
+	},
+
+	reloadState: function() {
+		var self = this;
+
+		return callState().then(function(state) {
+			if (state == null || typeof state !== 'object' || !Array.isArray(state.devices))
+				throw new Error(_('后端返回的数据不完整'));
+
+			self.state = state;
+			self.error = null;
+			self.refreshError = null;
+			self.renderRows();
+			self.syncDrawer();
+
+			return state;
+		}).catch(function(err) {
+			self.refreshError = (err != null && err.message) ? ('' + err.message) : ('' + err);
+			self.syncAlert();
+
+			if (self.state == null) self.renderRows();
+		});
+	},
+
+	/* 15s 自动刷新：只重新拉 get_state，过滤/排序/分段状态都保留。 */
+	refresh: function() {
+		var self = this;
+
+		if (this.refreshing === true) return Promise.resolve();
+
+		this.refreshing = true;
+
+		return callState().then(function(state) {
+			self.refreshing = false;
+
+			if (state == null || typeof state !== 'object' || !Array.isArray(state.devices))
+				throw new Error(_('后端返回的数据不完整'));
+
+			self.state = state;
+			self.error = null;
+			self.refreshError = null;
+			self.renderRows();
+			self.syncDrawer();
+
+			return state;
+		}).catch(function(err) {
+			self.refreshing = false;
+			/* 失败保留旧数据：不清 state、不重建表格，只在顶部提示。 */
+			self.refreshError = (err != null && err.message) ? ('' + err.message) : ('' + err);
+			self.syncAlert();
+		});
+	},
+
+	startRefresh: function() {
+		var self = this;
+
+		if (this.paused === true || this.timer != null) return;
+
+		if (typeof window == 'undefined' || typeof window.setInterval != 'function') return;
+
+		this.timer = window.setInterval(function() {
+			var attached = true;
+
+			if (self.root != null && typeof document != 'undefined' && document.body != null &&
+				typeof document.body.contains == 'function')
+				attached = document.body.contains(self.root);
+
+			/* 离开页面后 #view 会被清空，这里顺手停表，避免后台一直轮询。 */
+			if (!attached) {
+				self.stopRefresh();
+				self.closeDrawer();
+
+				return;
+			}
+
+			if (typeof document != 'undefined' && document.hidden === true) return;
+
+			self.refresh();
+		}, REFRESH_MS);
+	},
+
+	stopRefresh: function() {
+		if (this.timer != null) {
+			if (typeof window != 'undefined' && typeof window.clearInterval == 'function')
+				window.clearInterval(this.timer);
+
+			this.timer = null;
+		}
+	},
+
+	toggleRefresh: function() {
+		this.paused = !(this.paused === true);
+
+		if (this.paused) this.stopRefresh();
+		else this.startRefresh();
+
+		this.syncRefreshHint();
+	},
+
+	syncRefreshHint: function() {
+		if (this.refreshBtn != null)
+			this.refreshBtn.textContent = this.paused ? _('继续刷新') : _('暂停刷新');
+
+		if (this.refreshHint != null) {
+			this.refreshHint.textContent = this.paused
+				? _('自动刷新已暂停')
+				: _('每') + ' ' + Math.round(REFRESH_MS / 1000) + ' ' + _('秒自动刷新');
+		}
+	},
+
+	/* ---- 设备详情抽屉 ---- */
+
+	openDrawer: function(dev) {
+		if (dev == null) return;
+
+		var self = this;
+
+		if (this.drawerOverlay != null) this.closeDrawer();
+
+		this.drawerDev = dev;
+
+		var closeBtn = E('button', {
+			'class': 'tsd-drawer-close',
+			type: 'button',
+			'aria-label': _('关闭设备详情'),
+			title: _('关闭（Esc）'),
+			click: function(ev) {
+				if (ev != null && ev.preventDefault) ev.preventDefault();
+
+				self.closeDrawer();
+			}
+		}, '×');
+
+		this.drawerBody = E('div', {}, '');
+
+		var panel = E('div', {
+			'class': 'tsd-drawer-panel',
+			role: 'dialog',
+			'aria-modal': 'true',
+			'aria-labelledby': 'tsd-drawer-title'
+		}, [ closeBtn, this.drawerBody ]);
+
+		var overlay = E('div', {
+			'class': 'tsd-drawer-overlay',
+			click: function(ev) {
+				/* 只有点到遮罩本身才关闭；点面板内部不关。 */
+				if (ev != null && ev.target === overlay) {
+					if (ev.preventDefault) ev.preventDefault();
+
+					self.closeDrawer();
+				}
+			}
+		}, panel);
+
+		this.drawerOverlay = overlay;
+		this.drawerPanel = panel;
+
+		dom.content(this.drawerBody, this.renderDrawerContent(dev));
+
+		/* 挂在 #view 的根节点里：SPA 切页时随视图一起移除，不会留下盖住新页面的遮罩。 */
+		var mount = (this.root != null) ? this.root : ((typeof document != 'undefined') ? document.body : null);
+
+		if (mount != null && typeof mount.appendChild == 'function')
+			mount.appendChild(overlay);
+
+		/* 从右侧滑入：先以 translateX(100%) 挂上，再切到 0 触发 transition。 */
+		nextFrame(function() {
+			if (self.drawerPanel === panel && panel.style != null)
+				panel.style.transform = 'translateX(0)';
+		});
+
+		this.escFn = function(ev) {
+			if (ev == null || !(ev.key === 'Escape' || ev.key === 'Esc' || ev.keyCode === 27))
+				return;
+
+			/* 编辑弹窗开着时 Esc 交给弹窗，抽屉保持打开。 */
+			if (self.dialog != null) return;
+
+			var attached = (self.root == null) ? false :
+				(typeof document == 'undefined' || document.body == null ||
+					typeof document.body.contains != 'function') ? true : document.body.contains(self.root);
+
+			if (!attached) {
+				self.closeDrawer();
+
+				return;
+			}
+
+			if (typeof ev.preventDefault == 'function') ev.preventDefault();
+
+			self.closeDrawer();
+		};
+
+		if (typeof document != 'undefined' && typeof document.addEventListener == 'function')
+			document.addEventListener('keydown', this.escFn);
+
+		try {
+			closeBtn.focus();
+		}
+		catch (e) { /* 老浏览器/测试环境没有 focus 也不影响 */ }
+	},
+
+	closeDrawer: function() {
+		if (this.escFn != null && typeof document != 'undefined' &&
+			typeof document.removeEventListener == 'function')
+			document.removeEventListener('keydown', this.escFn);
+
+		this.escFn = null;
+
+		var overlay = this.drawerOverlay;
+
+		if (overlay != null) {
+			if (overlay.parentNode != null && typeof overlay.parentNode.removeChild == 'function')
+				overlay.parentNode.removeChild(overlay);
+			else if (typeof document != 'undefined' && document.body != null &&
+				typeof document.body.removeChild == 'function') {
+				try { document.body.removeChild(overlay); }
+				catch (e) { /* 已经不在文档里 */ }
+			}
+		}
+
+		this.drawerOverlay = null;
+		this.drawerPanel = null;
+		this.drawerBody = null;
+		this.drawerDev = null;
+	},
+
+	/* 刷新后把抽屉里的设备对象换成最新的一份，在线状态/用量不显示旧值。 */
+	syncDrawer: function() {
+		if (this.drawerBody == null || this.drawerDev == null) return;
+
+		var key = macKey(this.drawerDev);
+		var all = (this.state != null && Array.isArray(this.state.devices)) ? this.state.devices : [];
+		var found = null;
+
+		/* 没有 MAC 的设备无法按 MAC 对齐，保留打开时的对象，避免错配到另一台空 MAC 设备。 */
+		if (!key.length) return;
+
+		for (var i = 0; i < all.length; i++) {
+			if (macKey(all[i]) === key) {
+				found = all[i];
+
+				break;
+			}
+		}
+
+		if (found != null) this.drawerDev = found;
+
+		dom.content(this.drawerBody, this.renderDrawerContent(this.drawerDev));
+	},
+
+	drawerSection: function(title, content) {
+		return E('div', { 'class': 'tsd-drawer-sec' }, [
+			E('h5', {}, title),
+			content
+		]);
+	},
+
+	drawerInfo: function(pairs) {
+		var cells = [];
+
+		for (var i = 0; i < pairs.length; i++) {
+			cells.push(E('div', { 'class': 'tsd-info-k' }, pairs[i][0]));
+			cells.push(E('div', { 'class': 'tsd-info-v' }, pairs[i][1]));
+		}
+
+		return E('div', { 'class': 'tsd-info' }, cells);
+	},
+
+	renderDrawerSignal: function(st) {
+		if (st == null || typeof st.signal !== 'number' || !isFinite(st.signal)) return '—';
+
+		var parts = [];
+
+		if (st.node_name) parts.push('' + st.node_name);
+		if (st.iface) parts.push('' + st.iface);
+
+		return E('span', {
+			style: 'color:' + signalColor(st.signal) + ';font-weight:600'
+		}, st.signal + ' dBm' + (parts.length ? '（' + parts.join(' · ') + '）' : ''));
+	},
+
+	renderDrawerContent: function(dev) {
+		var self = this;
+		var mac = macKey(dev);
+		var name = deviceName(dev);
+		var online = isDeviceOnline(dev, nowSec());
+		var st = stationFor(this.stations, dev);
+		var alias = aliasOf(dev);
+		var group = groupOf(dev);
+
+		var header = E('div', {}, [
+			E('div', { 'class': 'tsd-drawer-h', id: 'tsd-drawer-title' }, shorten(name, 60)),
+			E('div', { 'class': 'tsd-drawer-sub' }, [
+				alias.length ? alias : _('未命名'),
+				group.length ? ' · ' + _('分组') + '：' + group : '',
+				mac.length ? ' · ' + mac : ''
+			]),
+			E('div', {
+				style: 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 0 0'
+			}, [
+				E('span', {
+					'class': 'tsd-pill ' + (online ? 'tsd-pill-on' : 'tsd-pill-off')
+				}, online ? _('在线') : _('离线')),
+				isAdmin()
+					? E('button', {
+						'class': 'cbi-button cbi-button-edit tsd-edit',
+						type: 'button',
+						click: function(ev) {
+							if (ev != null && ev.preventDefault) ev.preventDefault();
+
+							self.openEditDialog(dev);
+						}
+					}, _('编辑'))
+					: E('span', { style: 'font-size:11px;opacity:.6' }, _('只读'))
+			])
+		]);
+
+		var basic = this.drawerInfo([
+			[ _('IP'), (dev.ip != null && ('' + dev.ip).length) ? E('code', {}, '' + dev.ip) : '—' ],
+			[ _('MAC'), mac.length ? E('code', {}, mac) : '—' ],
+			[ _('接入方式'), this.linkBadge(dev) ],
+			[ _('信号'), this.renderDrawerSignal(st) ],
+			[ _('首次出现'), num(dev.first_seen) > 0 ? fmtDate(dev.first_seen) : '—' ],
+			[ _('上次活跃'), fmtTime(dev.last_seen) +
+				(num(dev.last_seen) > 0 ? '（' + fmtDate(num(dev.last_seen)) + '）' : '') ]
+		]);
+
+		var usedKnown = monthAvailable(dev);
+
+		var usage = this.drawerInfo([
+			[ _('本月下载'), usedKnown ? fmtBytes(num(dev.month_rx)) : '—' ],
+			[ _('本月上传'), usedKnown ? fmtBytes(num(dev.month_tx)) : '—' ],
+			[ _('本月合计'), usedKnown ? fmtBytes(monthTotal(dev)) : '—' ]
+		]);
+
+		var q = deviceQuota(dev);
+		var hasQuota = (dev != null && dev.quota_limit != null);
+		var quotaNode;
+
+		if (q != null) {
+			quotaNode = E('div', { style: 'margin-top:10px' }, [
+				E('div', { style: 'font-size:12px;line-height:1.6' }, [
+					_('配额') + ' ' + fmtBytes(q.limit) + ' · ' + _('已用') + ' ' + fmtBytes(q.used) +
+						'（' + q.pct.toFixed(1) + '%）'
+				]),
+				E('div', { 'class': 'tsd-drawer-bar' }, E('div', {
+					style: 'width:' + q.pct.toFixed(1) + '%;background:' + quotaLook(q.pct)
+				})),
+				E('div', {
+					style: 'font-size:12px;line-height:1.6;' + (q.remaining < 0 ? 'color:#c62828' : '')
+				}, q.remaining < 0
+					? _('已超额') + ' ' + fmtBytes(-q.remaining)
+					: _('剩余') + ' ' + fmtBytes(q.remaining))
+			]);
+		}
+		else if (hasQuota) {
+			quotaNode = E('div', { style: 'font-size:12px;line-height:1.6;margin-top:10px;opacity:.85' },
+				_('配额剩余') + ' — ' + _('（配额上限为 0，分母为 0，无法计算百分比）'));
+		}
+		else {
+			quotaNode = E('div', { style: 'font-size:12px;line-height:1.6;margin-top:10px;opacity:.75' },
+				_('未配置单设备配额（在设置页选择“每设备”配额并填写额度后显示）'));
+		}
+
+		var usageSection = this.drawerSection(_('用量'), E('div', {}, [ usage, quotaNode ]));
+
+		var list = deviceAppList(dev);
+		var listTotal = appListTotal(list);
+		var appsContent;
+
+		if (list.length === 0) {
+			appsContent = E('div', { style: 'font-size:12px;opacity:.7' }, _('该设备暂无应用明细'));
+		}
+		else {
+			var top = list.slice(0, 10);
+			var appRows = [];
+
+			for (var i = 0; i < top.length; i++) {
+				var app = top[i];
+				var pct = (listTotal > 0) ? (app.total * 100 / listTotal) : 0;
+
+				appRows.push(E('tr', {}, [
+					E('td', {
+						style: 'max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap',
+						title: app.host
+					}, shorten(appLabel(app.host), 28)),
+					E('td', {}, chainBadge(app.chain)),
+					E('td', { style: 'text-align:right;white-space:nowrap' }, fmtBytes(app.total)),
+					E('td', { style: 'width:92px' }, [
+						E('div', { 'class': 'tsd-drawer-bar', style: 'margin:0' }, E('div', {
+							style: 'width:' + pct.toFixed(1) + '%;background:#2b7de9'
+						})),
+						E('div', { style: 'font-size:10.5px;opacity:.7' }, pct.toFixed(1) + '%')
+					])
+				]));
+			}
+
+			appsContent = E('div', {}, [
+				E('table', { 'class': 'tsd-drawer-apps' }, E('tbody', {}, appRows)),
+				list.length > top.length
+					? E('p', { 'class': 'tsd-drawer-note' },
+						_('仅显示流量前 10 项（共 ') + list.length + _(' 项）；列表里点「▸」可展开全部应用。'))
+					: ''
+			]);
+		}
+
+		var appsSection = this.drawerSection(_('应用分布'), appsContent);
+
+		var statusNode = E('div', { 'class': 'tsd-drawer-note', role: 'status' }, '');
+
+		var copyAttrs = { 'class': 'cbi-button', type: 'button' };
+
+		if (!mac.length) copyAttrs.disabled = true;
+
+		var copyMacBtn = E('button', copyAttrs, _('复制 MAC'));
+
+		copyMacBtn.addEventListener('click', function(ev) {
+			if (ev != null && ev.preventDefault) ev.preventDefault();
+
+			self.copyText(mac, statusNode);
+		});
+
+		var actionButtons = E('div', { 'class': 'tsd-drawer-actions' }, [
+			E('button', {
+				'class': 'cbi-button cbi-button-action',
+				type: 'button',
+				click: function(ev) {
+					if (ev != null && ev.preventDefault) ev.preventDefault();
+
+					self.exportDeviceCsv(dev, statusNode);
+				}
+			}, _('导出该设备 CSV')),
+			copyMacBtn
+		]);
+
+		var blockNode;
+
+		if (mac.length) {
+			var cmd = blockCommand(mac);
+
+			blockNode = E('div', {}, [
+				E('pre', { 'class': 'tsd-drawer-code' }, E('code', {}, cmd)),
+				E('p', { 'class': 'tsd-drawer-note' },
+					_('本页只显示命令，不会执行；nft 规则在防火墙重载 / 重启后失效。需在路由器 SSH 中手动执行，执行前请确认不是自己的设备。')),
+				E('div', { 'class': 'tsd-drawer-actions' }, [
+					E('button', {
+						'class': 'cbi-button',
+						type: 'button',
+						click: function(ev) {
+							if (ev != null && ev.preventDefault) ev.preventDefault();
+
+							self.copyText(cmd, statusNode);
+						}
+					}, _('复制命令'))
+				])
+			]);
+		}
+		else {
+			blockNode = E('p', { 'class': 'tsd-drawer-note' },
+				_('这台设备的 state.json 里没有 MAC（只有 IP），无法生成基于 MAC 的 nftables 规则，因此没有阻断建议。'));
+		}
+
+		var opsSection = this.drawerSection(_('操作'), E('div', {}, [
+			actionButtons,
+			statusNode,
+			E('div', { style: 'font-size:12px;font-weight:600;margin:14px 0 0 0' }, _('阻断建议')),
+			blockNode
+		]));
+
+		return [ header, this.drawerSection(_('基本信息'), basic),
+			usageSection, appsSection, opsSection ];
+	},
+
+	/* 单设备 CSV：export_csv 只支持整页 devices，这里按同样的列导出一行。 */
+	exportDeviceCsv: function(dev, statusNode) {
+		try {
+			this.saveCsv({ filename: deviceCsvFilename(dev), csv: deviceCsv(dev), rows: 1 }, 'device');
+			nodeText(statusNode, _('已导出该设备的 CSV'), '#2e7d32');
+		}
+		catch (err) {
+			var message = (err != null && err.message) ? ('' + err.message) : ('' + err);
+
+			nodeText(statusNode, _('导出失败：') + message, '#c62828');
+			ui.addNotification(null, E('p', {}, _('导出失败：') + message), 'error');
+		}
+	},
+
+	copyText: function(text, statusNode) {
+		var value = (text == null) ? '' : ('' + text);
+		var done = function(ok, message) {
+			nodeText(statusNode, message || (ok ? _('已复制到剪贴板') : _('复制失败，请手动选择文本')),
+				ok ? '#2e7d32' : '#c62828');
+		};
+
+		if (!value.length) {
+			done(false, _('没有可复制的内容'));
+
+			return;
+		}
+
+		var nav = (typeof navigator != 'undefined') ? navigator : null;
+
+		if (nav != null && nav.clipboard != null && typeof nav.clipboard.writeText == 'function') {
+			nav.clipboard.writeText(value).then(function() { done(true); })
+				.catch(function() { done(false); });
+
+			return;
+		}
+
+		try {
+			var area = document.createElement('textarea');
+
+			area.value = value;
+			area.style.position = 'fixed';
+			area.style.opacity = '0';
+			area.style.left = '-9999px';
+			document.body.appendChild(area);
+
+			if (typeof area.select == 'function') area.select();
+
+			var ok = (typeof document.execCommand == 'function') ? document.execCommand('copy') : false;
+
+			document.body.removeChild(area);
+			done(ok === true);
+		}
+		catch (err) {
+			done(false);
+		}
 	},
 
 	/* 接入方式的数据来源提示：FDB 读不到或没配端口时，本列会大面积显示"未知/有线"，先把原因说清楚。 */
@@ -615,9 +1697,11 @@ return view.extend({
 		var h = (state != null && state.health) ? state.health : {};
 		var reasons = Array.isArray(h.reasons) ? h.reasons : [];
 		var message;
+		var self = this;
 
 		if (state == null) {
-			message = _('暂时读不到设备列表：rpcd 对象 traffic-stats 不可用，或者后端尚未安装。');
+			message = _('暂时读不到设备列表：rpcd 对象 traffic-stats 不可用，或者后端尚未安装。') +
+				(this.error ? '（' + this.error + '）' : '');
 		}
 		else if (state.running !== true) {
 			message = _('暂无数据：traffic-statsd 未运行，因此还没有设备记录。');
@@ -630,6 +1714,16 @@ return view.extend({
 			E('p', {}, E('strong', {}, message)),
 			reasons.length ? E('ul', {}, reasons.map(function(r) { return E('li', {}, '' + r); })) : '',
 			E('p', {}, [
+				E('button', {
+					'class': 'cbi-button cbi-button-action',
+					type: 'button',
+					click: function(ev) {
+						if (ev != null && ev.preventDefault) ev.preventDefault();
+
+						self.reloadState();
+					}
+				}, _('重试')),
+				' ',
 				E('a', { href: L.url('admin/services/traffic-stats/settings') }, _('前往设置页')),
 				' · ',
 				E('a', { href: L.url('admin/services/traffic-stats/overview') }, _('返回总览'))
@@ -638,19 +1732,22 @@ return view.extend({
 	},
 
 	renderDeviceRow: function(dev) {
+		var self = this;
 		var direct = num(dev.direct_rx) + num(dev.direct_tx);
 		var proxy = num(dev.proxy_rx) + num(dev.proxy_tx);
 		var total = direct + proxy;
 		var name = deviceName(dev);
 		var mac = macKey(dev);
-		var marker = E('span', {
-			style: 'display:inline-block;width:12px;opacity:.6',
-			title: _('展开应用分布')
+		var marker = E('button', {
+			'class': 'tsd-appbtn',
+			type: 'button',
+			title: _('展开/收起该设备的应用分布'),
+			'aria-label': _('展开应用分布')
 		}, '▸');
 
 		var cell = E('td', {
 			'class': 'td',
-			colspan: 12,
+			colspan: 13,
 			style: 'padding:10px 12px;background:rgba(127,127,127,.06)'
 		}, E('em', {}, _('展开后加载…')));
 
@@ -667,12 +1764,29 @@ return view.extend({
 
 		dom.content(aliasCell, this.renderAliasContent(dev));
 
+		/* 行内「应用」按钮单独控制展开，点击行本身打开右侧详情抽屉。 */
+		marker.addEventListener('click', function(ev) {
+			if (ev != null) {
+				if (ev.preventDefault) ev.preventDefault();
+				if (ev.stopPropagation) ev.stopPropagation();
+			}
+
+			open = !open;
+			detailRow.style.display = open ? '' : 'none';
+			marker.textContent = open ? '▾' : '▸';
+
+			if (open && !filled) {
+				filled = true;
+				dom.content(cell, self.renderApps(dev));
+			}
+		});
+
 		var firstSeen = num(dev.first_seen);
 
 		var row = E('tr', {
 			'class': 'tr',
 			style: 'cursor:pointer',
-			title: _('点击展开/收起该设备的应用分布')
+			title: _('点击查看设备详情')
 		}, [
 			E('td', { 'class': 'td' }, [
 				marker,
@@ -707,19 +1821,22 @@ return view.extend({
 				E('div', { style: 'font-size:11px;opacity:.7' }, '↑ ' + fmtRateBits(num(dev.tx_rate)))
 			]),
 			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtTime(dev.last_seen)),
-			this.renderSignal(dev)
+			this.renderSignal(dev),
+			E('td', { 'class': 'td', style: 'text-align:right' }, E('button', {
+				'class': 'cbi-button tsd-detail-btn',
+				type: 'button',
+				click: function(ev) {
+					if (ev != null) {
+						if (ev.preventDefault) ev.preventDefault();
+						if (ev.stopPropagation) ev.stopPropagation();
+					}
+
+					self.openDrawer(dev);
+				}
+			}, _('详情')))
 		]);
 
-		row.addEventListener('click', function() {
-			open = !open;
-			detailRow.style.display = open ? '' : 'none';
-			marker.textContent = open ? '▾' : '▸';
-
-			if (open && !filled) {
-				filled = true;
-				dom.content(cell, this.renderApps(dev));
-			}
-		}.bind(this));
+		row.addEventListener('click', function() { self.openDrawer(dev); });
 
 		return [ row, detailRow ];
 	},
@@ -904,6 +2021,9 @@ return view.extend({
 				if (cell != null)
 					dom.content(cell, self.renderAliasContent(dev));
 
+				/* 抽屉同时开着时，头部别名 / 分组也要立刻换成后端保存后的值。 */
+				self.syncDrawer();
+
 				/* 后端返回值和提交值不一致 = 被截断/清理，绝不能只弹“已保存”。 */
 				if (result.truncated) {
 					aliasInput.value = result.alias;
@@ -1037,19 +2157,21 @@ return view.extend({
 		setTimeout(function() { URL.revokeObjectURL(url); }, 1500);
 	},
 
-	/* 接入列：无线 / 有线 / 未知；字段缺失（老后端）显示 "-"。
-	   数据来自主路由的桥 FDB（见守护进程 brctl showmacs），与字节来源无关。 */
-	renderLink: function(dev) {
-		var kind = linkOf(dev);
-		var style = LINK_STYLE[kind];
+	/* 接入标签：抽屉和表格共用。数据来自主路由的桥 FDB（见守护进程 brctl showmacs），
+	   与字节来源无关；字段缺失（老后端）显示 "-"。 */
+	linkBadge: function(dev) {
+		var style = LINK_STYLE[linkOf(dev)];
 
-		if (style == null)
-			return E('td', { 'class': 'td' }, '-');
+		if (style == null) return '-';
 
-		return E('td', { 'class': 'td' }, E('span', {
+		return E('span', {
 			style: 'font-size:11px;padding:1px 6px;border-radius:4px;white-space:nowrap;color:' +
 				style.color + ';background:' + style.bg
-		}, _(style.label)));
+		}, _(style.label));
+	},
+
+	renderLink: function(dev) {
+		return E('td', { 'class': 'td' }, this.linkBadge(dev));
 	},
 
 	/* 信号列：有数据就显示 "-53 dBm" 并分级着色；没有该设备的数据就显示 "-"。
@@ -1080,32 +2202,15 @@ return view.extend({
 	},
 
 	renderApps: function(dev) {
-		var apps = (dev.apps != null && typeof dev.apps == 'object') ? dev.apps : {};
-		var list = [];
-
-		for (var host in apps) {
-			if (!apps.hasOwnProperty(host)) continue;
-
-			list.push({
-				host: host,
-				rx: num(apps[host] && apps[host].rx),
-				tx: num(apps[host] && apps[host].tx),
-				chain: (apps[host] && apps[host].chain) ? '' + apps[host].chain : ''
-			});
-		}
+		var list = deviceAppList(dev);
 
 		if (list.length == 0)
 			return E('div', {}, E('em', { style: 'opacity:.7' }, _('该设备暂无应用明细')));
 
-		list.sort(function(a, b) { return (b.rx + b.tx) - (a.rx + a.tx); });
-
-		var sum = 0;
-
-		for (var i = 0; i < list.length; i++)
-			sum += list[i].rx + list[i].tx;
+		var sum = appListTotal(list);
 
 		var rows = list.map(function(app) {
-			var total = app.rx + app.tx;
+			var total = app.total;
 			var percent = (sum > 0) ? (total * 100 / sum) : 0;
 
 			return E('tr', { 'class': 'tr' }, [

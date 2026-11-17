@@ -512,6 +512,9 @@ const HOOK_NAMES = [
 	'fmtAgo',
 	'isDeviceOnline',
 	'isGuestDevice',
+	'deviceKindOf',
+	'deviceKindSvg',
+	'topoBusSvg',
 	'classifyDevice',
 	'groupDevices',
 	'sortDevices',
@@ -1487,13 +1490,14 @@ function topoApState(card) {
 	return node ? textOf(node) : null;
 }
 
+/* L5 设备层已改为拓扑节点（.tsm-dnode），不再是文字行。 */
 function topoRows(ctx) {
-	return findAll(ctx.topoHost, function (node) { return hasClass(node, 'tsm-trow'); });
+	return findAll(ctx.topoHost, function (node) { return hasClass(node, 'tsm-dnode'); });
 }
 
 function topoRowByName(ctx, name) {
 	return topoRows(ctx).find(function (row) {
-		const node = findAll(row, function (n) { return hasClass(n, 'tsm-tname'); })[0];
+		const node = findAll(row, function (n) { return hasClass(n, 'tsm-dnode-name'); })[0];
 
 		return node != null && textOf(node) === name;
 	}) || null;
@@ -1633,34 +1637,63 @@ async function testTopology() {
 		textOf(topoApByName(ctx, '车库 AP')).indexOf('0 台在线') >= 0,
 		'text=' + repr(textOf(topoApByName(ctx, '车库 AP'))));
 
-	/* L5 */
+	/* L5：三组设备节点网格（不再是文字行） */
 	const wifiGroup = findAll(ctx.topoHost, function (n) { return hasClass(n, 'tsm-tgroup-wifi'); })[0];
-	const wifiRows = findAll(wifiGroup, function (n) { return hasClass(n, 'tsm-trow'); });
+	const wifiRows = findAll(wifiGroup, function (n) { return hasClass(n, 'tsm-dnode'); });
+	const wiredGroup = findAll(ctx.topoHost, function (n) { return hasClass(n, 'tsm-tgroup-wired'); })[0];
+	const unknownGroup = findAll(ctx.topoHost, function (n) { return hasClass(n, 'tsm-tgroup-unknown'); })[0];
 
 	same('L5 无线组最多显示 5 台', wifiRows.length, 5);
 	check('L5 无线组显示「还有 2 台」',
 		textOf(wifiGroup).indexOf('还有 2 台') >= 0, 'group=' + repr(textOf(wifiGroup)));
 	same('L5 有线组 1 台',
-		findAll(findAll(ctx.topoHost, function (n) { return hasClass(n, 'tsm-tgroup-wired'); })[0],
-			function (n) { return hasClass(n, 'tsm-trow'); }).length, 1);
+		findAll(wiredGroup, function (n) { return hasClass(n, 'tsm-dnode'); }).length, 1);
 	same('L5 未知组 1 台',
-		findAll(findAll(ctx.topoHost, function (n) { return hasClass(n, 'tsm-tgroup-unknown'); })[0],
-			function (n) { return hasClass(n, 'tsm-trow'); }).length, 1);
-	check('L5 设备行带圆形首字、名称与速率',
+		findAll(unknownGroup, function (n) { return hasClass(n, 'tsm-dnode'); }).length, 1);
+	check('L5 组标题保留名称与数量',
+		textOf(findByClass(wifiGroup, 'tsm-tgroup-h')).indexOf('无线 7') >= 0 &&
+		textOf(findByClass(wiredGroup, 'tsm-tgroup-h')).indexOf('有线 1') >= 0,
+		'h=' + repr([ textOf(findByClass(wifiGroup, 'tsm-tgroup-h')),
+			textOf(findByClass(wiredGroup, 'tsm-tgroup-h')) ]));
+	check('L5 每组都有 SVG 连线覆盖层（树干 + 分叉，按 link 上色）',
+		[ [ wifiGroup, 'wifi' ], [ wiredGroup, 'wired' ], [ unknownGroup, 'unknown' ] ]
+			.every(function (pair) {
+				const bus = findByClass(pair[0], 'tsm-tbus');
+				const lines = bus ? findAll(bus, function (n) { return hasClass(n, 'tsm-tline'); }) : [];
+
+				return bus != null && bus.tag === 'svg' && lines.length >= 2 &&
+					findAll(bus, function (n) {
+						return hasClass(n, 'tsm-tline-' + pair[1]);
+					}).length >= 1;
+			}),
+		'bus=' + repr([ wifiGroup, wiredGroup, unknownGroup ].map(function (group) {
+			const bus = findByClass(group, 'tsm-tbus');
+
+			return bus ? findAll(bus, function (n) { return hasClass(n, 'tsm-tline'); }).length : -1;
+		})));
+	check('L5 设备节点带状态环、类型图标、名称与速率',
 		textOf(wifiRows[0]).indexOf('↓') >= 0 &&
-		findAll(wifiRows[0], function (n) { return hasClass(n, 'tsm-tava'); }).length === 1,
-		'row=' + repr(textOf(wifiRows[0])));
+		findAll(wifiRows[0], function (n) { return hasClass(n, 'tsm-dnode-ring'); }).length === 1 &&
+		findAll(wifiRows[0], function (n) { return n.tag === 'svg'; }).length === 1 &&
+		findAll(wifiRows[0], function (n) { return hasClass(n, 'tsm-dnode-name'); }).length === 1,
+		'node=' + repr(textOf(wifiRows[0])));
+	check('L5 无线组节点挂 is-wifi 状态类',
+		hasClass(wifiRows[0], 'is-wifi'),
+		'wifiNode=' + repr(wifiRows[0].attrs['class']));
+	check('L5 有线组节点挂 is-wired 状态类',
+		hasClass(findAll(wiredGroup, function (n) { return hasClass(n, 'tsm-dnode'); })[0], 'is-wired'),
+		'wired=' + repr(findAll(wiredGroup, function (n) { return hasClass(n, 'tsm-dnode'); })[0].attrs['class']));
 
 	const row = topoRowByName(ctx, '手机A');
 
-	check('拓扑设备行 role=button/tabindex=0',
+	check('拓扑设备节点 role=button/tabindex=0',
 		row != null && row.attrs.role === 'button' && row.attrs.tabindex === '0',
 		'row=' + repr(row && row.attrs));
 
 	ctx.setPage(0);
 	row.listeners.click[0]({});
 
-	same('点击拓扑设备行切到设备屏', ctx.pageIndex, 1);
+	same('点击拓扑设备节点切到设备屏', ctx.pageIndex, 1);
 	same('自动定位到主网络设备 tab', ctx.devTab, 'main');
 
 	const devRow = deviceRowByName(ctx, '手机A');
@@ -1722,6 +1755,223 @@ async function testTopology() {
 	check('无 AP 数据 → 暂无 AP 数据', emptyText.indexOf('暂无 AP 数据') >= 0, emptyText.slice(0, 240));
 	check('无在线设备 → 暂无在线设备', emptyText.indexOf('暂无在线设备') >= 0, emptyText.slice(0, 240));
 	check('没有 hostname 时回退「主路由」', emptyText.indexOf('主路由') >= 0, emptyText.slice(0, 200));
+}
+
+// ---------------------------------------------------------------- 7d. 设备类型图标 + 概览设备拓扑
+
+function ovTopoRows(ctx) {
+	return findAll(ctx.ovTopoHost, function (node) { return hasClass(node, 'tsm-dnode'); });
+}
+
+function ovTopoRowByName(ctx, name) {
+	return ovTopoRows(ctx).find(function (node) {
+		const label = findAll(node, function (n) { return hasClass(n, 'tsm-dnode-name'); })[0];
+
+		return label != null && textOf(label) === name;
+	}) || null;
+}
+
+async function testDeviceKindOf() {
+	console.log('\n[7d] 设备类型：deviceKindOf 关键词分类 + 自绘线条 SVG 图标');
+
+	const booted = await boot({ state: baseState() });
+	const kindOf = booted.hooks.deviceKindOf;
+
+	same('iPhone（混合大小写）→ phone', kindOf({ hostname: 'iPhone-15' }), 'phone');
+	same('ANDROID 大写 → phone', kindOf({ hostname: 'ANDROID-9' }), 'phone');
+	same('vivo（alias）→ phone', kindOf({ alias: 'vivo X90' }), 'phone');
+	same('OPPO 大写 → phone', kindOf({ hostname: 'OPPO-Reno' }), 'phone');
+	same('huawei → phone', kindOf({ hostname: 'HUAWEI-P40' }), 'phone');
+	same('mi 按词边界 → phone', kindOf({ hostname: 'MI-11' }), 'phone');
+	same('中文「手机」→ phone', kindOf({ hostname: '华为手机' }), 'phone');
+	same('MacBook → laptop', kindOf({ hostname: 'MacBook-Pro' }), 'laptop');
+	same('windows/desktop → laptop', kindOf({ hostname: 'WIN-DESKTOP' }), 'laptop');
+	same('linux → laptop', kindOf({ hostname: 'linux-box' }), 'laptop');
+	same('pc 按词边界 → laptop', kindOf({ alias: 'pc-01' }), 'laptop');
+	same('中文「电脑」→ laptop', kindOf({ hostname: '台式电脑' }), 'laptop');
+	same('TVBOX → tv', kindOf({ hostname: 'TVBOX' }), 'tv');
+	same('Apple TV → tv', kindOf({ alias: 'Apple TV' }), 'tv');
+	same('Android-TV 先判电视', kindOf({ hostname: 'Android-TV' }), 'tv');
+	same('roku → tv', kindOf({ hostname: 'Roku-Stick' }), 'tv');
+	same('中文「电视」→ tv', kindOf({ hostname: '客厅电视' }), 'tv');
+	same('iPad → tablet', kindOf({ hostname: 'iPad-Air' }), 'tablet');
+	same('tablet → tablet', kindOf({ alias: 'Tablet-2' }), 'tablet');
+	same('中文「平板」→ tablet', kindOf({ hostname: '客厅平板' }), 'tablet');
+	same('camera → iot', kindOf({ hostname: 'Camera-01' }), 'iot');
+	same('echo → iot', kindOf({ hostname: 'Echo-Dot' }), 'iot');
+	same('HomePod mini → iot（mini 里的 mi 不误判手机）', kindOf({ hostname: 'HomePod mini' }), 'iot');
+	same('bulb/plug → iot', kindOf({ alias: 'LED Bulb Plug' }), 'iot');
+	same('无法识别的名称 → unknown', kindOf({ hostname: 'unknown-device' }), 'unknown');
+	same('hostname/alias 都为空 → unknown', kindOf({}), 'unknown');
+	same('null → unknown', kindOf(null), 'unknown');
+
+	const kinds = [ 'phone', 'laptop', 'tv', 'tablet', 'iot', 'unknown' ];
+
+	kinds.forEach(function (kind) {
+		const svg = booted.hooks.deviceKindSvg(kind, '#2b7de9');
+		const shapeTags = [ 'rect', 'path', 'circle', 'ellipse', 'line' ];
+
+		check('deviceKindSvg(' + kind + ') 是 24px 自绘线条 SVG',
+			svg != null && svg.tag === 'svg' && svg.attrs.viewBox === '0 0 24 24' &&
+			svg.children.length >= 2 &&
+			svg.children.every(function (child) {
+				return child.namespace === 'http://www.w3.org/2000/svg' &&
+					shapeTags.indexOf(child.tag) >= 0 &&
+					(child.attrs.stroke === '#2b7de9' || child.attrs.fill === '#2b7de9');
+			}),
+			'svg=' + repr(svg && svg.children.map(function (c) { return c.tag; })));
+	});
+
+	check('图标只用线条图形（无 <text>、无 emoji 文本节点）',
+		kinds.every(function (kind) {
+			const svg = booted.hooks.deviceKindSvg(kind, '#000');
+
+			return findAll(svg, function (n) { return n.tag === 'text'; }).length === 0 &&
+				svg.children.every(function (child) { return typeof child === 'object'; });
+		}),
+		'icons=' + repr(kinds));
+}
+
+function overviewTopoDevices(list) {
+	return list.map(function (item, index) {
+		return {
+			mac: 'OT' + index,
+			hostname: item.hostname,
+			link: item.link,
+			last_seen: NOW - 20 - index,
+			rx_rate: item.rx_rate,
+			tx_rate: item.tx_rate
+		};
+	});
+}
+
+async function testOverviewTopo() {
+	console.log('\n[7e] 概览设备拓扑：主路由根节点 + 两列在线节点 + SVG 连线 + 点击下钻');
+
+	const devices = overviewTopoDevices([
+		{ hostname: 'iPhone 15', link: 'wifi', rx_rate: 150000, tx_rate: 20000 },
+		{ hostname: 'MacBook Air', link: 'wifi', rx_rate: 750000, tx_rate: 100000 },
+		{ hostname: '客厅电视', link: 'wired', rx_rate: 300000, tx_rate: 50000 },
+		{ hostname: '离线终端', link: 'wifi', rx_rate: 1, tx_rate: 1 }
+	]);
+
+	/* 最后一台置为离线：只应出现在设备屏离线分类，不进拓扑 */
+	devices[3].last_seen = NOW - 9000;
+
+	const booted = await boot({ state: topoState({ devices: devices }) });
+	const ctx = booted.ctx;
+
+	check('概览屏出现设备拓扑区块', ctx.ovTopoHost != null &&
+		hasClass(ctx.ovTopoHost, 'tsm-otopo'), 'host=' + repr(ctx.ovTopoHost && ctx.ovTopoHost.attrs));
+
+	const root = findByClass(ctx.ovTopoHost, 'tsm-otop-root');
+	const grid = findByClass(ctx.ovTopoHost, 'tsm-otop-grid');
+
+	check('主路由根节点存在且显示 hostname',
+		root != null && textOf(root).indexOf('R4S-主路由') >= 0 &&
+		findAll(root, function (n) { return n.tag === 'svg'; }).length === 1,
+		'root=' + repr(root && textOf(root)));
+	check('设备拓扑区块在「N 台终端」胶囊之后、累计口径说明之前',
+		ctx.pages[0].children.indexOf(ctx.ovTopoHost) ===
+			ctx.pages[0].children.indexOf(findByClass(ctx.pages[0], 'tsm-foot')) + 1 &&
+		ctx.pages[0].children.indexOf(ctx.moreBox) ===
+			ctx.pages[0].children.indexOf(ctx.ovTopoHost) + 1,
+		'order=' + repr(ctx.pages[0].children.map(function (n) {
+			return (n && n.attrs && n.attrs['class']) || n;
+		})));
+
+	same('在线终端 3 台 → 3 个设备节点', ovTopoRows(ctx).length, 3);
+	check('节点名称正确（离线终端不出现）',
+		ovTopoRows(ctx).map(function (node) {
+			return textOf(findByClass(node, 'tsm-dnode-name'));
+		}).sort().join(',') === 'MacBook Air,iPhone 15,客厅电视',
+		'names=' + repr(ovTopoRows(ctx).map(function (node) {
+			return textOf(findByClass(node, 'tsm-dnode-name'));
+		})));
+	check('节点速率小字 = ↓ + Mb/s',
+		textOf(ovTopoRowByName(ctx, 'iPhone 15')).indexOf('↓ 1.2 Mb/s') >= 0,
+		'node=' + repr(textOf(ovTopoRowByName(ctx, 'iPhone 15'))));
+	check('节点 title 同时给出上行/下行',
+		String(ovTopoRowByName(ctx, 'MacBook Air').attrs.title).indexOf('6.0 Mb/s') >= 0 &&
+		String(ovTopoRowByName(ctx, 'MacBook Air').attrs.title).indexOf('上行') >= 0,
+		'title=' + repr(ovTopoRowByName(ctx, 'MacBook Air').attrs.title));
+	check('每台设备节点都有状态环与类型图标',
+		ovTopoRows(ctx).every(function (node) {
+			return findAll(node, function (n) { return hasClass(n, 'tsm-dnode-ring'); }).length === 1 &&
+				findAll(node, function (n) { return n.tag === 'svg'; }).length === 1;
+		}),
+		'nodes=' + repr(ovTopoRows(ctx).map(function (n) { return textOf(n); })));
+
+	const bus = findByClass(ctx.ovTopoHost, 'tsm-tbus');
+	const lines = bus ? findAll(bus, function (n) { return hasClass(n, 'tsm-tline'); }) : [];
+
+	check('根节点与设备之间有 SVG 连线（树干 + 3 条分叉）',
+		grid != null && bus != null && bus.tag === 'svg' && lines.length === 4,
+		'lines=' + repr(lines.map(function (n) { return n.attrs['class']; })));
+	check('连线按链路类型着色：无线蓝 / 有线绿',
+		findAll(bus, function (n) { return hasClass(n, 'tsm-tline-wifi'); }).length === 2 &&
+		findAll(bus, function (n) { return hasClass(n, 'tsm-tline-wired'); }).length === 1,
+		'links=' + repr(findAll(bus, function (n) { return hasClass(n, 'tsm-tline'); })
+			.map(function (n) { return n.attrs['class']; })));
+
+	const node = ovTopoRowByName(ctx, '客厅电视');
+
+	check('概览设备节点 role=button/tabindex=0',
+		node != null && node.attrs.role === 'button' && node.attrs.tabindex === '0',
+		'node=' + repr(node && node.attrs));
+
+	ctx.setPage(0);
+	node.listeners.click[0]({});
+
+	same('点击概览设备节点切到设备屏', ctx.pageIndex, 1);
+
+	const devRow = deviceRowByName(ctx, '客厅电视');
+
+	check('点击后目标设备在设备屏已展开',
+		devRow != null && devRow.children[0].attrs['aria-expanded'] === 'true' &&
+		devRow.children[1].style.display !== 'none',
+		'devRow=' + repr(devRow && devRow.children[0].attrs['aria-expanded']));
+
+	ctx.setPage(0);
+
+	const node2 = ovTopoRowByName(ctx, 'iPhone 15');
+
+	node2.listeners.keydown[0]({ key: 'Enter', preventDefault: function () {} });
+	same('键盘 Enter 也切到设备屏', ctx.pageIndex, 1);
+	same('键盘 Enter 展开对应设备',
+		deviceRowByName(ctx, 'iPhone 15').children[0].attrs['aria-expanded'], 'true');
+
+	/* 0 台在线：只给占位，不造假节点 */
+	const emptyBoot = await boot({ state: topoState({
+		devices: [ { mac: 'OFF1', hostname: '离线终端', link: 'wifi', last_seen: NOW - 9000 } ]
+	}) });
+
+	check('0 台在线 → 「暂无在线设备」占位', textOf(emptyBoot.ctx.ovTopoHost).indexOf('暂无在线设备') >= 0,
+		'text=' + repr(textOf(emptyBoot.ctx.ovTopoHost)));
+	same('0 台在线 → 0 个设备节点', ovTopoRows(emptyBoot.ctx).length, 0);
+	check('0 台在线 → 根节点仍在（不伪造子节点）',
+		findByClass(emptyBoot.ctx.ovTopoHost, 'tsm-otop-root') != null &&
+		findByClass(emptyBoot.ctx.ovTopoHost, 'tsm-tbus') == null,
+		'root=' + repr(textOf(emptyBoot.ctx.ovTopoHost)));
+
+	/* 9 台在线：8 个节点 + 「还有 1 台」 */
+	const many = [];
+
+	for (let i = 1; i <= 9; i++)
+		many.push({ hostname: '终端' + i, link: (i % 2) ? 'wifi' : 'wired', rx_rate: i * 100000, tx_rate: 1000 });
+
+	const manyBoot = await boot({ state: topoState({ devices: overviewTopoDevices(many) }) });
+	const manyCtx = manyBoot.ctx;
+
+	same('9 台在线 → 最多显示 8 个节点', ovTopoRows(manyCtx).length, 8);
+	check('9 台在线 → 末尾显示「还有 1 台」',
+		textOf(manyCtx.ovTopoHost).indexOf('还有 1 台') >= 0,
+		'text=' + repr(textOf(manyCtx.ovTopoHost).slice(-60)));
+	check('第 9 台不生成节点',
+		ovTopoRowByName(manyCtx, '终端9') == null,
+		'names=' + repr(ovTopoRows(manyCtx).map(function (n) {
+			return textOf(findByClass(n, 'tsm-dnode-name'));
+		})));
 }
 
 async function testTopologyDegrade() {
@@ -1853,6 +2103,36 @@ async function testTopoStyles() {
 	check('320px 下拓扑层间距收紧',
 		small != null && small[0].indexOf('.tsm-topo .tsm-conn{height:14px}') >= 0,
 		'small=' + repr(small && small[0].slice(0, 240)));
+
+	/* 设备节点 / 连线：两列网格、1.5px 状态环、1px 连线、按 link 上色 */
+	const gridRule = SOURCE.match(/\.tsm-tgroup-body,\.tsm-tnodes,\.tsm-otop-grid\{[^}]*\}/);
+	const ringRule = SOURCE.match(/\.tsm-dnode-ring\{[^}]*\}/);
+	const lineRule = SOURCE.match(/\.tsm-tline\{[^}]*\}/);
+
+	check('设备节点网格固定两列（minmax(0,1fr) 不横向溢出）',
+		gridRule != null && gridRule[0].indexOf('grid-template-columns:repeat(2,minmax(0,1fr))') >= 0,
+		'grid=' + repr(gridRule));
+	check('设备节点自身没有固定像素宽度（靠网格自适应）',
+		!/\.tsm-dnode\{[^}]*\bwidth:\s*\d+px/.test(SOURCE) &&
+		/\.tsm-dnode\{[^}]*min-width:0/.test(SOURCE),
+		'node=' + repr(SOURCE.match(/\.tsm-dnode\{[^}]*\}/)));
+	check('状态环 1.5px、连线 1px（线宽符合要求）',
+		ringRule != null && ringRule[0].indexOf('border:1.5px solid') >= 0 &&
+		lineRule != null && lineRule[0].indexOf('stroke-width:1;') >= 0,
+		'ring=' + repr(ringRule) + ' line=' + repr(lineRule));
+	check('连线颜色：无线 --tsm-blue / 有线 --tsm-green / 未知 --tsm-sub',
+		/\.tsm-tline-wifi\{[^}]*stroke:var\(--tsm-blue\)/.test(SOURCE) &&
+		/\.tsm-tline-wired\{[^}]*stroke:var\(--tsm-green\)/.test(SOURCE) &&
+		/\.tsm-tline-unknown\{[^}]*stroke:var\(--tsm-sub\)/.test(SOURCE),
+		'lines=' + repr(SOURCE.match(/\.tsm-tline-[a-z]+\{[^}]*\}/g)));
+	check('320px 媒体查询仍把节点网格钉成两列',
+		small != null &&
+		small[0].indexOf('.tsm-tgroup-body,.tsm-otop-grid{grid-template-columns:repeat(2,minmax(0,1fr))}') >= 0,
+		'small=' + repr(small && small[0].slice(0, 240)));
+	check('深色主题下连线仍走变量（--tsm-line-strong 由深色块覆盖）',
+		dark != null && dark[0].indexOf('--tsm-line-strong:rgba(255,255,255,.18)') >= 0 &&
+		lineRule != null && lineRule[0].indexOf('stroke:var(--tsm-line-strong)') >= 0,
+		'dark=' + repr(dark && dark[0].slice(0, 160)));
 
 	const booted = await boot({ state: topoState(), stations: topoStations() });
 	const ctx = booted.ctx;
@@ -2649,6 +2929,8 @@ async function testTouchTargets() {
 		await testFiltering();
 		await testNodeScreen();
 		await testTopology();
+		await testDeviceKindOf();
+		await testOverviewTopo();
 		await testTopologyDegrade();
 		await testSafetyAndHealth();
 		await testPolling();

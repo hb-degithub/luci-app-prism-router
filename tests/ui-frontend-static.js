@@ -564,6 +564,9 @@ async function testSemantics() {
 	const overview = readView('overview');
 	const panel = readView('panel');
 	const mobile = readView('mobile');
+	const devicesPage = readView('devices');
+	const appsPage = readView('apps');
+	const nodesPage = readView('nodes');
 
 	check('概览「昨日全天」按 day 查找，不写死 days[1]',
 		!/days\[1\]/.test(overview) && /findYesterdayDay/.test(overview) &&
@@ -591,6 +594,31 @@ async function testSemantics() {
 	check('panel 拓扑含五层与 AP 降级文案',
 		/topoLayer/.test(panel) && /互联网/.test(panel) && /主路由/.test(panel) &&
 		/AP 数据不可用/.test(panel));
+
+	/* 概览 Top 下钻 → 设备页/应用页定位；两端都必须解析并清理 hash。 */
+	check('概览 Top 下钻链接带 #mac= / #host=',
+		/#mac=' \+ encodeURIComponent/.test(overview) &&
+		/#host=' \+ encodeURIComponent/.test(overview));
+	check('设备页解析 #mac= 打开抽屉并清理 hash',
+		/applyHashTarget/.test(devicesPage) && /#mac=/.test(devicesPage) &&
+		/replaceState/.test(devicesPage));
+	check('应用页解析 #host= 过滤并清理 hash',
+		/applyHashTarget/.test(appsPage) && /#host=/.test(appsPage) &&
+		/replaceState/.test(appsPage));
+
+	/* 商用化改造的关键结构（防止回退成纯列表）。 */
+	check('设备页有分段筛选、表头排序与详情抽屉',
+		/segment/.test(devicesPage) && /sortKey/.test(devicesPage) &&
+		/openDrawer/.test(devicesPage) && /drawer/i.test(devicesPage));
+	check('应用页有时间范围、类别聚合与自动刷新',
+		/RANGE_/.test(appsPage) && /categor/i.test(appsPage) &&
+		/autoRefresh/.test(appsPage));
+	check('节点页有状态摘要、排序与展开详情',
+		/age_sec/.test(nodesPage) && /sort/i.test(nodesPage) &&
+		/expanded/.test(nodesPage));
+	check('概览页有在线/离线/访客摘要与刷新开关',
+		/deviceCounts/.test(overview) && /在线/.test(overview) &&
+		/访客/.test(overview) && /autoRefresh|autoInput/.test(overview));
 
 	/* ---- 拓扑：懒加载 / 下钻 / 可读性（静态断言，不启动浏览器） ---- */
 	const loadBody = (panel.match(/load:\s*function\s*\(\)\s*\{([\s\S]*?)\n\t\},/) || [])[1] || '';
