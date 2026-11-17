@@ -92,7 +92,7 @@
         <span class="card__label">下载速率</span>
         <span class="card__icon card__icon--down" aria-hidden="true">↓</span>
       </div>
-      <p class="card__value"><span id="card-rx">—</span><span class="card__unit">Mbps</span></p>
+      <p class="card__value"><span id="card-rx">—</span><span class="card__unit" id="card-rx-unit">Mbps</span></p>
       <p class="card__sub" id="card-rx-sub">等待数据</p>
     </article>
 
@@ -101,7 +101,7 @@
         <span class="card__label">上传速率</span>
         <span class="card__icon card__icon--up" aria-hidden="true">↑</span>
       </div>
-      <p class="card__value"><span id="card-tx">—</span><span class="card__unit">Mbps</span></p>
+      <p class="card__value"><span id="card-tx">—</span><span class="card__unit" id="card-tx-unit">Mbps</span></p>
       <p class="card__sub" id="card-tx-sub">等待数据</p>
     </article>
 
@@ -212,7 +212,7 @@
         <span class="panel__meta" id="apps-meta"></span>
       </header>
       <div class="table-scroll">
-        <table class="dtable">
+        <table class="dtable dtable--apps">
           <caption class="visually-hidden">按下载流量排序的前 10 个应用域名</caption>
           <thead>
             <tr>

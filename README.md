@@ -19,10 +19,28 @@
 - **按应用**：真实域名（来自 mihomo `/connections`）与出口节点，含类别（视频/社交/游戏/下载/开发/购物/系统）
 - **两个正交维度**：代理 vs 直连、无线 vs 有线——各自独立成条，**不可相加**
 - **软路由自身性能**：CPU / 内存 / Swap / 负载 / 磁盘 / 温度 / 运行时长 / WAN 上下行速率
-- **六类界面**：概览、设备、应用、节点、设置、手机版；另有独立「详细面板」（六标签，铺满整屏）
+- **六类界面**：概览、设备、应用、节点、设置、手机版；另有「详细面板」（七标签）与**独立面板服务**（独立端口，不经过 LuCI）
 - **手机版 App 界面**：五屏分页（概览速率/设备/节点/拓扑/安装），上下行大数字与出口节点卡、主网络/访客/离线分段列表、AP 卡片网格；支持触摸滑动与纯本地筛选
 - **网络拓扑**：手机版纵向五层（互联网 → 出口 → 主路由 → AP → 按接入方式分组的设备），详细面板横向七标签版本；点击出口/AP 卡可下钻查看其在线设备；AP 归属按 stations 上报的 MAC 匹配，数据缺失时逐层降级。AP 数据按需加载，不产生首屏开销
 - **设备搜索**：手机版设备屏支持按名称 / MAC / IP 过滤，与接入方式筛选、排序叠加
+
+## 独立面板服务（脱离 LuCI）
+
+在路由器上启用后，浏览器直接访问 `http://<路由器LAN地址>:8099/` 即可打开只读面板，
+不需要登录 LuCI，也不依赖 LuCI 会话：
+
+```sh
+uci set traffic-stats.panel=panel          # 老配置升级后需要先建段
+uci set traffic-stats.panel.enabled='1'
+uci set traffic-stats.panel.port='8099'    # 可选
+uci set traffic-stats.panel.bind=''        # 留空 = 自动绑定 network.lan.ipaddr
+uci commit traffic-stats
+/etc/init.d/traffic-panel enable
+/etc/init.d/traffic-panel start
+```
+
+默认关闭；建议设置 `traffic-stats.panel.token`（访问时带 `?token=...` 或 `X-Panel-Token`
+请求头），或仅保持 LAN 可达。服务只调用 `traffic-stats` 的只读接口，不写配置。
 - **手机版 PWA**：扫码安装到主屏，独立窗口打开，含绑定二维码与安装引导
 - **飞书可配**：发什么（7 个区块任选）、什么时候（daily/weekly/both + 时间）、什么条件下（应用超限/突增/离线/CPU/内存/磁盘/免打扰）
 - **子母多节点**：每个节点独立 HMAC 密钥、nonce 防重放，母节点汇总各子节点快照；默认校验 HTTPS 证书

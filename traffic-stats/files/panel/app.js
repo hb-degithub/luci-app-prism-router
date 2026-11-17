@@ -80,6 +80,14 @@
 		node.textContent = (text === undefined || text === null) ? '' : String(text);
 	}
 
+	function setMeta(node, text) {
+		if (!node) return;
+		var value = (text === undefined || text === null) ? '' : String(text);
+		node.textContent = value;
+		if (value) node.removeAttribute('hidden');
+		else node.setAttribute('hidden', '');
+	}
+
 	function str(v) {
 		if (typeof v === 'string') return v;
 		if (v === undefined || v === null) return '';
@@ -513,6 +521,8 @@
 		if (!state || !totals) {
 			setText(dom.cardRx, '—');
 			setText(dom.cardTx, '—');
+			setText(dom.cardRxUnit, '');
+			setText(dom.cardTxUnit, '');
 			setText(dom.cardRxSub, '等待数据');
 			setText(dom.cardTxSub, '等待数据');
 			setText(dom.cardToday, '—');
@@ -531,6 +541,8 @@
 		var txRate = n0(totals.tx_rate);
 		setText(dom.cardRx, fmtMbps(rxRate));
 		setText(dom.cardTx, fmtMbps(txRate));
+		setText(dom.cardRxUnit, 'Mbps');
+		setText(dom.cardTxUnit, 'Mbps');
 		setText(dom.cardRxSub, fmtBytes(rxRate) + '/s · ' + fmtRate(rxRate));
 		setText(dom.cardTxSub, fmtBytes(txRate) + '/s · ' + fmtRate(txRate));
 
@@ -858,7 +870,7 @@
 
 		var meta = devices.length ? '共 ' + devices.length + ' 台' : '';
 		if (state && state.truncated) meta += meta ? ' · 已截断' : '已截断';
-		setText(dom.devicesMeta, meta);
+		setMeta(dom.devicesMeta, meta);
 
 		if (!list.length) {
 			var emptyRow = el('tr');
@@ -937,7 +949,7 @@
 
 		var meta = apps.length ? '共 ' + apps.length + ' 个' : '';
 		if (state && state.truncated) meta += meta ? ' · 已截断' : '已截断';
-		setText(dom.appsMeta, meta);
+		setMeta(dom.appsMeta, meta);
 
 		if (!list.length) {
 			var emptyRow = el('tr');
@@ -983,7 +995,7 @@
 
 		if (!raw || !Object.keys(raw).length) {
 			list.appendChild(el('p', 'node__empty', state ? '暂无出口节点数据' : '正在加载…'));
-			setText(dom.nodesMeta, '');
+			setMeta(dom.nodesMeta, '');
 			return;
 		}
 
@@ -995,7 +1007,7 @@
 
 		var sum = 0;
 		nodes.forEach(function (node) { sum += node.total; });
-		setText(dom.nodesMeta, '共 ' + nodes.length + ' 个');
+		setMeta(dom.nodesMeta, '共 ' + nodes.length + ' 个');
 
 		nodes.forEach(function (node, idx) {
 			var box = el('div', 'node');
@@ -1079,7 +1091,7 @@
 			sources.appendChild(el('span', 'badge badge--unknown', '正在加载…'));
 			clear(dom.healthReasons);
 			dom.healthReasons.appendChild(el('p', 'node__empty', '正在读取面板数据…'));
-			setText(dom.healthMeta, '');
+			setMeta(dom.healthMeta, '');
 			return;
 		}
 
@@ -1112,7 +1124,7 @@
 		var reasonList = dom.healthReasons;
 		clear(reasonList);
 
-		setText(dom.healthMeta, reasons.length ? reasons.length + ' 条告警' : '无告警');
+		setMeta(dom.healthMeta, reasons.length ? reasons.length + ' 条告警' : '无告警');
 
 		if (!reasons.length) {
 			var okBox = el('p', 'reasons__empty');
@@ -1411,7 +1423,7 @@
 			'state-pill', 'confidence-pill', 'last-updated', 'refresh-btn', 'auto-refresh',
 			'aria-live', 'error-bar', 'error-text', 'error-retry',
 			'auth-panel', 'auth-desc', 'auth-form', 'token-input', 'token-clear', 'auth-hint',
-			'card-rx', 'card-rx-sub', 'card-tx', 'card-tx-sub',
+			'card-rx', 'card-rx-sub', 'card-rx-unit', 'card-tx', 'card-tx-sub', 'card-tx-unit',
 			'card-today', 'card-today-sub', 'card-month', 'card-month-sub',
 			'card-devices', 'card-devices-unit', 'card-devices-sub',
 			'card-clash', 'card-clash-sub',

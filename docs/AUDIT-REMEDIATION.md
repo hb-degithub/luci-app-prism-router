@@ -39,6 +39,8 @@ v2 加入 nonce，母节点拒绝重放、未知节点和错误节点密钥。�
 
 `mobile.js` 重做为五屏 App 风格：概览（上传/下载大号速率、出口节点卡片与 Clash 连接数角标、终端数胶囊）、设备（主网络/访客/离线分段、筛选排序、展开应用分布）、节点（AP/子节点卡片与详情）、拓扑（纵向五层：互联网 → 出口 → 主路由 → AP → 设备）、安装（PWA 与二维码）。数据只来自 `get_state`、只读的 `get_nodes` 与 `get_stations`，切屏和筛选不发 RPC；陈旧 `state` 会用真实时间重新判定在线并提示未更新。
 
+独立面板服务（`/etc/init.d/traffic-panel` + `/www/traffic-panel/`）：procd 启动独立 uhttpd 实例，默认关闭；`panel.enabled/port/bind/token` 可配，`bind` 留空自动绑定 `network.lan.ipaddr`；CGI 只读白名单 `state/history/nodes/stations/status`，token 校验先于参数校验，异常统一 500 不泄漏细节。开启方式见 README。
+
 详细面板（`panel.js`）新增横向「拓扑」标签：出口按流量取前 6 张卡、AP 上报 5 分钟内算在线、设备按接入方式分组最多 8 台；`get_stations` 失败只降级 AP 层。手机版与面板都不保存节点密钥，也不新增写接口。
 
 拓扑下钻：出口卡按其 apps 中的 chain 归集在线设备（DIRECT 大小写不敏感），AP 卡按 `stations` 的 `node_id` + MAC 归集在线无线设备，各最多 8 台并可再次点击收起。`get_nodes` / `get_stations` 改为按需加载：首屏只取 `state`，首次进入节点/拓扑时补拉一次，轮询只在对应界面激活时刷新。手机版设备屏另有名称/MAC/IP 搜索，与分类、接入筛选和排序叠加。
