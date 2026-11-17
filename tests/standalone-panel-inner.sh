@@ -8,8 +8,8 @@
 #   3. 默认关闭：/etc/init.d/traffic-panel start 不监听任何端口
 #   4. 真实 procd 启动独立 uhttpd → ?what=state 200 + JSON(totals) + 安全响应头 + Content-Length
 #   5. 白名单：status / nodes / stations / state 默认；what=bad → 400
-#   6. 方法：POST → 405；HEAD → 200 且无 body
-#   7. token：未设 → 200；设置后 无/错 → 401，query/header 正确 → 200（常量时间比较不改变结果）
+#   6. 方法：POST → 405；HEAD → 200 且 CGI 不输出 body
+#   7. token：未设 → 200；设置后 无/错 → 401，query/Bearer 正确 → 200，X-Panel-Token 在 CGI 层验证
 #   8. history：days=2 → 200 且含 days 数组；非法 days 回退/夹取不报错
 #   9. 静态页面：/ → 200 text/html（页面尚未由前端任务提供时用临时占位，不写最终页面）
 #  10. 参数回退：非法 port → 8099；非法 bind → 监听所有接口；旧端口不再监听
@@ -165,17 +165,22 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=bad")
 code=$(req "$PANEL/cgi-bin/panel-api?what=set_config")
 [ "$code" = "400" ] && ok "写方法名（set_config）不在白名单 -> 400" || bad "set_config -> $code"
 
-echo "=== 8. 方法：POST -> 405，HEAD -> 200 且无 body ==="
-# uhttpd 对 CGI 的 POST 可能直接断连（版本相关），405 契约在 CGI 层验证
-code=$(env REQUEST_METHOD=POST QUERY_STRING="what=state" ucode /www/traffic-panel/cgi-bin/panel-api 2>/dev/null | head -1 | tr -d '\r')
-case "$code" in
-  "Status: 405 Method Not Allowed") ok "POST -> 405 method_not_allowed（CGI 层）" ;;
-  *) bad "POST -> $code" ;;
-esac
-code=$(req -I "$PANEL/cgi-bin/panel-api?what=state")
+echo "=== 8. 方法：POST -> 405，HEAD -> 200（CGI 层不输出 body）==="
+code=$(req "$PANEL/cgi-bin/panel-api?what=state" -X POST)
+[ "$code" = "405" ] && [ "$(json_expr 'd?.error=="method_not_allowed"')" = "1" ] \
+  && ok "POST -> 405 method_not_allowed（经 uhttpd）" || bad "POST -> $code / $(head -c 120 "$B")"
+code=$(req "$PANEL/cgi-bin/panel-api?what=state" -I)
 [ "$code" = "200" ] && ok "HEAD -> 200" || bad "HEAD -> $code"
-[ ! -s "$B" ] && ok "HEAD 无响应体" || ok "HEAD 带 body（uhttpd 对 CGI 的 HEAD 行为，长度 $(wc -c < "$B") 字节）"
 [ -n "$(hdr 'Content-Length')" ] && ok "HEAD 仍带 Content-Length（GET 会返回的字节数）" || bad "HEAD 缺 Content-Length"
+# curl -I 的 -o 收到的是响应头本身，不能据此判断 body；直接执行 CGI 看 HEAD 是否真的不回体
+out=$(env REQUEST_METHOD=HEAD QUERY_STRING="what=state" ucode /www/traffic-panel/cgi-bin/panel-api 2>/dev/null | tr -d '\r')
+case "$out" in
+  *"Content-Type: application/json"*) ok "HEAD CGI 输出 JSON 头" ;;
+  *) bad "HEAD CGI 未输出 JSON 头" ;;
+esac
+BODY_LINES=$(printf '%s\n' "$out" | awk 'BEGIN{b=0} /^$/ {b=1; next} {if (b) n++} END{print n+0}')
+[ "$BODY_LINES" = "0" ] && ok "HEAD 直接执行 CGI 无 body（只有响应头）" \
+  || bad "HEAD CGI 仍输出 $BODY_LINES 行 body"
 
 echo "=== 9. history days（1–31） ==="
 code=$(req "$PANEL/cgi-bin/panel-api?what=history&days=2")
@@ -198,11 +203,18 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=state&token=wrong-token")
 [ "$code" = "401" ] && ok "错误 token -> 401" || bad "错误 token -> $code"
 code=$(req "$PANEL/cgi-bin/panel-api?what=state&token=$TOK")
 [ "$code" = "200" ] && ok "?token=<正确> -> 200" || bad "query token -> $code"
+# uhttpd 只转发 Accept/Authorization/Host/User-Agent，自定义 X-* 头会被丢弃，
+# 所以 X-Panel-Token 在 CGI 层直接验证（标准 CGI/反代场景），HTTP 层用 Bearer 验证。
 out=$(env REQUEST_METHOD=GET QUERY_STRING="what=state" HTTP_X_PANEL_TOKEN="$TOK" ucode /www/traffic-panel/cgi-bin/panel-api 2>/dev/null | tr -d '\r')
 case "$out" in
-  *"Content-Type: application/json"*) ok "X-Panel-Token: <正确> -> 200（CGI 层，无 401）" ;;
+  *"Content-Type: application/json"*) ok "X-Panel-Token: <正确> -> 200（CGI 层；uhttpd 不转发 X-* 头）" ;;
   *) bad "header token -> $(printf '%s' "$out" | head -1)" ;;
 esac
+code=$(req "$PANEL/cgi-bin/panel-api?what=state" -H "Authorization: Bearer $TOK")
+[ "$code" = "200" ] && ok "Authorization: Bearer <正确> -> 200（经 uhttpd）" \
+  || bad "Authorization Bearer -> $code / $(head -c 120 "$B")"
+code=$(req "$PANEL/cgi-bin/panel-api?what=state" -H "Authorization: Bearer wrong")
+[ "$code" = "401" ] && ok "Authorization: Bearer 错误 -> 401" || bad "Authorization Bearer 错误 -> $code"
 code=$(env REQUEST_METHOD=GET QUERY_STRING="what=state" HTTP_X_PANEL_TOKEN=wrong ucode /www/traffic-panel/cgi-bin/panel-api 2>/dev/null | head -1 | tr -d '\r')
 case "$code" in
   "Status: 401 Unauthorized") ok "错误 X-Panel-Token -> 401（CGI 层）" ;;

@@ -10,8 +10,12 @@
 //     get_nodes / get_stations / status）。**不写任何文件**，除 `ubus call` 之外
 //     不执行外部命令。
 //   * 认证：UCI traffic-stats.panel.token 非空时，请求必须带**完全相同**的
-//     `?token=` 或 `X-Panel-Token:` 头，否则 401。token 为空 = 不做应用层认证，
-//     只依赖网络边界（面板默认关闭，建议保持关闭或设置 token）。
+//     `?token=`、`X-Panel-Token:` 头或 `Authorization: Bearer <token>`，否则 401。
+//     token 为空 = 不做应用层认证，只依赖网络边界（面板默认关闭，建议保持关闭或设置 token）。
+//     ⚠ uhttpd 只把 Accept / Authorization / Host / User-Agent 转成 CGI 环境变量，
+//     自定义 X-* 头会被静默丢弃（ingest.uc 里同样的实测结论）。所以经本服务访问时
+//     实际可用的是 `?token=` 与 `Authorization: Bearer`；X-Panel-Token 仍保留，
+//     供 nginx+fcgiwrap 等标准 CGI 或反向代理转发使用。
 //   * 方法白名单：state / history / nodes / stations / status，其它 400；
 //     GET / HEAD 之外 405。
 //   * 任何异常（ubus 不可用、返回非 JSON、内部错误）一律 500 {"error":"internal"}，
@@ -180,7 +184,7 @@ function token_matches(want, got) {
 	return diff == 0;
 }
 
-function authorized(want, query_token, header_token) {
+function authorized(want, query_token, header_token, bearer) {
 	if (length(want) == 0)
 		return true;
 
@@ -188,11 +192,29 @@ function authorized(want, query_token, header_token) {
 	    && token_matches(want, header_token))
 		return true;
 
+	if (length(bearer) > 0 && length(bearer) <= MAX_TOKEN_BYTES
+	    && token_matches(want, bearer))
+		return true;
+
 	if (length(query_token) > 0 && length(query_token) <= MAX_TOKEN_BYTES
 	    && token_matches(want, query_token))
 		return true;
 
 	return false;
+}
+
+/* Authorization: Bearer <token> —— uhttpd 只转发 Accept/Authorization/Host/User-Agent，
+   自定义 X-* 头会被静默丢弃（与 ingest.uc 的实测结论一致）。所以规范要求的
+   X-Panel-Token 之外，这里再接受 Bearer，保证"用请求头传 token"在 uhttpd 下真的可用。
+   只认 "Bearer " 前缀（大小写不敏感），其余一律当没有。 */
+function bearer_token(raw) {
+	if (length(raw) <= 7)
+		return '';
+
+	if (lc(substr(raw, 0, 7)) != 'bearer ')
+		return '';
+
+	return trim(substr(raw, 7));
 }
 
 // ───────────────────────────── ubus 只读调用 ─────────────────────────────
@@ -271,7 +293,8 @@ function handle(query) {
 	/* 认证先于参数校验：未认证的调用方连"what 白名单"都不该探测到。 */
 	const token = config_token();
 
-	if (!authorized(token, opt(query, 'token'), env('HTTP_X_PANEL_TOKEN')))
+	if (!authorized(token, opt(query, 'token'), env('HTTP_X_PANEL_TOKEN'),
+	                  bearer_token(env('HTTP_AUTHORIZATION'))))
 		return { code: 401, reason: 'Unauthorized', body: { error: 'unauthorized' } };
 
 	let what = opt(query, 'what');

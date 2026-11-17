@@ -4,8 +4,7 @@
    运行环境：浏览器直接访问面板端口，同源请求 /cgi-bin/panel-api。
    无 LuCI、无 jQuery、无外部 CDN、无构建步骤。
    约束：只用 createElement / textContent 组装 DOM，后端字符串一律当纯文本；
-   不使用 innerHTML / outerHTML / insertAdjacentHTML / document.write /
-   eval / new Function，不加载任何外部资源。
+   不注入 HTML 字符串、不做动态求值、不加载任何外部资源。
    ========================================================================= */
 (function () {
 	'use strict';
@@ -875,7 +874,7 @@
 		if (!list.length) {
 			var emptyRow = el('tr');
 			var emptyCell = el('td', 'placeholder', state ? '暂无设备数据（等待下一轮采集）' : '正在加载…');
-			emptyCell.colSpan = 6;
+			emptyCell.colSpan = 5;
 			emptyRow.appendChild(emptyCell);
 			body.appendChild(emptyRow);
 			return;
@@ -890,27 +889,15 @@
 			row.setAttribute('data-key', key);
 
 			var nameCell = el('td');
-			nameCell.appendChild(el('span', 'cell-main', name));
+			var nameWrap = el('div', 'name-wrap');
+			var nameText = el('div', 'name-wrap__text');
+			nameText.appendChild(el('span', 'cell-main', name));
 			var subParts = [];
 			if (str(dev.alias) && str(dev.hostname)) subParts.push(str(dev.hostname));
 			if (str(dev.ip)) subParts.push(str(dev.ip));
-			if (subParts.length) nameCell.appendChild(el('span', 'cell-sub', subParts.join(' · ')));
-			row.appendChild(nameCell);
+			if (subParts.length) nameText.appendChild(el('span', 'cell-sub', subParts.join(' · ')));
+			nameWrap.appendChild(nameText);
 
-			var linkCell = el('td', 'col-link');
-			var link = linkMeta(dev.link);
-			linkCell.appendChild(badge(link.text, link.cls));
-			row.appendChild(linkCell);
-
-			var speedCell = el('td', 'num');
-			speedCell.appendChild(el('span', 'speed speed--down', '↓ ' + fmtRate(dev.rx_rate)));
-			speedCell.appendChild(el('span', 'speed speed--up', '↑ ' + fmtRate(dev.tx_rate)));
-			row.appendChild(speedCell);
-
-			row.appendChild(el('td', 'num', fmtBytes(devTotal(dev))));
-			row.appendChild(el('td', 'num', dev.month_total === undefined ? '—' : fmtBytes(dev.month_total)));
-
-			var caretCell = el('td', 'caret-col');
 			var btn = el('button', 'row-toggle');
 			btn.type = 'button';
 			btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
@@ -918,8 +905,22 @@
 			btn.setAttribute('aria-label', (expanded ? '收起 ' : '展开 ') + name + ' 的应用明细');
 			btn.setAttribute('data-name', name);
 			btn.appendChild(el('span', 'caret', '▶'));
-			caretCell.appendChild(btn);
-			row.appendChild(caretCell);
+			nameWrap.appendChild(btn);
+			nameCell.appendChild(nameWrap);
+			row.appendChild(nameCell);
+
+			var linkCell = el('td', 'col-link');
+			var link = linkMeta(dev.link);
+			linkCell.appendChild(badge(link.text, link.cls));
+			row.appendChild(linkCell);
+
+			var speedCell = el('td', 'num col-speed');
+			speedCell.appendChild(el('span', 'speed speed--down', '↓ ' + fmtRate(dev.rx_rate)));
+			speedCell.appendChild(el('span', 'speed speed--up', '↑ ' + fmtRate(dev.tx_rate)));
+			row.appendChild(speedCell);
+
+			row.appendChild(el('td', 'num', fmtBytes(devTotal(dev))));
+			row.appendChild(el('td', 'num', dev.month_total === undefined ? '—' : fmtBytes(dev.month_total)));
 
 			body.appendChild(row);
 
@@ -927,7 +928,7 @@
 			detailRow.id = 'dev-detail-' + idx;
 			detailRow.hidden = !expanded;
 			var detailCell = el('td');
-			detailCell.colSpan = 6;
+			detailCell.colSpan = 5;
 			detailCell.appendChild(buildDeviceDetail(dev));
 			detailRow.appendChild(detailCell);
 			body.appendChild(detailRow);

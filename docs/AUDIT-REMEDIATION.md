@@ -41,6 +41,8 @@ v2 加入 nonce，母节点拒绝重放、未知节点和错误节点密钥。�
 
 独立面板服务（`/etc/init.d/traffic-panel` + `/www/traffic-panel/`）：procd 启动独立 uhttpd 实例，默认关闭；`panel.enabled/port/bind/token` 可配，`bind` 留空自动绑定 `network.lan.ipaddr`；CGI 只读白名单 `state/history/nodes/stations/status`，token 校验先于参数校验，异常统一 500 不泄漏细节。开启方式见 README。
 
+认证头有一个**实测边界**：OpenWrt 的 uhttpd 只把 `Accept/Authorization/Host/User-Agent` 转成 CGI 环境变量，自定义 `X-*` 头会被静默丢弃（与 ingest.uc 的结论一致）。因此除规范要求的 `?token=` 与 `X-Panel-Token`（后者供标准 CGI/反向代理场景）外，`panel-api` 额外接受 `Authorization: Bearer <token>`，保证"用请求头传令牌"经 uhttpd 真的可用；三条路径都要求与 `panel.token` 逐字节完全相等，且比对为常量时间。前端仍用查询串（取到后立刻从地址栏移除）。`cursor('traffic-stats').get(...)` 在本机 ucode 读不到值，正确写法是 `cursor().get('traffic-stats', section, option)`（门禁已验证 401/200 行为）。
+
 详细面板（`panel.js`）新增横向「拓扑」标签：出口按流量取前 6 张卡、AP 上报 5 分钟内算在线、设备按接入方式分组最多 8 台；`get_stations` 失败只降级 AP 层。手机版与面板都不保存节点密钥，也不新增写接口。
 
 拓扑下钻：出口卡按其 apps 中的 chain 归集在线设备（DIRECT 大小写不敏感），AP 卡按 `stations` 的 `node_id` + MAC 归集在线无线设备，各最多 8 台并可再次点击收起。`get_nodes` / `get_stations` 改为按需加载：首屏只取 `state`，首次进入节点/拓扑时补拉一次，轮询只在对应界面激活时刷新。手机版设备屏另有名称/MAC/IP 搜索，与分类、接入筛选和排序叠加。
@@ -53,6 +55,6 @@ node tests/ui-frontend-static.js
 node tests/mobile-ui-static.js
 ```
 
-构建一次后，所有门禁验证同一份带 `SHA256SUMS` 的 dist 快照；单独运行某个门禁默认只复用产物，`--build` 才显式重建。发布门禁检查依赖、权限、payload 与源码一致、重装/卸载和 legacy 负例。
+构建一次后，所有门禁验证同一份带 `SHA256SUMS` 的 dist 快照；单独运行某个门禁默认只复用产物，`--build` 才显式重建。发布门禁检查依赖、权限、payload 与源码一致、重装/卸载和 legacy 负例。独立面板另设第 13 套门禁 `tests/container-validate-standalone-panel.sh`（68 项）：容器内真实 `ubusd/procd/rpcd` 启动独立 uhttpd，验证默认关闭不监听、200/JSON/安全头、400/401/405、token 三种携带方式、`history days`、非法 port/bind 回退、后端异常 500 不泄漏，以及日志不含 token。
 
 本地容器验证不能代替真实 Clash/conntrack/offload、真实浏览器、PWA 或飞书端到端验证；未经用户另行确认，不进行真机部署。

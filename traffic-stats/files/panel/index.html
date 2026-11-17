@@ -7,6 +7,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="description" content="OpenWrt 流量统计独立面板：直连与代理分账的设备、应用、出口与健康状态。">
 <title>流量统计 · 独立面板</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -50,7 +51,7 @@
         <span class="btn__label">刷新</span>
       </button>
       <label class="switch" for="auto-refresh">
-        <input id="auto-refresh" class="switch__input" type="checkbox" checked>
+        <input id="auto-refresh" class="switch__input" type="checkbox" checked aria-label="自动刷新，每 15 秒一次">
         <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
         <span class="switch__label">自动刷新 <span class="muted">15s</span></span>
       </label>
@@ -82,7 +83,7 @@
   </form>
 </section>
 
-<main id="main" class="layout">
+<main id="main" class="layout" tabindex="-1">
   <h2 class="visually-hidden">概览</h2>
   <section class="cards" aria-labelledby="cards-title">
     <h3 id="cards-title" class="visually-hidden">速率与总量</h3>
@@ -183,24 +184,24 @@
         </div>
         <span class="panel__meta" id="devices-meta"></span>
       </header>
-      <div class="table-scroll">
+      <div class="table-scroll" tabindex="0" role="region" aria-label="设备榜表格，列较多时可横向滚动">
         <table class="dtable">
           <caption class="visually-hidden">按累计流量排序的前 10 台设备，点击行可展开该设备应用明细</caption>
           <thead>
             <tr>
               <th scope="col">设备</th>
               <th scope="col" class="col-link">接入</th>
-              <th scope="col" class="num">上下行</th>
+              <th scope="col" class="num col-speed">上下行</th>
               <th scope="col" class="num">累计</th>
               <th scope="col" class="num">本月</th>
-              <th scope="col" class="caret-col"><span class="visually-hidden">应用明细</span></th>
             </tr>
           </thead>
           <tbody id="devices-body">
-            <tr><td colspan="6" class="placeholder">正在加载…</td></tr>
+            <tr><td colspan="5" class="placeholder">正在加载…</td></tr>
           </tbody>
         </table>
       </div>
+      <p class="scroll-hint">表格可左右滑动查看全部列</p>
     </section>
 
     <section class="panel" aria-labelledby="apps-title">
@@ -211,7 +212,7 @@
         </div>
         <span class="panel__meta" id="apps-meta"></span>
       </header>
-      <div class="table-scroll">
+      <div class="table-scroll" tabindex="0" role="region" aria-label="应用榜表格，列较多时可横向滚动">
         <table class="dtable dtable--apps">
           <caption class="visually-hidden">按下载流量排序的前 10 个应用域名</caption>
           <thead>
@@ -227,6 +228,7 @@
           </tbody>
         </table>
       </div>
+      <p class="scroll-hint">表格可左右滑动查看全部列</p>
     </section>
   </div>
 

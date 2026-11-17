@@ -126,6 +126,8 @@ code {
 }
 .skip-link:focus { top: 0; }
 
+main:focus { outline: none; }
+
 /* 焦点可见（键盘导航） */
 :focus-visible {
   outline: 3px solid var(--accent);
@@ -421,7 +423,10 @@ code {
   grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
   gap: 16px;
 }
-.columns--tables { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
+.columns--tables {
+  grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+  align-items: start;
+}
 
 /* ------------------------------------------------------------------ *
  * 概览卡
@@ -587,15 +592,22 @@ code {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
 }
+.table-scroll:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.scroll-hint {
+  display: none;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--muted);
+}
 
 .dtable {
   width: 100%;
-  min-width: 560px;
+  min-width: 500px;
   border-collapse: collapse;
   table-layout: fixed;
   font-size: 13px;
 }
-.dtable--apps { min-width: 400px; }
+.dtable--apps { min-width: 350px; }
 .dtable--apps th.num, .dtable--apps td.num { width: 72px; }
 .dtable caption { text-align: left; }
 .dtable th, .dtable td {
@@ -607,8 +619,21 @@ code {
   text-overflow: ellipsis;
 }
 .dtable .col-link { width: 64px; }
-.dtable th.num, .dtable td.num { width: 86px; }
-.dtable th.caret-col, .dtable td.caret-col { width: 44px; }
+.dtable th.num, .dtable td.num { width: 88px; }
+.dtable th.col-speed, .dtable td.col-speed { width: 104px; }
+
+/* 设备名 + 展开按钮同一单元格：省一列，窄屏更从容 */
+.name-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.name-wrap__text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.name-wrap .row-toggle { flex: none; }
 .dtable th {
   font-size: 11px;
   font-weight: 650;
@@ -625,7 +650,7 @@ code {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
-.caret-col { width: 44px; }
+
 .placeholder { color: var(--muted); text-align: center; padding: 22px 10px; }
 
 /* 设备行 */
@@ -698,8 +723,8 @@ code {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 36px;
+  width: 40px;
+  height: 40px;
   padding: 0;
   border: 1px solid transparent;
   border-radius: 8px;
@@ -881,16 +906,19 @@ code {
  * 响应式：1200 / 1000 / 760 / 390
  * ------------------------------------------------------------------ */
 
-/* 1000–1199：图表与设备榜整行，节点与应用并排 */
+/* 1000–1199：概览卡 3 列 × 2 行，图表/节点、设备/应用仍保持左右分栏 */
 @media (max-width: 1199px) {
   .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .columns { grid-template-columns: minmax(0, 1fr); }
-  .columns--tables { grid-template-columns: minmax(0, 1fr); }
+  .dtable .col-link { width: 56px; }
+  .dtable th.num, .dtable td.num { width: 76px; }
+  .dtable th.col-speed, .dtable td.col-speed { width: 100px; }
+  .dtable--apps th.num, .dtable--apps td.num { width: 72px; }
 }
 
-/* 760–999：概览卡 2 列，全部单列堆叠 */
+/* 760–999：概览卡 2 列，面板改为单列堆叠 */
 @media (max-width: 999px) {
   .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .columns, .columns--tables { grid-template-columns: minmax(0, 1fr); }
   .panel__meta { max-width: 42%; }
 }
 
@@ -914,9 +942,11 @@ code {
   .topbar__actions { width: 100%; justify-content: space-between; gap: 8px; }
   .btn--icon .btn__label { display: inline; }
   .switch__label { display: none; }
-  .dtable { min-width: 600px; font-size: 13px; }
-  .dtable th.num, .dtable td.num { width: 76px; }
-  .dtable .col-link { width: 60px; }
+  .dtable { min-width: 560px; font-size: 13px; }
+  .dtable th.num, .dtable td.num { width: 74px; }
+  .dtable th.col-speed, .dtable td.col-speed { width: 98px; }
+  .dtable .col-link { width: 58px; }
+  .scroll-hint { display: block; }
   .panel__head { flex-wrap: wrap; }
 }
 

@@ -38,6 +38,9 @@
 /usr/share/traffic-stats/retention.uc     # 数据/日志保留与清理脚本（cron 调用，见 §9）
 /usr/share/rpcd/ucode/traffic-stats.uc   # rpcd 后端，读 state/history 返回 JSON
 /www/cgi-bin/traffic-stats-metrics # Prometheus 指标导出 CGI（§10.3；只读 + token 认证）
+/etc/init.d/traffic-panel         # 独立面板服务的 procd init（§11；默认关闭）
+/www/traffic-panel/               # 独立面板静态根：index.html / app.js / style.css（§11）
+/www/traffic-panel/cgi-bin/panel-api  # 独立面板只读 JSON CGI（§11；0644→0755，ucode）
 /usr/share/rpcd/acl.d/luci-app-traffic-stats.json
 /usr/share/luci/menu.d/luci-app-traffic-stats.json
 /htdocs/luci-static/resources/view/traffic-stats/*.js
@@ -825,3 +828,108 @@ CSV 规则（门禁逐条验）：
 - ACL（read 含 `export_csv`、write 含 `set_device_meta`）、`set_config` 放行 5 个新选项、未知字段仍拒绝
 - 真实 ubus → rpcd：插件注册成功（无 `Skipping registration`）、`get_state`/`set_device_meta`/`export_csv`
   端到端；缺省参数不改、空串清除
+
+---
+
+## 11. 独立面板服务（`traffic-panel`，脱离 LuCI）
+
+一个**独立的只读 HTTP 服务**：procd 启动一个专门的 uhttpd 实例，浏览器直接访问
+`http://<路由器LAN地址>:8099/` 就能看面板，不需要 LuCI 会话，也不经过 LuCI 的 uhttpd 实例。
+
+### 11.1 安装内容
+
+```
+/etc/init.d/traffic-panel            0755   procd init（USE_PROCD=1，START=95）
+/www/traffic-panel/index.html        0644   静态页面（由 files/panel/ 安装）
+/www/traffic-panel/app.js            0644
+/www/traffic-panel/style.css         0644
+/www/traffic-panel/cgi-bin/panel-api 0755   只读 ucode CGI（#!/usr/bin/ucode）
+```
+
+`traffic-stats` 的 `DEPENDS` 因此包含 `uhttpd`（系统自带的 web 服务器，不是 LuCI）。
+面板数据来自 rpcd 的 `traffic-stats` ubus 对象，所以 **`luci-app-traffic-stats` 必须安装**
+（该包提供 `/usr/share/rpcd/ucode/traffic-stats.uc`）；面板本身不读 LuCI 的会话/菜单/ACL。
+
+### 11.2 配置（UCI `traffic-stats`，section `panel`）
+
+```
+config panel 'panel'
+    option enabled '0'     # 1 = 启动独立面板服务；0 = 关闭（默认）
+    option port '8099'     # 1–65535；非法/空/越界回退 8099
+    option bind ''         # IPv4 字面量；留空 = 取 network.lan.ipaddr；都没有 = 监听所有接口
+    option token ''        # 空 = 不做应用层认证（只依赖网络边界）
+```
+
+- **默认关闭**：`enabled=0` 时 `/etc/init.d/traffic-panel start` 直接 `return 0`，不监听任何端口；
+  postinst/prerm 只按 `panel.enabled` 做 `enable`/`disable`，**绝不强制启动**。
+- 老配置升级后没有 `panel` 段，`config_get_bool` 取默认 0 —— 行为与未安装前一致。
+- 修改 `port`/`bind` 后需要 `/etc/init.d/traffic-panel restart`（uhttpd 的监听参数在启动时确定）；
+  修改 `token` 不需要重启（CGI 每个请求重新读 UCI）。
+
+### 11.3 启动命令（procd）
+
+```
+/usr/sbin/uhttpd -f -h /www/traffic-panel -x /cgi-bin \
+    -p <listen> -t 60 -T 60 -A 1
+```
+
+- `-f` 前台运行（由 procd 托管），`-p` 在有 bind 时是 `addr:port`，否则只给 `port`（所有接口）；
+- `respawn 3600 5 0`（异常退出自动拉起），stdout/stderr 转 syslog；
+- `reload_service` = `stop` + `start`；`service_triggers` 注册 `traffic-stats` 的 reload 触发器。
+- `bind` 只接受 IPv4 字面量（四段 0–255）；主机名/IPv6/带端口的写法一律记一条日志后
+  回退为监听所有接口 —— 绝不把 UCI 原文拼进 argv。
+
+### 11.4 API：`/cgi-bin/panel-api`（只读）
+
+| 参数 | 取值 | 说明 |
+|---|---|---|
+| `what` | `state`（默认）\|`history`\|`nodes`\|`stations`\|`status` | 白名单，其它 → **400** `{"error":"bad_request"}` |
+| `days` | 1–31（默认 1） | 仅 `history`；非数字回退 1，越界夹到 1–31 |
+| `token` | 字符串 | `panel.token` 非空时必须完全相等 |
+
+- `what` → ubus 方法映射：`state→get_state`、`history→get_history`、`nodes→get_nodes`、
+  `stations→get_stations`、`status→status`。响应体是 ubus 返回的 JSON 原样透传
+  （`state` 含 `totals`，`history` 含 `days[]`）。
+- 方法：只允许 `GET`/`HEAD`，其它 → **405** `{"error":"method_not_allowed"}`（`HEAD` 只回头不回体）。
+- 认证：`token` 为空 → 不做应用层认证；非空时要求 `?token=`、`X-Panel-Token:` 或
+  `Authorization: Bearer <token>` 与配置**逐字节完全相等**（常量时间比较），否则
+  → **401** `{"error":"unauthorized"}`（先于参数白名单校验）。
+- 任何异常（ubus 不可用、返回非 JSON、超 256 KiB、内部错误）→ **500** `{"error":"internal"}`，
+  响应体不含堆栈/路径/命令输出。
+- 响应头固定：`Content-Type: application/json; charset=utf-8`、`Content-Length`、
+  `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`。
+- **只读**：不写任何文件；除 `ubus call traffic-stats <只读方法>` 之外不执行外部命令。
+  CGI 不做任何日志（不记录 token）。
+
+### 11.5 安全边界
+
+- 默认关闭 + 默认绑定 LAN 地址；`bind` 解析失败时宁可监听所有接口也不拼命令（uhttpd argv 由
+  procd 以列表形式传递，不经过 shell）。
+- 文档根只放静态页面；目录里没有可写路径。token 只在 CGI 内从 UCI 读取，不写日志、不进 argv。
+- 这是**仅限局域网**的明文 HTTP 服务：没有 TLS、没有防重放；不要暴露到 WAN，跨网络请用
+  WireGuard/Tailscale。
+- ⚠ OpenWrt 的 uhttpd 只把 `Accept/Authorization/Host/User-Agent` 转成 CGI 环境变量，
+  自定义 `X-*` 头会被静默丢弃（与 §5.1 的实测结论一致）。因此经本服务实际可用的是
+  `?token=` 与 `Authorization: Bearer`；`X-Panel-Token` 仍被 CGI 接受，供 nginx+fcgiwrap
+  等标准 CGI/反向代理转发场景使用。
+- `?token=` 会出现在浏览器历史/书签里；页面取到后立即从地址栏移除并改存 localStorage。
+
+### 11.6 容器门禁
+
+`tests/container-validate-standalone-panel.sh`（第 13 套，隔离容器、`--network none`，**68 项**）：
+
+- 装包后落位/权限（init 755、CGI 755、静态 644）、`sh -n`/`ucode -c`、panel 段默认值；
+- **默认关闭**：`enabled=0` 时 start 退出码 0 且 18099 无监听；
+- 真实 `ubusd + procd + rpcd` → `/etc/init.d/traffic-panel start` 拉起独立 uhttpd →
+  `?what=state` 200 + `application/json` + 四个安全头 + `Content-Length` + `totals`；
+- 白名单/默认 what/`what=bad`→400/写方法名→400；POST→405（经 uhttpd）；
+  HEAD→200 且 CGI 层不输出 body；
+- token：未设→200；设置后无/错→401、`?token=`→200、`Bearer`→200（经 uhttpd）、
+  错误 Bearer→401；`X-Panel-Token` 在 CGI 层验证（uhttpd 不转发 X-*）；
+- `history&days=2`→200 且含 `days[]`；`days=99`/`days=abc` 不报错；
+- 静态 `/`→200 `text/html`（页面未就绪时用临时占位，不写最终页面）；
+- 非法 `port=99999`→回退 8099、非法 bind→监听所有接口、旧端口不再监听；
+- `panel.bind` 留空 → 自动取 `network.lan.ipaddr`；
+- 停掉 rpcd → 500 `{"error":"internal"}` 且响应不含路径/堆栈；
+- init 不读 token、CGI 无写文件/日志调用、临时日志里没有 token、系统目录权限不变。
+

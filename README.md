@@ -10,7 +10,7 @@
 
 | 包 | 内容 |
 |---|---|
-| `traffic-stats` | 采集守护进程 `traffic-statsd.uc`、飞书推送 `feishu.uc`、子节点推送 `push.uc`、母节点接收 CGI `traffic-stats-ingest`、init/UCI 配置 |
+| `traffic-stats` | 采集守护进程 `traffic-statsd.uc`、飞书推送 `feishu.uc`、子节点推送 `push.uc`、母节点接收 CGI `traffic-stats-ingest`、独立面板服务（`traffic-panel` init + `/www/traffic-panel/`）、init/UCI 配置 |
 | `luci-app-traffic-stats` | 5 个界面页（概览/设备/应用/节点/设置）、rpcd 后端、菜单与 ACL |
 
 ## 功能
@@ -23,24 +23,6 @@
 - **手机版 App 界面**：五屏分页（概览速率/设备/节点/拓扑/安装），上下行大数字与出口节点卡、主网络/访客/离线分段列表、AP 卡片网格；支持触摸滑动与纯本地筛选
 - **网络拓扑**：手机版纵向五层（互联网 → 出口 → 主路由 → AP → 按接入方式分组的设备），详细面板横向七标签版本；点击出口/AP 卡可下钻查看其在线设备；AP 归属按 stations 上报的 MAC 匹配，数据缺失时逐层降级。AP 数据按需加载，不产生首屏开销
 - **设备搜索**：手机版设备屏支持按名称 / MAC / IP 过滤，与接入方式筛选、排序叠加
-
-## 独立面板服务（脱离 LuCI）
-
-在路由器上启用后，浏览器直接访问 `http://<路由器LAN地址>:8099/` 即可打开只读面板，
-不需要登录 LuCI，也不依赖 LuCI 会话：
-
-```sh
-uci set traffic-stats.panel=panel          # 老配置升级后需要先建段
-uci set traffic-stats.panel.enabled='1'
-uci set traffic-stats.panel.port='8099'    # 可选
-uci set traffic-stats.panel.bind=''        # 留空 = 自动绑定 network.lan.ipaddr
-uci commit traffic-stats
-/etc/init.d/traffic-panel enable
-/etc/init.d/traffic-panel start
-```
-
-默认关闭；建议设置 `traffic-stats.panel.token`（访问时带 `?token=...` 或 `X-Panel-Token`
-请求头），或仅保持 LAN 可达。服务只调用 `traffic-stats` 的只读接口，不写配置。
 - **手机版 PWA**：扫码安装到主屏，独立窗口打开，含绑定二维码与安装引导
 - **飞书可配**：发什么（7 个区块任选）、什么时候（daily/weekly/both + 时间）、什么条件下（应用超限/突增/离线/CPU/内存/磁盘/免打扰）
 - **子母多节点**：每个节点独立 HMAC 密钥、nonce 防重放，母节点汇总各子节点快照；默认校验 HTTPS 证书
@@ -59,7 +41,7 @@ opkg install luci-app-traffic-stats_1.0.0-1_all.ipk
 /etc/init.d/rpcd reload; rm -f /tmp/luci-indexcache*
 ```
 
-依赖：`ucode`、`ucode-mod-{fs,uci,uloop}`、`curl`；飞书/子母签名需 `openssl-util`。
+依赖：`ucode`、`ucode-mod-{fs,uci,uloop}`、`curl`、`uhttpd`；飞书/子母签名需 `openssl-util`。
 
 界面：LuCI → 服务 → 流量统计。
 
@@ -72,6 +54,33 @@ uci set traffic-stats.settings.clash_secret=''        # 留空=自动读 opencla
 uci set traffic-stats.settings.fake_ip_ranges='198.18.0.0/16'
 uci commit traffic-stats
 ```
+
+## 独立面板服务（脱离 LuCI）
+
+`traffic-stats` 会安装一个**独立**的 uhttpd 实例（procd 管理，不占用 LuCI 的 web 端口，
+也不经过 LuCI 会话）。启用后浏览器直接访问 `http://<路由器LAN地址>:8099/` 即可看到只读面板：
+
+```sh
+uci set traffic-stats.panel=panel          # 老配置升级后需要先建段（没有该段时默认关闭）
+uci set traffic-stats.panel.enabled='1'
+uci set traffic-stats.panel.port='8099'    # 1–65535；非法值回退 8099
+uci set traffic-stats.panel.bind=''        # 留空 = 自动绑定 network.lan.ipaddr；都没有则监听所有接口
+uci set traffic-stats.panel.token='<随机串>'  # 可选：留空 = 只依赖网络边界
+uci commit traffic-stats
+/etc/init.d/traffic-panel enable
+/etc/init.d/traffic-panel restart
+```
+
+- **默认关闭**：`panel.enabled=0` 时 init 直接返回，不监听任何端口；安装/升级也不会强制启动。
+- **只读**：静态根 `/www/traffic-panel` 只放页面，CGI `/cgi-bin/panel-api` 只调用
+  `traffic-stats` 的只读 ubus 方法（`state/history/nodes/stations/status`），不写文件、不改配置。
+- **token**：页面首次用 `?token=<值>` 打开后会把令牌存到浏览器本地并继续用查询串携带；
+  脚本可用 `Authorization: Bearer <token>`。CGI 也接受 `X-Panel-Token` 头，但 OpenWrt 的
+  uhttpd 只转发 `Accept/Authorization/Host/User-Agent`，自定义 `X-*` 头会被丢掉（实测），
+  所以经本服务访问时请用查询串或 Bearer。
+- 这是**仅限局域网**的明文 HTTP 服务，不要暴露到 WAN；需要跨网络请走 WireGuard/Tailscale。
+- 面板数据来自 rpcd 的 `traffic-stats` ubus 对象（由 `luci-app-traffic-stats` 提供），
+  两个包都要装；运行时还需要系统自带的 `uhttpd`（已声明为 `traffic-stats` 依赖）。
 
 ## 飞书
 
@@ -128,10 +137,10 @@ ucode /usr/share/traffic-stats/push.uc && echo ok
 
 ## 部署前验证（强制）
 
-十二套容器门禁（全部 `--network none` 隔离运行）。统一入口会只构建一次，所有门禁随后验证同一份只读产物：
+十三套容器门禁（全部 `--network none` 隔离运行）。统一入口会只构建一次，所有门禁随后验证同一份只读产物：
 
 ```sh
-./tools/test-release.sh                 # 全部：发布/原有回归/核心/认证
+./tools/test-release.sh                 # 全部：发布/原有回归/核心/认证/独立面板
 node tests/ui-frontend-static.js        # LuCI 静态与纯函数检查
 node tests/mobile-ui-static.js          # 手机版 App 界面（分页/分类/节点/轮询）
 
@@ -147,10 +156,11 @@ node tests/mobile-ui-static.js          # 手机版 App 界面（分页/分类/�
 ./tests/container-validate-features.sh   # 别名/配额/导出 156
 ./tests/container-validate-core-fixes.sh # 跨重启/去重/历史/并发 72
 ./tests/container-validate-security-fixes.sh # 独立凭证/防重放/TLS 87
+./tests/container-validate-standalone-panel.sh # 独立面板服务 68（真实 procd + uhttpd + CGI）
 ./tests/container-validate-release.sh    # 发布物/权限/升级/卸载，23.05+24.10 各110
 ```
 
-原有回归合计 **804 项断言**，另含核心、安全、发布与前端专项；实际通过数以本次运行输出为准。真机部署后再跑 `./tests/smoke.sh`（15 项）与 `LUCI_PASS='<密码>' ./tests/ui/run.sh`（页面渲染）。
+原有回归合计 **804 项断言**，另含核心、安全、独立面板（68 项）、发布与前端专项；实际通过数以本次运行输出为准。真机部署后再跑 `./tests/smoke.sh`（15 项）与 `LUCI_PASS='<密码>' ./tests/ui/run.sh`（页面渲染）。
 
 ```sh
 ./tests/container-validate.sh        # 28 项：包安装、属主权限、系统目录未被改动、守护进程离线用例

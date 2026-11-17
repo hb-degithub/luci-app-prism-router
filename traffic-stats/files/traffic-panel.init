@@ -127,6 +127,12 @@ start_service() {
 
 	listen="$(panel_listen "$bind" "$port")"
 
+	# uhttpd 由 traffic-stats 的 Depends 保证；缺失时明确失败，不要静默空转。
+	if [ ! -x "$PANEL_HTTPD" ]; then
+		logger -t traffic-panel "missing $PANEL_HTTPD, not starting"
+		return 1
+	fi
+
 	procd_open_instance "main"
 	procd_set_param command "$PANEL_HTTPD" -f -h "$PANEL_ROOT" -x "$PANEL_CGI_PREFIX" -p "$listen" -t 60 -T 60 -A 1
 	# 异常退出自动拉起：<阈值秒> <重启间隔> <次数，0=不限>
@@ -136,7 +142,7 @@ start_service() {
 	procd_close_instance
 }
 
-# 端口 / bind / token 改完必须整体重启 uhttpd 才生效（CGI 每个请求重新读 UCI，token 不必重启）。
+# 端口 / bind 改完必须整体重启 uhttpd 才生效；token 由 CGI 每个请求重新读 UCI，不必重启。
 reload_service() {
 	stop
 	start
