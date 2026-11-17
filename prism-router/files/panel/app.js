@@ -1377,8 +1377,25 @@
 		return null;
 	}
 
+	function topbarOffset() {
+		var bar = document.querySelector('.topbar');
+		var h = bar ? bar.getBoundingClientRect().height : 0;
+		return (h > 0 ? h : 0) + 12;
+	}
+
 	function scrollToNode(node, block) {
 		if (!node) return;
+
+		/* 区块跳到顶：按当前顶栏实际高度留出空间（窄屏顶栏会换行变高）。 */
+		if (block === 'start') {
+			var docTop = window.pageYOffset || document.documentElement.scrollTop || 0;
+			var top = node.getBoundingClientRect().top + docTop - topbarOffset();
+			try {
+				window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+				return;
+			} catch (e) { /* 回退到 scrollIntoView */ }
+		}
+
 		try {
 			node.scrollIntoView({ behavior: 'smooth', block: block || 'center' });
 		} catch (e) {
@@ -1481,7 +1498,9 @@
 
 		var alerts = buildAlerts(state);
 		var shown = alerts.slice(0, ALERT_MAX);
-		setMeta(dom.alertsMeta, shown.length + ' 项需要关注');
+		var countText = alerts.length + ' 项需要关注';
+		if (alerts.length > shown.length) countText += ' · 显示前 ' + shown.length + ' 项';
+		setMeta(dom.alertsMeta, countText);
 
 		if (!shown.length) {
 			var box = el('div', 'alerts__empty');
