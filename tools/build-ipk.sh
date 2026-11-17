@@ -2,8 +2,8 @@
 # 不依赖 OpenWrt SDK 手搓 .ipk（纯脚本包，无编译产物）
 #
 # 产物（默认只有 2 个 modern 包 + SHA256SUMS）：
-#   dist/traffic-stats_1.0.0-1_all.ipk
-#   dist/luci-app-traffic-stats_1.0.0-1_all.ipk
+#   dist/prism-router_1.0.0-1_all.ipk
+#   dist/luci-app-prism-router_1.0.0-1_all.ipk
 #   dist/SHA256SUMS
 #
 # 24.10 / 23.05 的 .ipk 外层都是 tar.gz（见 docs/IPK-FORMAT.md）。
@@ -66,13 +66,13 @@ pack() { # $1=dir $2=basename（不带扩展名）
   find "$d/data" -type f -exec chmod 644 {} +
   # 可执行条目单独 755：守护进程 / init / 测试脚本 / 接收子节点上报的 CGI / 接收 AP 站点元数据的 CGI
   # / 独立面板的 init 与只读 CGI（静态页面仍是 644）
-  chmod 755 "$d/data/usr/bin/traffic-statsd" "$d/data/etc/init.d/traffic-statsd" \
-    "$d/data/usr/share/traffic-stats/feishu-test.sh" \
-    "$d/data/www/cgi-bin/traffic-stats-ingest" \
-    "$d/data/www/cgi-bin/traffic-stats-stations" \
-    "$d/data/www/cgi-bin/traffic-stats-metrics" \
-    "$d/data/etc/init.d/traffic-panel" \
-    "$d/data/www/traffic-panel/cgi-bin/panel-api" 2>/dev/null || true
+  chmod 755 "$d/data/usr/bin/prism-routerd" "$d/data/etc/init.d/prism-routerd" \
+    "$d/data/usr/share/prism-router/feishu-test.sh" \
+    "$d/data/www/cgi-bin/prism-router-ingest" \
+    "$d/data/www/cgi-bin/prism-router-stations" \
+    "$d/data/www/cgi-bin/prism-router-metrics" \
+    "$d/data/etc/init.d/prism-router-panel" \
+    "$d/data/www/prism-router-panel/cgi-bin/panel-api" 2>/dev/null || true
   # control 归档：目录 755，control/conffiles 644，维护脚本 755（opkg 会直接 exec）
   find "$d/control" -type d -exec chmod 755 {} +
   chmod 644 "$d/control/control"
@@ -100,112 +100,115 @@ pack() { # $1=dir $2=basename（不带扩展名）
 ctl() { # $1=dir  $2=pkgname  $3=section  $4=depends  $5=desc
   # Priority 必须是 Debian/OpenWrt 的合法值；不能把占位符/密码类字符串写进 control。
   # Depends 必须与两个 Makefile 保持一致（release gate 会逐项比对）。
-  printf 'Package: %s\nVersion: %s-%s\nArchitecture: all\nMaintainer: traffic-stats\nSection: %s\nPriority: standard\nDepends: %s\nDescription: %s\n' \
+  printf 'Package: %s\nVersion: %s-%s\nArchitecture: all\nMaintainer: prism-router\nSection: %s\nPriority: standard\nDepends: %s\nDescription: %s\n' \
     "$2" "$VER" "$REL" "$3" "$4" "$5" > "$1/control/control"
   chmod 644 "$1/control/control"
 }
 hook() { printf '%s\n' "$@" > "$W/_h"; chmod 644 "$W/_h"; }
 
-# ================= traffic-stats =================
-D="$W/ts"; mkdir -p "$D/data/usr/bin" "$D/data/usr/share/traffic-stats" \
-  "$D/data/etc/init.d" "$D/data/etc/config" "$D/data/etc/traffic-stats/daily" \
-  "$D/data/www/cgi-bin" "$D/data/www/traffic-panel/cgi-bin" "$D/control"
+# ================= prism-router =================
+D="$W/ts"; mkdir -p "$D/data/usr/bin" "$D/data/usr/share/prism-router" \
+  "$D/data/etc/init.d" "$D/data/etc/config" "$D/data/etc/prism-router/daily" \
+  "$D/data/www/cgi-bin" "$D/data/www/prism-router-panel/cgi-bin" "$D/control"
 chmod 755 "$D" "$D/control" "$D/data" "$D/data/usr" "$D/data/usr/bin" \
-  "$D/data/usr/share" "$D/data/usr/share/traffic-stats" \
+  "$D/data/usr/share" "$D/data/usr/share/prism-router" \
   "$D/data/etc" "$D/data/etc/init.d" "$D/data/etc/config" \
-  "$D/data/etc/traffic-stats" "$D/data/etc/traffic-stats/daily" \
+  "$D/data/etc/prism-router" "$D/data/etc/prism-router/daily" \
   "$D/data/www" "$D/data/www/cgi-bin" \
-  "$D/data/www/traffic-panel" "$D/data/www/traffic-panel/cgi-bin"
-install -m 755 "$ROOT/traffic-stats/files/traffic-statsd.uc"  "$D/data/usr/bin/traffic-statsd"
-install -m 644 "$ROOT/traffic-stats/files/feishu.uc"          "$D/data/usr/share/traffic-stats/feishu.uc"
-install -m 755 "$ROOT/traffic-stats/files/feishu-test.sh"     "$D/data/usr/share/traffic-stats/feishu-test.sh"
+  "$D/data/www/prism-router-panel" "$D/data/www/prism-router-panel/cgi-bin"
+install -m 755 "$ROOT/prism-router/files/prism-routerd.uc"  "$D/data/usr/bin/prism-routerd"
+install -m 644 "$ROOT/prism-router/files/feishu.uc"          "$D/data/usr/share/prism-router/feishu.uc"
+install -m 755 "$ROOT/prism-router/files/feishu-test.sh"     "$D/data/usr/share/prism-router/feishu-test.sh"
 # 数据 / 日志保留与清理（用户 cron 调用；只动白名单目录，见 docs/SPEC.md §9）
-install -m 644 "$ROOT/traffic-stats/files/retention.uc"       "$D/data/usr/share/traffic-stats/retention.uc"
+install -m 644 "$ROOT/prism-router/files/retention.uc"       "$D/data/usr/share/prism-router/retention.uc"
 # 子节点推送脚本（cron 调用；不进 PATH，避免和守护进程抢名字）
-install -m 644 "$ROOT/traffic-stats/files/push.uc"            "$D/data/usr/share/traffic-stats/push.uc"
+install -m 644 "$ROOT/prism-router/files/push.uc"            "$D/data/usr/share/prism-router/push.uc"
 # 母节点接收端：CGI，必须可执行（uhttpd -c /cgi-bin 直接 exec）
-install -m 755 "$ROOT/traffic-stats/files/ingest.uc"          "$D/data/www/cgi-bin/traffic-stats-ingest"
+install -m 755 "$ROOT/prism-router/files/ingest.uc"          "$D/data/www/cgi-bin/prism-router-ingest"
 # 哑桥 AP 侧：无线站点元数据上报（cron 调用；只报信号/速率，绝不报字节）
-install -m 644 "$ROOT/traffic-stats/files/stations.uc"        "$D/data/usr/share/traffic-stats/stations.uc"
+install -m 644 "$ROOT/prism-router/files/stations.uc"        "$D/data/usr/share/prism-router/stations.uc"
 # 安全模块新增的节点/站点认证共享库：存在就打包，不存在不影响；不能因手打包漏掉。
-if [ -f "$ROOT/traffic-stats/files/traffic-stats-node-auth.uc" ]; then
-  install -m 644 "$ROOT/traffic-stats/files/traffic-stats-node-auth.uc" \
-    "$D/data/usr/share/traffic-stats/traffic-stats-node-auth.uc"
-  echo "  + traffic-stats: 含 traffic-stats-node-auth.uc"
+if [ -f "$ROOT/prism-router/files/prism-router-node-auth.uc" ]; then
+  install -m 644 "$ROOT/prism-router/files/prism-router-node-auth.uc" \
+    "$D/data/usr/share/prism-router/prism-router-node-auth.uc"
+  echo "  + prism-router: 含 prism-router-node-auth.uc"
 fi
 # 母节点接收端：AP 站点元数据 CGI（必须可执行；不写 jsonl 历史）
-install -m 755 "$ROOT/traffic-stats/files/ingest-stations.uc" "$D/data/www/cgi-bin/traffic-stats-stations"
+install -m 755 "$ROOT/prism-router/files/ingest-stations.uc" "$D/data/www/cgi-bin/prism-router-stations"
 # Prometheus 指标导出 CGI（只读；token 认证；未启用/未配 token 一律 403）
-install -m 755 "$ROOT/traffic-stats/files/traffic-stats-metrics.uc" "$D/data/www/cgi-bin/traffic-stats-metrics"
-install -m 755 "$ROOT/traffic-stats/files/traffic-statsd.init" "$D/data/etc/init.d/traffic-statsd"
-install -m 644 "$ROOT/traffic-stats/files/traffic-stats.config" "$D/data/etc/config/traffic-stats"
+install -m 755 "$ROOT/prism-router/files/prism-router-metrics.uc" "$D/data/www/cgi-bin/prism-router-metrics"
+install -m 755 "$ROOT/prism-router/files/prism-routerd.init" "$D/data/etc/init.d/prism-routerd"
+install -m 644 "$ROOT/prism-router/files/prism-router.config" "$D/data/etc/config/prism-router"
 # 独立面板服务：procd 管理的独立 uhttpd 实例（init）+ 只读 ucode CGI。
-# 静态页面由前端任务放在 traffic-stats/files/panel/，存在才装（空目录不失败）。
-install -m 755 "$ROOT/traffic-stats/files/traffic-panel.init" "$D/data/etc/init.d/traffic-panel"
-if [ -f "$ROOT/traffic-stats/files/panel-api.uc" ]; then
-  install -m 755 "$ROOT/traffic-stats/files/panel-api.uc" \
-    "$D/data/www/traffic-panel/cgi-bin/panel-api"
+# 静态页面由前端任务放在 prism-router/files/panel/，存在才装（空目录不失败）。
+install -m 755 "$ROOT/prism-router/files/prism-router-panel.init" "$D/data/etc/init.d/prism-router-panel"
+if [ -f "$ROOT/prism-router/files/panel-api.uc" ]; then
+  install -m 755 "$ROOT/prism-router/files/panel-api.uc" \
+    "$D/data/www/prism-router-panel/cgi-bin/panel-api"
 fi
-if [ -d "$ROOT/traffic-stats/files/panel" ]; then
-  for f in "$ROOT"/traffic-stats/files/panel/*; do
+if [ -d "$ROOT/prism-router/files/panel" ]; then
+  for f in "$ROOT"/prism-router/files/panel/*; do
     [ -f "$f" ] || continue
-    install -m 644 "$f" "$D/data/www/traffic-panel/$(basename "$f")"
+    install -m 644 "$f" "$D/data/www/prism-router-panel/$(basename "$f")"
   done
 fi
 # openssl-util 是飞书 HMAC-SHA256 与子母节点签名的真实运行时依赖，必须声明；
-# uhttpd 是独立面板服务（traffic-panel.init）的运行时依赖。
-ctl "$D" traffic-stats net "ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util, uhttpd" \
+# uhttpd 是独立面板服务（prism-router-panel.init）的运行时依赖。
+ctl "$D" prism-router net "ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util, uhttpd" \
   "Traffic statistics daemon: per-device/per-app usage with proxy-vs-direct split (OpenClash API + conntrack)."
-printf '/etc/config/traffic-stats\n' > "$D/control/conffiles"; chmod 644 "$D/control/conffiles"
+printf '/etc/config/prism-router\n' > "$D/control/conffiles"; chmod 644 "$D/control/conffiles"
 # 独立面板默认关闭：postinst 只跟随 panel.enabled 决定是否开机自启，绝不强制启动。
 hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
-  '/etc/init.d/traffic-statsd enable >/dev/null 2>&1' \
-  '/etc/init.d/traffic-statsd restart >/dev/null 2>&1' \
-  'if [ "$(uci -q get traffic-stats.panel.enabled)" = "1" ]; then /etc/init.d/traffic-panel enable >/dev/null 2>&1; else /etc/init.d/traffic-panel disable >/dev/null 2>&1; fi' \
+  'if [ -f /etc/config/traffic-stats ]; then cp -p /etc/config/traffic-stats /etc/config/prism-router 2>/dev/null; if ! uci -q get prism-router.panel.enabled >/dev/null 2>&1; then uci -q set prism-router.panel=panel; uci -q set prism-router.panel.enabled='"'"'0'"'"'; uci -q set prism-router.panel.port='"'"'8099'"'"'; uci -q set prism-router.panel.bind='"'"''"'"'; uci -q set prism-router.panel.token='"'"''"'"'; uci -q commit prism-router; fi; fi' \
+  'if [ -d /etc/traffic-stats ]; then mkdir -p /etc/prism-router; cp -a /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null || cp -r /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null; fi' \
+  'if [ -x /etc/init.d/traffic-statsd ]; then /etc/init.d/traffic-statsd stop >/dev/null 2>&1; /etc/init.d/traffic-statsd disable >/dev/null 2>&1; fi' \
+  '/etc/init.d/prism-routerd enable >/dev/null 2>&1' \
+  '/etc/init.d/prism-routerd restart >/dev/null 2>&1' \
+  'if [ "$(uci -q get prism-router.panel.enabled)" = "1" ]; then /etc/init.d/prism-router-panel enable >/dev/null 2>&1; else /etc/init.d/prism-router-panel disable >/dev/null 2>&1; fi' \
   'exit 0'
 install -m 755 "$W/_h" "$D/control/postinst"
 hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
-  '/etc/init.d/traffic-panel stop >/dev/null 2>&1' \
-  '/etc/init.d/traffic-panel disable >/dev/null 2>&1' \
-  '/etc/init.d/traffic-statsd stop >/dev/null 2>&1' \
-  '/etc/init.d/traffic-statsd disable >/dev/null 2>&1' \
+  '/etc/init.d/prism-router-panel stop >/dev/null 2>&1' \
+  '/etc/init.d/prism-router-panel disable >/dev/null 2>&1' \
+  '/etc/init.d/prism-routerd stop >/dev/null 2>&1' \
+  '/etc/init.d/prism-routerd disable >/dev/null 2>&1' \
   'exit 0'
 install -m 755 "$W/_h" "$D/control/prerm"
-pack "$D" "traffic-stats_${VER}-${REL}_all"
+pack "$D" "prism-router_${VER}-${REL}_all"
 
-# ================= luci-app-traffic-stats =================
-D="$W/luci"; mkdir -p "$D/data/www/luci-static/resources/view/traffic-stats" \
-  "$D/data/www/luci-static/resources/traffic-stats" \
+# ================= luci-app-prism-router =================
+D="$W/luci"; mkdir -p "$D/data/www/luci-static/resources/view/prism-router" \
+  "$D/data/www/luci-static/resources/prism-router" \
   "$D/data/usr/share/luci/menu.d" "$D/data/usr/share/rpcd/acl.d" "$D/data/usr/share/rpcd/ucode" "$D/control"
 chmod 755 "$D" "$D/control" "$D/data" "$D/data/www" \
   "$D/data/www/luci-static" "$D/data/www/luci-static/resources" \
-  "$D/data/www/luci-static/resources/view" "$D/data/www/luci-static/resources/view/traffic-stats" \
-  "$D/data/www/luci-static/resources/traffic-stats" \
+  "$D/data/www/luci-static/resources/view" "$D/data/www/luci-static/resources/view/prism-router" \
+  "$D/data/www/luci-static/resources/prism-router" \
   "$D/data/usr" "$D/data/usr/share" "$D/data/usr/share/luci" "$D/data/usr/share/luci/menu.d" \
   "$D/data/usr/share/rpcd" "$D/data/usr/share/rpcd/acl.d" "$D/data/usr/share/rpcd/ucode"
-for f in "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/view/traffic-stats/*.js; do
+for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/view/prism-router/*.js; do
   [ -f "$f" ] || continue
-  install -m 644 "$f" "$D/data/www/luci-static/resources/view/traffic-stats/$(basename "$f")"
+  install -m 644 "$f" "$D/data/www/luci-static/resources/view/prism-router/$(basename "$f")"
 done
 # PWA 资源（manifest + 主屏图标 + 应用类别表）
-for f in "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/traffic-stats/*; do
+for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/prism-router/*; do
   [ -f "$f" ] || continue
-  install -m 644 "$f" "$D/data/www/luci-static/resources/traffic-stats/$(basename "$f")"
+  install -m 644 "$f" "$D/data/www/luci-static/resources/prism-router/$(basename "$f")"
 done
 # root/ 整树安装，与 luci.mk 的行为一致：未来新增的 menu/acl/rpcd ucode 插件
-# （例如安全 agent 的 traffic-stats-node-auth.uc）放进来就自动进包，不会漏。
+# （例如安全 agent 的 prism-router-node-auth.uc）放进来就自动进包，不会漏。
 # 源文件常被 0600/0700 的 umask 创建，这里按“可执行→755、其余→644”归一。
 while IFS= read -r f; do
-  rel="${f#"$ROOT/luci-app-traffic-stats/root/"}"
+  rel="${f#"$ROOT/luci-app-prism-router/root/"}"
   if [ -x "$f" ]; then m=755; else m=644; fi
   install -D -m "$m" "$f" "$D/data/$rel"
-done < <(find "$ROOT/luci-app-traffic-stats/root" -type f | LC_ALL=C sort)
+done < <(find "$ROOT/luci-app-prism-router/root" -type f | LC_ALL=C sort)
 # 内置 SVG 不需要 luci-lib-chartjs；curl / openssl-util 是飞书 RPC 的真实依赖。
-ctl "$D" luci-app-traffic-stats luci "luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, curl, openssl-util, traffic-stats" \
-  "LuCI pages for traffic statistics (overview / devices / apps / settings). Conffile: /etc/config/traffic-stats (owned by traffic-stats)."
+ctl "$D" luci-app-prism-router luci "luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, curl, openssl-util, prism-router" \
+  "LuCI pages for traffic statistics (overview / devices / apps / settings). Conffile: /etc/config/prism-router (owned by prism-router)."
 hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' 'rm -f /tmp/luci-indexcache* 2>/dev/null' '/etc/init.d/rpcd reload >/dev/null 2>&1' 'exit 0'
 install -m 755 "$W/_h" "$D/control/postinst"
-pack "$D" "luci-app-traffic-stats_${VER}-${REL}_all"
+pack "$D" "luci-app-prism-router_${VER}-${REL}_all"
 
 # ================= 发布校验和 =================
 # 只覆盖本次实际生成的 *.ipk（默认 2 个 modern；--legacy 时含 4 个）。

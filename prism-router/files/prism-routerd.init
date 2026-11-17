@@ -1,0 +1,63 @@
+#!/bin/sh /etc/rc.common
+# prism-routerd — 棱镜路由守护进程（procd）
+#
+# 打包落位（见 ../Makefile）：
+#   /usr/bin/prism-routerd        <- files/prism-routerd.uc
+#   /etc/init.d/prism-routerd     <- 本文件
+#   /etc/config/prism-router      <- files/prism-router.config
+#
+# 用法：
+#   /etc/init.d/prism-routerd enable     # 开机自启
+#   /etc/init.d/prism-routerd start|stop|restart|reload
+#   logread -e prism-routerd -f
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/prism-routerd
+PROG_ALT=/usr/share/prism-router/prism-routerd.uc
+
+start_service() {
+	local enabled=1
+
+	config_load prism-router
+	config_get_bool enabled settings enabled 1
+
+	if [ "$enabled" -ne 1 ]; then
+		logger -t prism-routerd "disabled in /etc/config/prism-router, not starting"
+		return 0
+	fi
+
+	# 优先用包装好的可执行文件；也兼容直接把 .uc 放在 /usr/share 的部署
+	if [ -x "$PROG" ]; then
+		set -- "$PROG"
+	elif [ -f "$PROG_ALT" ]; then
+		set -- /usr/bin/ucode "$PROG_ALT"
+	else
+		logger -t prism-routerd "missing $PROG"
+		return 1
+	fi
+
+	procd_open_instance "main"
+	procd_set_param command "$@"
+	# 异常退出自动拉起：<阈值秒> <重启间隔> <次数，0=不限>
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param nice 0
+	procd_close_instance
+}
+
+stop_service() {
+	logger -t prism-routerd "stopping"
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "prism-router"
+}

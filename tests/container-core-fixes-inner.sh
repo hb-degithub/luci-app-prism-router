@@ -31,13 +31,13 @@ check(){ local got; got=$(ls -ld "$1" 2>/dev/null | awk '{print $3":"$4" "$1}')
   [ "$got" = "$2" ] && ok "$1 -> $got" || bad "$1 期望[$2] 实际[${got:-不存在}]"; }
 UCI(){ uci "$@" >/dev/null 2>&1; }
 CGET(){ uci -q get "$1" 2>/dev/null; }
-cfg_commit(){ uci commit traffic-stats >/dev/null 2>&1; }
+cfg_commit(){ uci commit prism-router >/dev/null 2>&1; }
 rpc(){ # $1=method [$2=args json]
-  env TRAFFIC_STATS_STATE_FILE="${RSTATE:-/tmp/cf/none/state.json}" \
-      TRAFFIC_STATS_DAILY_DIR="${RDAILY:-/tmp/cf/none/daily}" \
-      TRAFFIC_STATS_DEVICES_FILE="${RDEV:-/tmp/cf/none/devices.json}" \
-      TRAFFIC_STATS_METHOD="$1" TRAFFIC_STATS_ARGS="${2:-}" \
-      ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc 2>>/tmp/cf/rpc.err
+  env PRISM_ROUTER_STATE_FILE="${RSTATE:-/tmp/cf/none/state.json}" \
+      PRISM_ROUTER_DAILY_DIR="${RDAILY:-/tmp/cf/none/daily}" \
+      PRISM_ROUTER_DEVICES_FILE="${RDEV:-/tmp/cf/none/devices.json}" \
+      PRISM_ROUTER_METHOD="$1" PRISM_ROUTER_ARGS="${2:-}" \
+      ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc 2>>/tmp/cf/rpc.err
 }
 jget(){ # $1=file $2=ucode expression (d parsed)
   F="$1" ucode -e "let fs=require('fs'); let d=json(fs.readfile(getenv('F'))); print($2);" 2>/dev/null
@@ -47,19 +47,19 @@ ROOT=/tmp/cf
 mkdir -p "$ROOT"
 
 echo "=== 0. 安装两个包 ==="
-opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
-  && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 \
-  && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
-check /usr/bin/traffic-statsd "root:root -rwxr-xr-x"
-check /usr/share/rpcd/ucode/traffic-stats.uc "root:root -rw-r--r--"
+opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
+  && ok "安装 prism-router" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 \
+  && ok "安装 luci-app-prism-router" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+check /usr/bin/prism-routerd "root:root -rwxr-xr-x"
+check /usr/share/rpcd/ucode/prism-router.uc "root:root -rw-r--r--"
 
 echo "=== 1. ucode 语法 ==="
-ucode -c /usr/bin/traffic-statsd && ok "traffic-statsd 语法 OK" || bad "traffic-statsd 语法错误"
-ucode -c /usr/share/rpcd/ucode/traffic-stats.uc && ok "rpcd uc 语法 OK" || bad "rpcd uc 语法错误"
+ucode -c /usr/bin/prism-routerd && ok "prism-routerd 语法 OK" || bad "prism-routerd 语法错误"
+ucode -c /usr/share/rpcd/ucode/prism-router.uc && ok "rpcd uc 语法 OK" || bad "rpcd uc 语法错误"
 
-UCI set traffic-stats.settings.lan_ranges='192.168.100.0/24'
-UCI set traffic-stats.settings.poll_interval='5'
+UCI set prism-router.settings.lan_ranges='192.168.100.0/24'
+UCI set prism-router.settings.poll_interval='5'
 cfg_commit
 
 mkdir -p "$ROOT/mock"
@@ -100,20 +100,20 @@ YDAY=$(date -d "@$(( $(date +%s) - 86400 ))" +%Y-%m-%d 2>/dev/null || echo "2000
 
 run_once(){ # $1=state dir $2=daily dir $3=devices file $4=conntrack $5=clash api [$6=polls]
   rm -rf "$1"; mkdir -p "$1"
-  env TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_ONCE_POLLS="${6:-1}" \
-      TRAFFIC_STATS_STATE_DIR="$1" TRAFFIC_STATS_DAILY_DIR="$2" \
-      TRAFFIC_STATS_DEVICES_FILE="$3" TRAFFIC_STATS_CONNTRACK_FILE="$4" \
-      TRAFFIC_STATS_CLASH_API="$5" TRAFFIC_STATS_DEBUG=1 \
-      ucode /usr/bin/traffic-statsd >"$1.log" 2>&1
+  env PRISM_ROUTER_ONCE=1 PRISM_ROUTER_ONCE_POLLS="${6:-1}" \
+      PRISM_ROUTER_STATE_DIR="$1" PRISM_ROUTER_DAILY_DIR="$2" \
+      PRISM_ROUTER_DEVICES_FILE="$3" PRISM_ROUTER_CONNTRACK_FILE="$4" \
+      PRISM_ROUTER_CLASH_API="$5" PRISM_ROUTER_DEBUG=1 \
+      ucode /usr/bin/prism-routerd >"$1.log" 2>&1
   echo $?
 }
 run_resume(){ # 软重启：保留 state/daily/devices/baseline，不删目录
   mkdir -p "$1"
-  env TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_ONCE_POLLS="${6:-1}" \
-      TRAFFIC_STATS_STATE_DIR="$1" TRAFFIC_STATS_DAILY_DIR="$2" \
-      TRAFFIC_STATS_DEVICES_FILE="$3" TRAFFIC_STATS_CONNTRACK_FILE="$4" \
-      TRAFFIC_STATS_CLASH_API="$5" TRAFFIC_STATS_DEBUG=1 \
-      ucode /usr/bin/traffic-statsd >"$1.log" 2>&1
+  env PRISM_ROUTER_ONCE=1 PRISM_ROUTER_ONCE_POLLS="${6:-1}" \
+      PRISM_ROUTER_STATE_DIR="$1" PRISM_ROUTER_DAILY_DIR="$2" \
+      PRISM_ROUTER_DEVICES_FILE="$3" PRISM_ROUTER_CONNTRACK_FILE="$4" \
+      PRISM_ROUTER_CLASH_API="$5" PRISM_ROUTER_DEBUG=1 \
+      ucode /usr/bin/prism-routerd >"$1.log" 2>&1
   echo $?
 }
 sum_daily(){ # file -> rx|tx|direct_rx|direct_tx|proxy_rx|proxy_tx
@@ -229,10 +229,10 @@ BTURL='http://127.0.0.1:19101/connections'
 
 BT1="$ROOT/t2b"; BSD="$BT1/state"; BD="$BT1/daily"; BDEV="$BT1/devices.json"
 rm -rf "$BT1"; mkdir -p "$BT1"
-env TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_BASELINE_MAX_ENTRIES=2 \
-    TRAFFIC_STATS_STATE_DIR="$BSD" TRAFFIC_STATS_DAILY_DIR="$BD" \
-    TRAFFIC_STATS_DEVICES_FILE="$BDEV" TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
-    TRAFFIC_STATS_CLASH_API="$BTURL" ucode /usr/bin/traffic-statsd >"$BT1.log" 2>&1
+env PRISM_ROUTER_ONCE=1 PRISM_ROUTER_BASELINE_MAX_ENTRIES=2 \
+    PRISM_ROUTER_STATE_DIR="$BSD" PRISM_ROUTER_DAILY_DIR="$BD" \
+    PRISM_ROUTER_DEVICES_FILE="$BDEV" PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
+    PRISM_ROUTER_CLASH_API="$BTURL" ucode /usr/bin/prism-routerd >"$BT1.log" 2>&1
 eq "$?" "0" "baseline 截断：首轮退出码 0"
 eq "$(sum_daily "$BD/$TODAY.json")" "3000|0|3000|0|0|0" "截断前：3 条直连流量 3000"
 eq "$(jget "$BSD/baseline.json" 'sprintf("%d|%d|%d|%d", int(d.v??0), int(d.clash_total??0), int(d.clash_truncated??0), length(d.clash_prev??{}))')" \
@@ -247,10 +247,10 @@ cat > "$MB/connections.new" <<'BT'
 ]}
 BT
 mv "$MB/connections.new" "$MB/connections"
-env TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_BASELINE_MAX_ENTRIES=2 TRAFFIC_STATS_DEBUG=1 \
-    TRAFFIC_STATS_STATE_DIR="$BSD" TRAFFIC_STATS_DAILY_DIR="$BD" \
-    TRAFFIC_STATS_DEVICES_FILE="$BDEV" TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
-    TRAFFIC_STATS_CLASH_API="$BTURL" ucode /usr/bin/traffic-statsd >"$BT1.resume.log" 2>&1
+env PRISM_ROUTER_ONCE=1 PRISM_ROUTER_BASELINE_MAX_ENTRIES=2 PRISM_ROUTER_DEBUG=1 \
+    PRISM_ROUTER_STATE_DIR="$BSD" PRISM_ROUTER_DAILY_DIR="$BD" \
+    PRISM_ROUTER_DEVICES_FILE="$BDEV" PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
+    PRISM_ROUTER_CLASH_API="$BTURL" ucode /usr/bin/prism-routerd >"$BT1.resume.log" 2>&1
 eq "$?" "0" "baseline 截断：恢复轮退出码 0"
 eq "$(sum_daily "$BD/$TODAY.json")" "5000|0|5000|0|0|0" \
   "截断恢复：未覆盖连接只采样，不被全量重加（5000 而不是 7000）"
@@ -274,10 +274,10 @@ cat > "$MB/connections" <<'BIGCT'
  {"id":"big-8199","metadata":{"sourceIP":"192.168.100.101","sourcePort":"42001","host":"miss.example","destinationIP":"9.9.9.9","destinationPort":"443","network":"tcp"},"upload":5000,"download":50000,"chains":["DIRECT"]}
 ]}
 BIGCT
-env TRAFFIC_STATS_ONCE=1 \
-    TRAFFIC_STATS_STATE_DIR="$BIGS" TRAFFIC_STATS_DAILY_DIR="$BIGD" \
-    TRAFFIC_STATS_DEVICES_FILE="$BIG/devices.json" TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
-    TRAFFIC_STATS_CLASH_API="$BTURL" TRAFFIC_STATS_DEBUG=1 ucode /usr/bin/traffic-statsd >"$BIG.log" 2>&1
+env PRISM_ROUTER_ONCE=1 \
+    PRISM_ROUTER_STATE_DIR="$BIGS" PRISM_ROUTER_DAILY_DIR="$BIGD" \
+    PRISM_ROUTER_DEVICES_FILE="$BIG/devices.json" PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
+    PRISM_ROUTER_CLASH_API="$BTURL" PRISM_ROUTER_DEBUG=1 ucode /usr/bin/prism-routerd >"$BIG.log" 2>&1
 eq "$?" "0" ">8192 条 baseline：恢复退出码 0"
 eq "$(jget "$BIGD/$TODAY.json" 'sprintf("%d|%d", int(d.totals.rx??0), int(d.totals.tx??0))')" "1234|123" \
   ">8192 条 baseline：未覆盖连接不全量重加（daily 保持 1234/123）"
@@ -286,7 +286,7 @@ grep -q 'baseline clash truncated' "$BIG.log" && ok "日志确认满 8192 条旧
 echo "=== 2c. 去重 TTL 不采用恢复锚点年龄（600s 旧基线） ==="
 # baseline 的 ts 是 600s 前：首轮 dt=600，修复前 TTL=max(10,600*2)=1200s。
 # 修复后配置 poll_interval=5 -> clamp dt 到 15s -> ttl=30s。
-UCI set traffic-stats.settings.poll_interval='5'; cfg_commit
+UCI set prism-router.settings.poll_interval='5'; cfg_commit
 cat > "$MB/connections" <<'BT'
 {"connections":[
  {"id":"b1","metadata":{"sourceIP":"192.168.100.101","sourcePort":"41001","host":"b1.example","destinationIP":"1.1.1.1","destinationPort":"443","network":"tcp"},"upload":0,"download":1000,"chains":["DIRECT"]},
@@ -299,10 +299,10 @@ rm -rf "$TT"; mkdir -p "$TTS"
 NOWTTL=$(date +%s)
 printf '{"v":2,"ts":%s,"day":"%s","clash_ts":%s,"ct_ts":%s,"clash_prev":{},"ct_prev":{},"clash_total":0,"ct_total":0,"clash_truncated":0,"ct_truncated":0}\n' \
   "$((NOWTTL-600))" "$TODAY" "$((NOWTTL-600))" "$((NOWTTL-600))" > "$TTS/baseline.json"
-env TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_DEBUG=1 \
-    TRAFFIC_STATS_STATE_DIR="$TTS" TRAFFIC_STATS_DAILY_DIR="$TTD" \
-    TRAFFIC_STATS_DEVICES_FILE="$TT/devices.json" TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
-    TRAFFIC_STATS_CLASH_API="$BTURL" ucode /usr/bin/traffic-statsd >"$TT.log" 2>&1
+env PRISM_ROUTER_ONCE=1 PRISM_ROUTER_DEBUG=1 \
+    PRISM_ROUTER_STATE_DIR="$TTS" PRISM_ROUTER_DAILY_DIR="$TTD" \
+    PRISM_ROUTER_DEVICES_FILE="$TT/devices.json" PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
+    PRISM_ROUTER_CLASH_API="$BTURL" ucode /usr/bin/prism-routerd >"$TT.log" 2>&1
 eq "$?" "0" "600s 旧基线：启动退出码 0"
 grep -q 'dt=600s' "$TT.log" && ok "首轮 dt 确实来自 600s 旧锚点" || bad "首轮 dt 不是 600s"
 grep -q 'clash dedup: entries=6 ttl=30s dt=600s' "$TT.log" \
@@ -344,7 +344,7 @@ echo "=== 3b. clash 故障跨 TTL：去重续期 + 恢复按旧基线，不双�
 # -> 恢复 clash（计数已增长）。修复前：conntrack 先把增长按 direct 计，clash
 # 恢复后又按旧基线把同一段算成 proxy/direct，双计。修复后：故障期间续期已有
 # 去重键，恢复只按旧基线补差量，总量等于真实流量。
-UCI set traffic-stats.settings.poll_interval='1'; cfg_commit
+UCI set prism-router.settings.poll_interval='1'; cfg_commit
 cat > "$MB/connections" <<'CT0'
 {"connections":[
  {"id":"c1","metadata":{"sourceIP":"192.168.100.101","sourcePort":"40000","host":"a.example","destinationIP":"1.1.1.1","destinationPort":"443","network":"tcp"},"upload":500,"download":5000,"chains":["US1"]},
@@ -367,10 +367,10 @@ ipv4 2 tcp 6 431999 ESTABLISHED src=192.168.100.104 dst=198.18.0.9 sport=40003 d
 CTF1
 TF="$ROOT/t3fail"; TFS="$TF/state"; TFD="$TF/daily"
 rm -rf "$TF"; mkdir -p "$TFS"
-env TRAFFIC_STATS_STATE_DIR="$TFS" TRAFFIC_STATS_DAILY_DIR="$TFD" \
-    TRAFFIC_STATS_DEVICES_FILE="$TF/devices.json" TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct_fail0.txt" \
-    TRAFFIC_STATS_CLASH_API="$BTURL" TRAFFIC_STATS_DEBUG=1 \
-    ucode /usr/bin/traffic-statsd >"$TF.log" 2>&1 &
+env PRISM_ROUTER_STATE_DIR="$TFS" PRISM_ROUTER_DAILY_DIR="$TFD" \
+    PRISM_ROUTER_DEVICES_FILE="$TF/devices.json" PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct_fail0.txt" \
+    PRISM_ROUTER_CLASH_API="$BTURL" PRISM_ROUTER_DEBUG=1 \
+    ucode /usr/bin/prism-routerd >"$TF.log" 2>&1 &
 TFPID=$!
 sleep 2
 eq "$(sum_daily "$TFD/$TODAY.json")" "16000|1600|8000|800|8000|800" "故障前：正常一轮 16000/1600"
@@ -394,7 +394,7 @@ wait $TFPID 2>/dev/null
 eq "$(sum_daily "$TFD/$TODAY.json")" "34000|3400|18000|1800|16000|1600" \
   "故障跨 TTL 后恢复：总量 34000/3400 等于真实流量（无 direct/proxy 双计）"
 grep -q 'clash dedup renewed on failure' "$TF.log" && ok "日志确认故障期间续期去重键" || bad "故障期间没有续期去重键"
-UCI set traffic-stats.settings.poll_interval='5'; cfg_commit
+UCI set prism-router.settings.poll_interval='5'; cfg_commit
 kill $MSRV 2>/dev/null
 wait $MSRV 2>/dev/null
 
@@ -403,7 +403,7 @@ echo "=== 3c. 慢 curl 失败跨 TTL：故障期间保留并续期去重键（�
 # 恢复 clash。修复前续期用 poll 起始 ctx.now 且删除过期键，conntrack 会先把
 # 增量按 direct 记、恢复后 clash 再按旧基线记 proxy，双计。修复后故障全程保留
 # 键、从真实 time() 续期，恢复总量等于真实流量。
-UCI set traffic-stats.settings.poll_interval='1'; cfg_commit
+UCI set prism-router.settings.poll_interval='1'; cfg_commit
 FC="$ROOT/fc"; FCS="$FC/state"; FCD="$FC/daily"
 rm -rf "$FC"; mkdir -p "$FCS"
 FCM="$FC/mode"; FCB="$FC/body.json"; FCCT="$FC/ct"
@@ -422,10 +422,10 @@ ipv4 2 tcp 6 431999 ESTABLISHED src=192.168.100.102 dst=4.4.4.4 sport=40001 dpor
 FCT1
 cp "$FC/b0.json" "$FCB"; cp "$FC/ct0" "$FCCT"
 env PATH="$ROOT/bin:$PATH" TS_TEST_CURL_MODE="$FCM" TS_TEST_CURL_BODY="$FCB" \
-    TRAFFIC_STATS_STATE_DIR="$FCS" TRAFFIC_STATS_DAILY_DIR="$FCD" \
-    TRAFFIC_STATS_DEVICES_FILE="$FC/devices.json" TRAFFIC_STATS_CONNTRACK_FILE="$FCCT" \
-    TRAFFIC_STATS_CLASH_API='http://127.0.0.1:19999/connections' TRAFFIC_STATS_DEBUG=1 \
-    ucode /usr/bin/traffic-statsd >"$FC.log" 2>&1 &
+    PRISM_ROUTER_STATE_DIR="$FCS" PRISM_ROUTER_DAILY_DIR="$FCD" \
+    PRISM_ROUTER_DEVICES_FILE="$FC/devices.json" PRISM_ROUTER_CONNTRACK_FILE="$FCCT" \
+    PRISM_ROUTER_CLASH_API='http://127.0.0.1:19999/connections' PRISM_ROUTER_DEBUG=1 \
+    ucode /usr/bin/prism-routerd >"$FC.log" 2>&1 &
 FCPID=$!
 sleep 2
 echo slow > "$FCM"
@@ -472,10 +472,10 @@ ipv4 2 tcp 6 431999 ESTABLISHED src=192.168.100.105 dst=5.5.5.5 sport=40005 dpor
 FDCT1
 cp "$FD/b0.json" "$FDB"; cp "$FD/ct0" "$FDCT"
 env PATH="$ROOT/bin:$PATH" TS_TEST_CURL_MODE="$FDM" TS_TEST_CURL_BODY="$FDB" \
-    TRAFFIC_STATS_STATE_DIR="$FDS" TRAFFIC_STATS_DAILY_DIR="$FDD" \
-    TRAFFIC_STATS_DEVICES_FILE="$FD/devices.json" TRAFFIC_STATS_CONNTRACK_FILE="$FDCT" \
-    TRAFFIC_STATS_CLASH_API='http://127.0.0.1:19999/connections' TRAFFIC_STATS_DEBUG=1 \
-    ucode /usr/bin/traffic-statsd >"$FD.log" 2>&1 &
+    PRISM_ROUTER_STATE_DIR="$FDS" PRISM_ROUTER_DAILY_DIR="$FDD" \
+    PRISM_ROUTER_DEVICES_FILE="$FD/devices.json" PRISM_ROUTER_CONNTRACK_FILE="$FDCT" \
+    PRISM_ROUTER_CLASH_API='http://127.0.0.1:19999/connections' PRISM_ROUTER_DEBUG=1 \
+    ucode /usr/bin/prism-routerd >"$FD.log" 2>&1 &
 FDPID=$!
 sleep 2
 echo down > "$FDM"
@@ -530,10 +530,10 @@ ipv4 2 tcp 6 431999 ESTABLISHED src=192.168.100.105 dst=5.5.5.5 sport=40005 dpor
 FECT2
 fe_start(){ # $1=log；exec 让后台 PID 就是 ucode，TERM 才能真正触发优雅停止
   exec env PATH="$ROOT/bin:$PATH" TS_TEST_CURL_MODE="$FEM" TS_TEST_CURL_BODY="$FEB" \
-      TRAFFIC_STATS_STATE_DIR="$FES" TRAFFIC_STATS_DAILY_DIR="$FED" \
-      TRAFFIC_STATS_DEVICES_FILE="$FE/devices.json" TRAFFIC_STATS_CONNTRACK_FILE="$FECT" \
-      TRAFFIC_STATS_CLASH_API='http://127.0.0.1:19999/connections' TRAFFIC_STATS_DEBUG=1 \
-      ucode /usr/bin/traffic-statsd >>"$1" 2>&1
+      PRISM_ROUTER_STATE_DIR="$FES" PRISM_ROUTER_DAILY_DIR="$FED" \
+      PRISM_ROUTER_DEVICES_FILE="$FE/devices.json" PRISM_ROUTER_CONNTRACK_FILE="$FECT" \
+      PRISM_ROUTER_CLASH_API='http://127.0.0.1:19999/connections' PRISM_ROUTER_DEBUG=1 \
+      ucode /usr/bin/prism-routerd >>"$1" 2>&1
 }
 cp "$FE/b0.json" "$FEB"; cp "$FE/ct0" "$FECT"
 fe_start "$FE/d1.log" & FEP1=$!
@@ -562,7 +562,7 @@ grep -q 'clash outage recovered: outage ledger cleared' "$FE/d3.log" \
 echo "=== 4. get_history：31 天/288 桶 <180KiB，summary 轻量，跳过未来/非法日 ==="
 RT="$ROOT/rpc"; RSTATE="$RT/state/state.json"; RDAILY="$RT/daily"; RDEV="$RT/devices.json"
 rm -rf "$RT"; mkdir -p "$RT/state" "$RT/daily"
-mkdir -p /tmp/traffic-stats
+mkdir -p /tmp/prism-router
 F="$RDAILY" O="$RSTATE" ucode -e '
 let fs=require("fs"); let dir=getenv("F"); let now=time(); let t=localtime(now);
 let today=sprintf("%04d-%02d-%02d", t.year, t.mon, t.mday);
@@ -576,7 +576,7 @@ for (let k=0; k<31; k++) {
   fs.writefile(dir+"/"+day+".json", sprintf("%J",obj));
 }
 let hist=[]; for (let i=0;i<288;i++) push(hist,{ts:now-288*300+i*300,direct_rx:1000+i,direct_tx:100,proxy_rx:2000+i,proxy_tx:200,wifi_rx:1,wifi_tx:1,wired_rx:2,wired_tx:2,top_apps:[{host:"x",rx:1,tx:1}],top_devices:[{ip:"1",rx:1,tx:1}]});
-fs.writefile("/tmp/traffic-stats/history.json", sprintf("%J",{day:today,buckets:hist}));
+fs.writefile("/tmp/prism-router/history.json", sprintf("%J",{day:today,buckets:hist}));
 let st={ts:now,uptime:10,source:{clash:"ok",conntrack:"ok"},totals:{direct_rx:1,direct_tx:1,proxy_rx:1,proxy_tx:1},nodes:{},devices:[],apps:[],health:{accounting_confidence:"unavailable",reasons:["synthetic"],clash_deduped:7}};
 fs.writefile(getenv("O"), sprintf("%J",st));
 ' 2>/dev/null
@@ -650,57 +650,57 @@ eq "$R" "0" "totals 有效 rx=0/tx=0 时不回退 devices 行（月总账 0）"
 echo "=== 5. set_config：argv 无 shell / 失败回滚 staged UCI / 严格 is_root ==="
 R=$(rpc set_config '{"section":"settings","options":"{\"poll_interval\":\"9\",\"metrics_token\":\"$(touch /tmp/cf/pwned2)\"}"}')
 echo "$R" | tr -d ' \n' | grep -q '"ok":true' && ok "set_config 合法字段写入成功" || bad "set_config 失败：$R"
-eq "$(CGET traffic-stats.settings.metrics_token)" '$(touch /tmp/cf/pwned2)' "注入串被当作字面值写入（argv 数组）"
+eq "$(CGET prism-router.settings.metrics_token)" '$(touch /tmp/cf/pwned2)' "注入串被当作字面值写入（argv 数组）"
 [ -e "$ROOT/pwned2" ] && bad "set_config 执行了注入命令！" || ok "set_config 未执行注入命令"
-BEFORE=$(CGET traffic-stats.settings.poll_interval)
+BEFORE=$(CGET prism-router.settings.poll_interval)
 LONG=$(awk 'BEGIN{for(i=0;i<2000;i++)printf "x"}')
 printf '{"section":"settings","options":"{\\"poll_interval\\":\\"7\\",\\"clash_secret\\":\\"%s\\"}"}\n' "$LONG" > "$ROOT/badargs.json"
-R=$(env TRAFFIC_STATS_METHOD=set_config TRAFFIC_STATS_ARGS="$(cat "$ROOT/badargs.json")" \
-    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc 2>/dev/null)
+R=$(env PRISM_ROUTER_METHOD=set_config PRISM_ROUTER_ARGS="$(cat "$ROOT/badargs.json")" \
+    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc 2>/dev/null)
 echo "$R" | grep -q '过长' && ok "超长字段被拒绝" || bad "超长字段未被拒绝：$R"
-eq "$(CGET traffic-stats.settings.poll_interval)" "$BEFORE" "失败回滚：poll_interval 未被改成 7"
-[ -z "$(uci changes traffic-stats 2>/dev/null)" ] && ok "失败后没有残留 staged UCI" || bad "残留 staged UCI：$(uci changes traffic-stats)"
+eq "$(CGET prism-router.settings.poll_interval)" "$BEFORE" "失败回滚：poll_interval 未被改成 7"
+[ -z "$(uci changes prism-router 2>/dev/null)" ] && ok "失败后没有残留 staged UCI" || bad "残留 staged UCI：$(uci changes prism-router)"
 
 # 别的字段/别的写者已经 staged 的改动必须保留：预置 history_days=77，
 # 本次调用也写 history_days=42 但随后失败，恢复应把 77 原样放回，而不是
 # 整段 revert 或用 42 覆盖。
-UCI set traffic-stats.settings.history_days='77'
+UCI set prism-router.settings.history_days='77'
 printf '{"section":"settings","options":"{\\"poll_interval\\":\\"7\\",\\"history_days\\":\\"42\\",\\"clash_secret\\":\\"%s\\"}"}\n' "$LONG" > "$ROOT/badargs2.json"
-R=$(env TRAFFIC_STATS_METHOD=set_config TRAFFIC_STATS_ARGS="$(cat "$ROOT/badargs2.json")" \
-    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc 2>/dev/null)
+R=$(env PRISM_ROUTER_METHOD=set_config PRISM_ROUTER_ARGS="$(cat "$ROOT/badargs2.json")" \
+    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc 2>/dev/null)
 echo "$R" | grep -q '过长' && ok "带预置 staged 字段的失败调用被拒绝" || bad "失败调用未被拒绝：$R"
-eq "$(CGET traffic-stats.settings.history_days)" "77" "预置 staged 的 history_days 保持 77（未被误清/覆盖）"
-uci changes traffic-stats 2>/dev/null | grep -q "settings.history_days='77'" \
-  && ok "history_days 仍是 staged 且值正确" || bad "history_days staged 丢失：$(uci changes traffic-stats)"
-eq "$(CGET traffic-stats.settings.poll_interval)" "$BEFORE" "失败回滚：本次 poll_interval 未生效"
-UCI revert traffic-stats.settings.history_days
-[ -z "$(uci changes traffic-stats 2>/dev/null)" ] && ok "预置字段清理后无残留 staged UCI" || bad "清理后仍有 staged：$(uci changes traffic-stats)"
+eq "$(CGET prism-router.settings.history_days)" "77" "预置 staged 的 history_days 保持 77（未被误清/覆盖）"
+uci changes prism-router 2>/dev/null | grep -q "settings.history_days='77'" \
+  && ok "history_days 仍是 staged 且值正确" || bad "history_days staged 丢失：$(uci changes prism-router)"
+eq "$(CGET prism-router.settings.poll_interval)" "$BEFORE" "失败回滚：本次 poll_interval 未生效"
+UCI revert prism-router.settings.history_days
+[ -z "$(uci changes prism-router 2>/dev/null)" ] && ok "预置字段清理后无残留 staged UCI" || bad "清理后仍有 staged：$(uci changes prism-router)"
 # 终审阻断 4：别人已经 staged 删除（uci changes 里是 `-section.option`，没有 `=`）
 # 时，本次 set 冲突失败的回滚必须把删除意图放回去，不能 revert 成已提交值。
-UCI set traffic-stats.settings.clash_secret='committed-secret'; cfg_commit
-uci delete traffic-stats.settings.clash_secret >/dev/null 2>&1
-uci changes traffic-stats 2>/dev/null | grep -q "^-traffic-stats.settings.clash_secret$" \
-  && ok "预置 staged 删除（delete 行无 =）" || bad "预置 staged 删除失败：$(uci changes traffic-stats)"
+UCI set prism-router.settings.clash_secret='committed-secret'; cfg_commit
+uci delete prism-router.settings.clash_secret >/dev/null 2>&1
+uci changes prism-router 2>/dev/null | grep -q "^-prism-router.settings.clash_secret$" \
+  && ok "预置 staged 删除（delete 行无 =）" || bad "预置 staged 删除失败：$(uci changes prism-router)"
 LONG2=$(awk 'BEGIN{for(i=0;i<2000;i++)printf "z"}')
 printf '{"section":"settings","options":"{\\"clash_secret\\":\\"new-secret\\",\\"metrics_token\\":\\"%s\\"}"}\n' "$LONG2" > "$ROOT/badargs3.json"
-R=$(env TRAFFIC_STATS_METHOD=set_config TRAFFIC_STATS_ARGS="$(cat "$ROOT/badargs3.json")" \
-    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc 2>/dev/null)
+R=$(env PRISM_ROUTER_METHOD=set_config PRISM_ROUTER_ARGS="$(cat "$ROOT/badargs3.json")" \
+    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc 2>/dev/null)
 echo "$R" | grep -q '过长' && ok "带 staged 删除的冲突调用被拒绝" || bad "冲突调用未被拒绝：$R"
-CH=$(uci changes traffic-stats 2>/dev/null)
-echo "$CH" | grep -q "^-traffic-stats.settings.clash_secret$" \
+CH=$(uci changes prism-router 2>/dev/null)
+echo "$CH" | grep -q "^-prism-router.settings.clash_secret$" \
   && ok "失败回滚后删除仍 staged（保留原删除意图）" || bad "删除意图丢失：$CH"
 echo "$CH" | grep -q "clash_secret='new-secret'" \
   && bad "回滚残留本次 set 行：$CH" || ok "回滚没有残留本次 set"
-eq "$(CGET traffic-stats.settings.clash_secret)" "" "staged 删除生效：读取为空"
-UCI revert traffic-stats.settings.clash_secret
-[ -z "$(uci changes traffic-stats 2>/dev/null)" ] && ok "删除意图清理后无残留 staged UCI" \
-  || bad "删除意图清理后仍有 staged：$(uci changes traffic-stats)"
-UCI delete traffic-stats.settings.clash_secret; cfg_commit
+eq "$(CGET prism-router.settings.clash_secret)" "" "staged 删除生效：读取为空"
+UCI revert prism-router.settings.clash_secret
+[ -z "$(uci changes prism-router 2>/dev/null)" ] && ok "删除意图清理后无残留 staged UCI" \
+  || bad "删除意图清理后仍有 staged：$(uci changes prism-router)"
+UCI delete prism-router.settings.clash_secret; cfg_commit
 
-sed 's/user: .root./user: "guest"/' /usr/share/rpcd/ucode/traffic-stats.uc > "$ROOT/guest.uc"
-sed 's/user: .root./user: null/' /usr/share/rpcd/ucode/traffic-stats.uc > "$ROOT/nouser.uc"
+sed 's/user: .root./user: "guest"/' /usr/share/rpcd/ucode/prism-router.uc > "$ROOT/guest.uc"
+sed 's/user: .root./user: null/' /usr/share/rpcd/ucode/prism-router.uc > "$ROOT/nouser.uc"
 for u in guest nouser; do
-  R=$(env TRAFFIC_STATS_METHOD=set_config TRAFFIC_STATS_ARGS='{"section":"settings","options":"{\"poll_interval\":\"8\"}"}' \
+  R=$(env PRISM_ROUTER_METHOD=set_config PRISM_ROUTER_ARGS='{"section":"settings","options":"{\"poll_interval\":\"8\"}"}' \
       ucode -L /usr/lib/ucode "$ROOT/$u.uc" 2>/dev/null)
   echo "$R" | grep -q 'permission denied' && ok "is_root 严格拒绝 $u" || bad "is_root 未拒绝 $u：$R"
 done
@@ -714,9 +714,9 @@ i=0
 PIDS=""
 while [ $i -lt 20 ]; do
   m=$(printf '02:00:00:00:01:%02x' $i)
-  env TRAFFIC_STATS_METHOD=set_device_meta TRAFFIC_STATS_DEVICES_FILE="$DDEV" \
-      TRAFFIC_STATS_ARGS="{\"mac\":\"$m\",\"alias\":\"a$i\"}" \
-      ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc >/dev/null 2>>"$ROOT/dev.err" &
+  env PRISM_ROUTER_METHOD=set_device_meta PRISM_ROUTER_DEVICES_FILE="$DDEV" \
+      PRISM_ROUTER_ARGS="{\"mac\":\"$m\",\"alias\":\"a$i\"}" \
+      ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc >/dev/null 2>>"$ROOT/dev.err" &
   PIDS="$PIDS $!"
   i=$((i+1))
 done
@@ -725,9 +725,9 @@ eq "$(F="$DDEV" ucode -e 'let fs=require("fs"); print(length(keys(json(fs.readfi
 [ -z "$(ls "$DD" | grep -E '\.tmp|\.lock' || true)" ] && ok "无 .tmp/.lock 残留" || bad "并发后残留：$(ls "$DD")"
 mkdir -p "$DDEV.lock"
 touch -t 202001010000 "$DDEV.lock" 2>/dev/null || true
-R=$(env TRAFFIC_STATS_METHOD=set_device_meta TRAFFIC_STATS_DEVICES_FILE="$DDEV" \
-    TRAFFIC_STATS_ARGS='{"mac":"02:00:00:00:01:ff","alias":"stale"}' \
-    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc 2>/dev/null)
+R=$(env PRISM_ROUTER_METHOD=set_device_meta PRISM_ROUTER_DEVICES_FILE="$DDEV" \
+    PRISM_ROUTER_ARGS='{"mac":"02:00:00:00:01:ff","alias":"stale"}' \
+    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc 2>/dev/null)
 echo "$R" | tr -d ' \n' | grep -q '"ok":true' && ok "陈旧 mkdir 锁被回收" || bad "陈旧锁未恢复：$R"
 [ -d "$DDEV.lock" ] && bad "陈旧锁仍残留" || ok "陈旧锁已删除"
 eq "$(F="$DDEV" ucode -e 'let fs=require("fs"); print(length(keys(json(fs.readfile(getenv("F"))))));' 2>/dev/null)" "21" "陈旧锁恢复后写入成功（21 条）"
@@ -737,9 +737,9 @@ eq "$(F="$DDEV" ucode -e 'let fs=require("fs"); print(length(keys(json(fs.readfi
 mkdir -p "$DDEV.lock"
 printf '999999|0|0|1\n' > "$DDEV.lock/owner"
 touch -t 202001010000 "$DDEV.lock" 2>/dev/null || true
-R=$(env TRAFFIC_STATS_METHOD=set_device_meta TRAFFIC_STATS_DEVICES_FILE="$DDEV" \
-    TRAFFIC_STATS_ARGS='{"mac":"02:00:00:00:01:fe","alias":"staleowner"}' \
-    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc 2>/dev/null)
+R=$(env PRISM_ROUTER_METHOD=set_device_meta PRISM_ROUTER_DEVICES_FILE="$DDEV" \
+    PRISM_ROUTER_ARGS='{"mac":"02:00:00:00:01:fe","alias":"staleowner"}' \
+    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc 2>/dev/null)
 echo "$R" | tr -d ' \n' | grep -q '"ok":true' && ok "带 owner 的陈旧锁被回收" || bad "带 owner 陈旧锁未恢复：$R"
 [ -e "$DDEV.lock" ] && bad "带 owner 陈旧锁仍残留" || ok "带 owner 陈旧锁目录已清掉"
 eq "$(F="$DDEV" ucode -e 'let fs=require("fs"); print(length(keys(json(fs.readfile(getenv("F"))))));' 2>/dev/null)" "22" "owner 陈旧锁恢复后写入成功（22 条）"
@@ -751,9 +751,9 @@ PIDS=""
 i=0
 while [ $i -lt 8 ]; do
   m=$(printf '02:00:00:00:02:%02x' $i)
-  env TRAFFIC_STATS_METHOD=set_device_meta TRAFFIC_STATS_DEVICES_FILE="$DDEV" \
-      TRAFFIC_STATS_ARGS="{\"mac\":\"$m\",\"alias\":\"r$i\"}" \
-      ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc >/dev/null 2>>"$ROOT/dev.err" &
+  env PRISM_ROUTER_METHOD=set_device_meta PRISM_ROUTER_DEVICES_FILE="$DDEV" \
+      PRISM_ROUTER_ARGS="{\"mac\":\"$m\",\"alias\":\"r$i\"}" \
+      ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc >/dev/null 2>>"$ROOT/dev.err" &
   PIDS="$PIDS $!"
   i=$((i+1))
 done
@@ -765,9 +765,9 @@ eq "$(F="$DDEV" ucode -e 'let fs=require("fs"); print(length(keys(json(fs.readfi
 # 且不能删除别人的锁/owner。
 mkdir -p "$DDEV.lock"
 printf 'other-owner|1|2|3\n' > "$DDEV.lock/owner"
-R=$(env TRAFFIC_STATS_METHOD=set_device_meta TRAFFIC_STATS_DEVICES_FILE="$DDEV" \
-    TRAFFIC_STATS_ARGS='{"mac":"02:00:00:00:03:01","alias":"otherheld"}' \
-    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc 2>/dev/null)
+R=$(env PRISM_ROUTER_METHOD=set_device_meta PRISM_ROUTER_DEVICES_FILE="$DDEV" \
+    PRISM_ROUTER_ARGS='{"mac":"02:00:00:00:03:01","alias":"otherheld"}' \
+    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc 2>/dev/null)
 echo "$R" | grep -q '设备元数据忙' && ok "他人持有的锁导致本次写失败（不无锁覆盖）" || bad "他人持锁时仍写入：$R"
 eq "$(cat "$DDEV.lock/owner" 2>/dev/null)" "other-owner|1|2|3" "失败释放没有删除/改写他人的 owner"
 eq "$(F="$DDEV" ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F"))); print(d["02:00:00:00:03:01"]==null?"absent":"present");' 2>/dev/null)" "absent" "他人持锁时未写入 devices.json"
@@ -777,14 +777,14 @@ rm -rf "$DDEV.lock"
 # daemon + rpcd 双写者：daemon 写 first_seen，rpcd 同时写 alias，双方都不丢
 DW="$ROOT/dev2"; DWD="$DW/state"; DWDV="$DW/devices.json"
 rm -rf "$DW"; mkdir -p "$DWD"
-env TRAFFIC_STATS_STATE_DIR="$DWD" TRAFFIC_STATS_DAILY_DIR="$DW/daily" \
-    TRAFFIC_STATS_DEVICES_FILE="$DWDV" TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct.txt" \
-    TRAFFIC_STATS_CLASH_API="$CLASH_URL" ucode /usr/bin/traffic-statsd >"$DW/daemon.log" 2>&1 &
+env PRISM_ROUTER_STATE_DIR="$DWD" PRISM_ROUTER_DAILY_DIR="$DW/daily" \
+    PRISM_ROUTER_DEVICES_FILE="$DWDV" PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct.txt" \
+    PRISM_ROUTER_CLASH_API="$CLASH_URL" ucode /usr/bin/prism-routerd >"$DW/daemon.log" 2>&1 &
 DPID=$!
 sleep 1
-env TRAFFIC_STATS_METHOD=set_device_meta TRAFFIC_STATS_DEVICES_FILE="$DWDV" \
-    TRAFFIC_STATS_ARGS='{"mac":"aa:bb:cc:dd:ee:01","alias":"并发别名"}' \
-    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc >/dev/null 2>>"$ROOT/dev.err"
+env PRISM_ROUTER_METHOD=set_device_meta PRISM_ROUTER_DEVICES_FILE="$DWDV" \
+    PRISM_ROUTER_ARGS='{"mac":"aa:bb:cc:dd:ee:01","alias":"并发别名"}' \
+    ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc >/dev/null 2>>"$ROOT/dev.err"
 sleep 1
 kill -TERM $DPID 2>/dev/null
 wait $DPID 2>/dev/null
@@ -792,17 +792,17 @@ R=$(F="$DWDV" ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F")
 eq "$R" "并发别名|seen" "daemon first_seen 与 rpcd alias 同时保留（无丢更新）"
 
 echo "=== 7. 日切写失败：pending 快照保留并重试 ==="
-UCI set traffic-stats.settings.poll_interval='1'; cfg_commit
+UCI set prism-router.settings.poll_interval='1'; cfg_commit
 RW="$ROOT/roll"; RD="$RW/daily"; RSD="$RW/state"
 rm -rf "$RW"; mkdir -p "$RSD"
 printf 'block\n' > "$RD"   # daily 路径先是普通文件 -> mkpath 必失败
 NOW2=$(date +%s)
 printf '{"v":1,"ts":%s,"day":"%s","clash_ts":%s,"ct_ts":%s,"clash_prev":{},"ct_prev":{}}\n' \
   "$NOW2" "$TODAY" "$NOW2" "$NOW2" > "$RSD/baseline.json"
-env TRAFFIC_STATS_TEST_ROLLOVER_AFTER=2 TRAFFIC_STATS_DEBUG=1 \
-    TRAFFIC_STATS_STATE_DIR="$RSD" TRAFFIC_STATS_DAILY_DIR="$RD" \
-    TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct.txt" TRAFFIC_STATS_CLASH_API="$CLASH_URL" \
-    ucode /usr/bin/traffic-statsd >"$RW/daemon.log" 2>&1 &
+env PRISM_ROUTER_TEST_ROLLOVER_AFTER=2 PRISM_ROUTER_DEBUG=1 \
+    PRISM_ROUTER_STATE_DIR="$RSD" PRISM_ROUTER_DAILY_DIR="$RD" \
+    PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct.txt" PRISM_ROUTER_CLASH_API="$CLASH_URL" \
+    ucode /usr/bin/prism-routerd >"$RW/daemon.log" 2>&1 &
 RPID=$!
 sleep 3
 rm -f "$RD"; mkdir -p "$RD"
@@ -826,10 +826,10 @@ printf 'block\n' > "$RRD"
 NOW3=$(date +%s)
 printf '{"v":2,"ts":%s,"day":"%s","clash_ts":%s,"ct_ts":%s,"clash_prev":{},"ct_prev":{},"clash_total":0,"ct_total":0,"clash_truncated":0,"ct_truncated":0}\n' \
   "$NOW3" "$TODAY" "$NOW3" "$NOW3" > "$RRSD/baseline.json"
-env TRAFFIC_STATS_TEST_ROLLOVER_AFTER=2 TRAFFIC_STATS_DEBUG=1 \
-    TRAFFIC_STATS_STATE_DIR="$RRSD" TRAFFIC_STATS_DAILY_DIR="$RRD" \
-    TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct.txt" TRAFFIC_STATS_CLASH_API="$CLASH_URL" \
-    ucode /usr/bin/traffic-statsd >"$RR/daemon1.log" 2>&1 &
+env PRISM_ROUTER_TEST_ROLLOVER_AFTER=2 PRISM_ROUTER_DEBUG=1 \
+    PRISM_ROUTER_STATE_DIR="$RRSD" PRISM_ROUTER_DAILY_DIR="$RRD" \
+    PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct.txt" PRISM_ROUTER_CLASH_API="$CLASH_URL" \
+    ucode /usr/bin/prism-routerd >"$RR/daemon1.log" 2>&1 &
 RRPID=$!
 sleep 3
 kill -TERM $RRPID 2>/dev/null
@@ -838,10 +838,10 @@ wait $RRPID 2>/dev/null
 R=$(F="$RRSD/pending-daily.json" ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F"))); let x=(d.days??{})["2000-01-01"]??{}; let t=x.totals??{}; print(sprintf("%s|%d|%d", x.day??"", int(t.rx??0), int(t.tx??0)));' 2>/dev/null)
 eq "$R" "2000-01-01|16000|1600" "持久化 pending 保留完整日切数据"
 rm -f "$RRD"; mkdir -p "$RRD"
-env TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_DEBUG=1 \
-    TRAFFIC_STATS_STATE_DIR="$RRSD" TRAFFIC_STATS_DAILY_DIR="$RRD" \
-    TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct.txt" TRAFFIC_STATS_CLASH_API="$CLASH_URL" \
-    ucode /usr/bin/traffic-statsd >"$RR/daemon2.log" 2>&1
+env PRISM_ROUTER_ONCE=1 PRISM_ROUTER_DEBUG=1 \
+    PRISM_ROUTER_STATE_DIR="$RRSD" PRISM_ROUTER_DAILY_DIR="$RRD" \
+    PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct.txt" PRISM_ROUTER_CLASH_API="$CLASH_URL" \
+    ucode /usr/bin/prism-routerd >"$RR/daemon2.log" 2>&1
 eq "$?" "0" "pending 恢复：重启退出码 0"
 grep -q 'pending daily restored' "$RR/daemon2.log" && ok "重启日志确认 pending 恢复" || bad "重启没有 pending 恢复记录"
 [ -f "$RRD/2000-01-01.json" ] && ok "重启后 pending 被重试落盘（2000-01-01.json）" || bad "重启后 pending 没有落盘"
@@ -864,11 +864,11 @@ PEND
 echo down > "$ROOT/trav.mode"
 printf '' > "$ROOT/trav.body"
 env PATH="$ROOT/bin:$PATH" TS_TEST_CURL_MODE="$ROOT/trav.mode" TS_TEST_CURL_BODY="$ROOT/trav.body" \
-    TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_DEBUG=1 \
-    TRAFFIC_STATS_STATE_DIR="$PTS" TRAFFIC_STATS_DAILY_DIR="$PTD" \
-    TRAFFIC_STATS_DEVICES_FILE="$PT/devices.json" TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
-    TRAFFIC_STATS_CLASH_API='http://127.0.0.1:19999/connections' \
-    ucode /usr/bin/traffic-statsd >"$PT.log" 2>&1
+    PRISM_ROUTER_ONCE=1 PRISM_ROUTER_DEBUG=1 \
+    PRISM_ROUTER_STATE_DIR="$PTS" PRISM_ROUTER_DAILY_DIR="$PTD" \
+    PRISM_ROUTER_DEVICES_FILE="$PT/devices.json" PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
+    PRISM_ROUTER_CLASH_API='http://127.0.0.1:19999/connections' \
+    ucode /usr/bin/prism-routerd >"$PT.log" 2>&1
 eq "$?" "0" "非法 pending day：启动退出码 0"
 grep -q 'pending daily rejected: invalid day' "$PT.log" \
   && ok "非法 pending day 被拒绝" || bad "非法 pending day 没有被拒绝"
@@ -898,11 +898,11 @@ let o={v:3,ts:now,day:day,clash_ts:now,ct_ts:now,clash_prev:{},ct_prev:{},
        clash_dedup:dd,clash_outage:oo,clash_outage_active:false,clash_outage_had:false};
 fs.writefile(getenv("F"), sprintf("%J", o));' 2>/dev/null
 env PATH="$ROOT/bin:$PATH" TS_TEST_CURL_MODE="$ROOT/trav.mode" TS_TEST_CURL_BODY="$ROOT/trav.body" \
-    TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_BASELINE_MAX_ENTRIES=8 TRAFFIC_STATS_DEBUG=1 \
-    TRAFFIC_STATS_STATE_DIR="$BBS" TRAFFIC_STATS_DAILY_DIR="$BBD" \
-    TRAFFIC_STATS_DEVICES_FILE="$BB/devices.json" TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
-    TRAFFIC_STATS_CLASH_API='http://127.0.0.1:19999/connections' \
-    ucode /usr/bin/traffic-statsd >"$BB.log" 2>&1
+    PRISM_ROUTER_ONCE=1 PRISM_ROUTER_BASELINE_MAX_ENTRIES=8 PRISM_ROUTER_DEBUG=1 \
+    PRISM_ROUTER_STATE_DIR="$BBS" PRISM_ROUTER_DAILY_DIR="$BBD" \
+    PRISM_ROUTER_DEVICES_FILE="$BB/devices.json" PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
+    PRISM_ROUTER_CLASH_API='http://127.0.0.1:19999/connections' \
+    ucode /usr/bin/prism-routerd >"$BB.log" 2>&1
 eq "$?" "0" "超大/坏类型 baseline：启动退出码 0"
 eq "$(jget "$BBS/baseline.json" 'sprintf("%d|%d|%d", int(d.v??0), length(keys(d.clash_dedup??{})), length(keys(d.clash_outage??{})))')" \
   "3|8|8" "baseline 账本按上限截断（8/8）且版本仍为 v3"
@@ -917,16 +917,16 @@ rm -rf "$BIGB"; mkdir -p "$BIGBS"
 head -c 9000000 /dev/zero > "$BIGBS/baseline.json" 2>/dev/null \
   || dd if=/dev/zero of="$BIGBS/baseline.json" bs=1024 count=9000 2>/dev/null
 env PATH="$ROOT/bin:$PATH" TS_TEST_CURL_MODE="$ROOT/trav.mode" TS_TEST_CURL_BODY="$ROOT/trav.body" \
-    TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_DEBUG=1 \
-    TRAFFIC_STATS_STATE_DIR="$BIGBS" TRAFFIC_STATS_DAILY_DIR="$BIGBD" \
-    TRAFFIC_STATS_DEVICES_FILE="$BIGB/devices.json" TRAFFIC_STATS_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
-    TRAFFIC_STATS_CLASH_API='http://127.0.0.1:19999/connections' \
-    ucode /usr/bin/traffic-statsd >"$BIGB.log" 2>&1
+    PRISM_ROUTER_ONCE=1 PRISM_ROUTER_DEBUG=1 \
+    PRISM_ROUTER_STATE_DIR="$BIGBS" PRISM_ROUTER_DAILY_DIR="$BIGBD" \
+    PRISM_ROUTER_DEVICES_FILE="$BIGB/devices.json" PRISM_ROUTER_CONNTRACK_FILE="$ROOT/ct_empty.txt" \
+    PRISM_ROUTER_CLASH_API='http://127.0.0.1:19999/connections' \
+    ucode /usr/bin/prism-routerd >"$BIGB.log" 2>&1
 eq "$?" "0" "超大 baseline：启动退出码 0"
 grep -q 'baseline too large' "$BIGB.log" \
   && ok "超大 baseline 读取前被拒绝" || bad "超大 baseline 没有被大小检查拦住"
 
-UCI set traffic-stats.settings.poll_interval='5'; cfg_commit
+UCI set prism-router.settings.poll_interval='5'; cfg_commit
 
 echo
 echo "=== 结果：PASS $PASS / FAIL $FAIL ==="

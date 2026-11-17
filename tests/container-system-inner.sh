@@ -29,7 +29,7 @@ perm(){ ls -ld "$1" 2>/dev/null | awk '{print $1,$3":"$4}'; }
 check(){ local got; got=$(ls -ld "$1" 2>/dev/null | awk '{print $3":"$4" "$1}')
   [ "$got" = "$2" ] && ok "$1 -> $got" || bad "$1 期望[$2] 实际[${got:-不存在}]"; }
 UCI(){ uci "$@" >/dev/null 2>&1; }
-cfg_commit(){ uci commit traffic-stats >/dev/null 2>&1; }
+cfg_commit(){ uci commit prism-router >/dev/null 2>&1; }
 
 EXP_DIRECT_RX=900240   # 与 tests/container-inner.sh 同一 fixture 口径（fake-ip 已排除）
 
@@ -37,13 +37,13 @@ EXP_DIRECT_RX=900240   # 与 tests/container-inner.sh 同一 fixture 口径（fa
 run_once(){
   SD="$1"; N="$2"; EXTRA="$3"
   rm -rf "$SD"; mkdir -p "$SD"
-  env TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_ONCE_POLLS="$N" \
-      TRAFFIC_STATS_STATE_DIR="$SD" \
-      TRAFFIC_STATS_DAILY_DIR="$SD.daily" \
-      TRAFFIC_STATS_CONNTRACK_FILE=/fixtures/nf_conntrack \
-      TRAFFIC_STATS_CLASH_API=127.0.0.1:1 \
+  env PRISM_ROUTER_ONCE=1 PRISM_ROUTER_ONCE_POLLS="$N" \
+      PRISM_ROUTER_STATE_DIR="$SD" \
+      PRISM_ROUTER_DAILY_DIR="$SD.daily" \
+      PRISM_ROUTER_CONNTRACK_FILE=/fixtures/nf_conntrack \
+      PRISM_ROUTER_CLASH_API=127.0.0.1:1 \
       $EXTRA \
-      ucode /usr/bin/traffic-statsd >"$SD.log" 2>&1
+      ucode /usr/bin/prism-routerd >"$SD.log" 2>&1
   echo $?
 }
 
@@ -143,18 +143,18 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 echo "=== 1. 安装两个包 ==="
-opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 prism-router" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-prism-router" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新配置项与文件权限 ==="
 for k in system_enabled wan_iface; do
-  grep -q "option $k" /etc/config/traffic-stats && ok "config 含 $k" || bad "config 缺少 $k"
+  grep -q "option $k" /etc/config/prism-router && ok "config 含 $k" || bad "config 缺少 $k"
 done
-grep -q "option system_enabled '1'" /etc/config/traffic-stats && ok "system_enabled 默认 1" || bad "system_enabled 默认值不对"
-grep -q "option wan_iface ''" /etc/config/traffic-stats && ok "wan_iface 默认空（自动默认路由）" || bad "wan_iface 默认值不对"
-check /usr/bin/traffic-statsd "root:root -rwxr-xr-x"
-check /etc/config/traffic-stats "root:root -rw-r--r--"
-check /usr/share/rpcd/ucode/traffic-stats.uc "root:root -rw-r--r--"
+grep -q "option system_enabled '1'" /etc/config/prism-router && ok "system_enabled 默认 1" || bad "system_enabled 默认值不对"
+grep -q "option wan_iface ''" /etc/config/prism-router && ok "wan_iface 默认空（自动默认路由）" || bad "wan_iface 默认值不对"
+check /usr/bin/prism-routerd "root:root -rwxr-xr-x"
+check /etc/config/prism-router "root:root -rw-r--r--"
+check /usr/share/rpcd/ucode/prism-router.uc "root:root -rw-r--r--"
 
 echo "=== 3. 系统目录权限未被改动（回归核心）==="
 [ "$B_ETC" = "$(perm /etc)" ] && ok "/etc 未变" || bad "/etc 被改动"
@@ -163,12 +163,12 @@ echo "=== 3. 系统目录权限未被改动（回归核心）==="
 [ "$B_CGI" = "$(perm /www/cgi-bin 2>/dev/null)" ] && ok "/www/cgi-bin 未变" || bad "/www/cgi-bin 被改动"
 
 echo "=== 4. ucode 语法 ==="
-ucode -c /usr/bin/traffic-statsd && ok "traffic-statsd 语法 OK" || bad "traffic-statsd 语法错误"
+ucode -c /usr/bin/prism-routerd && ok "prism-routerd 语法 OK" || bad "prism-routerd 语法错误"
 
 echo "=== 5. 容器真实 /proc（两轮采样）==="
-UCI set traffic-stats.settings.lan_ranges='192.168.100.0/24'
-UCI set traffic-stats.settings.system_enabled='1'
-UCI set traffic-stats.settings.wan_iface=''
+UCI set prism-router.settings.lan_ranges='192.168.100.0/24'
+UCI set prism-router.settings.system_enabled='1'
+UCI set prism-router.settings.wan_iface=''
 cfg_commit
 cp -f /fixtures/dhcp.leases /tmp/dhcp.leases 2>/dev/null
 RC=$(run_once /tmp/sys/real 2 "")
@@ -210,9 +210,9 @@ mkfifo "$FD/proc/stat" "$FD/proc/net/dev"
   mkdev "$FD/proc/net/dev" 11000 3000 5700 5600
 ) &
 WPID=$!
-UCI set traffic-stats.settings.wan_iface=''
+UCI set prism-router.settings.wan_iface=''
 cfg_commit
-RC=$(run_once /tmp/sys/fake 2 "TRAFFIC_STATS_PROC_DIR=$FD/proc TRAFFIC_STATS_THERMAL=$FD/no-such-temp TRAFFIC_STATS_DF=$FD/fakedf TRAFFIC_STATS_ROOTFS=/")
+RC=$(run_once /tmp/sys/fake 2 "PRISM_ROUTER_PROC_DIR=$FD/proc PRISM_ROUTER_THERMAL=$FD/no-such-temp PRISM_ROUTER_DF=$FD/fakedf PRISM_ROUTER_ROOTFS=/")
 kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null
 [ "$RC" = "0" ] && ok "伪造 /proc 运行退出码 0" || { bad "退出码 $RC"; tail -5 /tmp/sys/fake.log; }
 if [ -f /tmp/sys/fake/state.json ]; then
@@ -259,13 +259,13 @@ PD=/tmp/sys/plain; rm -rf "$PD"; mkfake "$PD"
 printf 'cpu  100 0 100 800 0 0 0 0 0 0\n' > "$PD/proc/stat"
 mkdev "$PD/proc/net/dev" 1000 2000 500 600
 mkfakedf "$PD/fakedf" /tmp/sys/df.plain
-UCI set traffic-stats.settings.system_enabled='0'
+UCI set prism-router.settings.system_enabled='0'
 cfg_commit
-RC=$(run_once /tmp/sys/off 2 "TRAFFIC_STATS_PROC_DIR=$PD/proc TRAFFIC_STATS_THERMAL=$PD/no-such-temp TRAFFIC_STATS_DF=$PD/fakedf")
+RC=$(run_once /tmp/sys/off 2 "PRISM_ROUTER_PROC_DIR=$PD/proc PRISM_ROUTER_THERMAL=$PD/no-such-temp PRISM_ROUTER_DF=$PD/fakedf")
 [ "$RC" = "0" ] && ok "system_enabled=0 运行退出码 0" || bad "退出码 $RC"
-UCI set traffic-stats.settings.system_enabled='1'
+UCI set prism-router.settings.system_enabled='1'
 cfg_commit
-RC=$(run_once /tmp/sys/on 2 "TRAFFIC_STATS_PROC_DIR=$PD/proc TRAFFIC_STATS_THERMAL=$PD/no-such-temp TRAFFIC_STATS_DF=$PD/fakedf")
+RC=$(run_once /tmp/sys/on 2 "PRISM_ROUTER_PROC_DIR=$PD/proc PRISM_ROUTER_THERMAL=$PD/no-such-temp PRISM_ROUTER_DF=$PD/fakedf")
 [ "$RC" = "0" ] && ok "system_enabled=1 运行退出码 0" || bad "退出码 $RC"
 if [ -f /tmp/sys/off/state.json ] && [ -f /tmp/sys/on/state.json ]; then
   [ "$(hassys /tmp/sys/off/state.json)" = "0" ] && ok "关闭时 state.json 没有 system 键（老消费方无感）" || bad "关闭时仍出现 system 键"
@@ -298,7 +298,7 @@ OUT
 DF
 chmod 755 "$MD/fakedf"
 printf '42950\n' > "$MD/temp"
-RC=$(run_once /tmp/sys/memmiss_state 1 "TRAFFIC_STATS_PROC_DIR=$MD/proc TRAFFIC_STATS_THERMAL=$MD/temp TRAFFIC_STATS_DF=$MD/fakedf")
+RC=$(run_once /tmp/sys/memmiss_state 1 "PRISM_ROUTER_PROC_DIR=$MD/proc PRISM_ROUTER_THERMAL=$MD/temp PRISM_ROUTER_DF=$MD/fakedf")
 [ "$RC" = "0" ] && ok "MemAvailable 缺失/temp 存在：退出码 0" || bad "退出码 $RC"
 if [ -f /tmp/sys/memmiss_state/state.json ]; then
   R=$(sysrep /tmp/sys/memmiss_state/state.json); OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
@@ -323,11 +323,11 @@ mkfakedf "$WD/fakedf" /tmp/sys/df.wan1
   mkdev "$WD/proc/net/dev" 0 0 5700 1100
 ) &
 WPID=$!
-UCI set traffic-stats.settings.wan_iface='wan1'
+UCI set prism-router.settings.wan_iface='wan1'
 cfg_commit
-RC=$(run_once /tmp/sys/wan1_state 2 "TRAFFIC_STATS_PROC_DIR=$WD/proc TRAFFIC_STATS_THERMAL=$WD/no-such-temp TRAFFIC_STATS_DF=$WD/fakedf")
+RC=$(run_once /tmp/sys/wan1_state 2 "PRISM_ROUTER_PROC_DIR=$WD/proc PRISM_ROUTER_THERMAL=$WD/no-such-temp PRISM_ROUTER_DF=$WD/fakedf")
 kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null
-UCI set traffic-stats.settings.wan_iface=''
+UCI set prism-router.settings.wan_iface=''
 cfg_commit
 [ "$RC" = "0" ] && ok "wan_iface=wan1 运行退出码 0" || { bad "退出码 $RC"; tail -5 /tmp/sys/wan1_state.log; }
 if [ -f /tmp/sys/wan1_state/state.json ]; then
@@ -347,13 +347,13 @@ ED=/tmp/sys/empty; rm -rf "$ED"; mkdir -p "$ED/proc/net"
 for f in stat meminfo loadavg uptime cpuinfo; do : > "$ED/proc/$f"; done
 : > "$ED/proc/net/dev"; : > "$ED/proc/net/route"
 printf '#!/bin/sh\nexit 1\n' > "$ED/faildf"; chmod 755 "$ED/faildf"
-UCI set traffic-stats.settings.system_enabled='1'
+UCI set prism-router.settings.system_enabled='1'
 cfg_commit
-RC=$(run_once /tmp/sys/empty_on 2 "TRAFFIC_STATS_PROC_DIR=$ED/proc TRAFFIC_STATS_THERMAL=$ED/no-such-temp TRAFFIC_STATS_DF=$ED/faildf")
+RC=$(run_once /tmp/sys/empty_on 2 "PRISM_ROUTER_PROC_DIR=$ED/proc PRISM_ROUTER_THERMAL=$ED/no-such-temp PRISM_ROUTER_DF=$ED/faildf")
 [ "$RC" = "0" ] && ok "空 /proc 运行不崩（退出码 0）" || { bad "退出码 $RC"; tail -5 /tmp/sys/empty_on.log; }
-UCI set traffic-stats.settings.system_enabled='0'
+UCI set prism-router.settings.system_enabled='0'
 cfg_commit
-RC=$(run_once /tmp/sys/empty_off 2 "TRAFFIC_STATS_PROC_DIR=$ED/proc TRAFFIC_STATS_THERMAL=$ED/no-such-temp TRAFFIC_STATS_DF=$ED/faildf")
+RC=$(run_once /tmp/sys/empty_off 2 "PRISM_ROUTER_PROC_DIR=$ED/proc PRISM_ROUTER_THERMAL=$ED/no-such-temp PRISM_ROUTER_DF=$ED/faildf")
 [ "$RC" = "0" ] && ok "空 /proc（system 关闭）运行退出码 0" || bad "退出码 $RC"
 if [ -f /tmp/sys/empty_on/state.json ]; then
   R=$(sysrep /tmp/sys/empty_on/state.json); OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS

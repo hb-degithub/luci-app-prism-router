@@ -35,10 +35,10 @@ echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 # 前端已统一使用内置 SVG，无需 luci-lib-chartjs；严格按声明依赖安装。
 echo "=== 1. 严格依赖安装（无 --force-depends）==="
-opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/rel-i1.log 2>&1 \
-  && ok "traffic-stats 安装成功" || { bad "traffic-stats 安装失败"; tail -8 /tmp/rel-i1.log; }
-opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/rel-i2.log 2>&1 \
-  && ok "luci-app-traffic-stats 安装成功" || { bad "luci-app 安装失败"; tail -8 /tmp/rel-i2.log; }
+opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/rel-i1.log 2>&1 \
+  && ok "prism-router 安装成功" || { bad "prism-router 安装失败"; tail -8 /tmp/rel-i1.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/rel-i2.log 2>&1 \
+  && ok "luci-app-prism-router 安装成功" || { bad "luci-app 安装失败"; tail -8 /tmp/rel-i2.log; }
 
 echo "=== 2. 系统目录权限未被改动 ==="
 [ "$B_ETC" = "$(perm /etc)" ] && ok "/etc 未变" || bad "/etc 被改动"
@@ -47,24 +47,24 @@ echo "=== 2. 系统目录权限未被改动 ==="
 [ "$B_CGI" = "$(perm /www/cgi-bin 2>/dev/null)" ] && ok "/www/cgi-bin 未变" || bad "/www/cgi-bin 被改动"
 
 echo "=== 3. 包内文件权限 / 属主 / 语法 ==="
-for d in /etc/traffic-stats /etc/traffic-stats/daily /usr/share/traffic-stats \
-         /www/luci-static/resources/view/traffic-stats /www/luci-static/resources/traffic-stats \
+for d in /etc/prism-router /etc/prism-router/daily /usr/share/prism-router \
+         /www/luci-static/resources/view/prism-router /www/luci-static/resources/prism-router \
          /usr/share/rpcd/ucode /usr/share/rpcd/acl.d /usr/share/luci/menu.d; do
   check "$d" "root:root drwxr-xr-x"
 done
 for pair in \
-  "/usr/bin/traffic-statsd:root:root -rwxr-xr-x" \
-  "/etc/init.d/traffic-statsd:root:root -rwxr-xr-x" \
-  "/etc/config/traffic-stats:root:root -rw-r--r--" \
-  "/usr/share/traffic-stats/feishu.uc:root:root -rw-r--r--" \
-  "/usr/share/traffic-stats/feishu-test.sh:root:root -rwxr-xr-x" \
-  "/usr/share/traffic-stats/retention.uc:root:root -rw-r--r--" \
-  "/usr/share/traffic-stats/push.uc:root:root -rw-r--r--" \
-  "/usr/share/traffic-stats/stations.uc:root:root -rw-r--r--" \
-  "/www/cgi-bin/traffic-stats-ingest:root:root -rwxr-xr-x" \
-  "/www/cgi-bin/traffic-stats-stations:root:root -rwxr-xr-x" \
-  "/www/cgi-bin/traffic-stats-metrics:root:root -rwxr-xr-x" \
-  "/usr/share/rpcd/ucode/traffic-stats.uc:root:root -rw-r--r--"; do
+  "/usr/bin/prism-routerd:root:root -rwxr-xr-x" \
+  "/etc/init.d/prism-routerd:root:root -rwxr-xr-x" \
+  "/etc/config/prism-router:root:root -rw-r--r--" \
+  "/usr/share/prism-router/feishu.uc:root:root -rw-r--r--" \
+  "/usr/share/prism-router/feishu-test.sh:root:root -rwxr-xr-x" \
+  "/usr/share/prism-router/retention.uc:root:root -rw-r--r--" \
+  "/usr/share/prism-router/push.uc:root:root -rw-r--r--" \
+  "/usr/share/prism-router/stations.uc:root:root -rw-r--r--" \
+  "/www/cgi-bin/prism-router-ingest:root:root -rwxr-xr-x" \
+  "/www/cgi-bin/prism-router-stations:root:root -rwxr-xr-x" \
+  "/www/cgi-bin/prism-router-metrics:root:root -rwxr-xr-x" \
+  "/usr/share/rpcd/ucode/prism-router.uc:root:root -rw-r--r--"; do
   f="${pair%%:*}"; want="${pair#*:}"
   check "$f" "$want"
 done
@@ -87,11 +87,11 @@ check_opkg_files() { # $1=包名
     esac
   done < "/tmp/files-$pkg.txt"
 }
-check_opkg_files traffic-stats
-check_opkg_files luci-app-traffic-stats
+check_opkg_files prism-router
+check_opkg_files luci-app-prism-router
 
-for f in /usr/bin/traffic-statsd /usr/share/traffic-stats/*.uc /usr/share/rpcd/ucode/*.uc \
-         /www/cgi-bin/traffic-stats-ingest /www/cgi-bin/traffic-stats-stations /www/cgi-bin/traffic-stats-metrics; do
+for f in /usr/bin/prism-routerd /usr/share/prism-router/*.uc /usr/share/rpcd/ucode/*.uc \
+         /www/cgi-bin/prism-router-ingest /www/cgi-bin/prism-router-stations /www/cgi-bin/prism-router-metrics; do
   [ -f "$f" ] || continue
   # ucode -c 按“raw script”编译；带 export 的共享库必须去掉 export 再编译，
   # 否则会把合法的 module 误判为语法错误。
@@ -103,7 +103,7 @@ for f in /usr/bin/traffic-statsd /usr/share/traffic-stats/*.uc /usr/share/rpcd/u
     ucode -c "$f" >/dev/null 2>&1 && ok "ucode 语法 $f" || bad "ucode 语法错误 $f"
   fi
 done
-for j in /usr/share/rpcd/acl.d/luci-app-traffic-stats.json /usr/share/luci/menu.d/luci-app-traffic-stats.json; do
+for j in /usr/share/rpcd/acl.d/luci-app-prism-router.json /usr/share/luci/menu.d/luci-app-prism-router.json; do
   ucode -e "json(require('fs').readfile('$j'))" >/dev/null 2>&1 \
     && ok "JSON 合法 $j" || bad "JSON 非法 $j"
 done
@@ -113,93 +113,93 @@ while IFS='|' read -r dst src; do
   [ -n "$dst" ] || continue
   same_file "$dst" "/src/repo/$src"
 done <<'PAYLOAD'
-/usr/bin/traffic-statsd|traffic-stats/files/traffic-statsd.uc
-/etc/init.d/traffic-statsd|traffic-stats/files/traffic-statsd.init
-/etc/config/traffic-stats|traffic-stats/files/traffic-stats.config
-/usr/share/traffic-stats/feishu.uc|traffic-stats/files/feishu.uc
-/usr/share/traffic-stats/feishu-test.sh|traffic-stats/files/feishu-test.sh
-/usr/share/traffic-stats/retention.uc|traffic-stats/files/retention.uc
-/usr/share/traffic-stats/push.uc|traffic-stats/files/push.uc
-/usr/share/traffic-stats/stations.uc|traffic-stats/files/stations.uc
-/www/cgi-bin/traffic-stats-ingest|traffic-stats/files/ingest.uc
-/www/cgi-bin/traffic-stats-stations|traffic-stats/files/ingest-stations.uc
-/www/cgi-bin/traffic-stats-metrics|traffic-stats/files/traffic-stats-metrics.uc
-/usr/share/rpcd/ucode/traffic-stats.uc|luci-app-traffic-stats/root/usr/share/rpcd/ucode/traffic-stats.uc
-/usr/share/rpcd/acl.d/luci-app-traffic-stats.json|luci-app-traffic-stats/root/usr/share/rpcd/acl.d/luci-app-traffic-stats.json
-/usr/share/luci/menu.d/luci-app-traffic-stats.json|luci-app-traffic-stats/root/usr/share/luci/menu.d/luci-app-traffic-stats.json
+/usr/bin/prism-routerd|prism-router/files/prism-routerd.uc
+/etc/init.d/prism-routerd|prism-router/files/prism-routerd.init
+/etc/config/prism-router|prism-router/files/prism-router.config
+/usr/share/prism-router/feishu.uc|prism-router/files/feishu.uc
+/usr/share/prism-router/feishu-test.sh|prism-router/files/feishu-test.sh
+/usr/share/prism-router/retention.uc|prism-router/files/retention.uc
+/usr/share/prism-router/push.uc|prism-router/files/push.uc
+/usr/share/prism-router/stations.uc|prism-router/files/stations.uc
+/www/cgi-bin/prism-router-ingest|prism-router/files/ingest.uc
+/www/cgi-bin/prism-router-stations|prism-router/files/ingest-stations.uc
+/www/cgi-bin/prism-router-metrics|prism-router/files/prism-router-metrics.uc
+/usr/share/rpcd/ucode/prism-router.uc|luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc
+/usr/share/rpcd/acl.d/luci-app-prism-router.json|luci-app-prism-router/root/usr/share/rpcd/acl.d/luci-app-prism-router.json
+/usr/share/luci/menu.d/luci-app-prism-router.json|luci-app-prism-router/root/usr/share/luci/menu.d/luci-app-prism-router.json
 PAYLOAD
-if [ -f /src/repo/traffic-stats/files/traffic-stats-node-auth.uc ]; then
-  same_file /usr/share/traffic-stats/traffic-stats-node-auth.uc \
-    /src/repo/traffic-stats/files/traffic-stats-node-auth.uc
+if [ -f /src/repo/prism-router/files/prism-router-node-auth.uc ]; then
+  same_file /usr/share/prism-router/prism-router-node-auth.uc \
+    /src/repo/prism-router/files/prism-router-node-auth.uc
 fi
 
-for f in /src/repo/luci-app-traffic-stats/htdocs/luci-static/resources/view/traffic-stats/*.js; do
+for f in /src/repo/luci-app-prism-router/htdocs/luci-static/resources/view/prism-router/*.js; do
   [ -f "$f" ] || continue
   b=$(basename "$f")
-  same_file "/www/luci-static/resources/view/traffic-stats/$b" "$f"
+  same_file "/www/luci-static/resources/view/prism-router/$b" "$f"
 done
-for f in /src/repo/luci-app-traffic-stats/htdocs/luci-static/resources/traffic-stats/*; do
+for f in /src/repo/luci-app-prism-router/htdocs/luci-static/resources/prism-router/*; do
   [ -f "$f" ] || continue
   b=$(basename "$f")
-  same_file "/www/luci-static/resources/traffic-stats/$b" "$f"
+  same_file "/www/luci-static/resources/prism-router/$b" "$f"
 done
 # 条件文件：安全 agent 新增的 rpcd 插件存在就必须进包并逐字节一致
-for f in /src/repo/luci-app-traffic-stats/root/usr/share/rpcd/ucode/*.uc; do
+for f in /src/repo/luci-app-prism-router/root/usr/share/rpcd/ucode/*.uc; do
   [ -f "$f" ] || continue
   b=$(basename "$f")
   same_file "/usr/share/rpcd/ucode/$b" "$f"
 done
 
 echo "=== 5. conffile / 同版本重装（升级覆盖）==="
-grep -qx '/etc/config/traffic-stats' /usr/lib/opkg/info/traffic-stats.conffiles 2>/dev/null \
-  && ok "conffiles 声明 /etc/config/traffic-stats" || bad "conffiles 未声明 /etc/config/traffic-stats"
+grep -qx '/etc/config/prism-router' /usr/lib/opkg/info/prism-router.conffiles 2>/dev/null \
+  && ok "conffiles 声明 /etc/config/prism-router" || bad "conffiles 未声明 /etc/config/prism-router"
 
-printf "\n\toption gate_marker '1'\n" >> /etc/config/traffic-stats
-rm -f /usr/share/rpcd/ucode/traffic-stats.uc
-opkg install --force-reinstall /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/re-luci.log 2>&1 \
+printf "\n\toption gate_marker '1'\n" >> /etc/config/prism-router
+rm -f /usr/share/rpcd/ucode/prism-router.uc
+opkg install --force-reinstall /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/re-luci.log 2>&1 \
   && ok "luci-app 同版本强制重装成功" || { bad "luci-app 重装失败"; tail -8 /tmp/re-luci.log; }
-same_file /usr/share/rpcd/ucode/traffic-stats.uc \
-  /src/repo/luci-app-traffic-stats/root/usr/share/rpcd/ucode/traffic-stats.uc
+same_file /usr/share/rpcd/ucode/prism-router.uc \
+  /src/repo/luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc
 
-rm -f /usr/bin/traffic-statsd
-opkg install --force-reinstall /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/re-daemon.log 2>&1 \
-  && ok "traffic-stats 同版本强制重装成功" || { bad "traffic-stats 重装失败"; tail -8 /tmp/re-daemon.log; }
-[ -f /usr/bin/traffic-statsd ] && ok "重装恢复 /usr/bin/traffic-statsd" || bad "重装未恢复 /usr/bin/traffic-statsd"
-if grep -q "gate_marker" /etc/config/traffic-stats; then
+rm -f /usr/bin/prism-routerd
+opkg install --force-reinstall /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/re-daemon.log 2>&1 \
+  && ok "prism-router 同版本强制重装成功" || { bad "prism-router 重装失败"; tail -8 /tmp/re-daemon.log; }
+[ -f /usr/bin/prism-routerd ] && ok "重装恢复 /usr/bin/prism-routerd" || bad "重装未恢复 /usr/bin/prism-routerd"
+if grep -q "gate_marker" /etc/config/prism-router; then
   ok "重装保留用户修改的 conffile"
 else
   bad "重装丢失用户修改的 conffile"
 fi
-[ -f /etc/config/traffic-stats-opkg ] && echo "  NOTE  存在 /etc/config/traffic-stats-opkg（opkg 对修改过的 conffile 的正常行为）"
+[ -f /etc/config/prism-router-opkg ] && echo "  NOTE  存在 /etc/config/prism-router-opkg（opkg 对修改过的 conffile 的正常行为）"
 
 echo "=== 6. 卸载完整清单 ==="
-opkg files luci-app-traffic-stats 2>/dev/null | tail -n +2 > /tmp/rm-luci-files.txt
-opkg files traffic-stats 2>/dev/null | tail -n +2 > /tmp/rm-daemon-files.txt
-opkg remove luci-app-traffic-stats >/tmp/rm-luci.log 2>&1 \
-  && ok "卸载 luci-app-traffic-stats 成功" || { bad "卸载 luci-app 失败"; tail -8 /tmp/rm-luci.log; }
-opkg remove traffic-stats >/tmp/rm-daemon.log 2>&1 \
-  && ok "卸载 traffic-stats 成功" || { bad "卸载 traffic-stats 失败"; tail -8 /tmp/rm-daemon.log; }
+opkg files luci-app-prism-router 2>/dev/null | tail -n +2 > /tmp/rm-luci-files.txt
+opkg files prism-router 2>/dev/null | tail -n +2 > /tmp/rm-daemon-files.txt
+opkg remove luci-app-prism-router >/tmp/rm-luci.log 2>&1 \
+  && ok "卸载 luci-app-prism-router 成功" || { bad "卸载 luci-app 失败"; tail -8 /tmp/rm-luci.log; }
+opkg remove prism-router >/tmp/rm-daemon.log 2>&1 \
+  && ok "卸载 prism-router 成功" || { bad "卸载 prism-router 失败"; tail -8 /tmp/rm-daemon.log; }
 
 leftover=0
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  [ "$f" = "/etc/config/traffic-stats" ] && continue
+  [ "$f" = "/etc/config/prism-router" ] && continue
   if [ -e "$f" ]; then bad "卸载残留 $f"; leftover=$((leftover+1)); fi
 done < /tmp/rm-luci-files.txt
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  [ "$f" = "/etc/config/traffic-stats" ] && continue
+  [ "$f" = "/etc/config/prism-router" ] && continue
   if [ -e "$f" ]; then bad "卸载残留 $f"; leftover=$((leftover+1)); fi
 done < /tmp/rm-daemon-files.txt
 [ "$leftover" = 0 ] && ok "卸载清单内文件全部移除（conffile 按规则保留）"
-[ -f /etc/config/traffic-stats ] && grep -q "gate_marker" /etc/config/traffic-stats \
+[ -f /etc/config/prism-router ] && grep -q "gate_marker" /etc/config/prism-router \
   && ok "conffile 在卸载后保留（用户修改）" || bad "conffile 未按预期保留"
-for f in /usr/bin/traffic-statsd /etc/init.d/traffic-statsd /www/cgi-bin/traffic-stats-ingest \
-         /www/cgi-bin/traffic-stats-stations /www/cgi-bin/traffic-stats-metrics; do
+for f in /usr/bin/prism-routerd /etc/init.d/prism-routerd /www/cgi-bin/prism-router-ingest \
+         /www/cgi-bin/prism-router-stations /www/cgi-bin/prism-router-metrics; do
   [ -e "$f" ] && bad "卸载后仍存在 $f" || ok "已移除 $f"
 done
-if opkg list-installed 2>/dev/null | grep -q '^luci-app-traffic-stats '; then bad "luci-app 卸载后 opkg 仍认为已安装"; else ok "luci-app 已从 opkg 数据库移除"; fi
-if opkg list-installed 2>/dev/null | grep -q '^traffic-stats '; then bad "traffic-stats 卸载后 opkg 仍认为已安装"; else ok "traffic-stats 已从 opkg 数据库移除"; fi
+if opkg list-installed 2>/dev/null | grep -q '^luci-app-prism-router '; then bad "luci-app 卸载后 opkg 仍认为已安装"; else ok "luci-app 已从 opkg 数据库移除"; fi
+if opkg list-installed 2>/dev/null | grep -q '^prism-router '; then bad "prism-router 卸载后 opkg 仍认为已安装"; else ok "prism-router 已从 opkg 数据库移除"; fi
 
 echo "=== 7. legacy（ar 容器）负例：必须被拒绝 ==="
 for p in /src/legacy/*.legacy.ipk; do

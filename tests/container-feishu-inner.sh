@@ -27,15 +27,15 @@ rc_is(){ # $1=期望退出码 $2=实际 $3=描述
   eq "$1" "$2" "$3"
 }
 
-FEISHU=/usr/share/traffic-stats/feishu.uc
-CFG=/etc/config/traffic-stats
+FEISHU=/usr/share/prism-router/feishu.uc
+CFG=/etc/config/prism-router
 NOW=$(date +%s)
 TODAY=$(date +%F)
 WORK=/tmp/fs-gate
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-echo "=== 0. 安装 traffic-stats ==="
-opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/fs-install.log 2>&1 \
+echo "=== 0. 安装 prism-router ==="
+opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/fs-install.log 2>&1 \
   && ok "安装成功" || { bad "安装失败"; tail -5 /tmp/fs-install.log; }
 [ -f "$FEISHU" ] && ok "feishu.uc 已安装（$FEISHU）" || { bad "feishu.uc 缺失"; exit 1; }
 if grep -q "report_items" "$CFG"; then
@@ -292,8 +292,8 @@ fi
 
 echo
 echo "=== 3. report_items 走 UCI（配置文件真的生效）==="
-uci set traffic-stats.feishu.report_items='overview,nodes' >/dev/null 2>&1
-uci commit traffic-stats >/dev/null 2>&1
+uci set prism-router.feishu.report_items='overview,nodes' >/dev/null 2>&1
+uci commit prism-router >/dev/null 2>&1
 card "$WORK/c-uci.json" >/dev/null 2>&1
 has "**总流量**"   "$WORK/c-uci.json" "UCI report_items=overview,nodes：含 overview"
 has "**代理节点**" "$WORK/c-uci.json" "UCI report_items=overview,nodes：含 nodes"
@@ -301,15 +301,15 @@ hasnot "**无线 / 有线**" "$WORK/c-uci.json" "UCI report_items=overview,nodes
 ucode "$FEISHU" check "$WORK/c-uci.json" --base "$BASE" >/dev/null 2>&1
 rc_is 0 $? "check 跟随 UCI report_items"
 # uci set 成空串会把选项直接删掉（等于回落默认值），所以关闭要用 'none' 哨兵
-uci set traffic-stats.feishu.report_items='none' >/dev/null 2>&1
-uci commit traffic-stats >/dev/null 2>&1
+uci set prism-router.feishu.report_items='none' >/dev/null 2>&1
+uci commit prism-router >/dev/null 2>&1
 rm -f "$WORK/c-uci-none.json"
 card "$WORK/c-uci-none.json" >/tmp/c6.log 2>&1
 rc_is 0 $? "UCI report_items=none：退出 0"
 [ -f "$WORK/c-uci-none.json" ] && bad "UCI report_items=none 仍生成卡片" || ok "UCI report_items=none 什么都不发"
 # 全部写成无效名字：同样什么都不发（未知项被忽略 -> 0 个区块）
-uci set traffic-stats.feishu.report_items='bogus,nonsense' >/dev/null 2>&1
-uci commit traffic-stats >/dev/null 2>&1
+uci set prism-router.feishu.report_items='bogus,nonsense' >/dev/null 2>&1
+uci commit prism-router >/dev/null 2>&1
 rm -f "$WORK/c-uci-bogus.json"
 card "$WORK/c-uci-bogus.json" >/tmp/c7.log 2>&1
 rc_is 0 $? "UCI report_items 全为无效名：退出 0"
@@ -423,9 +423,9 @@ rc_is 0 "$(alerts --cpu 1 --mem 1 --disk 1)" "state.system 缺失：alerts 退�
 STATE=""
 nofire sys_cpu "state.system 缺失：CPU 告警静默跳过"
 # 走 UCI 的阈值
-uci set traffic-stats.feishu.alert_app_daily_limit='20G' >/dev/null 2>&1
-uci set traffic-stats.feishu.alert_cpu_pct='90' >/dev/null 2>&1
-uci commit traffic-stats >/dev/null 2>&1
+uci set prism-router.feishu.alert_app_daily_limit='20G' >/dev/null 2>&1
+uci set prism-router.feishu.alert_cpu_pct='90' >/dev/null 2>&1
+uci commit prism-router >/dev/null 2>&1
 alerts >/dev/null
 fire app_limit "UCI alert_app_daily_limit=20G 生效"
 fire sys_cpu "UCI alert_cpu_pct=90 生效"
@@ -441,8 +441,8 @@ nofire app_limit "免打扰时段内不发送任何告警"
 alerts --app-limit 20G --quiet "00:00-00:01" >/dev/null
 if grep -q "免打扰时段" /tmp/fs-alerts.log; then bad "不该命中 00:00-00:01 免打扰"; else ok "时段外正常判定（00:00-00:01）"; fi
 fire app_limit "时段外告警正常触发"
-uci set traffic-stats.feishu.alert_quiet_hours="$QF-$QT" >/dev/null 2>&1
-uci commit traffic-stats >/dev/null 2>&1
+uci set prism-router.feishu.alert_quiet_hours="$QF-$QT" >/dev/null 2>&1
+uci commit prism-router >/dev/null 2>&1
 alerts --app-limit 20G >/dev/null
 if grep -q "免打扰时段" /tmp/fs-alerts.log; then ok "UCI alert_quiet_hours 生效"; else bad "UCI 免打扰未生效"; fi
 cp "$WORK/config.bak" "$CFG"
@@ -486,8 +486,8 @@ has "items" /tmp/fs-status.log "status 显示 report_items"
 has "report" /tmp/fs-status.log "status 显示 report_mode/time/weekday"
 has "alert+" /tmp/fs-status.log "status 显示新增告警阈值"
 # 旧的离线自测脚本（打包自带）仍然全绿
-if [ -x /usr/share/traffic-stats/feishu-test.sh ]; then
-  sh /usr/share/traffic-stats/feishu-test.sh >/tmp/fs-legacy.log 2>&1
+if [ -x /usr/share/prism-router/feishu-test.sh ]; then
+  sh /usr/share/prism-router/feishu-test.sh >/tmp/fs-legacy.log 2>&1
   LRC=$?
   if [ "$LRC" -eq 0 ]; then
     ok "feishu-test.sh（打包自带的离线自测）全绿：$(grep '结果：PASS' /tmp/fs-legacy.log | head -1)"

@@ -1,0 +1,3493 @@
+#!/usr/bin/ucode
+/**
+ * prism-routerd — OpenWrt 棱镜路由守护进程（ucode 实现）
+ *
+ * 数据源
+ *   1) OpenClash /connections (mihomo REST API)
+ *        - 被 clash 接管的流量：真实域名 host、出口链路 chains、每连接字节、源设备 IP
+ *   2) /proc/net/nf_conntrack
+ *        - 未经 clash 的直连流量（orig dst 不在 fake-ip 段）
+ *
+ * 去重（硬性）：conntrack 中 orig.dst 落在 fake_ip_ranges 的流一律跳过，
+ * 这部分流量由 clash 侧统计，绝不能两边都算。
+ *
+ * 接入方式（无线 / 有线，与"代理 / 直连"是两个正交维度）：
+ *   主路由 br-lan 是软件桥，哑桥 AP 挂在其中一个桥端口上；无线客户端和 AP 自己的
+ *   br-lan MAC 都学在**同一个桥端口**上。所以每 link_refresh 秒跑一次
+ *
+ *       brctl showmacs <lan_bridge>          # 注意：这台机器上没有 bridge 命令
+ *
+ *   解析 "port mac is-local" 得到 mac -> port，再用 ap_macs 反查 AP 上联端口
+ *   （优先），没配 ap_macs 就用显式的 wireless_ports。设备的 MAC 落在无线上联端口
+ *   -> wifi，落在其它端口 -> wired，FDB 里没有 -> unknown。新增的 totals.wifi_* 、
+ *   wired_* 与 unknown_* 三桶与 direct/proxy 严格互斥且完备（相加恒等）。
+ *
+ * 软路由自身性能指标（system，SPEC §3.3）：
+ *   每轮 poll 读 /proc（uptime / loadavg / stat / cpuinfo / meminfo / net/dev / net/route）
+ *   与 sysfs（thermal_zone0），全部只读、成本极低；cpu_pct 用两次 /proc/stat 采样差值，
+ *   disk 每 60 秒最多跑一次 `df -k /` 并缓存。任何一项读不到只是省略字段，
+ *   **绝不**影响 direct/proxy/link 统计，也不进 health.reasons。
+ *
+ * 契约：docs/SPEC.md —— 字段名 / 文件路径以契约为准，不得改动。
+ *
+ * 仅测试用的环境变量（生产环境不要设置）：
+ *   PRISM_ROUTER_STATE_DIR  覆盖 /tmp/prism-router
+ *   PRISM_ROUTER_DAILY_DIR  覆盖 /etc/prism-router/daily
+ *   PRISM_ROUTER_DEVICES_FILE  覆盖 /etc/prism-router/devices.json（设备别名/分组/首次出现）
+ *   PRISM_ROUTER_ONCE=1     只跑一轮、写完文件后退出（用于冒烟测试）
+ *   PRISM_ROUTER_ONCE_POLLS=N  仅 --once 时连续跑 N 轮（自测：cpu/wan 需要两次采样）
+ *   PRISM_ROUTER_CONNTRACK_FILE  覆盖 /proc/net/nf_conntrack（合成数据自测用）
+ *   PRISM_ROUTER_CLASH_API  覆盖 clash_api（自测用）
+ *   PRISM_ROUTER_BRCTL      覆盖 brctl 路径（自测用：指向假 brctl / 不存在路径）
+ *   PRISM_ROUTER_PROC_DIR   覆盖 /proc 基目录（自测：指向固定内容 / FIFO）
+ *   PRISM_ROUTER_PROC_STAT / _MEMINFO / _LOADAVG / _UPTIME / _CPUINFO
+ *   PRISM_ROUTER_PROC_NET_DEV / _NET_ROUTE  单独覆盖对应 /proc 文件
+ *   PRISM_ROUTER_THERMAL    覆盖 /sys/class/thermal/thermal_zone0/temp
+ *   PRISM_ROUTER_DF         覆盖 df 命令（自测：假 df 统计调用次数）
+ *   PRISM_ROUTER_ROOTFS     覆盖 df 的目标（默认 /）
+ *   PRISM_ROUTER_PRUNE_NOW=1  启动时立刻跑一次 daily 清理判定（自测：验证 daily 清理归属）
+ *   PRISM_ROUTER_TEST_ROLLOVER_AFTER=N  仅测试：第 N 轮模拟跨天（验证日切失败 pending 重试）
+ *   PRISM_ROUTER_BASELINE_MAX_ENTRIES=N 仅测试：降低 baseline 条目上限（生产固定 8192）
+ *   PRISM_ROUTER_DEBUG=1    详细日志输出到 stderr
+ */
+
+const fs = require('fs');
+const uloop = require('uloop');
+
+const DAEMON_VERSION = '1.0.0';
+
+const STATE_DIR_DEFAULT = '/tmp/prism-router';
+const DAILY_DIR_DEFAULT = '/etc/prism-router/daily';
+const DEVICES_FILE_DEFAULT = '/etc/prism-router/devices.json';
+const LEASES_FILE = '/tmp/dhcp.leases';
+const CONNTRACK_FILE = '/proc/net/nf_conntrack';
+
+/* 设备元数据（/etc/prism-router/devices.json，SPEC §10.1）：
+ *   { "<mac>": { "alias": "客厅电视", "group": "家人", "first_seen": 1794600000 } }
+ * 守护进程只负责 first_seen（首次见到该 MAC 的 unix 时间）；alias/group 由 rpcd 的
+ * set_device_meta 写。两边都走「读-改-写 + 临时文件 rename」，互不覆盖对方的字段。
+ * 上限只是为了让长期运行时的文件有界，家用网关远达不到。 */
+const DEVICE_META_MAX = 512;
+const DEVICE_META_TEXT_MAX = 128; /* alias/group 单字段字节上限（与 rpcd 侧一致） */
+
+/* 资源上限：家庭网关上远达不到，仅用于保证长时间运行内存有界（SPEC §8.7） */
+const MAX_TRACK_DEVICES = 256;    /* 内部跟踪的设备数上限 */
+const MAX_OUT_DEVICES = 200;      /* state.json 输出上限（SPEC §3） */
+const MAX_DEV_APPS = 96;          /* 每设备跟踪的 host 数上限 */
+const MAX_DEV_APPS_OUT = 30;      /* 每设备输出 Top N（SPEC §3） */
+const MAX_GLOBAL_APPS = 512;      /* 全局跟踪的 host 数上限 */
+const MAX_OUT_APPS = 50;          /* apps 数组输出条数 */
+const MAX_DAY_APPS = 512;         /* 当日应用累计上限 */
+const MAX_BUCKET_APPS = 256;      /* 单个 5 分钟桶内的应用数上限 */
+const BUCKET_SECONDS = 300;       /* 5 分钟桶（SPEC §4） */
+const TOP_PER_BUCKET = 10;
+const HISTORY_FLUSH_SECONDS = 60; /* history.json 最少刷新间隔 */
+const DAILY_RETRY_SECONDS = 600;  /* daily 目录写失败后的重试间隔 */
+const DAILY_WRITE_SECONDS = 300;  /* daily 文件最短落盘间隔：/etc 在闪存上，别每轮都写 */
+const DAILY_PENDING_RETRY_SECONDS = 5; /* 日切写失败后 pending 快照的重试间隔（跨天数据不能丢） */
+/* 日切 pending 快照持久化在 state_dir（tmpfs）。限制天数只为让长期异常时内存/文件有界：
+ * 正常最多只会有 1 天（日切失败），单位数天足够覆盖连续失败。 */
+const DAILY_PENDING_MAX_DAYS = 16;
+const SYSTEM_DISK_SECONDS = 60;   /* `df -k /` 最短间隔：磁盘容量变化慢，别每轮 fork */
+
+/* 跨软重启基线（/tmp 在软重启后仍然存在；hard reboot 自然清空）：
+ *   baseline.json = { v, ts, day, clash_ts, ct_ts, clash_prev, ct_prev }
+ * 只接受「同一天 + 不超过 BASELINE_MAX_AGE 秒」的基线；损坏/过期一律降级为
+ * 「先采样、不记增量」（prime），避免首帧把现存连接全量加一遍造成虚高速率。 */
+const BASELINE_FILE = 'baseline.json';
+const BASELINE_VERSION = 3;
+const BASELINE_MAX_AGE = 3600;
+const BASELINE_MAX_ENTRIES = 8192;
+/* baseline 是 /tmp 下的 JSON，读取前先看大小：异常大的文件直接拒绝恢复，
+ * 不让伪造/损坏文件把内存撑爆。正常上限见 baseline_write（四个 8192 表）。 */
+const BASELINE_MAX_BYTES = 8 * 1024 * 1024;
+/* 去重/故障账本里持久化的过期时间只允许落在「现在 + 24h」以内：
+ * 合法值最多是 failure TTL（< 1h），超过这个范围视为被篡改。 */
+const BASELINE_EXP_MAX_AHEAD = 86400;
+const BASELINE_KEY_MAX_LEN = 160;
+
+/* 双源去重键的保留时长：至少覆盖 1~2 个轮询间隔，避免 clash / conntrack
+ * 两次拉取之间的边界把同一条流漏掉或重复计入。 */
+const DEDUP_TTL_MIN = 10;
+const DEDUP_MAX_ENTRIES = 8192;
+
+let tmp_seq = 0;
+
+/*
+ * ucode 不做函数提升：被调用者必须先于调用者定义。
+ * 下面这些函数在源码里是后置定义的，先用 let 建好绑定，避免编译期解析不到。
+ */
+let store_evict, evict_device, elapsed_ms, node_add, day_dev_add, poll_dev_add;
+
+/* ------------------------------------------------------------------ *
+ * 基础工具
+ * ------------------------------------------------------------------ */
+
+/** MAC 校验：不能依赖 match()（本 build 的 match() 恒返回 nil，见 docs/INCIDENT 附录） */
+function is_mac(m) {
+	if (length(m) != 17) return false;
+	for (let i = 0; i < 17; i++) {
+		let ch = substr(m, i, 1);
+		if (i % 3 == 2) {
+			if (ch != ':') return false;
+		} else if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function str(v) {
+	if (v == null) return '';
+	return '' + v;
+}
+
+function to_int(v, dflt) {
+	if (v == null) return dflt;
+	let t = type(v);
+	if (t == 'int') return v;
+	if (t == 'double') return int(v);
+	let n = int(v);
+	if (type(n) != 'int') return dflt;
+	return n;
+}
+
+/** 去掉首尾空白，让 health.reasons 干净可读 */
+function trim(s) {
+	s = str(s);
+	let a = 0, b = length(s);
+	while (a < b && index(" \t\r\n", substr(s, a, 1)) >= 0) a++;
+	while (b > a && index(" \t\r\n", substr(s, b - 1, 1)) >= 0) b--;
+	return substr(s, a, b - a);
+}
+
+function clamp(v, lo, hi) {
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/** 按空白切分并丢弃空 token（conntrack / dhcp.leases 都需要） */
+function split_ws(s) {
+	/* 注意：brctl showmacs 的输出是**制表符分隔**，只按空格切会把整行当成一个 token。
+	   这里先把 TAB 归一成空格再切（conntrack 行本来就是空格分隔，不受影响）。 */
+	let out = [];
+	for (let t in split(replace(str(s), '\t', ' '), ' ')) {
+		if (t != '') push(out, t);
+	}
+	return out;
+}
+
+/** 按空格或逗号切分（配置里的 CIDR 列表） */
+function split_list(s) {
+	let out = [];
+	for (let t in split(replace(str(s), ',', ' '), ' ')) {
+		if (t != '') push(out, t);
+	}
+	return out;
+}
+
+/** 桥端口号列表："3" / "3,5" -> [3, 5]；非法项丢弃并去重 */
+function parse_port_list(s) {
+	let out = [];
+	for (let t in split_list(s)) {
+		let p = to_int(t, -1);
+		if (p < 0 || p > 65535) continue;
+		let dup = false;
+		for (let q in out) {
+			if (q == p) { dup = true; break; }
+		}
+		if (!dup) push(out, p);
+	}
+	return out;
+}
+
+/** MAC 列表：统一小写、`-` 归一成 `:`，非法项丢弃（brctl 输出的 MAC 是小写冒号格式） */
+function parse_mac_list(s) {
+	let out = [];
+	for (let t in split_list(s)) {
+		let m = lc(replace(t, '-', ':'));
+		if (!is_mac(m)) continue;
+		let dup = false;
+		for (let q in out) {
+			if (q == m) { dup = true; break; }
+		}
+		if (!dup) push(out, m);
+	}
+	return out;
+}
+
+/** 从 clash_api 配置里取出「scheme://host[:port]」origin。
+ *  支持：
+ *    - 127.0.0.1:9090
+ *    - http://127.0.0.1:9090
+ *    - https://user:pw@host:9090
+ *    - OpenClash 控制台 URL：http://host:9090/ui/#/connections?foo=1
+ *      （/路径、?query、#hash 全部丢弃，只保留 origin）
+ *  非法字符直接拒绝；返回值只用于 shell_quote 包裹后的 curl 参数，不拼 shell。 */
+function parse_clash_origin(raw) {
+	let s = trim(str(raw));
+	if (s == '') return '';
+
+	let scheme = 'http';
+	let sep = index(s, '://');
+	if (sep >= 0) {
+		scheme = lc(substr(s, 0, sep));
+		s = substr(s, sep + 3);
+		if (scheme != 'http' && scheme != 'https') return '';
+	}
+
+	/* 去掉 path / query / hash：origin 在第一个 /?# 之前 */
+	let end = length(s);
+	for (let i = 0; i < length(s); i++) {
+		let c = substr(s, i, 1);
+		if (c == '/' || c == '?' || c == '#') { end = i; break; }
+	}
+	let auth = substr(s, 0, end);
+	if (auth == '') return '';
+
+	/* 只允许 origin 需要的字符：IPv4/域名/IPv6 方括号、端口、userinfo。 */
+	for (let i = 0; i < length(auth); i++) {
+		let c = substr(auth, i, 1);
+		let n = ord(c);
+		let okc = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			|| (c >= '0' && c <= '9') || c == '.' || c == ':' || c == '-'
+			|| c == '_' || c == '[' || c == ']' || c == '@' || c == '%';
+		if (!okc || n < 0x21 || n > 0x7e) return '';
+	}
+
+	/* 端口显式存在时必须是 1..65535；没有端口交给 curl 用默认端口。 */
+	let hostpart = auth;
+	let at = 0;
+	for (let i = 0; i < length(auth); i++) if (substr(auth, i, 1) == '@') at = i + 1;
+	hostpart = substr(auth, at);
+	let port = '';
+	if (substr(hostpart, 0, 1) == '[') {
+		let close = index(hostpart, ']');
+		if (close < 0) return '';
+		if (substr(hostpart, close + 1, 1) == ':') port = substr(hostpart, close + 2);
+	} else {
+		let colon = 0, seen = false;
+		for (let i = 0; i < length(hostpart); i++) {
+			if (substr(hostpart, i, 1) == ':') { colon = i; seen = true; }
+		}
+		if (seen) port = substr(hostpart, colon + 1);
+	}
+	if (port != '') {
+		let p = to_int(port, -1);
+		if (p < 1 || p > 65535) return '';
+	}
+
+	return scheme + '://' + auth;
+}
+
+/** curl 配置文件里的值：只去掉会破坏 "header = \\"...\\"" 的字符 */
+function sanitize_secret(s) {
+	let out = '';
+	for (let i = 0; i < length(s); i++) {
+		let c = substr(s, i, 1);
+		if (c == '"' || c == '\\' || ord(c) < 0x20) continue;
+		out += c;
+	}
+	return out;
+}
+
+function shell_quote(s) {
+	return "'" + replace(str(s), "'", "'\\''") + "'";
+}
+
+function new_store() {
+	return { rx: 0, tx: 0, chain: '', chain_rx: {}, devs: {} };
+}
+
+/** 记录一条 host 流量；chain 取 rx 最大的那条链路 */
+function store_add(store, host, chain, rx, tx, ip, cap) {
+	let a = store[host];
+	if (a == null) {
+		a = new_store();
+		a.chain = chain;
+		store[host] = a;
+		/* 只在新建条目时检查容量：length() 是 O(n)，不能放在每条流的热路径上 */
+		if (cap > 0 && length(store) > cap) store_evict(store);
+	}
+	a.rx += rx;
+	a.tx += tx;
+	/* 从 daily 恢复的应用只带 rx/tx/chain/devices，没有 chain_rx 明细；
+	 * 合并新流量时按需补回，避免 a.chain_rx[...] 对 null 赋值。 */
+	if (type(a.chain_rx) != 'object') a.chain_rx = {};
+	if (type(a.devs) != 'object') a.devs = {};
+	a.chain_rx[chain] = (a.chain_rx[chain] || 0) + rx;
+	let best = a.chain, best_v = -1;
+	for (let k in a.chain_rx) {
+		if (a.chain_rx[k] > best_v) {
+			best_v = a.chain_rx[k];
+			best = k;
+		}
+	}
+	a.chain = best;
+	if (ip != null && ip != '') {
+		if (a.devs[ip] == null) {
+			a.devs[ip] = 1;
+			/* 从 daily 恢复的应用只有设备数（devices 字段），没有 IP 明细；
+			 * 这里在同一应用又出现新 IP 时把计数加回去，保持 daily 兼容。 */
+			if (a.dev_count != null) a.dev_count++;
+		}
+	}
+	return a;
+}
+
+/** 超过上限时淘汰流量最小的一条，避免长时间运行无限增长 */
+store_evict = function(store) {
+	let worst = null, worst_v = null;
+	for (let k in store) {
+		let v = store[k].rx + store[k].tx;
+		if (worst_v == null || v < worst_v) {
+			worst_v = v;
+			worst = k;
+		}
+	}
+	if (worst != null) delete store[worst];
+};
+
+/* ------------------------------------------------------------------ *
+ * 文件系统
+ * ------------------------------------------------------------------ */
+
+function mkpath(dir) {
+	if (dir == null || dir == '' || dir == '/') return true;
+	if (fs.stat(dir) != null) return true;
+	let parent = fs.dirname(dir);
+	if (parent != null && parent != dir) mkpath(parent);
+	if (fs.mkdir(dir)) return true;
+	return fs.stat(dir) != null;
+}
+
+/** 原子写：同目录唯一临时文件 + rename（SPEC §8.7 不允许半截文件）
+ *  临时名带 pid 不可得，这里用「秒 + clock 纳秒 + 进程内序号」保证两个写者
+ *  （守护进程 / rpcd）不会撞到同一个临时文件；真正需要互斥的 devices.json
+ *  另见 first_seen_track() 的 mkdir 锁。 */
+function atomic_write(path, text) {
+	tmp_seq++;
+	let tmp = path + '.tmp.' + sprintf('%d.%d.%d', time(), clock()[1], tmp_seq);
+	let n = fs.writefile(tmp, text);
+	if (type(n) != 'int') {
+		try { fs.unlink(tmp); } catch (e) { }
+		return false;
+	}
+	if (!fs.rename(tmp, path)) {
+		try { fs.unlink(tmp); } catch (e) { }
+		return false;
+	}
+	return true;
+}
+
+function load_json(path) {
+	let txt = fs.readfile(path);
+	if (txt == null || txt == '') return null;
+	try {
+		let o = json(txt);
+		return (type(o) == 'object') ? o : null;
+	} catch (e) {
+		return null;
+	}
+}
+
+/** 原子写 + 显式权限/属主：/etc 下的文件必须 0644 root:root（docs/DEPLOY-RULES.md） */
+function atomic_write_perm(path, text, mode) {
+	tmp_seq++;
+	let tmp = path + '.tmp.' + sprintf('%d.%d.%d', time(), clock()[1], tmp_seq);
+	let n = fs.writefile(tmp, text);
+	if (type(n) != 'int') {
+		try { fs.unlink(tmp); } catch (e) { }
+		return false;
+	}
+	try { fs.chmod(tmp, mode); } catch (e) { }
+	try { fs.chown(tmp, 0, 0); } catch (e) { }
+	if (!fs.rename(tmp, path)) {
+		try { fs.unlink(tmp); } catch (e) { }
+		return false;
+	}
+	return true;
+}
+
+/** UTF-8 安全截断：不切断多字节码点（length() 是字节长度） */
+function cut_text(s, maxb) {
+	s = str(s);
+	if (length(s) <= maxb) return s;
+	let n = maxb;
+	while (n > 0 && (ord(substr(s, n, 1)) & 0xc0) == 0x80) n--;
+	return substr(s, 0, n);
+}
+
+function unlink_quiet(list) {
+	for (let f in list) {
+		try {
+			fs.unlink(f);
+		} catch (e) {
+			/* ignore */
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * JSON 编码（ucode 的 %J 带空格，这里输出紧凑格式，与契约示例一致）
+ * ------------------------------------------------------------------ */
+
+function jstr(s) {
+	let out = '"';
+	for (let i = 0; i < length(s); i++) {
+		let c = substr(s, i, 1);
+		let n = ord(c);
+		if (c == '"') out += '\\"';
+		else if (c == '\\') out += '\\\\';
+		else if (n == 10) out += '\\n';
+		else if (n == 13) out += '\\r';
+		else if (n == 9) out += '\\t';
+		else if (n < 0x20) out += sprintf('\\u%04x', n);
+		else out += c;
+	}
+	return out + '"';
+}
+
+function jnum(v) {
+	let t = type(v);
+	if (t == 'int') return sprintf('%d', v);
+	/* 现有 state/history/daily 全是整数；system 段的小数统一保留 1 位，
+	   且 sprintf 是定点格式，不会出现科学计数法。 */
+	if (t == 'double') return sprintf('%.1f', v);
+	return '0';
+}
+
+function jenc(v) {
+	if (v == null) return 'null';
+	let t = type(v);
+	if (t == 'int' || t == 'double') return jnum(v);
+	if (t == 'bool') return v ? 'true' : 'false';
+	if (t == 'string') return jstr(v);
+	if (t == 'array') {
+		let parts = [];
+		for (let i in v) push(parts, jenc(i));
+		return '[' + join(',', parts) + ']';
+	}
+	if (t == 'object') {
+		let parts = [];
+		for (let k in v) push(parts, jstr(k) + ':' + jenc(v[k]));
+		return '{' + join(',', parts) + '}';
+	}
+	return 'null';
+}
+
+/* ------------------------------------------------------------------ *
+ * IPv4 / CIDR
+ * ------------------------------------------------------------------ */
+
+function ipv4_int(s) {
+	let p = split(str(s), '.');
+	if (length(p) != 4) return null;
+	let n = 0;
+	for (let i = 0; i < 4; i++) {
+		let v = int(p[i]);
+		if (type(v) != 'int' || v < 0 || v > 255) return null;
+		n = n * 256 + v;
+	}
+	return n;
+}
+
+function bits_to_mask(bits) {
+	if (bits == 0) return 0;
+	return (0xffffffff << (32 - bits)) & 0xffffffff;
+}
+
+function mask_to_bits(m) {
+	let n = ipv4_int(m);
+	if (n == null) return 24;
+	let bits = 0;
+	for (let i = 31; i >= 0; i--) {
+		if (n & (1 << i)) bits++;
+		else break;
+	}
+	return bits;
+}
+
+function parse_cidr(s) {
+	let parts = split(str(s), '/');
+	let ip = ipv4_int(parts[0]);
+	if (ip == null) return null;
+	let bits = 32;
+	if (length(parts) > 1) bits = to_int(parts[1], 32);
+	bits = clamp(bits, 0, 32);
+	let mask = bits_to_mask(bits);
+	return { base: ip & mask, mask: mask, bits: bits, text: str(s) };
+}
+
+function cidr_match(cidrs, ip) {
+	if (ip == null) return false;
+	for (let c in cidrs) {
+		if ((ip & c.mask) == c.base) return true;
+	}
+	return false;
+}
+
+/** "192.168.100.1" + "255.255.255.0" -> "192.168.100.0/24" */
+function cidr_from_ip_mask(ip, mask) {
+	let n = ipv4_int(ip);
+	if (n == null) return null;
+	let bits = mask_to_bits(mask);
+	let m = bits_to_mask(bits);
+	let net = n & m;
+	return sprintf('%d.%d.%d.%d/%d',
+		int(net / 16777216) % 256,
+		int(net / 65536) % 256,
+		int(net / 256) % 256,
+		net % 256, bits);
+}
+
+/* ------------------------------------------------------------------ *
+ * 配置（UCI: /etc/config/prism-router，缺省时全部走默认值）
+ * ------------------------------------------------------------------ */
+
+function cfg_str(cur, pkg, sec, opt, dflt) {
+	let v = null;
+	try {
+		v = cur.get(pkg, sec, opt);
+	} catch (e) {
+		v = null;
+	}
+	if (v == null || v == '') return dflt;
+	return str(v);
+}
+
+/** 环境变量覆盖（仅测试用）；空串视为未设置 */
+function env_path(name, dflt) {
+	let v = getenv(name);
+	return (v != null && v != '') ? v : dflt;
+}
+
+function load_config(cur) {
+	let c = {};
+
+	c.enabled = to_int(cfg_str(cur, 'prism-router', 'settings', 'enabled', '1'), 1) != 0;
+	c.poll_interval = clamp(to_int(cfg_str(cur, 'prism-router', 'settings', 'poll_interval', '5'), 5), 1, 3600);
+	c.clash_api = cfg_str(cur, 'prism-router', 'settings', 'clash_api', '127.0.0.1:9090');
+	c.clash_secret = cfg_str(cur, 'prism-router', 'settings', 'clash_secret', '');
+	c.fake_ip_ranges = split_list(cfg_str(cur, 'prism-router', 'settings', 'fake_ip_ranges', '198.18.0.0/16'));
+	c.lan_ranges = split_list(cfg_str(cur, 'prism-router', 'settings', 'lan_ranges', ''));
+	c.history_days = clamp(to_int(cfg_str(cur, 'prism-router', 'settings', 'history_days', '7'), 7), 1, 90);
+
+	/* 接入方式（无线 / 有线）判定：桥名 + 无线上联端口 + AP 的 LAN MAC */
+	c.lan_bridge = cfg_str(cur, 'prism-router', 'settings', 'lan_bridge', 'br-lan');
+	c.wireless_ports = parse_port_list(cfg_str(cur, 'prism-router', 'settings', 'wireless_ports', ''));
+	c.ap_macs = parse_mac_list(cfg_str(cur, 'prism-router', 'settings', 'ap_macs', ''));
+	c.link_refresh = clamp(to_int(cfg_str(cur, 'prism-router', 'settings', 'link_refresh', '30'), 30), 1, 3600);
+
+	/* 软路由自身性能指标（SPEC §3.3）：辅助信息，读不到只省略字段 */
+	c.system_enabled = to_int(cfg_str(cur, 'prism-router', 'settings', 'system_enabled', '1'), 1) != 0;
+	c.wan_iface = cfg_str(cur, 'prism-router', 'settings', 'wan_iface', '');
+
+	/* 保留策略归属（SPEC §9）：retention 段存在且 enabled != 0 时，daily 的清理
+	 * 交给 /usr/share/prism-router/retention.uc 按 retention.daily_days 做（按日期）；
+	 * 本进程不再按 history_days 做「只留 N 个文件」的计数裁剪，否则 daily_days=400
+	 * 会被 7 天的计数逻辑悄悄删掉。老配置（没有 retention 段）行为完全不变。
+	 * 注意 uci cursor 的 get(pkg, section) 返回的是 section 的 type 字符串（不存在时 null），
+	 * 选项值仍然用 cfg_str(cur, pkg, section, opt, dflt) 读。 */
+	let rsec = null;
+	try {
+		rsec = cur.get('prism-router', 'retention');
+	} catch (e) {
+		rsec = null;
+	}
+	c.retention_owns_daily = (rsec != null)
+		&& (to_int(cfg_str(cur, 'prism-router', 'retention', 'enabled', '1'), 1) != 0);
+
+	/* clash_secret 留空 -> 自动读 openclash 的控制器密码（契约 §2） */
+	if (c.clash_secret == '') {
+		c.clash_secret = cfg_str(cur, 'openclash', 'config', 'dashboard_password', '');
+	}
+
+
+	let sd = getenv('PRISM_ROUTER_STATE_DIR');
+	c.state_dir = (sd != null && sd != '') ? sd : STATE_DIR_DEFAULT;
+	let dd = getenv('PRISM_ROUTER_DAILY_DIR');
+	c.daily_dir = (dd != null && dd != '') ? dd : DAILY_DIR_DEFAULT;
+	/* 设备元数据（别名/分组/首次出现）：rpcd 与守护进程共用的同一个文件 */
+	c.devices_file = env_path('PRISM_ROUTER_DEVICES_FILE', DEVICES_FILE_DEFAULT);
+	let cf = getenv('PRISM_ROUTER_CONNTRACK_FILE');
+	c.conntrack_file = (cf != null && cf != '') ? cf : CONNTRACK_FILE;
+	let ca = getenv('PRISM_ROUTER_CLASH_API');
+	if (ca != null && ca != '') c.clash_api = ca;
+	c.debug = getenv('PRISM_ROUTER_DEBUG') != null;
+	c.once = (getenv('PRISM_ROUTER_ONCE') != null);
+	c.once_polls = clamp(to_int(getenv('PRISM_ROUTER_ONCE_POLLS'), 1), 1, 1000);
+	/* 仅测试：模拟第 N 轮跨天（验证日切失败 pending 重试）；生产不设置。 */
+	c.test_rollover_after = clamp(to_int(getenv('PRISM_ROUTER_TEST_ROLLOVER_AFTER'), 0), 0, 100000);
+
+	/* /proc 与 sysfs 读取路径：默认走真实内核接口，测试用环境变量指向固定内容 */
+	let pd = env_path('PRISM_ROUTER_PROC_DIR', '/proc');
+	c.proc_stat = env_path('PRISM_ROUTER_PROC_STAT', pd + '/stat');
+	c.proc_meminfo = env_path('PRISM_ROUTER_PROC_MEMINFO', pd + '/meminfo');
+	c.proc_loadavg = env_path('PRISM_ROUTER_PROC_LOADAVG', pd + '/loadavg');
+	c.proc_uptime = env_path('PRISM_ROUTER_PROC_UPTIME', pd + '/uptime');
+	c.proc_cpuinfo = env_path('PRISM_ROUTER_PROC_CPUINFO', pd + '/cpuinfo');
+	c.proc_net_dev = env_path('PRISM_ROUTER_PROC_NET_DEV', pd + '/net/dev');
+	c.proc_net_route = env_path('PRISM_ROUTER_PROC_NET_ROUTE', pd + '/net/route');
+	c.thermal_file = env_path('PRISM_ROUTER_THERMAL', '/sys/class/thermal/thermal_zone0/temp');
+	c.df_bin = env_path('PRISM_ROUTER_DF', 'df');
+	c.rootfs = env_path('PRISM_ROUTER_ROOTFS', '/');
+
+	for (let a in ARGV) {
+		if (a == '--once') c.once = true;
+		else if (a == '--debug') c.debug = true;
+		else if (a == '--version') {
+			printf('prism-routerd %s\n', DAEMON_VERSION);
+			exit(0);
+		}
+	}
+
+	return c;
+}
+
+function dbg(ctx, msg) {
+	if (ctx != null && ctx.cfg != null && ctx.cfg.debug) warn('prism-routerd: ' + msg + '\n');
+}
+
+/* ------------------------------------------------------------------ *
+ * 设备元数据（/etc/prism-router/devices.json）—— 只负责 first_seen
+ * ------------------------------------------------------------------ *
+ * 文件是 rpcd（set_device_meta 写 alias/group）与本进程（首次出现时写 first_seen）
+ * 的共同数据源，所以两边都必须「先读盘、只改自己那几把键、再原子写回」，绝不能
+ * 拿内存里的整份对象直接覆盖磁盘（否则会把对方刚写进去的字段抹掉）。
+ *
+ * 任何异常（文件缺失 / 半截 JSON / 字段类型错）都退化成空对象，绝不影响主统计：
+ * 本函数只在 poll() 末尾调用，失败只写调试日志。
+ */
+
+/** 只保留已知字段；MAC 统一小写冒号格式，alias/group 去控制字符并截断。 */
+function devices_meta_read(path) {
+	let out = {};
+	let txt = null;
+	try {
+		txt = fs.readfile(path);
+	} catch (e) {
+		txt = null;
+	}
+	if (txt == null || txt == '') return out;
+
+	let raw = null;
+	try {
+		raw = json(txt);
+	} catch (e) {
+		return out;
+	}
+	if (type(raw) != 'object') return out;
+
+	let n = 0;
+	for (let key in raw) {
+		let mac = lc(replace(str(key), '-', ':'));
+		if (!is_mac(mac)) continue;
+
+		let v = raw[key];
+		if (type(v) != 'object') continue;
+
+		let e = {};
+		let seen = to_int(v.first_seen, 0);
+		if (seen > 0) e.first_seen = seen;
+		let alias = str(v.alias);
+		if (alias != '') e.alias = cut_text(alias, DEVICE_META_TEXT_MAX);
+		let group = str(v.group);
+		if (group != '') e.group = cut_text(group, DEVICE_META_TEXT_MAX);
+
+		if (length(keys(e)) == 0) continue;
+
+		out[mac] = e;
+		if (++n >= DEVICE_META_MAX) break;
+	}
+
+	return out;
+}
+
+/** 上限裁剪：有 alias/group 的先留（用户手动命名的设备），其余按 first_seen 从新到旧。 */
+function devices_meta_prune(meta) {
+	let macs = keys(meta);
+	if (length(macs) <= DEVICE_META_MAX) return meta;
+
+	let keep = {}, n = 0;
+	for (let mac in macs) {
+		if (n >= DEVICE_META_MAX) break;
+		if (meta[mac].alias == null && meta[mac].group == null) continue;
+		keep[mac] = meta[mac];
+		n++;
+	}
+
+	let rest = [];
+	for (let mac in macs)
+		if (keep[mac] == null) push(rest, mac);
+
+	rest = sort(rest, function(a, b) {
+		return to_int(meta[b].first_seen, 0) - to_int(meta[a].first_seen, 0);
+	});
+
+	for (let i = 0; i < length(rest) && n < DEVICE_META_MAX; i++) {
+		keep[rest[i]] = meta[rest[i]];
+		n++;
+	}
+
+	return keep;
+}
+
+/** devices.json 是否损坏（存在但不是合法 JSON 对象）。
+ *  只用于「没有新设备时也把坏文件修回合法 JSON」；正常读取仍走 devices_meta_read()。 */
+function devices_meta_broken(path) {
+	let txt = null;
+	try {
+		txt = fs.readfile(path);
+	} catch (e) {
+		return false;
+	}
+	if (txt == null)
+		return false;
+	if (trim(txt) == '')
+		return true;
+	try {
+		let o = json(txt);
+		return (type(o) != 'object');
+	} catch (e) {
+		return true;
+	}
+}
+
+function devices_meta_write(path, meta) {
+	let dir = fs.dirname(path);
+	if (dir != null && dir != '' && dir != '/' && !mkpath(dir)) return false;
+
+	/* /etc 在 overlay flash 上：只有真的出现新 MAC 时才走到这里，写入频率极低 */
+	return atomic_write_perm(path, jenc(devices_meta_prune(meta)) + '\n', 420 /* 0644 */);
+}
+
+/* devices.json 是守护进程（first_seen）与 rpcd（alias/group）两个写者的共同文件。
+ * 两边都必须「拿锁 -> 重读 -> 只改自己的键 -> 原子写 -> 放锁」，只靠「读改写 +
+ * pid 临时名」仍会丢更新。ucode 没有 flock，这里用 mkdir 的原子性做互斥：
+ *   - 有限重试（约 1.5 秒），拿不到锁就让本次更新失败、下一轮再试；
+ *   - 锁目录里写 owner（pid + 进程内唯一 token）。陈旧锁回收必须先用 rename
+ *     把原锁整体挪到自己的唯一 stale 路径，只有 rename 成功的一方才能删除它：
+ *     避免两个写者同时 unlink/rmdir 同一个目录时把对方刚建的新锁删掉；
+ *   - 释放时校验 owner 是否仍属于自己，绝不动别人的锁。
+ * 协议必须与 luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc 完全一致。 */
+const DEVICE_LOCK_STALE_SECONDS = 25;
+const DEVICE_LOCK_RETRY_MS = 25;
+const DEVICE_LOCK_RETRIES = 60;
+
+let lock_seq = 0;
+let lock_pid = 0;
+let lock_rnd = '';
+
+/** ucode 没有 getpid()：从 /proc/self/stat 读第一个字段。失败用时间兜底（仅用于诊断）。 */
+function lock_owner_pid() {
+	if (lock_pid > 0) return lock_pid;
+	let txt = '';
+	try { txt = str(fs.readfile('/proc/self/stat')); } catch (e) { txt = ''; }
+	let n = 0;
+	for (let i = 0; i < length(txt); i++) {
+		let ch = substr(txt, i, 1);
+		if (ch < '0' || ch > '9') break;
+		n = n * 10 + ord(ch) - 48;
+	}
+	if (n <= 0) n = int(time() % 1000000) + 1;
+	lock_pid = n;
+	return lock_pid;
+}
+
+/** 随机唯一值：优先内核 uuid；读不到时退到高精度时钟（仍有 pid+序号保证唯一）。 */
+function lock_owner_nonce() {
+	if (lock_rnd != '') return lock_rnd;
+	try {
+		lock_rnd = replace(trim(str(fs.readfile('/proc/sys/kernel/random/uuid'))), '-', '');
+	} catch (e) {
+		lock_rnd = '';
+	}
+	if (lock_rnd == '') lock_rnd = sprintf('%d%d', int(time()), int(clock()[1]));
+	return lock_rnd;
+}
+
+/** owner 内容：pid|秒|随机唯一值|序号。 */
+function lock_owner_token() {
+	lock_seq++;
+	let cl = clock();
+	return sprintf('%d|%d|%s|%d', lock_owner_pid(), int(time()), lock_owner_nonce(), lock_seq);
+}
+
+/** 返回 { path, token }；null = 拿不到锁（调用方快速失败，下一轮再试）。 */
+function device_lock_acquire(path) {
+	let lock = path + '.lock';
+	for (let i = 0; i < DEVICE_LOCK_RETRIES; i++) {
+		if (fs.mkdir(lock, 448 /* 0700 */)) {
+			let token = lock_owner_token();
+			let n = fs.writefile(lock + '/owner', token + '\n');
+			if (type(n) == 'int') return { path: lock, token: token };
+			/* 刚创建的锁写不进 owner（磁盘满/权限异常）：清掉自己再失败，
+			 * 绝不把一个没有 owner 的锁留给后续写者误判。 */
+			try { fs.unlink(lock + '/owner'); } catch (e) { }
+			try { fs.rmdir(lock); } catch (e) { }
+			return null;
+		}
+
+		let st = null;
+		try { st = fs.stat(lock); } catch (e) { st = null; }
+		if (st != null && (time() - to_int(st.mtime, 0)) >= DEVICE_LOCK_STALE_SECONDS) {
+			/* 陈旧锁：rename 是原子操作，多个回收者里只有一个成功。
+			 * 失败者不能碰原路径（可能已被别人重建），下一轮按新锁重试。 */
+			let stale = lock + '.stale.' + lock_owner_token();
+			if (fs.rename(lock, stale)) {
+				try { fs.unlink(stale + '/owner'); } catch (e) { }
+				try { fs.rmdir(stale); } catch (e) { }
+				continue; /* 立刻重试 mkdir，不白等一个 sleep */
+			}
+		}
+		sleep(DEVICE_LOCK_RETRY_MS);
+	}
+	return null;
+}
+
+function device_lock_release(lock) {
+	if (lock == null) return false;
+	let dir = (type(lock) == 'object') ? str(lock.path) : str(lock);
+	let token = (type(lock) == 'object') ? str(lock.token) : '';
+	if (dir == '') return false;
+
+	/* 只有 owner 仍等于自己才删除：陈旧锁被回收后目录可能已经属于新写者。 */
+	let cur = null;
+	try { cur = fs.readfile(dir + '/owner'); } catch (e) { cur = null; }
+	if (token != '' && (cur == null || trim(str(cur)) != token)) return false;
+
+	try { fs.unlink(dir + '/owner'); } catch (e) { }
+	try { fs.rmdir(dir); } catch (e) { }
+	return true;
+}
+
+/**
+ * 记录「首次出现」：只给还没有 first_seen 的 MAC 补一个时间，然后原子写回。
+ * 没有新设备时最多每 30 秒读一次 devices.json（缓存），不会每轮 poll 都碰闪存。
+ */
+function first_seen_track(ctx) {
+	let path = ctx.cfg.devices_file;
+	let want = false;
+
+	for (let ip in ctx.devices) {
+		let mac = lc(str(ctx.devices[ip].mac));
+		if (!is_mac(mac)) continue;
+		let e = (ctx.devices_meta != null) ? ctx.devices_meta[mac] : null;
+		if (e == null || to_int(e.first_seen, 0) <= 0) { want = true; break; }
+	}
+
+	if (!want) {
+		if (ctx.devices_meta == null
+			|| ctx.now < ctx.devices_meta_ts
+			|| (ctx.now - ctx.devices_meta_ts) >= 30) {
+			let broken = devices_meta_broken(path);
+			ctx.devices_meta = devices_meta_read(path);
+			ctx.devices_meta_ts = ctx.now;
+
+			/* 没有新设备也要把损坏的 devices.json 修回合法 JSON：
+			 * 否则 rpcd 侧一直读到空对象，用户改的别名永远落不了盘。 */
+			if (broken) {
+				let lock = device_lock_acquire(path);
+				if (lock != null) {
+					if (devices_meta_broken(path) && !devices_meta_write(path, {}))
+						dbg(ctx, 'repair ' + path + ' failed: ' + str(fs.error()));
+					device_lock_release(lock);
+				}
+			}
+		}
+		return;
+	}
+
+	/* 有新设备：拿 devices.json 锁，再从磁盘重读并合并（rpcd 可能刚写进 alias/group，
+	   不能被覆盖；拿不到锁就下一轮再试，绝不无锁覆盖）。 */
+	let lock_dir = fs.dirname(path);
+	if (lock_dir != null && lock_dir != '' && lock_dir != '/')
+		mkpath(lock_dir);
+	let lock = device_lock_acquire(path);
+	if (lock == null) {
+		dbg(ctx, 'devices.json lock busy, retry next poll');
+		return;
+	}
+
+	let disk = devices_meta_read(path);
+	let changed = false;
+
+	for (let ip in ctx.devices) {
+		let mac = lc(str(ctx.devices[ip].mac));
+		if (!is_mac(mac)) continue;
+
+		let e = disk[mac];
+		if (e == null) {
+			disk[mac] = { first_seen: ctx.now };
+			changed = true;
+		} else if (to_int(e.first_seen, 0) <= 0) {
+			e.first_seen = ctx.now;
+			changed = true;
+		}
+	}
+
+	if (changed) {
+		if (!devices_meta_write(path, disk)) {
+			dbg(ctx, 'write ' + path + ' failed: ' + str(fs.error()));
+			device_lock_release(lock);
+			return;          /* 写失败时保留旧缓存，下一轮再试 */
+		}
+		dbg(ctx, 'first_seen: ' + sprintf('%d', length(keys(disk))) + ' devices -> ' + path);
+	}
+
+	device_lock_release(lock);
+	ctx.devices_meta = disk;
+	ctx.devices_meta_ts = ctx.now;
+}
+
+
+/* ------------------------------------------------------------------ *
+ * LAN / fake-ip 网段识别
+ * ------------------------------------------------------------------ */
+
+/** 解析 `ip -4 -o addr show` -> { ifname: [ "a.b.c.d/len", ... ] } */
+function read_if_addrs() {
+	let out = {};
+	let txt = null;
+	try {
+		let p = fs.popen('ip -4 -o addr show 2>/dev/null', 'r');
+		txt = p.read('all');
+		p.close();
+	} catch (e) {
+		txt = null;
+	}
+	if (txt == null) return out;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		/* 形如: 16: br-lan    inet 192.168.100.1/24 brd ... */
+		if (length(t) < 4) continue;
+		if (t[2] != 'inet') continue;
+		let dev = substr(t[1], 0, length(t[1]) - 1);
+		if (out[dev] == null) out[dev] = [];
+		push(out[dev], t[3]);
+	}
+	return out;
+}
+
+/** LAN 网段：优先 config 里的 lan_ranges，其次 firewall lan zone 的网络，最后兜底 */
+function detect_lan_cidrs(cur, cfg) {
+	let raw = [];
+	if (length(cfg.lan_ranges) > 0) {
+		for (let s in cfg.lan_ranges) push(raw, s);
+	}
+
+	if (length(raw) == 0) {
+		let addrs = read_if_addrs();
+		let nets = null;
+		try {
+			nets = cur.get('firewall', '@zone[0]', 'network');
+		} catch (e) {
+			nets = null;
+		}
+		if (type(nets) != 'array' || length(nets) == 0) nets = ['lan'];
+
+		for (let n in nets) {
+			let dev = null;
+			try {
+				dev = cur.get('network', n, 'device');
+				if (dev == null) dev = cur.get('network', n, 'ifname');
+			} catch (e) {
+				dev = null;
+			}
+			if (type(dev) == 'array') dev = length(dev) > 0 ? str(dev[0]) : null;
+			dev = str(dev);
+			if (dev == '') dev = 'br-' + n;
+
+			if (addrs[dev] != null) {
+				for (let a in addrs[dev]) push(raw, a);
+				continue;
+			}
+			let ip = null, mask = null;
+			try {
+				ip = cur.get('network', n, 'ipaddr');
+				mask = cur.get('network', n, 'netmask');
+			} catch (e) {
+				ip = null;
+			}
+			let c = cidr_from_ip_mask(str(ip), str(mask));
+			if (c != null) push(raw, c);
+		}
+
+		if (length(raw) == 0 && addrs['br-lan'] != null) {
+			for (let a in addrs['br-lan']) push(raw, a);
+		}
+		if (length(raw) == 0) {
+			for (let dev in keys(addrs)) {
+				if (dev == 'lo' || substr(dev, 0, 3) == 'tun' || substr(dev, 0, 2) == 'wg'
+					|| substr(dev, 0, 6) == 'docker' || substr(dev, 0, 4) == 'veth'
+					|| substr(dev, 0, 9) == 'tailscale' || substr(dev, 0, 2) == 'pp')
+					continue;
+				for (let a in addrs[dev]) push(raw, a);
+			}
+		}
+	}
+
+	let out = [];
+	for (let s in raw) {
+		let c = parse_cidr(s);
+		if (c != null) push(out, c);
+	}
+	return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * 设备身份：/tmp/dhcp.leases -> { ip: { mac, hostname } }
+ * ------------------------------------------------------------------ */
+
+function load_leases(ctx) {
+	let now = time();
+	if (now - ctx.leases_ts < 30) return;
+	ctx.leases_ts = now;
+	let txt = fs.readfile(LEASES_FILE);
+	let m = {};
+	if (txt != null) {
+		for (let line in split(txt, '\n')) {
+			if (line == '') continue;
+			let f = split_ws(line);
+			/* 格式: expiry mac ip hostname clientid */
+			if (length(f) < 4) continue;
+			let ip = f[2];
+			if (ipv4_int(ip) == null) continue;
+			let host = f[3];
+			if (host == '*') host = '';
+			m[ip] = { mac: f[1], hostname: host };
+		}
+	}
+	ctx.leases = m;
+}
+
+function dev_identity(ctx, ip) {
+	let l = ctx.leases[ip];
+	if (l == null) return { mac: '', hostname: '' };
+	return l;
+}
+
+/* ------------------------------------------------------------------ *
+ * 接入方式（无线 / 有线）：brctl showmacs FDB -> mac 所在桥端口
+ * ------------------------------------------------------------------ *
+ * 这台机器上**没有 bridge 命令**，只有 /usr/sbin/brctl（busybox）。
+ * 判定链：设备 MAC --(FDB)--> 桥端口 --(无线上联端口集合)--> wifi / wired。
+ *   - 无线上联端口 = ap_macs 反查结果（优先），否则就用 wireless_ports
+ *   - FDB 里查不到设备 MAC（静态 IP / 未学到）-> unknown
+ * 分类必须与字节累加同步：conntrack 与 clash 两侧每笔增量都进且只进一个桶，
+ * 保证 wifi + wired + unknown == direct + proxy（见 build_state）。
+ */
+
+/** 定位 brctl：env 覆盖 > PATH（测试注入假 brctl 走这里）> 固定路径 > 裸名字 */
+function resolve_brctl() {
+	let env = getenv('PRISM_ROUTER_BRCTL');
+	if (env != null && env != '') return env;
+
+	let found = '';
+	try {
+		let p = fs.popen('command -v brctl 2>/dev/null', 'r');
+		found = trim(p.read('all'));
+		p.close();
+	} catch (e) {
+		found = '';
+	}
+	if (found != '') return found;
+
+	for (let c in [ '/usr/sbin/brctl', '/sbin/brctl', '/usr/bin/brctl', '/bin/brctl' ]) {
+		if (fs.stat(c) != null) return c;
+	}
+	return 'brctl';
+}
+
+/** 端口集合的文本形式（health / 日志用） */
+function ports_txt(list) {
+	let out = [];
+	for (let p in list) push(out, sprintf('%d', p));
+	return join(',', out);
+}
+
+/** 解析 `brctl showmacs <bridge>`：每行 "port mac is-local?"，返回 {map, lines, parsed} */
+function parse_fdb(text) {
+	let map = {}, lines = 0, parsed = 0;
+	for (let line in split(text, '\n')) {
+		let l = trim(line);
+		if (l == '') continue;
+		lines++;
+		let t = split_ws(l);
+		if (length(t) < 2) continue;
+		let port = to_int(t[0], -1);
+		if (port < 0) continue;
+		let mac = lc(t[1]);
+		if (!is_mac(mac)) continue;
+		map[mac] = port;
+		parsed++;
+	}
+	return { map: map, lines: lines, parsed: parsed };
+}
+
+/** 用 ap_macs 反查无线上联端口；查不到时保持 wireless_ports 原值并返回原因 */
+function resolve_link_ports(ctx) {
+	ctx.link_ap_ports = [];
+	ctx.link_ports = ctx.cfg.wireless_ports;
+
+	if (length(ctx.cfg.ap_macs) == 0) return '';
+
+	let ports = [], missing = [];
+	for (let m in ctx.cfg.ap_macs) {
+		let p = ctx.link_fdb[m];
+		if (p == null) {
+			push(missing, m);
+			continue;
+		}
+		let dup = false;
+		for (let q in ports) {
+			if (q == p) { dup = true; break; }
+		}
+		if (!dup) push(ports, p);
+	}
+
+	if (length(ports) > 0) {
+		ctx.link_ports = sort(ports, function(a, b) { return a - b; });
+		ctx.link_ap_ports = ctx.link_ports;
+		ctx.link_ports_from = 'ap_macs';
+		return '';
+	}
+
+	ctx.link_ports_from = (length(ctx.link_ports) > 0) ? 'wireless_ports' : 'none';
+	return 'link: ap_macs 未在 ' + ctx.cfg.lan_bridge + ' 的 FDB 中找到（' + join(',', missing)
+		+ '），保持 wireless_ports=' + (length(ctx.link_ports) > 0 ? ports_txt(ctx.link_ports) : '空');
+}
+
+/**
+ * 读一次 FDB。成功 -> health.link_source="brctl"；失败/输出无法解析 -> "none" + link_error。
+ * 任何失败都只影响接入方式分类，绝不影响 direct/proxy 的统计。
+ */
+function fdb_refresh(ctx) {
+	ctx.link_last = (ctx.now > 0) ? ctx.now : time();
+	ctx.link_cache = {};
+	ctx.link_fdb = {};
+	ctx.link_entries = 0;
+	ctx.link_error = '';
+	ctx.link_source = 'none';
+
+	let out = ctx.cfg.state_dir + '/.fdb.out';
+	let err = ctx.cfg.state_dir + '/.fdb.err';
+	unlink_quiet([ out, err ]);
+
+	let cmd = shell_quote(ctx.link_brctl) + ' showmacs ' + shell_quote(ctx.cfg.lan_bridge)
+		+ ' > ' + shell_quote(out) + ' 2> ' + shell_quote(err);
+	let rc = -1;
+	try {
+		rc = system([ 'sh', '-c', cmd ]);
+	} catch (e) {
+		rc = -1;
+	}
+
+	let text = null;
+	try {
+		text = fs.readfile(out);
+	} catch (e) {
+		text = null;
+	}
+	let errtext = substr(replace(trim(str(fs.readfile(err))), '\n', ' '), 0, 100);
+	unlink_quiet([ out, err ]);
+
+	if (rc != 0) {
+		ctx.link_error = 'link: brctl showmacs ' + ctx.cfg.lan_bridge + ' 失败（rc=' + rc
+			+ (errtext != '' ? '，' + errtext : '') + '），接入方式无法判定';
+		resolve_link_ports(ctx);
+		return;
+	}
+
+	let p = parse_fdb(str(text));
+	if (p.lines > 0 && p.parsed == 0) {
+		ctx.link_error = 'link: brctl showmacs ' + ctx.cfg.lan_bridge + ' 输出无法解析（'
+			+ p.lines + ' 行），接入方式无法判定';
+		resolve_link_ports(ctx);
+		return;
+	}
+
+	ctx.link_source = 'brctl';
+	ctx.link_fdb = p.map;
+	ctx.link_entries = p.parsed;
+
+	let reason = resolve_link_ports(ctx);
+	if (reason != '') ctx.link_error = reason;
+}
+
+/** 到了 link_refresh 才重新读 FDB；首轮（link_last=0）必定读一次 */
+function link_maybe_refresh(ctx) {
+	let now = (ctx.now > 0) ? ctx.now : time();
+	if (ctx.link_last > 0 && now - ctx.link_last < ctx.cfg.link_refresh) return;
+	fdb_refresh(ctx);
+}
+
+/** 是否配置了接入方式判定（只在配置过时才把 link 失败写进 health.reasons） */
+function link_configured(ctx) {
+	return (length(ctx.cfg.ap_macs) > 0) || (length(ctx.cfg.wireless_ports) > 0);
+}
+
+/** MAC -> wifi | wired | unknown */
+function link_of_mac(ctx, mac) {
+	let m = lc(str(mac));
+	if (m == '') return 'unknown';
+	let port = ctx.link_fdb[m];
+	if (port != null) {
+		/* 配了接入判定但端口暂时解析不出（例如 AP 自己的 MAC 刚好从 FDB 老化掉）时，
+		   不要武断判成 wired——那会覆盖正确记忆、把无线设备永久算成有线。
+		   完全没配置时按契约走原有行为（FDB 里学到的设备归 wired）。 */
+		if (length(ctx.link_ports) == 0 && link_configured(ctx)) return 'unknown';
+		let v = 'wired';
+		for (let p in ctx.link_ports) {
+			if (p == port) { v = 'wifi'; break; }
+		}
+		/* 记住判定结果：桥 FDB 老化时间只有 30 秒，空闲设备会从表里消失，
+		   若每次都重新判定，睡眠中的手机/音箱会被错算进 unknown 桶。 */
+		if (ctx.link_mem == null) ctx.link_mem = {};
+		ctx.link_mem[m] = v;
+		return v;
+	}
+	/* FDB 里暂时没有（空闲老化）→ 沿用上次判定 */
+	if (ctx.link_mem != null && ctx.link_mem[m] != null) return ctx.link_mem[m];
+	return 'unknown';
+}
+
+/** 设备 IP -> wifi | wired | unknown（每轮缓存：一条流查一次就够） */
+function dev_link(ctx, ip) {
+	if (ip == null || ip == '') return 'unknown';
+	let cached = ctx.link_cache[ip];
+	if (cached != null) return cached;
+	let link = link_of_mac(ctx, dev_identity(ctx, ip).mac);
+	ctx.link_cache[ip] = link;
+	return link;
+}
+
+/** 把增量同步累加到对应接入桶（必须与 direct/proxy 的累加一一对应） */
+function link_add(ctx, link, rx, tx) {
+	let t = ctx.totals;
+	if (link == 'wifi') {
+		t.wifi_rx += rx;
+		t.wifi_tx += tx;
+	} else if (link == 'wired') {
+		t.wired_rx += rx;
+		t.wired_tx += tx;
+	} else {
+		t.unknown_rx += rx;
+		t.unknown_tx += tx;
+	}
+}
+
+/* ------------------------------------------------------------------ *
+ * 设备记录
+ * ------------------------------------------------------------------ */
+
+function dev_slot(ctx, ip) {
+	let d = ctx.devices[ip];
+	if (d != null) return d;
+	d = {
+		ip: ip,
+		mac: '',
+		hostname: '',
+		direct_rx: 0, direct_tx: 0,
+		proxy_rx: 0, proxy_tx: 0,
+		rx_rate: 0, tx_rate: 0,
+		last_seen: 0,
+		apps: {}
+	};
+	ctx.devices[ip] = d;
+	if (length(ctx.devices) > MAX_TRACK_DEVICES) evict_device(ctx);
+	return d;
+}
+
+evict_device = function(ctx) {
+	let worst = null, worst_v = null;
+	for (let ip in ctx.devices) {
+		let v = ctx.devices[ip].last_seen;
+		if (worst_v == null || v < worst_v) {
+			worst_v = v;
+			worst = ip;
+		}
+	}
+	if (worst != null) delete ctx.devices[worst];
+};
+
+/* ------------------------------------------------------------------ *
+ * clash /connections 采集
+ * ------------------------------------------------------------------ */
+
+function clash_url(ctx) {
+	let origin = parse_clash_origin(ctx.cfg.clash_api);
+	if (origin == '') return '';
+	return origin + '/connections';
+}
+
+/** curl 的 -m 超时（秒）：与 fetch_clash 共用，故障续期 TTL 必须覆盖它。 */
+function clash_fetch_timeout(ctx) {
+	return clamp(to_int(ctx.cfg.poll_interval, 5) * 2, 2, 10);
+}
+
+/** 取一次 /connections；返回 { ok, conns, n, ms, reason } */
+function fetch_clash(ctx) {
+	let t0 = clock();
+	let res = { ok: false, conns: [], ms: 0, reason: '', http: 0, n: 0 };
+	let url = clash_url(ctx);
+	if (url == '') {
+		res.reason = 'clash: clash_api 配置无效（只支持 http(s)://host:port 或 host:port）';
+		res.ms = elapsed_ms(t0);
+		return res;
+	}
+	let body = ctx.cfg.state_dir + '/.clash.body';
+	let code = ctx.cfg.state_dir + '/.clash.code';
+	let errf = ctx.cfg.state_dir + '/.clash.err';
+	let timeout = clash_fetch_timeout(ctx);
+	let cmd = 'curl -sS -m ' + timeout + ' -K - -o ' + shell_quote(body)
+		+ " -w '%{http_code}' " + shell_quote(url)
+		+ ' > ' + shell_quote(code) + ' 2> ' + shell_quote(errf);
+
+	try {
+		let p = fs.popen(cmd, 'w');
+		if (ctx.cfg.clash_secret != '') {
+			/* 走 curl 配置的 stdin，避免 secret 出现在 ps 命令行里 */
+			let sec = sanitize_secret(ctx.cfg.clash_secret);
+			p.write("header = \"Authorization: Bearer " + sec + "\"\n");
+		}
+		p.close();
+	} catch (e) {
+		res.reason = 'clash: 执行 curl 失败（' + str(e) + '）';
+		res.ms = elapsed_ms(t0);
+		unlink_quiet([body, code, errf]);
+		return res;
+	}
+
+	let http = to_int(str(fs.readfile(code)), 0);
+	res.http = http;
+	let text = null;
+	try {
+		text = fs.readfile(body);
+	} catch (e) {
+		text = null;
+	}
+
+	if (http != 200) {
+		let errtext = trim(str(fs.readfile(errf)));
+		if (http == 0) {
+			res.reason = 'clash: 无法连接 ' + ctx.cfg.clash_api
+				+ (errtext != '' ? '（' + substr(replace(errtext, '\n', ' '), 0, 90) + '）' : '');
+		} else if (http == 401 || http == 403) {
+			res.reason = 'clash: 认证失败 HTTP ' + http + '（检查 clash_secret / openclash.config.dashboard_password）';
+		} else {
+			let detail = (text != null && text != '') ? substr(replace(text, '\n', ' '), 0, 90) : '';
+			res.reason = 'clash: HTTP ' + http + (detail != '' ? ' ' + detail : '');
+		}
+		res.ms = elapsed_ms(t0);
+		unlink_quiet([body, code, errf]);
+		return res;
+	}
+
+	let obj = null;
+	try {
+		obj = (text != null && text != '') ? json(text) : null;
+	} catch (e) {
+		obj = null;
+	}
+	if (type(obj) != 'object' || type(obj.connections) != 'array') {
+		res.reason = 'clash: /connections 返回的不是预期 JSON 结构';
+		res.ms = elapsed_ms(t0);
+		unlink_quiet([body, code, errf]);
+		return res;
+	}
+
+	res.ok = true;
+	res.conns = obj.connections;
+	res.n = length(obj.connections);
+	res.ms = elapsed_ms(t0);
+	unlink_quiet([body, code, errf]);
+	return res;
+}
+
+elapsed_ms = function(t0) {
+	let t1 = clock();
+	return int(((t1[0] - t0[0]) * 1000000000 + (t1[1] - t0[1])) / 1000000);
+};
+
+function ms_between(a, b) {
+	return int(((b[0] - a[0]) * 1000000000 + (b[1] - a[1])) / 1000000);
+}
+
+/* ------------------------------------------------------------------ *
+ * 双源去重（clash 活跃连接 -> conntrack）
+ * ------------------------------------------------------------------ *
+ * fake-ip 只能挡住「目的地址被改写成 fake-ip」的代理流；DIRECT 链以及部分
+ * 未走 fake-ip 的代理流，conntrack 里看到的是真实目的 IP，会和 clash 侧重复。
+ * 所以每轮都用 clash 的**全部活跃连接**建一份去重集合：
+ *
+ *   key = proto|deviceIP|peerIP|devicePort|peerPort
+ *
+ * 其中 deviceIP 是 LAN 设备、peerIP 是外部对端；devicePort 缺失时用 `*`。
+ * 出方向与入方向各建一条，conntrack 按自己的 orig 方向选对应 key。
+ * 集合保留 2 个轮询间隔（至少 DEDUP_TTL_MIN 秒），覆盖两次拉取的时间差。
+ */
+function clash_proto(md) {
+	let p = lc(str(md.network));
+	if (p == 'tcp' || p == 'udp') return p;
+	let t = lc(str(md.type));
+	if (t == 'tcp' || t == 'udp') return t;
+	return '*';
+}
+
+function dedup_key(proto, dev, peer, devport, peerport) {
+	if (dev == '' || peer == '' || peerport == '') return '';
+	return str(proto) + '|' + dev + '|' + peer + '|'
+		+ ((devport != '') ? devport : '*') + '|' + peerport;
+}
+
+function dedup_add(ctx, key, exp) {
+	if (key == '') return;
+	if (length(keys(ctx.clash_dedup)) >= DEDUP_MAX_ENTRIES && ctx.clash_dedup[key] == null) {
+		/* 极端情况下先清过期项，仍满则放弃新键（宁可少去重也不无限涨内存）。 */
+		for (let k in keys(ctx.clash_dedup))
+			if (ctx.clash_dedup[k] < ctx.now) delete ctx.clash_dedup[k];
+		if (length(keys(ctx.clash_dedup)) >= DEDUP_MAX_ENTRIES) return;
+	}
+	ctx.clash_dedup[key] = exp;
+}
+
+/** 一次流在两个方向上的所有可能 key（源端口/协议缺失时包含 `*` 兜底）。 */
+function dedup_keys(proto, dev, peer, devport, peerport) {
+	let out = [];
+	let protos = [ proto ];
+	if (proto != '*') push(protos, '*');
+	let ports = [ (devport != '') ? devport : '*' ];
+	if (devport != '' && devport != '*') push(ports, '*');
+
+	for (let p in protos) {
+		for (let dp in ports) {
+			let key = dedup_key(p, dev, peer, dp, peerport);
+			if (key != '') push(out, key);
+		}
+	}
+	return out;
+}
+
+/** 查 conntrack 流是否命中某张 key->过期时间 的表（去重表 / 故障期 conntrack 表）。
+ *  热路径（每条 conntrack 流）不分配临时数组，直接枚举 proto/源端口两个兜底维度。 */
+function dedup_lookup(map, now, proto, dev, peer, devport, peerport) {
+	if (map == null) return false;
+	let proto2 = (proto != '*') ? '*' : null;
+	let port2 = (devport != '' && devport != '*') ? '*' : null;
+	for (let pi = 0; pi < 2; pi++) {
+		let p = (pi == 0) ? proto : proto2;
+		if (p == null) break;
+		for (let di = 0; di < 2; di++) {
+			let dp = (di == 0) ? ((devport != '') ? devport : '*') : port2;
+			if (dp == null) break;
+			let key = dedup_key(p, dev, peer, dp, peerport);
+			if (key == '') continue;
+			let exp = map[key];
+			if (exp != null && exp >= now) return true;
+		}
+	}
+	return false;
+}
+
+/** 查 conntrack 流是否命中 clash 活跃连接。 */
+function dedup_match(ctx, proto, dev, peer, devport, peerport) {
+	return dedup_lookup(ctx.clash_dedup, ctx.now, proto, dev, peer, devport, peerport);
+}
+
+/**
+ * 去重 key 的保留时长：只由「配置的轮询间隔」和本轮实际 dt 决定，且实际 dt
+ * 最多按 3 个轮询间隔计。绝不能直接用恢复基线后的 dt —— 跨软重启时
+ * last_poll_ts 被锚定到最多 1 小时前，会得到 2 小时的 TTL，把去重键留到
+ * 实际连接早已结束之后。自适应降频的真实 dt 最多也是 3 倍配置间隔。
+ */
+function dedup_ttl(ctx) {
+	let base = to_int(ctx.cfg.poll_interval, 5);
+	if (base < 1) base = 1;
+	let cap = base * 3;
+	let dt = (ctx.poll_dt > 0) ? ctx.poll_dt : base;
+	if (dt > cap) dt = cap;
+	if (dt < 1) dt = 1;
+	return max(DEDUP_TTL_MIN, dt * 2);
+}
+
+/**
+ * 故障期间续期/故障账本的 TTL：必须覆盖「本轮 curl 最长耗时 + 下一轮最长调度
+ * 间隔 + 余量」。下一轮可能在空闲降频后变成 3 倍间隔（上限 30s），不能只按
+ * 当前 poll_interval 算；否则慢 curl 一次跨过 TTL，键会在恢复前被清掉。
+ */
+function dedup_failure_ttl(ctx) {
+	let base = to_int(ctx.cfg.poll_interval, 5);
+	if (base < 1) base = 1;
+	let next = min(base * 3, 30);
+	if (next < base) next = base;
+	let need = clash_fetch_timeout(ctx) + next + DEDUP_TTL_MIN;
+	return max(dedup_ttl(ctx), need);
+}
+
+/** 用本轮 clash 活跃连接重建去重集合（所有链，含 DIRECT / 代理）。 */
+function build_clash_dedup(ctx, conns) {
+	/* 保留 2 轮：自适应降频到 30s 时也能覆盖两次拉取边界；恢复基线的
+	 * 陈旧 dt 已被 dedup_ttl() clamp，不让锚点年龄参与。 */
+	let ttl = dedup_ttl(ctx);
+	let exp = ctx.now + ttl;
+
+	for (let k in keys(ctx.clash_dedup))
+		if (ctx.clash_dedup[k] < ctx.now) delete ctx.clash_dedup[k];
+
+	for (let c in conns) {
+		if (type(c) != 'object') continue;
+		let md = (type(c.metadata) == 'object') ? c.metadata : {};
+		let src = str(md.sourceIP);
+		let dst = str(md.destinationIP);
+		let sport = str(md.sourcePort);
+		let dport = str(md.destinationPort);
+		if (src == '' || dst == '' || dport == '') continue;
+
+		let proto = clash_proto(md);
+		dedup_add(ctx, dedup_key(proto, src, dst, sport, dport), exp);
+		/* 入方向：clash 把 sourceIP 报成 LAN 设备时，conntrack 的 orig 是反的。 */
+		dedup_add(ctx, dedup_key(proto, dst, src, dport, sport), exp);
+	}
+	dbg(ctx, sprintf('clash dedup: entries=%d ttl=%ds dt=%ds',
+		length(keys(ctx.clash_dedup)), ttl, ctx.poll_dt));
+}
+
+/**
+ * clash 拉取失败时续期已有去重键：故障期间 conntrack 仍会看到这些真实目的 IP
+ * 的流，如果键在 TTL 后过期，conntrack 会先按 direct 记账；恢复后 clash 又按
+ * 旧基线把同一段增量算成 proxy，造成双计。
+ *
+ * 关键点（终审阻断 1）：
+ *   - **不删除过期键**。慢 curl 可能一次阻塞 10s，跨过原 TTL；这里从续期时的
+ *     真实 time() 重新计 TTL，并把所有已有的键（包括已过期但本轮还没来得及
+ *     用的）全部续上。过期清理只发生在成功 build_clash_dedup() 时。
+ *   - TTL 覆盖 curl 超时 + 下一轮最长调度间隔 + 余量（见 dedup_failure_ttl）。
+ *   - 表大小仍受 DEDUP_MAX_ENTRIES 限制（只续期、不加新键，不增长）。
+ */
+function renew_clash_dedup_on_failure(ctx) {
+	let now = time();
+	if (now < ctx.now) now = ctx.now;
+	let ttl = dedup_failure_ttl(ctx);
+	let exp = now + ttl;
+	let kept = 0;
+	for (let k in keys(ctx.clash_dedup)) {
+		let old = ctx.clash_dedup[k];
+		/* 只接受内部生成的字符串键 + 正整数过期时间，坏值直接丢弃（不续期）。 */
+		if (type(k) != 'string' || type(old) != 'int' || old <= 0) {
+			delete ctx.clash_dedup[k];
+			continue;
+		}
+		ctx.clash_dedup[k] = exp;
+		kept++;
+	}
+	/* 故障期 conntrack 记录的 5 元组必须保留到「恢复成功轮」：它们是恢复时
+	 * 判断「这条 clash 连接是否已经被 conntrack 按 direct 计过」的唯一依据。
+	 * 同样不在这里删除过期项；只续期。 */
+	let notes = 0;
+	for (let k in keys(ctx.clash_outage_ct)) {
+		let old = ctx.clash_outage_ct[k];
+		if (type(k) != 'string' || type(old) != 'int' || old <= 0) {
+			delete ctx.clash_outage_ct[k];
+			continue;
+		}
+		ctx.clash_outage_ct[k] = exp;
+		notes++;
+	}
+	dbg(ctx, sprintf('clash dedup renewed on failure: entries=%d outage=%d ttl=%ds dt=%ds',
+		kept, notes, ttl, ctx.poll_dt));
+}
+
+/** 故障账本满时淘汰一个最早过期的条目（故障期新流量比旧条目更值得保留）。 */
+function outage_evict_one(ctx) {
+	let worst = null, worst_v = null;
+	for (let k in ctx.clash_outage_ct) {
+		let v = ctx.clash_outage_ct[k];
+		let n = (type(v) == 'int') ? v : 0;
+		if (worst_v == null || n < worst_v) {
+			worst_v = n;
+			worst = k;
+		}
+	}
+	if (worst != null) {
+		delete ctx.clash_outage_ct[worst];
+		return true;
+	}
+	return false;
+}
+
+/** 故障期间 conntrack 已按 direct 记账的流：记录其 key，恢复 clash 时若同一流
+ *  没有旧基线（故障期间新建），不能又把当前累计值全量加一遍。
+ *  过期时间用故障 TTL（覆盖恢复前的整个故障窗口），并随 baseline 持久化。 */
+function outage_note(ctx, proto, dev, peer, devport, peerport) {
+	let ks = dedup_keys(proto, dev, peer, devport, peerport);
+	if (length(ks) == 0) return;
+
+	let now = time();
+	if (now < ctx.now) now = ctx.now;
+	let exp = now + dedup_failure_ttl(ctx);
+
+	/* 有界：先按新键数量腾出槽位，再写入；绝不因为账本满就无界增长。 */
+	let add = 0;
+	for (let key in ks)
+		if (ctx.clash_outage_ct[key] == null) add++;
+	let over = length(keys(ctx.clash_outage_ct)) + add - DEDUP_MAX_ENTRIES;
+	while (over > 0) {
+		if (!outage_evict_one(ctx)) break;
+		over--;
+	}
+	for (let key in ks)
+		ctx.clash_outage_ct[key] = exp;
+}
+
+function outage_seen(ctx, proto, dev, peer, devport, peerport) {
+	return dedup_lookup(ctx.clash_outage_ct, ctx.now, proto, dev, peer, devport, peerport);
+}
+
+/**
+ * clash 侧增量累计
+ *  - id 是稳定键，用上轮快照做差；连接消失时删除快照（最后一次已知值即已计入）
+ *  - chains[0] == "DIRECT" -> 直连；否则代理，节点名 = chains[0]
+ *  - 域名取 metadata.host，空则用 destinationIP:destinationPort
+ *  - 设备用 metadata.sourceIP
+ */
+function accumulate_clash(ctx, conns, priming) {
+	let seen = {};
+	for (let c in conns) {
+		if (type(c) != 'object') continue;
+		let id = str(c.id);
+		if (id == '') continue;
+		seen[id] = 1;
+
+		let md = (type(c.metadata) == 'object') ? c.metadata : {};
+		let dl = to_int(c.download, 0);
+		let ul = to_int(c.upload, 0);
+		if (dl < 0) dl = 0;
+		if (ul < 0) ul = 0;
+
+		/* 没有可用基线（首次安装 / hard reboot / 文件损坏 / 过期）：
+		 * 只记录当前累计值，不把现存连接的全量字节算进第一帧。 */
+		if (priming) {
+			ctx.clash_prev[id] = { rx: dl, tx: ul };
+			continue;
+		}
+
+		let prev = ctx.clash_prev[id];
+		let ddl, dul;
+		if (prev == null) {
+			/* 基线被截断时，没被写进 baseline 的连接不能把当前累计值全量补进
+			 * daily（重启后这些字节其实早已计过）。首轮只采样；下一轮起新连接
+			 * 照常按增量计。 */
+			if (ctx.prime_missing_clash) {
+				ctx.clash_prev[id] = { rx: dl, tx: ul };
+				continue;
+			}
+			/* clash 故障期间 conntrack 可能已经把这条新建流按 direct 计过：
+			 * 恢复时若命中故障期 conntrack 记录，同样只采样，避免双计。 */
+			if (ctx.clash_recovering) {
+				let rs = str(md.sourceIP), rd = str(md.destinationIP);
+				let rsp = str(md.sourcePort), rdp = str(md.destinationPort);
+				let rp = clash_proto(md);
+				if (outage_seen(ctx, rp, rs, rd, rsp, rdp)
+					|| outage_seen(ctx, rp, rd, rs, rdp, rsp)) {
+					ctx.clash_prev[id] = { rx: dl, tx: ul };
+					continue;
+				}
+			}
+			ddl = dl;
+			dul = ul;
+		} else {
+			ddl = dl - prev.rx;
+			dul = ul - prev.tx;
+			/* 计数被重置（连接复用/异常）时以当前值为准 */
+			if (ddl < 0) ddl = dl;
+			if (dul < 0) dul = ul;
+		}
+		ctx.clash_prev[id] = { rx: dl, tx: ul };
+		if (ddl == 0 && dul == 0) continue;
+
+		let chain = '';
+		if (type(c.chains) == 'array' && length(c.chains) > 0) chain = str(c.chains[0]);
+		let is_direct = (chain == 'DIRECT');
+		let node = is_direct ? 'DIRECT' : (chain != '' ? chain : 'UNKNOWN');
+
+		let host = str(md.host);
+		if (host == '') {
+			let dip = str(md.destinationIP);
+			let dport = str(md.destinationPort);
+			host = (dip != '' ? dip : 'unknown') + (dport != '' ? ':' + dport : '');
+		}
+		let ip = str(md.sourceIP);
+
+		/* 接入方式与代理/直连正交：同一笔增量同时进一个 link 桶（不会重复计总量） */
+		link_add(ctx, dev_link(ctx, ip), ddl, dul);
+
+		if (is_direct) {
+			ctx.totals.direct_rx += ddl;
+			ctx.totals.direct_tx += dul;
+			ctx.day_totals.direct_rx += ddl;
+			ctx.day_totals.direct_tx += dul;
+		} else {
+			ctx.totals.proxy_rx += ddl;
+			ctx.totals.proxy_tx += dul;
+			ctx.day_totals.proxy_rx += ddl;
+			ctx.day_totals.proxy_tx += dul;
+		}
+
+		node_add(ctx.nodes, node, ddl, dul);
+		node_add(ctx.day_nodes, node, ddl, dul);
+		store_add(ctx.apps, host, node, ddl, dul, ip, MAX_GLOBAL_APPS);
+		store_add(ctx.day_apps, host, node, ddl, dul, ip, MAX_DAY_APPS);
+		store_add(ctx.poll_apps, host, node, ddl, dul, ip, 0);
+
+		if (ip != '') {
+			let d = dev_slot(ctx, ip);
+			d.last_seen = ctx.now;
+			let ident = dev_identity(ctx, ip);
+			if (ident.mac != '') d.mac = ident.mac;
+			if (ident.hostname != '') d.hostname = ident.hostname;
+			if (is_direct) {
+				d.direct_rx += ddl;
+				d.direct_tx += dul;
+			} else {
+				d.proxy_rx += ddl;
+				d.proxy_tx += dul;
+			}
+			d.rx_rate += ddl;
+			d.tx_rate += dul;
+			store_add(d.apps, host, node, ddl, dul, null, MAX_DEV_APPS);
+			day_dev_add(ctx, ip, ddl, dul);
+			poll_dev_add(ctx, ip, ddl, dul);
+		}
+	}
+
+	/* 已消失的连接：从快照表移除以保证内存有界 */
+	for (let id in keys(ctx.clash_prev)) {
+		if (seen[id] == null) delete ctx.clash_prev[id];
+	}
+	/* 截断基线的「未覆盖条目只采样」只作用于恢复后的第一轮成功采样。 */
+	ctx.prime_missing_clash = false;
+}
+
+node_add = function(store, node, rx, tx) {
+	let n = store[node];
+	if (n == null) {
+		n = { rx: 0, tx: 0 };
+		store[node] = n;
+	}
+	n.rx += rx;
+	n.tx += tx;
+};
+
+day_dev_add = function(ctx, ip, rx, tx) {
+	let d = ctx.day_devices[ip];
+	if (d == null) {
+		d = { rx: 0, tx: 0 };
+		ctx.day_devices[ip] = d;
+	}
+	d.rx += rx;
+	d.tx += tx;
+};
+
+poll_dev_add = function(ctx, ip, rx, tx) {
+	let d = ctx.poll_devs[ip];
+	if (d == null) {
+		d = { rx: 0, tx: 0 };
+		ctx.poll_devs[ip] = d;
+	}
+	d.rx += rx;
+	d.tx += tx;
+};
+
+/* ------------------------------------------------------------------ *
+ * conntrack 采集
+ * ------------------------------------------------------------------ */
+
+function fetch_conntrack(ctx) {
+	let txt = null;
+	try {
+		txt = fs.readfile(ctx.cfg.conntrack_file);
+	} catch (e) {
+		txt = null;
+	}
+	if (txt == null) {
+		return { ok: false, text: null,
+			reason: 'conntrack: 无法读取 ' + ctx.cfg.conntrack_file + '（模块未加载或无权限），直连流量无法统计' };
+	}
+	return { ok: true, text: txt, reason: '' };
+}
+
+/**
+ * 解析单行 conntrack。
+ * 一行里有两组 "src=.. dst=.. sport=.. dport=.. packets=.. bytes=.."，
+ * 第一组是原始方向，第二组是应答方向。
+ * 为了性能这里不对 token 做 split(tok,"=")，只按前缀取需要的字段。
+ */
+function parse_ct_line(line) {
+	let toks = split_ws(line);
+	if (length(toks) < 8) return null;
+	let family = toks[0];
+	if (family != 'ipv4' && family != 'ipv6') return null;
+	let proto = toks[2];
+
+	let groups = [];
+	let cur = null;
+	for (let tk in toks) {
+		let c0 = substr(tk, 0, 1);
+		if (c0 == 's') {
+			if (substr(tk, 0, 4) == 'src=') {
+				cur = { src: substr(tk, 4) };
+				push(groups, cur);
+			} else if (cur != null && substr(tk, 0, 6) == 'sport=') {
+				cur.sport = substr(tk, 6);
+			}
+		} else if (c0 == 'd') {
+			if (cur == null) continue;
+			if (substr(tk, 0, 4) == 'dst=') cur.dst = substr(tk, 4);
+			else if (substr(tk, 0, 6) == 'dport=') cur.dport = substr(tk, 6);
+		} else if (c0 == 'b') {
+			if (cur != null && substr(tk, 0, 6) == 'bytes=') cur.bytes = to_int(substr(tk, 6), 0);
+		} else if (c0 == 'p') {
+			if (cur != null && substr(tk, 0, 8) == 'packets=') cur.packets = to_int(substr(tk, 8), 0);
+		}
+	}
+	if (length(groups) == 0) return null;
+	let orig = groups[0];
+	if (orig.src == null || orig.dst == null) return null;
+	/* bytes= 是否存在取决于 nf_conntrack_acct；缺失时不能假装精确。 */
+	let acct = (orig.bytes != null);
+	if (orig.bytes == null) orig.bytes = 0;
+	let reply = (length(groups) > 1) ? groups[1] : null;
+	if (reply != null && reply.bytes == null) reply.bytes = 0;
+	return { family: family, proto: proto, orig: orig, reply: reply, acct: acct };
+}
+
+/**
+ * conntrack 侧增量累计（只处理直连流量）
+ *
+ * 方向统一按“设备视角”：orig 是设备发出的 -> tx，reply 是设备收到的 -> rx；
+ * 若设备是 orig.dst（外网主动连入），则反过来。
+ */
+function accumulate_conntrack(ctx, text, priming) {
+	let seen = {};
+	let total = 0;
+
+	for (let line in split(text, '\n')) {
+		if (line == '') continue;
+		total++;
+		/* 粗筛：orig 里必须出现 LAN 网段前缀才值得解析，能省掉一大半 tokenize */
+		let maybe = false;
+		for (let pfx in ctx.lan_prefixes) {
+			if (index(line, pfx) >= 0) { maybe = true; break; }
+		}
+		if (!maybe) continue;
+		let flow = parse_ct_line(line);
+		if (flow == null) continue;
+
+		let o = flow.orig;
+		let osrc = ipv4_int(o.src);
+		let odst = ipv4_int(o.dst);
+		let ip = null, dir = 0;
+
+		if (osrc != null && cidr_match(ctx.lan_cidrs, osrc)) {
+			ip = o.src;
+			dir = 1; /* 设备发出 */
+		} else if (odst != null && cidr_match(ctx.lan_cidrs, odst)) {
+			ip = o.dst;
+			dir = 2; /* 设备接收（外网主动连入） */
+		} else {
+			continue; /* 与 LAN 设备无关（路由自身 / clash 的出站腿） */
+		}
+
+		/* 去重 1：orig.dst 落在 fake-ip 段 -> 已被 clash 接管，跳过，绝不重复计入直连 */
+		if (odst != null && cidr_match(ctx.fake_cidrs, odst)) {
+			ctx.fakeip_skipped++;
+			continue;
+		}
+
+		/* LAN 内部互访不计入设备直连，避免把内网流量当外网用量 */
+		if (dir == 1 && odst != null && cidr_match(ctx.lan_cidrs, odst)) continue;
+
+		/* 组播/广播不是外网用量（mDNS、SSDP 之类） */
+		if (odst != null && (odst >= 0xe0000000 || odst == 0xffffffff)) continue;
+
+		let key = flow.proto + '|' + o.src + '|' + str(o.sport) + '|' + o.dst + '|' + str(o.dport);
+		seen[key] = 1;
+
+		let cur_tx = (dir == 1) ? o.bytes : ((flow.reply != null) ? flow.reply.bytes : 0);
+		let cur_rx = (dir == 1) ? ((flow.reply != null) ? flow.reply.bytes : 0) : o.bytes;
+
+		ctx.ct_lan_flows++;
+		if (flow.acct) ctx.ct_acct_flows++;
+
+		/* 去重 2：DIRECT 链 / 非 fake-ip 的代理流，conntrack 里是真实目的 IP，
+		 * 只要命中本轮或上一轮 clash 活跃连接就跳过；同时把快照对齐到当前值，
+		 * 避免 TTL 过期后把已计过的字节再算一遍。 */
+		let dev, peer, devport, peerport;
+		if (dir == 1) {
+			dev = o.src; peer = o.dst; devport = str(o.sport); peerport = str(o.dport);
+		} else {
+			dev = o.dst; peer = o.src; devport = str(o.dport); peerport = str(o.sport);
+		}
+		if (dedup_match(ctx, flow.proto, dev, peer, devport, peerport)) {
+			ctx.clash_deduped++;
+			ctx.ct_prev[key] = { rx: cur_rx, tx: cur_tx };
+			continue;
+		}
+
+		/* 无基线首帧：只采样不记账（避免把现存直连流的全部字节算成新流量）。 */
+		if (priming) {
+			ctx.ct_prev[key] = { rx: cur_rx, tx: cur_tx };
+			continue;
+		}
+
+		let prev = ctx.ct_prev[key];
+		let d_rx, d_tx;
+		if (prev == null) {
+			/* 截断基线的未覆盖流：首轮只采样，避免重启后把已计过的累积字节
+			 * 全量重加（和 clash 侧同一策略）。 */
+			if (ctx.prime_missing_ct) {
+				ctx.ct_prev[key] = { rx: cur_rx, tx: cur_tx };
+				continue;
+			}
+			d_rx = cur_rx;
+			d_tx = cur_tx;
+		} else {
+			d_rx = cur_rx - prev.rx;
+			d_tx = cur_tx - prev.tx;
+			if (d_rx < 0) d_rx = cur_rx;
+			if (d_tx < 0) d_tx = cur_tx;
+		}
+		ctx.ct_prev[key] = { rx: cur_rx, tx: cur_tx };
+		if (d_rx == 0 && d_tx == 0) continue;
+
+		/* clash 故障期间按 direct 记账的流：记下 5 元组，恢复时若 clash 里
+		 * 出现同一条新连接（无旧基线），只采样不再重复加。 */
+		if (ctx.clash_outage_active)
+			outage_note(ctx, flow.proto, dev, peer, devport, peerport);
+
+		link_add(ctx, dev_link(ctx, ip), d_rx, d_tx);
+
+		ctx.totals.direct_rx += d_rx;
+		ctx.totals.direct_tx += d_tx;
+		ctx.day_totals.direct_rx += d_rx;
+		ctx.day_totals.direct_tx += d_tx;
+		node_add(ctx.nodes, 'DIRECT', d_rx, d_tx);
+		node_add(ctx.day_nodes, 'DIRECT', d_rx, d_tx);
+
+		let host = o.dst + (o.dport != null ? ':' + o.dport : '');
+		store_add(ctx.apps, host, 'DIRECT', d_rx, d_tx, ip, MAX_GLOBAL_APPS);
+		store_add(ctx.day_apps, host, 'DIRECT', d_rx, d_tx, ip, MAX_DAY_APPS);
+		store_add(ctx.poll_apps, host, 'DIRECT', d_rx, d_tx, ip, 0);
+
+		let d = dev_slot(ctx, ip);
+		d.last_seen = ctx.now;
+		let ident = dev_identity(ctx, ip);
+		if (ident.mac != '') d.mac = ident.mac;
+		if (ident.hostname != '') d.hostname = ident.hostname;
+		d.direct_rx += d_rx;
+		d.direct_tx += d_tx;
+		d.rx_rate += d_rx;
+		d.tx_rate += d_tx;
+		store_add(d.apps, host, 'DIRECT', d_rx, d_tx, null, MAX_DEV_APPS);
+		day_dev_add(ctx, ip, d_rx, d_tx);
+		poll_dev_add(ctx, ip, d_rx, d_tx);
+	}
+
+	ctx.ct_count = total;
+
+	/* 已消失的流：清理快照表 */
+	for (let key in keys(ctx.ct_prev)) {
+		if (seen[key] == null) delete ctx.ct_prev[key];
+	}
+	ctx.prime_missing_ct = false;
+}
+
+/* ------------------------------------------------------------------ *
+ * 5 分钟桶 / history.json（SPEC §4）
+ * ------------------------------------------------------------------ */
+
+function local_day_str(ts) {
+	let t = localtime(ts);
+	return sprintf('%04d-%02d-%02d', t.year, t.mon, t.mday);
+}
+
+/** 严格校验 YYYY-MM-DD（含真实日历日）。daily / pending 的文件名都由它把关，
+ *  防止从 pending-daily.json 读到的 day 带 `../` 之类字符穿越 daily 目录。 */
+function is_day_str(s) {
+	s = str(s);
+	if (length(s) != 10) return false;
+	for (let i = 0; i < 10; i++) {
+		let ch = substr(s, i, 1);
+		if (i == 4 || i == 7) {
+			if (ch != '-') return false;
+		} else if (ch < '0' || ch > '9') {
+			return false;
+		}
+	}
+	let y = to_int(substr(s, 0, 4), 0);
+	let m = to_int(substr(s, 5, 2), 0);
+	let d = to_int(substr(s, 8, 2), 0);
+	if (y < 1970 || y > 9999 || m < 1 || m > 12 || d < 1) return false;
+	let leap = ((y % 4 == 0) && (y % 100 != 0 || y % 400 == 0));
+	let mdays = [ 31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 ];
+	return d <= mdays[m - 1];
+}
+
+function bucket_ts_of(ts) {
+	return ts - (ts % BUCKET_SECONDS);
+}
+
+function bucket_reset(ctx, bts) {
+	ctx.cur_bucket = {
+		ts: bts,
+		direct_rx: 0, direct_tx: 0, proxy_rx: 0, proxy_tx: 0,
+		apps: {},
+		devs: {}
+	};
+}
+
+function bucket_add(ctx, deltas) {
+	let b = ctx.cur_bucket;
+	if (b == null) return;
+	b.direct_rx += deltas.direct_rx;
+	b.direct_tx += deltas.direct_tx;
+	b.proxy_rx += deltas.proxy_rx;
+	b.proxy_tx += deltas.proxy_tx;
+
+	for (let host in ctx.poll_apps) {
+		let a = ctx.poll_apps[host];
+		let cur = b.apps[host];
+		if (cur == null) {
+			cur = { rx: 0, tx: 0, chain: a.chain };
+			b.apps[host] = cur;
+		}
+		cur.rx += a.rx;
+		cur.tx += a.tx;
+		cur.chain = a.chain;
+	}
+	for (let ip in ctx.poll_devs) {
+		let d = ctx.poll_devs[ip];
+		let cur = b.devs[ip];
+		if (cur == null) {
+			cur = { rx: 0, tx: 0 };
+			b.devs[ip] = cur;
+		}
+		cur.rx += d.rx;
+		cur.tx += d.tx;
+	}
+	/* 桶内应用数有上限，防 P2P 场景膨胀 */
+	while (length(b.apps) > MAX_BUCKET_APPS) delete b.apps[keys(b.apps)[0]];
+}
+
+function bucket_finalize(b) {
+	let apps = [];
+	for (let host in b.apps) push(apps, { host: host, rx: b.apps[host].rx, tx: b.apps[host].tx });
+	apps = sort(apps, function(x, y) { return (y.rx + y.tx) - (x.rx + x.tx); });
+
+	let devs = [];
+	for (let ip in b.devs) push(devs, { ip: ip, rx: b.devs[ip].rx, tx: b.devs[ip].tx });
+	devs = sort(devs, function(x, y) { return (y.rx + y.tx) - (x.rx + x.tx); });
+
+	return {
+		ts: b.ts,
+		direct_rx: b.direct_rx, direct_tx: b.direct_tx,
+		proxy_rx: b.proxy_rx, proxy_tx: b.proxy_tx,
+		top_apps: slice(apps, 0, TOP_PER_BUCKET),
+		top_devices: slice(devs, 0, TOP_PER_BUCKET)
+	};
+}
+
+function history_flush(ctx, force) {
+	let now = ctx.now > 0 ? ctx.now : time();
+	if (!force && ctx.last_history_flush > 0
+		&& now - ctx.last_history_flush < HISTORY_FLUSH_SECONDS)
+		return;
+
+	let buckets = [];
+	for (let b in ctx.buckets) push(buckets, b);
+	if (ctx.cur_bucket != null) push(buckets, bucket_finalize(ctx.cur_bucket));
+
+	mkpath(ctx.cfg.state_dir);
+	let ok = atomic_write(ctx.cfg.state_dir + '/history.json',
+		jenc({ day: ctx.day, buckets: buckets }));
+	ctx.last_history_flush = now;
+	if (!ok) dbg(ctx, 'write history.json failed: ' + str(fs.error()));
+}
+
+/* ------------------------------------------------------------------ *
+ * 每日汇总（/etc/prism-router/daily/YYYY-MM-DD.json）
+ * ------------------------------------------------------------------ */
+
+function day_summary(ctx) {
+	let devices = [];
+	for (let ip in ctx.day_devices) {
+		let d = ctx.day_devices[ip];
+		let ident = dev_identity(ctx, ip);
+		push(devices, {
+			ip: ip, mac: ident.mac, hostname: ident.hostname,
+			rx: d.rx, tx: d.tx
+		});
+	}
+	devices = sort(devices, function(a, b) { return (b.rx + b.tx) - (a.rx + a.tx); });
+
+	let apps = [];
+	for (let host in ctx.day_apps) {
+		let a = ctx.day_apps[host];
+		push(apps, {
+			host: host, rx: a.rx, tx: a.tx, chain: a.chain,
+			devices: (a.dev_count != null) ? a.dev_count : length(a.devs)
+		});
+	}
+	apps = sort(apps, function(a, b) { return (b.rx + b.tx) - (a.rx + a.tx); });
+
+	let nodes = {};
+	for (let k in ctx.day_nodes) nodes[k] = { rx: ctx.day_nodes[k].rx, tx: ctx.day_nodes[k].tx };
+
+	return {
+		day: ctx.day,
+		ts: ctx.now,
+		totals: {
+			direct_rx: ctx.day_totals.direct_rx, direct_tx: ctx.day_totals.direct_tx,
+			proxy_rx: ctx.day_totals.proxy_rx, proxy_tx: ctx.day_totals.proxy_tx,
+			rx: ctx.day_totals.direct_rx + ctx.day_totals.proxy_rx,
+			tx: ctx.day_totals.direct_tx + ctx.day_totals.proxy_tx
+		},
+		nodes: nodes,
+		devices: slice(devices, 0, MAX_OUT_DEVICES),
+		apps: slice(apps, 0, MAX_OUT_APPS)
+	};
+}
+
+/**
+ * 从今天的 daily 文件恢复当日累计（跨软重启 / 进程重启）。
+ * 只认「文件名 == 今天」且文件内 day/ts 也指向今天的数据，坏文件/旧日文件
+ * 一律忽略 —— 绝不能把昨天的量读成今天。daily 格式保持原样（totals/devices/
+ * apps/nodes），老文件没有 apps.devices 明细也能只恢复计数。
+ */
+function daily_restore(ctx) {
+	let path = ctx.cfg.daily_dir + '/' + ctx.day + '.json';
+	ctx.daily_file_present = false;
+	try {
+		if (fs.stat(path) != null)
+			ctx.daily_file_present = true;
+	} catch (e) { }
+
+	let data = load_json(path);
+	if (data == null || type(data) != 'object') return false;
+
+	let file_day = str(data.day);
+	let ts = to_int(data.ts, 0);
+	if (file_day != '') {
+		if (file_day != ctx.day) return false;
+	} else if (ts > 0) {
+		if (local_day_str(ts) != ctx.day) return false;
+	} else {
+		return false;
+	}
+
+	let t = (type(data.totals) == 'object') ? data.totals : {};
+	let has_split = (t.direct_rx != null || t.direct_tx != null
+		|| t.proxy_rx != null || t.proxy_tx != null);
+	let drx, dtx, prx, ptx;
+	if (has_split) {
+		drx = max(0, to_int(t.direct_rx, 0));
+		dtx = max(0, to_int(t.direct_tx, 0));
+		prx = max(0, to_int(t.proxy_rx, 0));
+		ptx = max(0, to_int(t.proxy_tx, 0));
+	} else {
+		/* 老 daily 只有 rx/tx：保留总量，归入 direct（无法还原拆分时不丢数）。 */
+		drx = max(0, to_int(t.rx, 0));
+		dtx = max(0, to_int(t.tx, 0));
+		prx = 0; ptx = 0;
+	}
+	ctx.day_totals = { direct_rx: drx, direct_tx: dtx, proxy_rx: prx, proxy_tx: ptx };
+
+	ctx.day_devices = {};
+	if (type(data.devices) == 'array') {
+		let n = 0;
+		for (let dev in data.devices) {
+			if (type(dev) != 'object' || n >= MAX_OUT_DEVICES) continue;
+			let ip = str(dev.ip);
+			if (ip == '') continue;
+			ctx.day_devices[ip] = {
+				rx: max(0, to_int(dev.rx, 0)),
+				tx: max(0, to_int(dev.tx, 0))
+			};
+			n++;
+		}
+	}
+
+	ctx.day_apps = {};
+	if (type(data.apps) == 'array') {
+		let n = 0;
+		for (let app in data.apps) {
+			if (type(app) != 'object' || n >= MAX_OUT_APPS) continue;
+			let host = str(app.host);
+			if (host == '') continue;
+			let dc = max(0, to_int(app.devices, 0));
+			/* 只恢复计数，没有 IP 明细；用占位键保持 daily 的 devices 字段不变。 */
+			let devs = {};
+			for (let i = 0; i < dc && i < MAX_TRACK_DEVICES; i++) devs['~' + i] = 1;
+			ctx.day_apps[host] = {
+				rx: max(0, to_int(app.rx, 0)),
+				tx: max(0, to_int(app.tx, 0)),
+				chain: str(app.chain),
+				devs: devs,
+				dev_count: dc
+			};
+			n++;
+		}
+	}
+
+	ctx.day_nodes = {};
+	if (type(data.nodes) == 'object') {
+		let n = 0;
+		for (let name, node in data.nodes) {
+			if (type(node) != 'object' || n >= MAX_DAY_APPS) continue;
+			ctx.day_nodes[str(name)] = {
+				rx: max(0, to_int(node.rx, 0)),
+				tx: max(0, to_int(node.tx, 0))
+			};
+			n++;
+		}
+	}
+
+	dbg(ctx, 'daily restored: ' + path);
+	return true;
+}
+
+/** 写一份「已经定稿」的 daily 快照（日切时用；ctx.day 可能已经切到新的一天）。
+ *  文件名只接受严格合法的 YYYY-MM-DD：pending 文件来自磁盘，不能让它带着
+ *  `../` 之类的 day 穿越 daily 目录。 */
+function daily_snapshot_write(ctx, snap) {
+	if (snap == null || type(snap) != 'object' || !is_day_str(str(snap.day))) return false;
+	if (!mkpath(ctx.cfg.daily_dir)) return false;
+	return atomic_write(ctx.cfg.daily_dir + '/' + str(snap.day) + '.json', jenc(snap));
+}
+
+function pending_daily_path(ctx) {
+	return ctx.cfg.state_dir + '/pending-daily.json';
+}
+
+/**
+ * 日切 pending 快照持久化到 state_dir（/tmp tmpfs，原子写）。
+ * daily 目录（/etc，闪存）写失败时，进程重启不能丢掉跨天数据；启动时恢复后
+ * 按 DAILY_PENDING_RETRY_SECONDS 重试。文件结构 {v,ts,days:{day:snapshot}}。
+ */
+function pending_daily_persist(ctx) {
+	/* 只持久化合法日期：即使内存里混进坏 key（例如恢复前被外部写坏），
+	 * 也不会把带路径的 day 写回 pending 文件。 */
+	let days = {};
+	let n = 0;
+	for (let day in keys(ctx.pending_daily)) {
+		if (!is_day_str(day)) continue;
+		let snap = ctx.pending_daily[day];
+		if (snap == null || type(snap) != 'object' || str(snap.day) != day) continue;
+		days[day] = snap;
+		if (++n >= DAILY_PENDING_MAX_DAYS) break;
+	}
+	if (length(keys(days)) == 0) {
+		try { fs.unlink(pending_daily_path(ctx)); } catch (e) { }
+		return true;
+	}
+	mkpath(ctx.cfg.state_dir);
+	let out = { v: 1, ts: (ctx.now > 0) ? ctx.now : time(), days: days };
+	let ok = atomic_write(pending_daily_path(ctx), jenc(out));
+	if (!ok) dbg(ctx, 'write pending-daily.json failed: ' + str(fs.error()));
+	return ok;
+}
+
+/** 启动时恢复 pending 快照：只接受严格合法日期 + 结构完整的对象，
+ *  最多 DAILY_PENDING_MAX_DAYS 天。 */
+function pending_daily_restore(ctx) {
+	let o = load_json(pending_daily_path(ctx));
+	if (o == null || type(o) != 'object' || type(o.days) != 'object') return 0;
+	let n = 0;
+	for (let day, snap in o.days) {
+		let d = str(day);
+		if (!is_day_str(d)) {
+			dbg(ctx, 'pending daily rejected: invalid day');
+			continue;
+		}
+		if (type(snap) != 'object' || str(snap.day) != d) continue;
+		if (type(snap.totals) != 'object') continue;
+		ctx.pending_daily[d] = snap;
+		if (++n >= DAILY_PENDING_MAX_DAYS) break;
+	}
+	if (n > 0) {
+		/* 立刻重试：进程重启时用户通常已经修好 daily 目录。 */
+		ctx.pending_daily_ts = 0;
+		dbg(ctx, sprintf('pending daily restored: %d day(s)', n));
+	}
+	return n;
+}
+
+/**
+ * 日切时旧的一天写失败：保留快照，按 DAILY_PENDING_RETRY_SECONDS 重试。
+ * 绝不因为一次写失败就丢掉已经统计好的跨天数据。
+ */
+function daily_pending_retry(ctx, force) {
+	let days = keys(ctx.pending_daily);
+	if (length(days) == 0) return;
+	if (!force && ctx.pending_daily_ts > 0
+		&& ctx.now - ctx.pending_daily_ts < DAILY_PENDING_RETRY_SECONDS) return;
+
+	ctx.pending_daily_ts = ctx.now;
+	let changed = false;
+	for (let day in days) {
+		let snap = ctx.pending_daily[day];
+		if (snap == null) { delete ctx.pending_daily[day]; changed = true; continue; }
+		if (daily_snapshot_write(ctx, snap)) {
+			dbg(ctx, 'pending daily written: ' + day);
+			delete ctx.pending_daily[day];
+			changed = true;
+		} else {
+			/* 每一天独立重试：一天失败不跳过后面的天。 */
+			dbg(ctx, 'pending daily retry failed: ' + day + ' (' + str(fs.error()) + ')');
+		}
+	}
+	if (changed) pending_daily_persist(ctx);
+}
+
+function daily_write(ctx, force) {
+	daily_pending_retry(ctx, force);
+	if (!force) {
+		if (ctx.daily_fail_ts > 0 && ctx.now - ctx.daily_fail_ts < DAILY_RETRY_SECONDS) return;
+		if (ctx.last_daily_write > 0 && ctx.now - ctx.last_daily_write < DAILY_WRITE_SECONDS) return;
+	}
+	let snap = day_summary(ctx);
+	if (!daily_snapshot_write(ctx, snap)) {
+		ctx.daily_fail_ts = ctx.now;
+		return;
+	}
+	ctx.daily_fail_ts = 0;
+	ctx.last_daily_write = ctx.now;
+}
+
+function daily_prune(ctx) {
+	/* 保留策略由 retention.uc 接管时（新默认配置带 retention 段）不再按 history_days
+	 * 计数裁剪，否则 retention.daily_days=400 会被「只留 7 个文件」悄悄删掉。
+	 * 老配置没有 retention 段 -> retention_owns_daily 为 false -> 行为与从前完全一致。 */
+	if (ctx.cfg.retention_owns_daily) return;
+
+	let names = null;
+	try {
+		names = fs.lsdir(ctx.cfg.daily_dir);
+	} catch (e) {
+		names = null;
+	}
+	if (names == null) return;
+	let days = [];
+	for (let n in names) {
+		/* YYYY-MM-DD.json */
+		if (length(n) != 15 || substr(n, 10) != '.json') continue;
+		push(days, n);
+	}
+	days = sort(days);
+	while (length(days) > ctx.cfg.history_days) {
+		let victim = days[0];
+		days = slice(days, 1, length(days));
+		try {
+			fs.unlink(ctx.cfg.daily_dir + '/' + victim);
+		} catch (e) {
+			/* ignore */
+		}
+	}
+}
+
+function day_rollover_check(ctx) {
+	let d = local_day_str(ctx.now);
+	if (ctx.day == d) return;
+	if (ctx.day != '') {
+		/* 先把前一天定稿成快照；写失败就把快照留在 pending_daily 里重试，
+		 * 并立刻持久化到 state_dir，保证进程重启后仍能恢复。 */
+		let snap = day_summary(ctx);
+		if (!daily_snapshot_write(ctx, snap)) {
+			ctx.pending_daily[snap.day] = snap;
+			pending_daily_persist(ctx);
+		} else {
+			delete ctx.pending_daily[snap.day];
+			pending_daily_persist(ctx);
+		}
+		ctx.buckets = [];
+	}
+	ctx.day = d;
+	ctx.day_totals = { direct_rx: 0, direct_tx: 0, proxy_rx: 0, proxy_tx: 0 };
+	ctx.day_devices = {};
+	ctx.day_apps = {};
+	ctx.day_nodes = {};
+	ctx.cur_bucket = null;
+	ctx.last_history_flush = 0;
+	daily_prune(ctx);
+}
+
+/* ------------------------------------------------------------------ *
+ * 跨软重启基线（state_dir/baseline.json）
+ * ------------------------------------------------------------------ *
+ * 只持久化「连接累计值快照」和采样时间，不持久化 totals（SPEC §3.1 明确
+ * totals 是进程启动以来累计）。恢复后：
+ *   - 已存在的 clash 连接 / conntrack 流按上次快照做差，不会首帧全量加；
+ *   - 基线时间戳同时作为首轮 dt 的锚点，避免出现虚高的瞬时速率；
+ *   - 缺文件 / 坏 JSON / 旧日期 / 过期 -> 对应数据源进入 prime 模式（只采样不记账）。
+ *   - baseline 条目有 8192 上限并记录 total/truncated：未覆盖条目恢复首轮只采样。
+ *   - v3 起额外持久化双源去重键集和 clash 故障账本（均有版本、上限、类型校验），
+ *     这样「故障中重启」后 conntrack 不会把既有代理流再按 direct 记一遍。
+ * 剩余限制（有意保守降级，不承诺完美恢复）：/tmp 被清空、baseline 超过 1 小时；
+ * 截断基线里未覆盖的连接也会少计恢复首轮的一次采样。
+ */
+function baseline_path(ctx) {
+	return ctx.cfg.state_dir + '/' + BASELINE_FILE;
+}
+
+/** 基线条目上限（测试钩子可降低阈值；生产恒为 BASELINE_MAX_ENTRIES=8192）。
+ *  同一个上限同时用于写入与读取，保证两边截断口径一致。 */
+function baseline_max_entries() {
+	let v = to_int(getenv('PRISM_ROUTER_BASELINE_MAX_ENTRIES'), 0);
+	return (v > 0) ? v : BASELINE_MAX_ENTRIES;
+}
+
+/** 去重键格式：proto|dev|peer|devport|peerport。只接受可打印 ASCII、
+ *  恰好 4 个分隔符、长度有界；`../`、控制字符、超长键一律拒绝。 */
+function baseline_key_ok(k) {
+	if (type(k) != 'string') return false;
+	if (length(k) < 5 || length(k) > BASELINE_KEY_MAX_LEN) return false;
+	let bars = 0;
+	for (let i = 0; i < length(k); i++) {
+		let ch = substr(k, i, 1);
+		let n = ord(ch);
+		if (n < 0x21 || n > 0x7e) return false;
+		if (ch == '|') bars++;
+		else if (ch == '"' || ch == '\\') return false;
+	}
+	return bars == 4;
+}
+
+function baseline_map_load(raw, maxn) {
+	if (type(raw) != 'object') return null;
+	let out = {};
+	let n = 0;
+	let total = 0;
+	let truncated = 0;
+	for (let key, val in raw) {
+		total++;
+		if (type(val) != 'object') continue;
+		let rx = to_int(val.rx, null);
+		let tx = to_int(val.tx, null);
+		if (rx == null || tx == null || rx < 0 || tx < 0) continue;
+		if (n >= maxn) { truncated++; continue; }
+		out[str(key)] = { rx: rx, tx: tx };
+		n++;
+	}
+	return { map: out, total: total, kept: n, truncated: truncated };
+}
+
+/** 加载去重/故障账本：key 必须是字符串且结构合法，过期时间必须是正整数、
+ *  且不超过 now + BASELINE_EXP_MAX_AHEAD；条目数受 maxn 限制。
+ *  keep_expired=true 时保留已过期条目：故障期间需要它们续期，重启后第一次
+ *  成功 build 才会清过期；正常成功轮之前它们不会参与 dedup_lookup。 */
+function baseline_exp_map_load(raw, maxn, now, keep_expired) {
+	if (type(raw) != 'object') return { map: {}, total: 0, kept: 0, dropped: 0 };
+	let out = {}, n = 0, total = 0, dropped = 0;
+	for (let k, v in raw) {
+		total++;
+		if (!baseline_key_ok(k)) { dropped++; continue; }
+		if (type(v) != 'int' || v <= 0 || v > now + BASELINE_EXP_MAX_AHEAD) { dropped++; continue; }
+		if (!keep_expired && v < now) { dropped++; continue; }
+		if (n >= maxn) { dropped++; continue; }
+		out[str(k)] = v;
+		n++;
+	}
+	return { map: out, total: total, kept: n, dropped: dropped };
+}
+
+/** 写出去重/故障账本：只写类型/长度合法的条目，最多 maxn 条。 */
+function baseline_exp_map_out(map, maxn) {
+	let out = {}, n = 0, total = 0;
+	for (let k in keys(map)) {
+		total++;
+		let v = map[k];
+		if (!baseline_key_ok(k)) continue;
+		if (type(v) != 'int' || v <= 0) continue;
+		if (n >= maxn) continue;
+		out[str(k)] = v;
+		n++;
+	}
+	return { map: out, total: total, kept: n };
+}
+
+function baseline_write(ctx) {
+	if (ctx.cfg == null || ctx.cfg.state_dir == '') return false;
+
+	let maxn = baseline_max_entries();
+	let cp = {}, n = 0, clash_total = 0;
+	for (let id in ctx.clash_prev) {
+		clash_total++;
+		if (n >= maxn) continue;
+		cp[id] = { rx: ctx.clash_prev[id].rx, tx: ctx.clash_prev[id].tx };
+		n++;
+	}
+	let tp = {}, m = 0, ct_total = 0;
+	for (let key in ctx.ct_prev) {
+		ct_total++;
+		if (m >= maxn) continue;
+		tp[key] = { rx: ctx.ct_prev[key].rx, tx: ctx.ct_prev[key].tx };
+		m++;
+	}
+
+	/* 去重键/故障账本单独限长：即使测试钩子把 prev 上限调大，也不会超过
+	 * DEDUP_MAX_ENTRIES。 */
+	let dmax = min(maxn, DEDUP_MAX_ENTRIES);
+	let dd = baseline_exp_map_out(ctx.clash_dedup, dmax);
+	let oo = baseline_exp_map_out(ctx.clash_outage_ct, dmax);
+
+	/* 明确记录真实条数与被截断条数：只有写了 truncated 元数据，恢复时才能
+	 * 判断「某个连接没有基线」是因为它真的新建，还是因为 map 被截断了。
+	 * 没有这个元数据时，loader 对满 8192 条的旧基线按「可能截断」保守处理。 */
+	let out = {
+		v: BASELINE_VERSION,
+		ts: (ctx.now > 0) ? ctx.now : time(),
+		day: ctx.day,
+		clash_ts: ctx.clash_sample_ts,
+		ct_ts: ctx.ct_sample_ts,
+		clash_prev: cp,
+		ct_prev: tp,
+		clash_total: clash_total,
+		ct_total: ct_total,
+		clash_truncated: max(0, clash_total - n),
+		ct_truncated: max(0, ct_total - m),
+		/* v3：双源去重键集 + clash 故障账本，重启后仍能避免 direct/proxy 双计 */
+		clash_dedup: dd.map,
+		dedup_total: dd.total,
+		dedup_truncated: max(0, dd.total - dd.kept),
+		clash_outage: oo.map,
+		outage_total: oo.total,
+		outage_truncated: max(0, oo.total - oo.kept),
+		clash_outage_active: (ctx.clash_outage_active == true),
+		clash_outage_had: (ctx.clash_outage_had == true)
+	};
+	mkpath(ctx.cfg.state_dir);
+	let ok = atomic_write(baseline_path(ctx), jenc(out));
+	if (!ok) dbg(ctx, 'write baseline.json failed: ' + str(fs.error()));
+	if (clash_total > n || ct_total > m)
+		dbg(ctx, sprintf('baseline truncated: clash=%d/%d ct=%d/%d',
+			n, clash_total, m, ct_total));
+	return ok;
+}
+
+function baseline_load(ctx) {
+	ctx.prime_clash = true;
+	ctx.prime_ct = true;
+	ctx.prime_missing_clash = false;
+	ctx.prime_missing_ct = false;
+	ctx.baseline_file_present = false;
+	try {
+		if (fs.stat(baseline_path(ctx)) != null) ctx.baseline_file_present = true;
+	} catch (e) { }
+
+	/* 先看大小：损坏/伪造的超大文件不读进内存。 */
+	let st = null;
+	try { st = fs.stat(baseline_path(ctx)); } catch (e) { st = null; }
+	if (st != null && to_int(st.size, 0) > BASELINE_MAX_BYTES) {
+		dbg(ctx, sprintf('baseline too large: %d bytes', to_int(st.size, 0)));
+		return false;
+	}
+
+	let b = load_json(baseline_path(ctx));
+	if (b == null || type(b) != 'object') return false;
+	let bv = to_int(b.v, 1);
+	if (bv < 1 || bv > BASELINE_VERSION) {
+		dbg(ctx, sprintf('baseline version unsupported: %d', bv));
+		return false;
+	}
+	if (str(b.day) != ctx.day) return false;
+
+	let now = (ctx.now > 0) ? ctx.now : time();
+	let bts = to_int(b.ts, 0);
+	if (bts <= 0 || bts > now + 60 || now - bts > BASELINE_MAX_AGE) return false;
+
+	let maxn = baseline_max_entries();
+	let cp = baseline_map_load(b.clash_prev, maxn);
+	let tp = baseline_map_load(b.ct_prev, maxn);
+	let anchor = bts;
+	let cts = to_int(b.clash_ts, 0);
+	let tts = to_int(b.ct_ts, 0);
+	if (cts > now) cts = now;
+	if (tts > now) tts = now;
+
+	/* 数据源从未成功采样过（ts=0）时，空 map 不能当成「已知没有连接」：
+	 * 否则恢复后第一次成功拉取会把现存连接全量加一遍。 */
+	if (cp != null && cts > 0) {
+		ctx.clash_prev = cp.map;
+		ctx.prime_clash = false;
+		ctx.clash_sample_ts = cts;
+		if (cts < anchor) anchor = cts;
+		/* 截断标记 = 本次读取又截掉了一些，或写入方记录了被截断条数，
+		 * 或老版本 baseline 没有元数据但 map 已经顶到上限（可能被静默截断）。 */
+		let ctot = to_int(b.clash_total, cp.total);
+		let ctr = to_int(b.clash_truncated, 0);
+		ctx.prime_missing_clash = (ctr > 0 || cp.truncated > 0 || cp.total > cp.kept
+			|| (b.clash_total == null && cp.kept >= maxn));
+		if (ctx.prime_missing_clash && ctot < cp.kept) ctot = cp.kept;
+		if (ctx.prime_missing_clash)
+			dbg(ctx, sprintf('baseline clash truncated: kept=%d total=%d', cp.kept, ctot));
+	}
+	if (tp != null && tts > 0) {
+		ctx.ct_prev = tp.map;
+		ctx.prime_ct = false;
+		ctx.ct_sample_ts = tts;
+		if (tts < anchor) anchor = tts;
+		let ttot = to_int(b.ct_total, tp.total);
+		let ttr = to_int(b.ct_truncated, 0);
+		ctx.prime_missing_ct = (ttr > 0 || tp.truncated > 0 || tp.total > tp.kept
+			|| (b.ct_total == null && tp.kept >= maxn));
+		if (ctx.prime_missing_ct && ttot < tp.kept) ttot = tp.kept;
+		if (ctx.prime_missing_ct)
+			dbg(ctx, sprintf('baseline ct truncated: kept=%d total=%d', tp.kept, ttot));
+	}
+
+	/* v3：恢复去重键集和故障账本。dedup 保留过期项（故障续期/重启场景要用），
+	 * outage 账本在「故障活跃」时保留过期项；其它未过期项一律保留。 */
+	let oa = (type(b.clash_outage_active) == 'bool' && b.clash_outage_active == true);
+	let oh = (type(b.clash_outage_had) == 'bool' && b.clash_outage_had == true);
+	let dmax = min(maxn, DEDUP_MAX_ENTRIES);
+	let dd = baseline_exp_map_load(b.clash_dedup, dmax, now, true);
+	let oo = baseline_exp_map_load(b.clash_outage, dmax, now, oa);
+	if (dd.kept > 0 || oo.kept > 0 || oa) {
+		ctx.clash_dedup = dd.map;
+		ctx.clash_outage_ct = oo.map;
+		ctx.clash_outage_active = oa;
+		/* 进程在故障期间重启：即使 baseline 里只有 active 标记，也要把 had 置上，
+		 * 恢复成功轮才会用故障账本判断「新建连接是否已被 conntrack 计过」。 */
+		ctx.clash_outage_had = (oh || oa);
+		dbg(ctx, sprintf('baseline dedup restored: dedup=%d outage=%d active=%s had=%s',
+			dd.kept, oo.kept, oa ? '1' : '0', ctx.clash_outage_had ? '1' : '0'));
+	}
+	if (dd.dropped > 0 || oo.dropped > 0)
+		dbg(ctx, sprintf('baseline dedup sanitized: dropped=%d/%d total=%d/%d',
+			dd.dropped, oo.dropped, dd.total, oo.total));
+
+	/* 首轮速率的分母从基线采样时间算起，而不是固定 5s，避免「重启后一波大流量
+	 * 被除以 1 秒」这种虚高速率。 */
+	if (anchor > 0 && anchor <= now) ctx.last_poll_ts = anchor;
+	ctx.baseline_loaded = true;
+	dbg(ctx, sprintf('baseline restored: day=%s age=%ds clash=%s ct=%s',
+		ctx.day, now - bts,
+		ctx.prime_clash ? 'prime' : 'ok', ctx.prime_ct ? 'prime' : 'ok'));
+	return true;
+}
+
+/* ------------------------------------------------------------------ *
+ * state.json 组装（SPEC §3）
+ * ------------------------------------------------------------------ */
+
+function device_apps_out(apps) {
+	let list = [];
+	for (let host in apps) {
+		push(list, { host: host, rx: apps[host].rx, tx: apps[host].tx, chain: apps[host].chain });
+	}
+	list = sort(list, function(a, b) { return b.rx - a.rx; });
+
+	let out = {};
+	let other = { rx: 0, tx: 0, chain: 'MIXED' };
+	for (let i = 0; i < length(list); i++) {
+		let a = list[i];
+		if (i < MAX_DEV_APPS_OUT) out[a.host] = { rx: a.rx, tx: a.tx, chain: a.chain };
+		else { other.rx += a.rx; other.tx += a.tx; }
+	}
+	if (other.rx > 0 || other.tx > 0) out['__other__'] = other;
+	return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * 软路由自身性能指标（system，SPEC §3.3）
+ *
+ * 全部只读 /proc 或 sysfs；任何一项读不到只是省略字段，绝不 push reasons，
+ * 也绝不参与 direct / proxy / link 的任何计算。数值统一整数或 1 位小数。
+ * ------------------------------------------------------------------ */
+
+function read_sys_text(path) {
+	if (path == null || path == '') return null;
+	try {
+		let t = fs.readfile(path);
+		if (type(t) != 'string' || t == '') return null;
+		return t;
+	} catch (e) {
+		return null;
+	}
+}
+
+/** 把 "0.15" / "2" 这类十进制串按**字符串**四舍五入到 0.1，返回十分位整数。
+    不走浮点，避免 2.95*10 = 29.4999… 这类边界误差。 */
+function tenths_of(s) {
+	s = trim(str(s));
+	if (s == '') return null;
+	let neg = false;
+	if (substr(s, 0, 1) == '-') { neg = true; s = substr(s, 1); }
+	let dot = index(s, '.');
+	let ipart = (dot < 0) ? s : substr(s, 0, dot);
+	let fpart = (dot < 0) ? '' : substr(s, dot + 1);
+	let ip = int(ipart);
+	if (type(ip) != 'int' || ip < 0) return null;
+	let d1 = (length(fpart) >= 1) ? int(substr(fpart, 0, 1)) : 0;
+	let d2 = (length(fpart) >= 2) ? int(substr(fpart, 1, 1)) : 0;
+	if (type(d1) != 'int' || d1 < 0 || d1 > 9) d1 = 0;
+	if (type(d2) != 'int' || d2 < 0 || d2 > 9) d2 = 0;
+	let t = ip * 10 + d1 + ((d2 >= 5) ? 1 : 0);
+	return neg ? -t : t;
+}
+
+/** busy/total 的百分比四舍五入到 0.1，返回十分位整数（0..1000），纯整数运算 */
+function pct_tenths(busy, total) {
+	if (total <= 0) return 0;
+	if (busy < 0) busy = 0;
+	if (busy > total) busy = total;
+	let t = int((2000 * busy + total) / (2 * total));
+	if (t < 0) t = 0;
+	if (t > 1000) t = 1000;
+	return t;
+}
+
+function sys_collect_uptime(ctx, sys) {
+	let txt = read_sys_text(ctx.cfg.proc_uptime);
+	if (txt == null) return;
+	let t = split_ws(txt);
+	if (length(t) < 1) return;
+	let tenths = tenths_of(t[0]);
+	if (tenths == null) return;
+	sys.uptime = int(tenths / 10);
+}
+
+function sys_collect_load(ctx, sys) {
+	let txt = read_sys_text(ctx.cfg.proc_loadavg);
+	if (txt == null) return;
+	let t = split_ws(txt);
+	if (length(t) < 3) return;
+	let a = tenths_of(t[0]), b = tenths_of(t[1]), c = tenths_of(t[2]);
+	if (a != null) sys.load1 = a / 10.0;
+	if (b != null) sys.load5 = b / 10.0;
+	if (c != null) sys.load15 = c / 10.0;
+}
+
+/** /proc/stat 首行 -> { total, idle }（idle 含 iowait，口径同 top） */
+function sys_cpu_sample(txt) {
+	if (txt == null) return null;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		if (length(t) < 5) continue;
+		if (t[0] != 'cpu') continue;
+		let total = 0;
+		let maxf = (length(t) - 1 > 8) ? 8 : (length(t) - 1);
+		for (let i = 1; i <= maxf; i++) {
+			let v = to_int(t[i], null);
+			if (v == null) return null;
+			total += v;
+		}
+		let idle = to_int(t[4], 0) + to_int(t[5], 0);
+		return { total: total, idle: idle };
+	}
+	return null;
+}
+
+function sys_collect_cpu(ctx, sys) {
+	let s = sys_cpu_sample(read_sys_text(ctx.cfg.proc_stat));
+	if (s == null) return;
+	let prev = ctx.sys_cpu_prev;
+	ctx.sys_cpu_prev = s;
+	if (prev == null) return;  /* 第一次采样没有差值，省略 cpu_pct */
+	let dt = s.total - prev.total;
+	let didle = s.idle - prev.idle;
+	if (dt <= 0) return;
+	let busy = dt - didle;
+	if (busy < 0) busy = 0;
+	if (busy > dt) busy = dt;
+	sys.cpu_pct = pct_tenths(busy, dt) / 10.0;
+}
+
+/** /proc/cpuinfo 里 processor 行数：只成功读一次，缓存 */
+function sys_cpu_cores(ctx) {
+	if (ctx.sys_cpu_cores > 0) return ctx.sys_cpu_cores;
+	let txt = read_sys_text(ctx.cfg.proc_cpuinfo);
+	if (txt == null) return 0;
+	let n = 0;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		/* 真实内核输出是 "processor\t: 0"（冒号前有空格），归一后可能是 "processor" 或 "processor:" */
+		if (length(t) >= 1 && (t[0] == 'processor' || t[0] == 'processor:')) n++;
+	}
+	if (n > 0) ctx.sys_cpu_cores = n;
+	return n;
+}
+
+function sys_collect_mem(ctx, sys) {
+	let txt = read_sys_text(ctx.cfg.proc_meminfo);
+	if (txt == null) return;
+	let mt = null, ma = null, st = null, sf = null;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		if (length(t) < 2) continue;
+		let v = to_int(t[1], null);
+		if (v == null) continue;
+		if (t[0] == 'MemTotal:') mt = v * 1024;
+		else if (t[0] == 'MemAvailable:') ma = v * 1024;
+		else if (t[0] == 'SwapTotal:') st = v * 1024;
+		else if (t[0] == 'SwapFree:') sf = v * 1024;
+	}
+	if (mt != null && mt > 0) {
+		sys.mem_total = mt;
+		if (ma != null) {
+			sys.mem_avail = ma;
+			sys.mem_pct = pct_tenths(mt - ma, mt) / 10.0;
+		}
+	}
+	if (st != null) sys.swap_total = st;
+	if (sf != null) sys.swap_free = sf;
+}
+
+function sys_collect_temp(ctx, sys) {
+	let txt = read_sys_text(ctx.cfg.thermal_file);
+	if (txt == null) return;
+	let v = to_int(trim(txt), null);
+	if (v == null || v < 0) return;  /* 没有 thermal_zone0（x86 常见）就省略 */
+	sys.temp_c = int((v + 50) / 100) / 10.0;
+}
+
+/** `df -k <rootfs>` -> { total, used, pct }（字节）；失败返回 null */
+function sys_disk_read(ctx) {
+	let cmd = shell_quote(ctx.cfg.df_bin) + ' -k ' + shell_quote(ctx.cfg.rootfs) + ' 2>/dev/null';
+	let txt = null;
+	try {
+		let p = fs.popen(cmd, 'r');
+		txt = p.read('all');
+		p.close();
+	} catch (e) {
+		txt = null;
+	}
+	if (txt == null) return null;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		let n = length(t);
+		/* 从行尾取数字：兼容设备名里有空格、以及 GNU df 把长设备名换行拆开
+		   （拆开后数字行只有 5 个 token）。表头行数字解析失败会被跳过。 */
+		if (n < 5) continue;
+		let total = to_int(t[n - 5], null);
+		let used = to_int(t[n - 4], null);
+		let avail = to_int(t[n - 3], null);
+		if (total == null || used == null || avail == null) continue;
+		if (total <= 0 || used < 0 || avail < 0) continue;
+		let out = { total: total * 1024, used: used * 1024 };
+		if (used + avail > 0) out.pct = pct_tenths(used, used + avail) / 10.0;
+		return out;
+	}
+	return null;
+}
+
+/** 磁盘容量变化慢：最多每 SYSTEM_DISK_SECONDS 秒跑一次 df（不每轮 fork） */
+function sys_collect_disk(ctx, sys) {
+	if (ctx.sys_disk == null || (ctx.now - ctx.sys_disk_ts) >= SYSTEM_DISK_SECONDS) {
+		ctx.sys_disk = sys_disk_read(ctx);
+		ctx.sys_disk_ts = ctx.now;
+	}
+	let d = ctx.sys_disk;
+	if (d == null) return;
+	sys.disk_total = d.total;
+	sys.disk_used = d.used;
+	if (d.pct != null) sys.disk_pct = d.pct;
+}
+
+/** 未配置 wan_iface 时从 /proc/net/route 取默认路由（metric 最小）所在接口 */
+function sys_default_iface(ctx) {
+	let txt = read_sys_text(ctx.cfg.proc_net_route);
+	if (txt == null) return '';
+	let best = '', best_metric = null;
+	for (let line in split(txt, '\n')) {
+		let t = split_ws(line);
+		if (length(t) < 8) continue;
+		if (t[1] != '00000000') continue;
+		let m = to_int(t[6], 0);
+		if (best == '' || m < best_metric) {
+			best = t[0];
+			best_metric = m;
+		}
+	}
+	return best;
+}
+
+/** /proc/net/dev 中某接口的累计字节 rx/tx */
+function sys_dev_counters(txt, iface) {
+	if (txt == null || iface == '') return null;
+	for (let line in split(txt, '\n')) {
+		let c = index(line, ':');
+		if (c < 0) continue;
+		if (trim(substr(line, 0, c)) != iface) continue;
+		let t = split_ws(substr(line, c + 1));
+		if (length(t) < 9) return null;
+		let rx = to_int(t[0], null);
+		let tx = to_int(t[8], null);
+		if (rx == null || tx == null) return null;
+		return { rx: rx, tx: tx };
+	}
+	return null;
+}
+
+function sys_collect_wan(ctx, sys) {
+	let iface = ctx.cfg.wan_iface;
+	if (iface == '') iface = sys_default_iface(ctx);
+	if (iface == '') return;
+	let c = sys_dev_counters(read_sys_text(ctx.cfg.proc_net_dev), iface);
+	if (c == null) return;
+	let prev = ctx.sys_wan_prev;
+	ctx.sys_wan_prev = { iface: iface, rx: c.rx, tx: c.tx, ts: ctx.now };
+	if (prev == null || prev.iface != iface) return;  /* 首次采样没有速率 */
+	let dt = ctx.now - prev.ts;
+	if (dt <= 0) dt = 1;
+	/* 计数器回绕时不猜速率，直接省略（下一轮就有正常差值） */
+	if (c.rx >= prev.rx) sys.wan_rx_rate = int((c.rx - prev.rx) / dt);
+	if (c.tx >= prev.tx) sys.wan_tx_rate = int((c.tx - prev.tx) / dt);
+}
+
+function build_system(ctx) {
+	let sys = {};
+	sys_collect_uptime(ctx, sys);
+	sys_collect_load(ctx, sys);
+	sys_collect_cpu(ctx, sys);
+	let cores = sys_cpu_cores(ctx);
+	if (cores > 0) sys.cpu_cores = cores;
+	sys_collect_mem(ctx, sys);
+	sys_collect_temp(ctx, sys);
+	sys_collect_disk(ctx, sys);
+	sys_collect_wan(ctx, sys);
+	return sys;
+}
+
+function build_state(ctx) {
+	let dt = ctx.poll_dt > 0 ? ctx.poll_dt : 1;
+
+	let total_rx = ctx.totals.direct_rx + ctx.totals.proxy_rx;
+	let total_tx = ctx.totals.direct_tx + ctx.totals.proxy_tx;
+	ctx.totals.rx_rate = int((total_rx - ctx.prev_total_rx) / dt);
+	ctx.totals.tx_rate = int((total_tx - ctx.prev_total_tx) / dt);
+	ctx.prev_total_rx = total_rx;
+	ctx.prev_total_tx = total_tx;
+
+	let devices = [];
+	for (let ip in ctx.devices) {
+		let d = ctx.devices[ip];
+		let mac = (d.mac != '') ? d.mac : dev_identity(ctx, ip).mac;
+		push(devices, {
+			ip: d.ip,
+			mac: d.mac,
+			hostname: d.hostname,
+			link: link_of_mac(ctx, mac),
+			direct_rx: d.direct_rx,
+			direct_tx: d.direct_tx,
+			proxy_rx: d.proxy_rx,
+			proxy_tx: d.proxy_tx,
+			rx_rate: int(d.rx_rate / dt),
+			tx_rate: int(d.tx_rate / dt),
+			last_seen: d.last_seen,
+			apps: device_apps_out(d.apps)
+		});
+	}
+	devices = sort(devices, function(a, b) {
+		return (b.proxy_rx + b.direct_rx) - (a.proxy_rx + a.direct_rx);
+	});
+	devices = slice(devices, 0, MAX_OUT_DEVICES);
+
+	let apps = [];
+	for (let host in ctx.apps) {
+		let a = ctx.apps[host];
+		push(apps, { host: host, rx: a.rx, tx: a.tx, chain: a.chain, devices: length(a.devs) });
+	}
+	apps = sort(apps, function(a, b) { return b.rx - a.rx; });
+	apps = slice(apps, 0, MAX_OUT_APPS);
+
+	let nodes = {};
+	for (let k in ctx.nodes) nodes[k] = { rx: ctx.nodes[k].rx, tx: ctx.nodes[k].tx };
+
+	let reasons = ctx.reasons;
+	let conf = 'exact';
+	if (length(reasons) > 0) {
+		conf = (ctx.source.clash == 'error' && ctx.source.conntrack == 'error')
+			? 'unavailable' : 'degraded';
+	}
+
+	let st = {
+		ts: ctx.now,
+		uptime: ctx.now - ctx.started,
+		source: { clash: ctx.source.clash, conntrack: ctx.source.conntrack },
+		totals: {
+			direct_rx: ctx.totals.direct_rx, direct_tx: ctx.totals.direct_tx,
+			proxy_rx: ctx.totals.proxy_rx, proxy_tx: ctx.totals.proxy_tx,
+			wifi_rx: ctx.totals.wifi_rx, wifi_tx: ctx.totals.wifi_tx,
+			wired_rx: ctx.totals.wired_rx, wired_tx: ctx.totals.wired_tx,
+			unknown_rx: ctx.totals.unknown_rx, unknown_tx: ctx.totals.unknown_tx,
+			rx_rate: ctx.totals.rx_rate, tx_rate: ctx.totals.tx_rate
+		},
+		nodes: nodes,
+		devices: devices,
+		apps: apps
+	};
+
+	/* 新增顶层字段：关闭开关时整段不出现，老消费方完全无感（SPEC §3.3） */
+	if (ctx.cfg.system_enabled) st.system = ctx.system;
+
+	st.health = {
+		accounting_confidence: conf,
+		reasons: reasons,
+		conntrack_count: ctx.ct_count,
+		clash_connections: ctx.clash_count,
+		clash_poll_ms: ctx.clash_ms,
+		clash_deduped: ctx.clash_deduped,
+		poll_ms: ctx.poll_ms,
+		/* 接入方式判定的来源与状态（与 direct/proxy 完全独立） */
+		link_source: ctx.link_source,
+		link_bridge: ctx.cfg.lan_bridge,
+		link_ports: ctx.link_ports,
+		link_ports_from: ctx.link_ports_from,
+		link_entries: ctx.link_entries,
+		link_refresh: ctx.cfg.link_refresh,
+		link_error: ctx.link_error
+	};
+	return st;
+}
+
+/* ------------------------------------------------------------------ *
+ * 一轮采集
+ * ------------------------------------------------------------------ */
+
+function poll(ctx) {
+	let t0 = clock();
+	ctx.now = time();
+	/* 仅测试用：模拟「跑到第 N 轮时跨天」，用来验证日切写失败后的 pending 重试。
+	 * 正常生产环境不设置该环境变量，行为完全不变。 */
+	ctx.poll_no++;
+	let dt = ctx.now - ctx.last_poll_ts;
+	/* 全新启动的第一轮没有真实的上一次采样点：用配置间隔做分母，避免
+	 * 「启动瞬间跨秒」把首帧速率随机放大/缩小。恢复基线时仍用基线年龄。 */
+	if (ctx.poll_no == 1 && !ctx.baseline_loaded) dt = ctx.cfg.poll_interval;
+	if (dt <= 0) dt = 1;
+	ctx.last_poll_ts = ctx.now;
+	ctx.poll_dt = dt;
+
+	if (ctx.cfg.test_rollover_after > 0 && ctx.poll_no == ctx.cfg.test_rollover_after
+		&& ctx.day != '2000-01-01')
+		ctx.day = '2000-01-01';
+
+	day_rollover_check(ctx);
+
+	/* 5 分钟桶切换 */
+	let bts = bucket_ts_of(ctx.now);
+	if (ctx.cur_bucket == null) {
+		bucket_reset(ctx, bts);
+	} else if (bts != ctx.cur_bucket.ts) {
+		push(ctx.buckets, bucket_finalize(ctx.cur_bucket));
+		bucket_reset(ctx, bts);
+	}
+
+	load_leases(ctx);
+
+	/* 接入方式：到了 link_refresh 才重新读 FDB；失败只影响 link，不影响 direct/proxy */
+	ctx.link_cache = {};
+	link_maybe_refresh(ctx);
+
+	/* 本轮增量累加器 */
+	for (let ip in ctx.devices) {
+		ctx.devices[ip].rx_rate = 0;
+		ctx.devices[ip].tx_rate = 0;
+	}
+	ctx.poll_apps = {};
+	ctx.poll_devs = {};
+	ctx.fakeip_skipped = 0;
+	ctx.clash_deduped = 0;
+	ctx.ct_lan_flows = 0;
+	ctx.ct_acct_flows = 0;
+
+	let before_direct_rx = ctx.totals.direct_rx;
+	let before_direct_tx = ctx.totals.direct_tx;
+	let before_proxy_rx = ctx.totals.proxy_rx;
+	let before_proxy_tx = ctx.totals.proxy_tx;
+
+	let reasons = [];
+
+	/* 只有真的配置了接入方式判定，FDB 读取失败才进 health.reasons（否则只是 link_source=none） */
+	if (ctx.link_error != '' && link_configured(ctx)) push(reasons, ctx.link_error);
+
+	let t_clash0 = clock();
+	let clash = fetch_clash(ctx);
+	ctx.clash_ms = clash.ms;
+	if (clash.ok) {
+		ctx.source.clash = 'ok';
+		ctx.clash_count = clash.n;
+		ctx.clash_sample_ts = ctx.now;
+		/* 去重集合必须用「全部活跃连接」建（含 DIRECT），且先于 conntrack 累计。 */
+		ctx.clash_outage_active = false;
+		ctx.clash_recovering = ctx.clash_outage_had;
+		let recovered = ctx.clash_recovering;
+		build_clash_dedup(ctx, clash.conns);
+		accumulate_clash(ctx, clash.conns, ctx.prime_clash);
+		ctx.prime_clash = false;
+		/* 故障账本只在「恢复成功轮」消费完再清：故障全程（包括慢 curl 跨 TTL
+		 * 和进程重启）都必须保留，否则恢复时新连接会被 clash 全量再计一次。 */
+		if (recovered || length(keys(ctx.clash_outage_ct)) > 0) {
+			ctx.clash_outage_ct = {};
+			dbg(ctx, 'clash outage recovered: outage ledger cleared');
+		}
+		ctx.clash_recovering = false;
+		ctx.clash_outage_had = false;
+	} else {
+		ctx.source.clash = 'error';
+		ctx.clash_count = 0;
+		ctx.clash_outage_active = true;
+		ctx.clash_outage_had = true;
+		/* 故障期间续期已有去重键，并记录 conntrack 已记过的流；否则超过 TTL
+		 * 后 conntrack 先按 direct 计，恢复后 clash 又按旧基线算 proxy，双计。 */
+		renew_clash_dedup_on_failure(ctx);
+		push(reasons, clash.reason);
+	}
+
+	let t_clash1 = clock();
+	let ct = fetch_conntrack(ctx);
+	if (ct.ok) {
+		ctx.source.conntrack = 'ok';
+		ctx.ct_sample_ts = ctx.now;
+		accumulate_conntrack(ctx, ct.text, ctx.prime_ct);
+		ctx.prime_ct = false;
+		if (ctx.ct_lan_flows > 0 && ctx.ct_acct_flows == 0)
+			push(reasons, 'conntrack: LAN 流缺少 bytes 计数（nf_conntrack_acct 未启用），直连用量无法精确统计');
+	} else {
+		ctx.source.conntrack = 'error';
+		ctx.ct_count = 0;
+		push(reasons, ct.reason);
+	}
+
+	let deltas = {
+		direct_rx: ctx.totals.direct_rx - before_direct_rx,
+		direct_tx: ctx.totals.direct_tx - before_direct_tx,
+		proxy_rx: ctx.totals.proxy_rx - before_proxy_rx,
+		proxy_tx: ctx.totals.proxy_tx - before_proxy_tx
+	};
+	bucket_add(ctx, deltas);
+
+	/* 自适应轮询：连续空闲则降频，见 tick()。空闲判定=本轮四个方向增量全为 0。 */
+	let activity = deltas.direct_rx + deltas.direct_tx + deltas.proxy_rx + deltas.proxy_tx;
+	ctx.idle_rounds = (activity == 0) ? ((ctx.idle_rounds || 0) + 1) : 0;
+
+	/* 软路由自身指标：辅助信息。任何读取失败只省略字段，绝不进 reasons，
+	   也绝不影响上面已经算好的 direct/proxy/link。 */
+	let t_sys0 = clock();
+	if (ctx.cfg.system_enabled) {
+		try {
+			ctx.system = build_system(ctx);
+		} catch (e) {
+			ctx.system = {};
+			dbg(ctx, 'system metrics failed: ' + str(e));
+		}
+	} else {
+		ctx.system = {};
+	}
+	let t_sys1 = clock();
+
+	ctx.reasons = reasons;
+	ctx.poll_ms = elapsed_ms(t0);
+	let t_ct1 = clock();
+
+	let st = build_state(ctx);
+	mkpath(ctx.cfg.state_dir);
+	if (!atomic_write(ctx.cfg.state_dir + '/state.json', jenc(st)))
+		dbg(ctx, 'write state.json failed: ' + str(fs.error()));
+
+	let t_build1 = clock();
+	if (ctx.cfg.debug)
+		dbg(ctx, sprintf('timings clash=%dms ct=%dms sys=%dms build_write=%dms total=%dms',
+			ms_between(t_clash0, t_clash1), ms_between(t_clash1, t_ct1),
+			ms_between(t_sys0, t_sys1),
+			ms_between(t_ct1, t_build1), ctx.poll_ms));
+
+	history_flush(ctx, false);
+	daily_write(ctx, false);
+	/* 基线每轮原子落盘（/tmp，tmpfs）：软重启后直接按上次快照做差。 */
+	baseline_write(ctx);
+
+	/* 陌生设备标记（SPEC §10.4）：把首次出现的 MAC 时间落进 devices.json。
+	   只在新 MAC 出现时才写 /etc（闪存），任何失败都不影响主统计。 */
+	try {
+		first_seen_track(ctx);
+	} catch (e) {
+		dbg(ctx, 'first_seen track failed: ' + str(e));
+	}
+
+	return st;
+}
+
+/* 飞书与节点推送由独立模块负责，守护进程不保存任何外部服务密钥。 */
+
+/* ------------------------------------------------------------------ *
+ * 初始化 / 主循环
+ * ------------------------------------------------------------------ */
+
+function new_ctx() {
+	let now = time();
+	return {
+		cfg: null,
+		started: now,
+		now: now,
+		last_poll_ts: now - 5,
+		poll_dt: 5,
+		poll_ms: 0,
+		clash_ms: 0,
+		clash_count: 0,
+		ct_count: 0,
+		fakeip_skipped: 0,
+		source: { clash: 'ok', conntrack: 'ok' },
+		reasons: [],
+		totals: {
+			direct_rx: 0, direct_tx: 0, proxy_rx: 0, proxy_tx: 0,
+			wifi_rx: 0, wifi_tx: 0,
+			wired_rx: 0, wired_tx: 0,
+			unknown_rx: 0, unknown_tx: 0,
+			rx_rate: 0, tx_rate: 0
+		},
+		prev_total_rx: 0,
+		prev_total_tx: 0,
+		nodes: {},
+		apps: {},
+		devices: {},
+		day_totals: { direct_rx: 0, direct_tx: 0, proxy_rx: 0, proxy_tx: 0 },
+		day_devices: {},
+		day_apps: {},
+		day_nodes: {},
+		day: local_day_str(now),
+		buckets: [],
+		cur_bucket: null,
+		clash_prev: {},
+		ct_prev: {},
+		clash_dedup: {},
+		clash_deduped: 0,
+		/* clash 故障期的去重续期 / conntrack 已记账流 / 恢复标记 */
+		clash_outage_ct: {},
+		clash_outage_active: false,
+		clash_outage_had: false,
+		clash_recovering: false,
+		clash_sample_ts: 0,
+		ct_sample_ts: 0,
+		ct_lan_flows: 0,
+		ct_acct_flows: 0,
+		/* 无基线首帧只采样不记账；baseline_load 成功时按数据源分别关闭。 */
+		prime_clash: true,
+		prime_ct: true,
+		/* 基线被截断时，未被覆盖的条目在恢复首轮只采样、不全量加。 */
+		prime_missing_clash: false,
+		prime_missing_ct: false,
+		baseline_loaded: false,
+		baseline_file_present: false,
+		daily_file_present: false,
+		poll_no: 0,
+		leases: {},
+		leases_ts: 0,
+		lan_cidrs: [],
+		lan_prefixes: [],
+		fake_cidrs: [],
+		/* 接入方式（FDB）状态 */
+		link_brctl: 'brctl',		link_source: 'none',
+		link_ports: [],
+		link_ports_cfg: [],
+		link_ap_ports: [],
+		link_ports_from: 'none',
+		link_fdb: {},
+		link_cache: {},
+		link_entries: 0,
+		link_error: '',
+		link_last: 0,
+		/* 软路由自身指标（SPEC §3.3）：辅助信息，与主统计完全隔离 */
+		system: {},
+		sys_cpu_prev: null,
+		sys_cpu_cores: 0,
+		sys_disk: null,
+		sys_disk_ts: 0,
+		sys_wan_prev: null,
+		/* 设备元数据缓存（devices.json：alias/group/first_seen 的只读副本） */
+		devices_meta: null,
+		devices_meta_ts: 0,
+		poll_apps: {},
+		poll_devs: {},
+		last_history_flush: 0,
+		daily_fail_ts: 0,
+		last_daily_write: 0,
+		pending_daily: {},
+		pending_daily_ts: 0,
+		stopping: false
+	};
+}
+
+/** 由 LAN 网段推出用于粗筛的字符串前缀（/24 及以上精度才用） */
+function lan_prefixes_of(cidrs) {
+	let out = [];
+	for (let c in cidrs) {
+		if (c.bits < 8) continue;
+		let base = sprintf('%d.%d.%d.%d', int(c.base / 16777216) % 256,
+			int(c.base / 65536) % 256, int(c.base / 256) % 256, c.base % 256);
+		let p = split(base, '.');
+		if (c.bits >= 24) push(out, p[0] + '.' + p[1] + '.' + p[2] + '.');
+		else if (c.bits >= 16) push(out, p[0] + '.' + p[1] + '.');
+		else push(out, p[0] + '.');
+	}
+	return out;
+}
+
+function lan_txt_of(ctx) {
+	let out = [];
+	for (let c in ctx.lan_cidrs) push(out, c.text);
+	return out;
+}
+
+function boot() {
+	let cur = null;
+	try {
+		cur = require('uci').cursor();
+	} catch (e) {
+		cur = null;
+	}
+	let ctx = new_ctx();
+	ctx.cfg = load_config(cur);
+
+	if (!ctx.cfg.enabled) {
+		printf('prism-routerd: disabled by config (enabled=0)\n');
+		exit(0);
+	}
+
+	load_leases(ctx);
+	ctx.leases_ts = time();
+
+	for (let s in ctx.cfg.fake_ip_ranges) {
+		let c = parse_cidr(s);
+		if (c != null) push(ctx.fake_cidrs, c);
+	}
+	ctx.lan_cidrs = detect_lan_cidrs(cur, ctx.cfg);
+	ctx.lan_prefixes = lan_prefixes_of(ctx.lan_cidrs);
+
+	/* 接入方式：brctl 可执行文件与无线上联端口（ap_macs 反查在每轮 fdb_refresh 里做） */
+	ctx.link_brctl = resolve_brctl();
+	ctx.link_ports_cfg = ctx.cfg.wireless_ports;
+	ctx.link_ports = ctx.cfg.wireless_ports;
+	ctx.link_ports_from = (length(ctx.cfg.wireless_ports) > 0) ? 'wireless_ports' : 'none';
+
+	dbg(ctx, 'lan=' + join(',', lan_txt_of(ctx)) + '  fake=' + join(',', ctx.cfg.fake_ip_ranges)
+		+ '  interval=' + ctx.cfg.poll_interval + 's  api=' + ctx.cfg.clash_api);
+	dbg(ctx, 'link: brctl=' + ctx.link_brctl + ' bridge=' + ctx.cfg.lan_bridge
+		+ ' ports=' + (length(ctx.cfg.wireless_ports) > 0 ? ports_txt(ctx.cfg.wireless_ports) : '空')
+		+ ' ap_macs=' + (length(ctx.cfg.ap_macs) > 0 ? join(',', ctx.cfg.ap_macs) : '空')
+		+ ' refresh=' + ctx.cfg.link_refresh + 's');
+
+	if (length(ctx.lan_cidrs) == 0)
+		push(ctx.reasons, 'lan: 未能识别 LAN 网段，conntrack 直连流量将统计不到');
+	if (length(ctx.fake_cidrs) == 0)
+		push(ctx.reasons, 'fake_ip: fake_ip_ranges 无效，无法去重，可能重复计数');
+
+	mkpath(ctx.cfg.state_dir);
+
+	/* 先恢复日切 pending（可能上次进程在 daily 写失败后重启），再恢复今日
+	 * daily 与连接基线；第一轮 poll 就会重试 pending。 */
+	pending_daily_restore(ctx);
+
+	/* 跨软重启恢复：先接上今日 daily，再恢复同检查点的连接基线。
+	 * 只有 daily 与 baseline 都不存在才是首次安装。已有日汇总但基线丢失时
+	 * 必须首轮只采样；否则现存连接全量会再次入账，daily 越新越可能双计。 */
+	daily_restore(ctx);
+	baseline_load(ctx);
+	if (!ctx.daily_file_present && !ctx.baseline_file_present) {
+		ctx.prime_clash = false;
+		ctx.prime_ct = false;
+	}
+
+	/* 测试钩子（生产环境不要设置）：启动时立刻跑一次 daily 清理判定。
+	 * 正常流程只在跨天（day_rollover_check）才清理，容器门禁等不到零点，
+	 * 所以给 tests/container-retention-inner.sh 一个入口来验证「谁负责清理 daily」。 */
+	if (getenv('PRISM_ROUTER_PRUNE_NOW') != null)
+		daily_prune(ctx);
+
+	return ctx;
+}
+
+function flush_all(ctx, tag) {
+	ctx.now = time();
+	/* 三段各自独立 try：history 写失败不能连带跳过 daily / baseline，
+	 * 否则优雅停止时跨天数据和软重启基线都会丢。 */
+	try {
+		history_flush(ctx, true);
+	} catch (e) {
+		dbg(ctx, 'history flush on ' + tag + ' failed: ' + str(e));
+	}
+	try {
+		daily_write(ctx, true);       /* 内部会先强制重试 pending 日切快照 */
+	} catch (e) {
+		dbg(ctx, 'daily flush on ' + tag + ' failed: ' + str(e));
+	}
+	try {
+		baseline_write(ctx);          /* 优雅停止也保存连接基线 */
+	} catch (e) {
+		dbg(ctx, 'baseline flush on ' + tag + ' failed: ' + str(e));
+	}
+}
+
+function main() {
+	let ctx = boot();
+
+	if (ctx.cfg.once) {
+		/* 默认只跑一轮；PRISM_ROUTER_ONCE_POLLS=N 供自测连续采样（cpu/wan 差值） */
+		for (let i = 0; i < ctx.cfg.once_polls; i++) poll(ctx);
+		flush_all(ctx, 'once');
+		let st = load_json(ctx.cfg.state_dir + '/state.json');
+		if (st != null)
+			printf('once: devices=%d proxy_rx=%d direct_rx=%d apps=%d reasons=%d link=%s ports=%s entries=%d system=%d\n',
+				length(st.devices), st.totals.proxy_rx, st.totals.direct_rx,
+				length(st.apps), length(st.health.reasons), st.health.link_source,
+				ports_txt(st.health.link_ports), st.health.link_entries,
+				(st.system != null) ? length(st.system) : -1);
+		exit(0);
+	}
+
+	uloop.init();
+
+	let tmr = null;
+	let stop = function(tag) {
+		ctx.stopping = true;
+		flush_all(ctx, tag);
+		uloop.end();
+	};
+	uloop.signal('TERM', function() { stop('TERM'); });
+	uloop.signal('INT', function() { stop('INT'); });
+
+	let tick = function() {
+		if (ctx.stopping) return;
+		try {
+			poll(ctx);
+		} catch (e) {
+			warn('prism-routerd: poll error: ' + str(e) + '\n');
+		}
+		if (!ctx.stopping && tmr != null) {
+			/* 空闲 >=2 轮后降到 3 倍间隔（上限 30s），有流量立即恢复。
+			   速率由 poll 内部按实际 dt 计算，降频不影响速率正确性。 */
+			let base = ctx.cfg.poll_interval;
+			let iv = ((ctx.idle_rounds || 0) >= 2) ? clamp(base * 3, base, 30) : base;
+			if (iv != ctx.cur_interval) {
+				ctx.cur_interval = iv;
+				dbg(ctx, 'adaptive interval -> ' + iv + 's (idle_rounds=' + (ctx.idle_rounds || 0) + ')');
+			}
+			tmr.set(iv * 1000);
+		}
+	};
+
+	printf('prism-routerd %s started (interval=%ds, lan=%s)\n',
+		DAEMON_VERSION, ctx.cfg.poll_interval, join(',', lan_txt_of(ctx)));
+
+	/* 先跑一轮，之后按固定间隔自调度（上游慢时不会堆积） */
+	tick();
+	tmr = uloop.timer(ctx.cfg.poll_interval * 1000, tick);
+	uloop.run();
+
+	flush_all(ctx, 'exit');
+	dbg(ctx, 'stopped');
+}
+
+main();

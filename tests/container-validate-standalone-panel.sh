@@ -1,7 +1,7 @@
 #!/bin/bash
 # 独立面板服务门禁（第 13 套）：
 #   默认复用 dist（或 --build 临时构建）→ 在隔离 OpenWrt 24.10 容器里安装
-#   traffic-stats → 起 ubusd/procd/rpcd → 用真实 procd 启动独立 uhttpd →
+#   prism-router → 起 ubusd/procd/rpcd → 用真实 procd 启动独立 uhttpd →
 #   验证「默认关闭不监听 / 200+JSON+安全响应头 / 400 / 401 / 405 / token(query+header) /
 #   history days / 静态页面 / 非法 port·bind 回退 / 后端异常 500 不泄漏 / 不写日志」。
 #
@@ -46,7 +46,7 @@ else
   DIST="$ROOT/dist"
 fi
 
-for p in traffic-stats_1.0.0-1_all.ipk luci-app-traffic-stats_1.0.0-1_all.ipk; do
+for p in prism-router_1.0.0-1_all.ipk luci-app-prism-router_1.0.0-1_all.ipk; do
   [ -f "$DIST/$p" ] || { echo "ERROR: 缺少 $DIST/$p；先运行 tools/build-ipk.sh 或本脚本加 --build" >&2; exit 1; }
 done
 [ -f "$DIST/SHA256SUMS" ] || { echo "ERROR: 缺少 $DIST/SHA256SUMS；拒绝在未校验的产物上跑门禁" >&2; exit 1; }

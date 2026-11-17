@@ -5,7 +5,7 @@
 # 覆盖：
 #   1. 安装后落位与权限（init 755、CGI 755、静态 644）
 #   2. sh -n / ucode -c 语法；UCI panel 段默认值（enabled=0 / 8099 / bind 空 / token 空）
-#   3. 默认关闭：/etc/init.d/traffic-panel start 不监听任何端口
+#   3. 默认关闭：/etc/init.d/prism-router-panel start 不监听任何端口
 #   4. 真实 procd 启动独立 uhttpd → ?what=state 200 + JSON(totals) + 安全响应头 + Content-Length
 #   5. 白名单：status / nodes / stations / state 默认；what=bad → 400
 #   6. 方法：POST → 405；HEAD → 200 且 CGI 不输出 body
@@ -66,56 +66,56 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=$B_CGI"
 
 echo "=== 1. 安装两个包 ==="
-opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
-  && ok "traffic-stats 安装成功" || { bad "traffic-stats 安装失败"; tail -8 /tmp/i1.log; }
-opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 \
+opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
+  && ok "prism-router 安装成功" || { bad "prism-router 安装失败"; tail -8 /tmp/i1.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 \
   && ok "luci-app 安装成功" || { bad "luci-app 安装失败"; tail -8 /tmp/i2.log; }
 
 echo "=== 2. 落位 / 权限 / 语法 / 默认配置 ==="
-check /etc/init.d/traffic-panel "root:root -rwxr-xr-x"
-check /www/traffic-panel "root:root drwxr-xr-x"
-check /www/traffic-panel/cgi-bin "root:root drwxr-xr-x"
-check /www/traffic-panel/cgi-bin/panel-api "root:root -rwxr-xr-x"
-sh -n /etc/init.d/traffic-panel && ok "traffic-panel.init 语法 OK" || bad "traffic-panel.init 语法错误"
-ucode -c /www/traffic-panel/cgi-bin/panel-api && ok "panel-api 语法 OK" || bad "panel-api 语法错误"
-[ "$(CGET traffic-stats.panel.enabled)" = "0" ] && ok "panel.enabled 默认 0（关闭）" \
-  || bad "panel.enabled 默认值=$(CGET traffic-stats.panel.enabled)"
-[ "$(CGET traffic-stats.panel.port)" = "8099" ] && ok "panel.port 默认 8099" \
-  || bad "panel.port 默认值=$(CGET traffic-stats.panel.port)"
-[ -z "$(CGET traffic-stats.panel.bind)" ] && ok "panel.bind 默认空（自动取 LAN）" || bad "panel.bind 默认值非空"
-[ -z "$(CGET traffic-stats.panel.token)" ] && ok "panel.token 默认空（仅靠网络边界）" || bad "panel.token 默认值非空"
+check /etc/init.d/prism-router-panel "root:root -rwxr-xr-x"
+check /www/prism-router-panel "root:root drwxr-xr-x"
+check /www/prism-router-panel/cgi-bin "root:root drwxr-xr-x"
+check /www/prism-router-panel/cgi-bin/panel-api "root:root -rwxr-xr-x"
+sh -n /etc/init.d/prism-router-panel && ok "prism-router-panel.init 语法 OK" || bad "prism-router-panel.init 语法错误"
+ucode -c /www/prism-router-panel/cgi-bin/panel-api && ok "panel-api 语法 OK" || bad "panel-api 语法错误"
+[ "$(CGET prism-router.panel.enabled)" = "0" ] && ok "panel.enabled 默认 0（关闭）" \
+  || bad "panel.enabled 默认值=$(CGET prism-router.panel.enabled)"
+[ "$(CGET prism-router.panel.port)" = "8099" ] && ok "panel.port 默认 8099" \
+  || bad "panel.port 默认值=$(CGET prism-router.panel.port)"
+[ -z "$(CGET prism-router.panel.bind)" ] && ok "panel.bind 默认空（自动取 LAN）" || bad "panel.bind 默认值非空"
+[ -z "$(CGET prism-router.panel.token)" ] && ok "panel.token 默认空（仅靠网络边界）" || bad "panel.token 默认值非空"
 
-# 静态页面由前端任务提供（traffic-stats/files/panel/）。本门禁可以在页面尚未就绪时运行：
+# 静态页面由前端任务提供（prism-router/files/panel/）。本门禁可以在页面尚未就绪时运行：
 # 缺失时创建一个**临时占位** index.html，只用来验证静态根与 MIME，不写任何最终页面。
 PLACEHOLDER=0
-if [ -f /www/traffic-panel/index.html ]; then
-  check /www/traffic-panel/index.html "root:root -rw-r--r--"
+if [ -f /www/prism-router-panel/index.html ]; then
+  check /www/prism-router-panel/index.html "root:root -rw-r--r--"
   echo "  NOTE  静态页面已由前端任务提供"
 else
   printf '<!doctype html>\n<html><head><meta charset="utf-8"><title>panel placeholder</title></head><body>placeholder</body></html>\n' \
-    > /www/traffic-panel/index.html
-  chmod 644 /www/traffic-panel/index.html
+    > /www/prism-router-panel/index.html
+  chmod 644 /www/prism-router-panel/index.html
   PLACEHOLDER=1
   echo "  NOTE  静态页面尚未由前端任务提供，创建临时占位 index.html（不写最终页面）"
 fi
 
-echo "=== 3. 起 ubusd / procd / rpcd（真实 ubus 对象 traffic-stats）==="
+echo "=== 3. 起 ubusd / procd / rpcd（真实 ubus 对象 prism-router）==="
 /sbin/ubusd -s /var/run/ubus/ubus.sock >/tmp/ubusd.log 2>&1 &
 sleep 1
 /sbin/procd >/tmp/procd.log 2>&1 &
 sleep 1
 /sbin/rpcd -s /var/run/ubus/ubus.sock >/tmp/rpcd.log 2>&1 &
 sleep 1
-ubus list 2>/dev/null | grep -qx traffic-stats && ok "rpcd 已注册 ubus 对象 traffic-stats" \
-  || { bad "ubus 对象 traffic-stats 未注册"; cat /tmp/rpcd.log; }
+ubus list 2>/dev/null | grep -qx prism-router && ok "rpcd 已注册 ubus 对象 prism-router" \
+  || { bad "ubus 对象 prism-router 未注册"; cat /tmp/rpcd.log; }
 
 echo "=== 4. 默认关闭：start 不监听 ==="
-UCI set traffic-stats.panel.bind='127.0.0.1'
-UCI set traffic-stats.panel.port="$PORT"
-UCI commit traffic-stats
-/etc/init.d/traffic-panel start >/tmp/panel-start-disabled.log 2>&1 \
-  && ok "/etc/init.d/traffic-panel start（enabled=0）退出码 0" \
-  || bad "/etc/init.d/traffic-panel start（enabled=0）退出码非 0"
+UCI set prism-router.panel.bind='127.0.0.1'
+UCI set prism-router.panel.port="$PORT"
+UCI commit prism-router
+/etc/init.d/prism-router-panel start >/tmp/panel-start-disabled.log 2>&1 \
+  && ok "/etc/init.d/prism-router-panel start（enabled=0）退出码 0" \
+  || bad "/etc/init.d/prism-router-panel start（enabled=0）退出码非 0"
 sleep 1
 if curl -s -m 3 -o /dev/null "$PANEL/"; then
   bad "enabled=0 时仍监听 $PORT（默认关闭失效）"
@@ -124,9 +124,9 @@ else
 fi
 
 echo "=== 5. 启用后（127.0.0.1:$PORT）真实 procd 启动 uhttpd ==="
-UCI set traffic-stats.panel.enabled='1'
-UCI commit traffic-stats
-/etc/init.d/traffic-panel start >/tmp/panel-start.log 2>&1 \
+UCI set prism-router.panel.enabled='1'
+UCI commit prism-router
+/etc/init.d/prism-router-panel start >/tmp/panel-start.log 2>&1 \
   && ok "启用后 start 退出码 0" || { bad "启用后 start 失败"; tail -5 /tmp/panel-start.log; }
 wait_panel && ok "uhttpd 已监听 $PANEL" || { bad "uhttpd 未监听 $PANEL"; cat /tmp/panel-start.log; }
 
@@ -173,7 +173,7 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=state" -I)
 [ "$code" = "200" ] && ok "HEAD -> 200" || bad "HEAD -> $code"
 [ -n "$(hdr 'Content-Length')" ] && ok "HEAD 仍带 Content-Length（GET 会返回的字节数）" || bad "HEAD 缺 Content-Length"
 # curl -I 的 -o 收到的是响应头本身，不能据此判断 body；直接执行 CGI 看 HEAD 是否真的不回体
-out=$(env REQUEST_METHOD=HEAD QUERY_STRING="what=state" ucode /www/traffic-panel/cgi-bin/panel-api 2>/dev/null | tr -d '\r')
+out=$(env REQUEST_METHOD=HEAD QUERY_STRING="what=state" ucode /www/prism-router-panel/cgi-bin/panel-api 2>/dev/null | tr -d '\r')
 case "$out" in
   *"Content-Type: application/json"*) ok "HEAD CGI 输出 JSON 头" ;;
   *) bad "HEAD CGI 未输出 JSON 头" ;;
@@ -194,8 +194,8 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=history&days=abc")
 [ "$code" = "200" ] && ok "days=abc 回退默认（不报错）" || bad "days=abc -> $code"
 
 echo "=== 10. token：未设 vs 设置后 ==="
-UCI set traffic-stats.panel.token="$TOK"
-UCI commit traffic-stats
+UCI set prism-router.panel.token="$TOK"
+UCI commit prism-router
 code=$(req "$PANEL/cgi-bin/panel-api?what=state")
 [ "$code" = "401" ] && [ "$(json_expr 'd?.error=="unauthorized"')" = "1" ] \
   && ok "设 token 后不带 -> 401 unauthorized" || bad "不带 token -> $code / $(head -c 120 "$B")"
@@ -205,7 +205,7 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=state&token=$TOK")
 [ "$code" = "200" ] && ok "?token=<正确> -> 200" || bad "query token -> $code"
 # uhttpd 只转发 Accept/Authorization/Host/User-Agent，自定义 X-* 头会被丢弃，
 # 所以 X-Panel-Token 在 CGI 层直接验证（标准 CGI/反代场景），HTTP 层用 Bearer 验证。
-out=$(env REQUEST_METHOD=GET QUERY_STRING="what=state" HTTP_X_PANEL_TOKEN="$TOK" ucode /www/traffic-panel/cgi-bin/panel-api 2>/dev/null | tr -d '\r')
+out=$(env REQUEST_METHOD=GET QUERY_STRING="what=state" HTTP_X_PANEL_TOKEN="$TOK" ucode /www/prism-router-panel/cgi-bin/panel-api 2>/dev/null | tr -d '\r')
 case "$out" in
   *"Content-Type: application/json"*) ok "X-Panel-Token: <正确> -> 200（CGI 层；uhttpd 不转发 X-* 头）" ;;
   *) bad "header token -> $(printf '%s' "$out" | head -1)" ;;
@@ -215,7 +215,7 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=state" -H "Authorization: Bearer $TOK"
   || bad "Authorization Bearer -> $code / $(head -c 120 "$B")"
 code=$(req "$PANEL/cgi-bin/panel-api?what=state" -H "Authorization: Bearer wrong")
 [ "$code" = "401" ] && ok "Authorization: Bearer 错误 -> 401" || bad "Authorization Bearer 错误 -> $code"
-code=$(env REQUEST_METHOD=GET QUERY_STRING="what=state" HTTP_X_PANEL_TOKEN=wrong ucode /www/traffic-panel/cgi-bin/panel-api 2>/dev/null | head -1 | tr -d '\r')
+code=$(env REQUEST_METHOD=GET QUERY_STRING="what=state" HTTP_X_PANEL_TOKEN=wrong ucode /www/prism-router-panel/cgi-bin/panel-api 2>/dev/null | head -1 | tr -d '\r')
 case "$code" in
   "Status: 401 Unauthorized") ok "错误 X-Panel-Token -> 401（CGI 层）" ;;
   *) bad "错误 header token -> $code" ;;
@@ -224,8 +224,8 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=bad")
 [ "$code" = "401" ] && ok "未认证时先返回 401（不暴露 what 白名单）" || bad "未认证 what=bad -> $code"
 code=$(req "$PANEL/cgi-bin/panel-api?what=bad&token=$TOK")
 [ "$code" = "400" ] && ok "认证后 what=bad -> 400" || bad "认证后 what=bad -> $code"
-UCI set traffic-stats.panel.token=''
-UCI commit traffic-stats
+UCI set prism-router.panel.token=''
+UCI commit prism-router
 code=$(req "$PANEL/cgi-bin/panel-api?what=state")
 [ "$code" = "200" ] && ok "清空 token 后恢复 200" || bad "清空 token 后 -> $code"
 
@@ -239,10 +239,10 @@ esac
 [ "$PLACEHOLDER" = 1 ] && echo "  NOTE  GET / 用的是临时占位页面（前端任务尚未提供静态文件）"
 
 echo "=== 12. 非法 port / bind 回退，旧端口不再监听 ==="
-UCI set traffic-stats.panel.port='99999'
-UCI set traffic-stats.panel.bind='not-an-ip'
-UCI commit traffic-stats
-/etc/init.d/traffic-panel reload >/tmp/panel-reload.log 2>&1 \
+UCI set prism-router.panel.port='99999'
+UCI set prism-router.panel.bind='not-an-ip'
+UCI commit prism-router
+/etc/init.d/prism-router-panel reload >/tmp/panel-reload.log 2>&1 \
   && ok "reload 退出码 0" || { bad "reload 失败"; tail -5 /tmp/panel-reload.log; }
 PANEL_BAK="$PANEL"; PANEL="http://127.0.0.1:8099"
 if wait_panel; then
@@ -260,10 +260,10 @@ PANEL="$PANEL_BAK"
 echo "=== 13. bind 留空 -> 自动取 network.lan.ipaddr ==="
 UCI set network.lan.ipaddr='127.0.0.1'
 UCI commit network
-UCI set traffic-stats.panel.port="$PORT"
-UCI set traffic-stats.panel.bind=''
-UCI commit traffic-stats
-/etc/init.d/traffic-panel reload >/tmp/panel-reload2.log 2>&1
+UCI set prism-router.panel.port="$PORT"
+UCI set prism-router.panel.bind=''
+UCI commit prism-router
+/etc/init.d/prism-router-panel reload >/tmp/panel-reload2.log 2>&1
 if wait_panel; then
   ok "panel.bind 留空 + network.lan.ipaddr=127.0.0.1 -> 监听 127.0.0.1:$PORT"
 else
@@ -284,12 +284,12 @@ else
 fi
 
 echo "=== 15. 日志与只读边界 ==="
-if grep -Eq 'config_get[^#]*token|uci -q get[^#]*token' /etc/init.d/traffic-panel; then
+if grep -Eq 'config_get[^#]*token|uci -q get[^#]*token' /etc/init.d/prism-router-panel; then
   bad "init 读取了 token（应只在 CGI 里读，且不写日志）"
 else
   ok "init 不读 token"
 fi
-if grep -Eq 'writefile|appendfile|logger|syslog|/dev/log' /www/traffic-panel/cgi-bin/panel-api; then
+if grep -Eq 'writefile|appendfile|logger|syslog|/dev/log' /www/prism-router-panel/cgi-bin/panel-api; then
   bad "CGI 出现写文件/日志调用"
 else
   ok "CGI 无写文件/日志调用（只读 + 只用 ubus）"
@@ -299,7 +299,7 @@ if grep -rqs "$TOK" /tmp/*.log 2>/dev/null; then
 else
   ok "临时日志里没有 token"
 fi
-grep -q 'config panel' /etc/config/traffic-stats && ok "conffile 已包含 panel 段" || bad "conffile 缺 panel 段"
+grep -q 'config panel' /etc/config/prism-router && ok "conffile 已包含 panel 段" || bad "conffile 缺 panel 段"
 
 echo "=== 16. 系统目录权限未被改动 ==="
 [ "$B_ETC" = "$(perm /etc)" ] && ok "/etc 未变" || bad "/etc 被改动"

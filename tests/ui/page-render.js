@@ -26,7 +26,7 @@ const PASS = process.env.LUCI_PASS || '';
   for (const p of pages) {
     errors.length = 0;
     try {
-      await page.goto(BASE + '/cgi-bin/luci/admin/services/traffic-stats/' + p, { waitUntil:'networkidle2', timeout:25000 });
+      await page.goto(BASE + '/cgi-bin/luci/admin/services/prism-router/' + p, { waitUntil:'networkidle2', timeout:25000 });
     } catch(e) { console.log(`${p}: NAV_FAIL ${e.message.slice(0,60)}`); bad++; continue; }
     await new Promise(r => setTimeout(r, 2500));
     const body = await page.evaluate(() => document.body.innerText || '');

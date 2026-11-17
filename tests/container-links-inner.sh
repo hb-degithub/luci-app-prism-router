@@ -25,7 +25,7 @@ check(){ local got; got=$(ls -ld "$1" 2>/dev/null | awk '{print $3":"$4" "$1}')
   [ "$got" = "$2" ] && ok "$1 -> $got" || bad "$1 期望[$2] 实际[${got:-不存在}]"; }
 UCI(){ uci "$@" >/dev/null 2>&1; }
 CGET(){ uci -q get "$1" 2>/dev/null; }
-cfg_commit(){ uci commit traffic-stats >/dev/null 2>&1; }
+cfg_commit(){ uci commit prism-router >/dev/null 2>&1; }
 
 BASE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
 LINK64='00:58:28:d7:63:60'
@@ -85,12 +85,12 @@ run_once(){
   SD="$1"; RUN_PATH="$2"
   rm -rf "$SD"
   mkdir -p "$(dirname "$SD")"
-  env PATH="$RUN_PATH" TRAFFIC_STATS_ONCE=1 \
-    TRAFFIC_STATS_STATE_DIR="$SD" \
-    TRAFFIC_STATS_DAILY_DIR="$SD.daily" \
-    TRAFFIC_STATS_CONNTRACK_FILE=/tmp/ct.txt \
-    TRAFFIC_STATS_CLASH_API=127.0.0.1:19091 \
-    ucode /usr/bin/traffic-statsd >"$SD.log" 2>&1
+  env PATH="$RUN_PATH" PRISM_ROUTER_ONCE=1 \
+    PRISM_ROUTER_STATE_DIR="$SD" \
+    PRISM_ROUTER_DAILY_DIR="$SD.daily" \
+    PRISM_ROUTER_CONNTRACK_FILE=/tmp/ct.txt \
+    PRISM_ROUTER_CLASH_API=127.0.0.1:19091 \
+    ucode /usr/bin/prism-routerd >"$SD.log" 2>&1
   echo $?
 }
 
@@ -99,21 +99,21 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 echo "=== 1. 安装两个包 ==="
-opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 prism-router" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-prism-router" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新配置项与文件权限 ==="
 for k in lan_bridge wireless_ports ap_macs link_refresh; do
-  grep -q "option $k" /etc/config/traffic-stats && ok "config 含 $k" || bad "config 缺少 $k"
+  grep -q "option $k" /etc/config/prism-router && ok "config 含 $k" || bad "config 缺少 $k"
 done
-grep -q "option lan_bridge 'br-lan'" /etc/config/traffic-stats && ok "lan_bridge 默认 br-lan" || bad "lan_bridge 默认值不对"
-grep -q "option link_refresh '30'" /etc/config/traffic-stats && ok "link_refresh 默认 30" || bad "link_refresh 默认值不对"
-check /usr/bin/traffic-statsd "root:root -rwxr-xr-x"
-check /usr/share/rpcd/ucode/traffic-stats.uc "root:root -rw-r--r--"
-check /www/luci-static/resources/view/traffic-stats/overview.js "root:root -rw-r--r--"
-check /www/luci-static/resources/view/traffic-stats/devices.js "root:root -rw-r--r--"
-check /www/luci-static/resources/view/traffic-stats/settings.js "root:root -rw-r--r--"
-check /etc/config/traffic-stats "root:root -rw-r--r--"
+grep -q "option lan_bridge 'br-lan'" /etc/config/prism-router && ok "lan_bridge 默认 br-lan" || bad "lan_bridge 默认值不对"
+grep -q "option link_refresh '30'" /etc/config/prism-router && ok "link_refresh 默认 30" || bad "link_refresh 默认值不对"
+check /usr/bin/prism-routerd "root:root -rwxr-xr-x"
+check /usr/share/rpcd/ucode/prism-router.uc "root:root -rw-r--r--"
+check /www/luci-static/resources/view/prism-router/overview.js "root:root -rw-r--r--"
+check /www/luci-static/resources/view/prism-router/devices.js "root:root -rw-r--r--"
+check /www/luci-static/resources/view/prism-router/settings.js "root:root -rw-r--r--"
+check /etc/config/prism-router "root:root -rw-r--r--"
 
 echo "=== 3. 系统目录权限未被改动（回归核心）==="
 [ "$B_ETC" = "$(perm /etc)" ] && ok "/etc 未变" || bad "/etc 被改动"
@@ -122,8 +122,8 @@ echo "=== 3. 系统目录权限未被改动（回归核心）==="
 [ "$B_CGI" = "$(perm /www/cgi-bin 2>/dev/null)" ] && ok "/www/cgi-bin 未变" || bad "/www/cgi-bin 被改动"
 
 echo "=== 4. ucode 语法 ==="
-ucode -c /usr/bin/traffic-statsd && ok "traffic-statsd 语法 OK" || bad "traffic-statsd 语法错误"
-ucode -c /usr/share/rpcd/ucode/traffic-stats.uc && ok "rpcd uc 语法 OK" || bad "rpcd uc 语法错误"
+ucode -c /usr/bin/prism-routerd && ok "prism-routerd 语法 OK" || bad "prism-routerd 语法错误"
+ucode -c /usr/share/rpcd/ucode/prism-router.uc && ok "rpcd uc 语法 OK" || bad "rpcd uc 语法错误"
 
 echo "=== 5. 假 brctl（固定 FDB）+ 合成租约 / conntrack + 假 clash API ==="
 cat > /tmp/fakebin/brctl <<'FAKEBRCTL'
@@ -169,8 +169,8 @@ while [ $i -lt 20 ]; do
 done
 [ $i -lt 20 ] && ok "假 clash API 就绪 (127.0.0.1:19091)" || { bad "假 clash API 未就绪"; cat /tmp/mockclash.log; }
 
-UCI set traffic-stats.settings.lan_ranges='192.168.100.0/24'
-UCI set traffic-stats.settings.poll_interval='5'
+UCI set prism-router.settings.lan_ranges='192.168.100.0/24'
+UCI set prism-router.settings.poll_interval='5'
 cfg_commit
 
 # 期望值（conntrack 3 条与 clash c1/c2/c3 同五元组，全部只在 Clash 侧计一次）：
@@ -188,10 +188,10 @@ EXP_UNKNOWN_RX=9111; EXP_UNKNOWN_TX=911
 EXP_ALL_RX=21111;     EXP_ALL_TX=2111
 
 echo "=== 6. Case A：ap_macs 反查上联端口（$LINK64 -> 端口 3）==="
-UCI set traffic-stats.settings.lan_bridge='br-lan'
-UCI set traffic-stats.settings.wireless_ports=''
-UCI set traffic-stats.settings.ap_macs="$LINK64"
-UCI set traffic-stats.settings.link_refresh='30'
+UCI set prism-router.settings.lan_bridge='br-lan'
+UCI set prism-router.settings.wireless_ports=''
+UCI set prism-router.settings.ap_macs="$LINK64"
+UCI set prism-router.settings.link_refresh='30'
 cfg_commit
 RC=$(run_once /tmp/lk/a "/tmp/fakebin:$BASE_PATH")
 [ "$RC" = "0" ] && ok "守护进程退出码 0（--once）" || { bad "退出码 $RC"; tail -5 /tmp/lk/a.log; }
@@ -228,7 +228,7 @@ else
 fi
 
 echo "=== 7. Case A2：ap_macs 大写 + 短横线归一 ==="
-UCI set traffic-stats.settings.ap_macs='00-58-28-D7-63-60'
+UCI set prism-router.settings.ap_macs='00-58-28-D7-63-60'
 cfg_commit
 RC=$(run_once /tmp/lk/a2 "/tmp/fakebin:$BASE_PATH")
 [ "$RC" = "0" ] && ok "退出码 0" || bad "退出码 $RC"
@@ -241,8 +241,8 @@ else
 fi
 
 echo "=== 8. Case B：wireless_ports='3,5'（不配 ap_macs）==="
-UCI set traffic-stats.settings.ap_macs=''
-UCI set traffic-stats.settings.wireless_ports='3,5'
+UCI set prism-router.settings.ap_macs=''
+UCI set prism-router.settings.wireless_ports='3,5'
 cfg_commit
 RC=$(run_once /tmp/lk/b "/tmp/fakebin:$BASE_PATH")
 [ "$RC" = "0" ] && ok "退出码 0" || bad "退出码 $RC"
@@ -264,8 +264,8 @@ fi
 chk_inv /tmp/lk/b/state.json "Case B"
 
 echo "=== 9. Case C：ap_macs 查不到 -> 保持 wireless_ports 原值 + reason ==="
-UCI set traffic-stats.settings.ap_macs='00:11:22:33:44:55'
-UCI set traffic-stats.settings.wireless_ports='2'
+UCI set prism-router.settings.ap_macs='00:11:22:33:44:55'
+UCI set prism-router.settings.wireless_ports='2'
 cfg_commit
 RC=$(run_once /tmp/lk/c "/tmp/fakebin:$BASE_PATH")
 [ "$RC" = "0" ] && ok "退出码 0（找不到 AP 也不崩）" || bad "退出码 $RC"
@@ -284,13 +284,13 @@ fi
 chk_inv /tmp/lk/c/state.json "Case C"
 
 echo "=== 10. Case D：brctl 不存在（指向不存在路径）==="
-UCI set traffic-stats.settings.ap_macs=''
-UCI set traffic-stats.settings.wireless_ports='3'
+UCI set prism-router.settings.ap_macs=''
+UCI set prism-router.settings.wireless_ports='3'
 cfg_commit
 rm -rf /tmp/lk/d
-RC=$(env PATH="$BASE_PATH" TRAFFIC_STATS_BRCTL=/nonexistent/brctl TRAFFIC_STATS_ONCE=1 \
-  TRAFFIC_STATS_STATE_DIR=/tmp/lk/d TRAFFIC_STATS_CONNTRACK_FILE=/tmp/ct.txt \
-  TRAFFIC_STATS_CLASH_API=127.0.0.1:19091 ucode /usr/bin/traffic-statsd >/tmp/lk/d.log 2>&1; echo $?)
+RC=$(env PATH="$BASE_PATH" PRISM_ROUTER_BRCTL=/nonexistent/brctl PRISM_ROUTER_ONCE=1 \
+  PRISM_ROUTER_STATE_DIR=/tmp/lk/d PRISM_ROUTER_CONNTRACK_FILE=/tmp/ct.txt \
+  PRISM_ROUTER_CLASH_API=127.0.0.1:19091 ucode /usr/bin/prism-routerd >/tmp/lk/d.log 2>&1; echo $?)
 [ "$RC" = "0" ] && ok "退出码 0（brctl 缺失不崩）" || { bad "退出码 $RC"; tail -5 /tmp/lk/d.log; }
 if [ -f /tmp/lk/d/state.json ]; then
   R=$(report /tmp/lk/d/state.json)
@@ -358,8 +358,8 @@ fi
 chk_inv /tmp/lk/f/state.json "Case F"
 
 echo "=== 13. Case G：未配置 wireless_ports / ap_macs（默认安装）==="
-UCI set traffic-stats.settings.wireless_ports=''
-UCI set traffic-stats.settings.ap_macs=''
+UCI set prism-router.settings.wireless_ports=''
+UCI set prism-router.settings.ap_macs=''
 cfg_commit
 RC=$(run_once /tmp/lk/g "/tmp/fakebin:$BASE_PATH")
 [ "$RC" = "0" ] && ok "退出码 0" || bad "退出码 $RC"
@@ -377,39 +377,39 @@ fi
 chk_inv /tmp/lk/g/state.json "Case G"
 
 echo "=== 14. link_refresh 生效（30s 只读一次 / 1s 至少两次）==="
-UCI set traffic-stats.settings.wireless_ports='3'
-UCI set traffic-stats.settings.link_refresh='30'
-UCI set traffic-stats.settings.poll_interval='1'
+UCI set prism-router.settings.wireless_ports='3'
+UCI set prism-router.settings.link_refresh='30'
+UCI set prism-router.settings.poll_interval='1'
 cfg_commit
 rm -f /tmp/fakebrctl.calls; rm -rf /tmp/lk/h1
-env PATH="/tmp/fakebin:$BASE_PATH" TRAFFIC_STATS_STATE_DIR=/tmp/lk/h1 \
-  TRAFFIC_STATS_CONNTRACK_FILE=/tmp/ct.txt TRAFFIC_STATS_CLASH_API=127.0.0.1:19091 \
-  ucode /usr/bin/traffic-statsd >/tmp/lk/h1.log 2>&1 &
+env PATH="/tmp/fakebin:$BASE_PATH" PRISM_ROUTER_STATE_DIR=/tmp/lk/h1 \
+  PRISM_ROUTER_CONNTRACK_FILE=/tmp/ct.txt PRISM_ROUTER_CLASH_API=127.0.0.1:19091 \
+  ucode /usr/bin/prism-routerd >/tmp/lk/h1.log 2>&1 &
 DPID=$!
 sleep 4
 kill $DPID >/dev/null 2>&1; wait $DPID >/dev/null 2>&1
 N1=$(wc -l < /tmp/fakebrctl.calls 2>/dev/null || echo 0)
 [ "$N1" = "1" ] && ok "link_refresh=30：4 秒内只读 1 次 FDB（实际 $N1）" || bad "link_refresh=30 读了 $N1 次，期望 1"
 
-UCI set traffic-stats.settings.link_refresh='1'
+UCI set prism-router.settings.link_refresh='1'
 cfg_commit
 rm -f /tmp/fakebrctl.calls; rm -rf /tmp/lk/h2
-env PATH="/tmp/fakebin:$BASE_PATH" TRAFFIC_STATS_STATE_DIR=/tmp/lk/h2 \
-  TRAFFIC_STATS_CONNTRACK_FILE=/tmp/ct.txt TRAFFIC_STATS_CLASH_API=127.0.0.1:19091 \
-  ucode /usr/bin/traffic-statsd >/tmp/lk/h2.log 2>&1 &
+env PATH="/tmp/fakebin:$BASE_PATH" PRISM_ROUTER_STATE_DIR=/tmp/lk/h2 \
+  PRISM_ROUTER_CONNTRACK_FILE=/tmp/ct.txt PRISM_ROUTER_CLASH_API=127.0.0.1:19091 \
+  ucode /usr/bin/prism-routerd >/tmp/lk/h2.log 2>&1 &
 DPID=$!
 sleep 4
 kill $DPID >/dev/null 2>&1; wait $DPID >/dev/null 2>&1
 N2=$(wc -l < /tmp/fakebrctl.calls 2>/dev/null || echo 0)
 [ "$N2" -ge 2 ] && ok "link_refresh=1：4 秒内读 $N2 次 FDB（>=2）" || bad "link_refresh=1 只读了 $N2 次"
-UCI set traffic-stats.settings.poll_interval='5'
-UCI set traffic-stats.settings.link_refresh='30'
+UCI set prism-router.settings.poll_interval='5'
+UCI set prism-router.settings.link_refresh='30'
 cfg_commit
 
 echo "=== 15. rpcd 透传：get_state / status ==="
-mkdir -p /tmp/traffic-stats
-cp -f /tmp/lk/a/state.json /tmp/traffic-stats/state.json
-TRAFFIC_STATS_METHOD=get_state ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc >/tmp/getstate.json 2>/tmp/getstate.err
+mkdir -p /tmp/prism-router
+cp -f /tmp/lk/a/state.json /tmp/prism-router/state.json
+PRISM_ROUTER_METHOD=get_state ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc >/tmp/getstate.json 2>/tmp/getstate.err
 [ -s /tmp/getstate.json ] && ok "get_state 返回非空（$(wc -c < /tmp/getstate.json) 字节）" || { bad "get_state 空"; cat /tmp/getstate.err; }
 CP=$(F=/tmp/getstate.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F")));
   let a=d.totals.direct_rx+d.totals.proxy_rx, b=d.totals.wifi_rx+d.totals.wired_rx+d.totals.unknown_rx;
@@ -425,7 +425,7 @@ CPL=$(F=/tmp/getstate.json ucode -e 'let fs=require("fs"); let d=json(fs.readfil
   print(sprintf("%d|%d", n, bad));')
 OLDIFS=$IFS; IFS='|'; set -- $CPL; IFS=$OLDIFS
 [ "$1" -ge 3 ] && [ "$2" = "0" ] && ok "get_state 每台设备都有合法 link（$1 台，非法 0）" || bad "设备 link 非法：$1 台 / 非法 $2"
-TRAFFIC_STATS_METHOD=status ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc >/tmp/status.json 2>/dev/null
+PRISM_ROUTER_METHOD=status ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc >/tmp/status.json 2>/dev/null
 STL=$(F=/tmp/status.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F")));
   print(sprintf("%s|%s|%d", (d.link_source ?? "missing"), (d.link_bridge ?? "missing"),
     length(d.link_ports ?? [])));')
@@ -437,15 +437,15 @@ else
 fi
 
 echo "=== 16. set_config 白名单放行新配置项 ==="
-SC=$(TRAFFIC_STATS_METHOD=set_config TRAFFIC_STATS_ARGS='{"section":"settings","options":"{\"lan_bridge\":\"br-lan\",\"wireless_ports\":\"3\",\"ap_macs\":\"00:58:28:d7:63:60\",\"link_refresh\":\"45\"}"}' \
-  ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc 2>/dev/null)
+SC=$(PRISM_ROUTER_METHOD=set_config PRISM_ROUTER_ARGS='{"section":"settings","options":"{\"lan_bridge\":\"br-lan\",\"wireless_ports\":\"3\",\"ap_macs\":\"00:58:28:d7:63:60\",\"link_refresh\":\"45\"}"}' \
+  ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc 2>/dev/null)
 echo "$SC" | tr -d ' \n' | grep -q '"ok":true' && ok "set_config 接受四个新字段" || bad "set_config 返回 $SC"
-[ "$(CGET traffic-stats.settings.wireless_ports)" = "3" ] && ok "uci wireless_ports=3" || bad "wireless_ports=$(CGET traffic-stats.settings.wireless_ports)"
-[ "$(CGET traffic-stats.settings.ap_macs)" = "00:58:28:d7:63:60" ] && ok "uci ap_macs 写入成功" || bad "ap_macs 写入失败"
-[ "$(CGET traffic-stats.settings.link_refresh)" = "45" ] && ok "uci link_refresh=45" || bad "link_refresh 写入失败"
-[ "$(CGET traffic-stats.settings.lan_bridge)" = "br-lan" ] && ok "uci lan_bridge=br-lan" || bad "lan_bridge 写入失败"
-BAD=$(TRAFFIC_STATS_METHOD=set_config TRAFFIC_STATS_ARGS='{"section":"settings","options":"{\"ap_mac\":\"x\"}"}' \
-  ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc 2>/dev/null)
+[ "$(CGET prism-router.settings.wireless_ports)" = "3" ] && ok "uci wireless_ports=3" || bad "wireless_ports=$(CGET prism-router.settings.wireless_ports)"
+[ "$(CGET prism-router.settings.ap_macs)" = "00:58:28:d7:63:60" ] && ok "uci ap_macs 写入成功" || bad "ap_macs 写入失败"
+[ "$(CGET prism-router.settings.link_refresh)" = "45" ] && ok "uci link_refresh=45" || bad "link_refresh 写入失败"
+[ "$(CGET prism-router.settings.lan_bridge)" = "br-lan" ] && ok "uci lan_bridge=br-lan" || bad "lan_bridge 写入失败"
+BAD=$(PRISM_ROUTER_METHOD=set_config PRISM_ROUTER_ARGS='{"section":"settings","options":"{\"ap_mac\":\"x\"}"}' \
+  ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc 2>/dev/null)
 echo "$BAD" | grep -q 'no valid options' && ok "非白名单字段仍被拒绝" || bad "非白名单字段未被拒绝：$BAD"
 
 echo "=== 17. 返回体体积仍远低于 ubus 上限 ==="

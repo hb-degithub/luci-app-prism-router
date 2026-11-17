@@ -1,6 +1,6 @@
 # OpenWrt 24.10 / 23.05 下「procd 守护进程 + LuCI 界面」插件工程规范调研
 
-> 调研对象：为 `luci-app-traffic-stats`（后台采集守护进程 + UCI 配置 + LuCI Web 图表界面 + root 特权操作 + opkg/apk 安装 + 自定义 feed）确定标准工程结构与实现规范。
+> 调研对象：为 `luci-app-prism-router`（后台采集守护进程 + UCI 配置 + LuCI Web 图表界面 + root 特权操作 + opkg/apk 安装 + 自定义 feed）确定标准工程结构与实现规范。
 >
 > 调研时间：2026-11-14。**本文只做调研，不含业务实现。**
 >
@@ -29,7 +29,7 @@
 | 4 | 配置 | `/etc/config/<pkg>` + `conffiles` 保留；`/etc/uci-defaults` 只在**首次启动/升级后**跑一次，退出 0 即删除；格式迁移**没有内建机制**，要自己用版本号标记 + 幂等 `uci -q get` 守卫 | 同 |
 | 5 | 打包 | **24.10 默认仍是 opkg**，apk 是标了 `(BROKEN)` 且 `depends on BROKEN` 的编译期选项；**23.05 根本没有 apk 包**；apk 成为默认是从 **25.12** 开始 | 23.05 无 apk；Makefile 写法两者一致 |
 | 6 | 二进制 vs 脚本 | 采集/高频路径用 C（`$(TARGET_CC)` 或 cmake.mk）；控制面/管理逻辑用 ucode 最划算（解释器约 64 KB）；Go 仅在生态强绑定时用，体积代价明显 | 同 |
-| 7 | 骨架 | 双包结构：`traffic-statsd`（架构相关）+ `luci-app-traffic-stats`（`LUCI_PKGARCH:=all`） | 同 |
+| 7 | 骨架 | 双包结构：`prism-routerd`（架构相关）+ `luci-app-prism-router`（`LUCI_PKGARCH:=all`） | 同 |
 
 **一句话架构建议**：守护进程用 C（或复用现成采集器）跑 root 采集，状态/查询走 **rpcd ucode 插件或 `/usr/libexec/rpcd` 脚本**，LuCI JS 只经 `rpc.declare()` 调 ubus、经 ACL 白名单拿数据，图表用 `luci-lib-chartjs`（24.10 自带，23.05 需自带 JS）。
 
@@ -85,10 +85,10 @@ return view.extend({
 	render: function() {
 		let m, s, o;
 
-		// 第一个参数 = /etc/config/ 下的配置名，即 /etc/config/traffic_stats
-		// 对应 ACL：read.uci / write.uci 里都要有 "traffic_stats"
-		m = new form.Map('traffic_stats', _('Traffic Statistics'),
-			_('流量统计守护进程配置'));
+		// 第一个参数 = /etc/config/ 下的配置名，即 /etc/config/prism_router
+		// 对应 ACL：read.uci / write.uci 里都要有 "prism_router"
+		m = new form.Map('prism_router', _('Traffic Statistics'),
+			_('棱镜路由守护进程配置'));
 
 		s = m.section(form.TypedSection, 'settings', _('采集设置'));
 		s.anonymous = true;
@@ -115,7 +115,7 @@ return view.extend({
 
 要点（都有源码依据）：
 - 顶部 `'require xxx'` 字符串是**依赖声明**，供构建期打包与运行期加载，不是注释。【源码确认】同文件与 `docs/README.md`
-- 视图文件路径 = 菜单 `action.path` 的路径 + `.js`；`view/traffic-stats/overview.js` ↔ `path: "traffic-stats/overview"`。
+- 视图文件路径 = 菜单 `action.path` 的路径 + `.js`；`view/prism-router/overview.js` ↔ `path: "prism-router/overview"`。
 - `form.Map` 直接读写 UCI，**ACL 必须同时给 `read.uci` 和 `write.uci`**，否则保存时报 "Access denied"。【文档确认】[structure.md ACL 段](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-example/structure.md)
 - 页面必须准备好"配置为空"的情况：官方注释提醒"如果配置文件完全为空，表单会显示该 section 还没有值，因此**安装时就该铺一份带 section 的默认配置**"。【源码确认】[form.js#L14-L17](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-example/htdocs/luci-static/resources/view/example/form.js#L14-L17)
 
@@ -131,23 +131,23 @@ JSON 的合法字段由 dispatcher 的 schema 校验决定，只有：`action`, 
 
 ```json
 {
-  "admin/status/traffic-stats": {
-    "title": "流量统计",
+  "admin/status/prism-router": {
+    "title": "棱镜路由",
     "order": 95,
     "action": { "type": "firstchild" },
-    "depends": { "acl": [ "luci-app-traffic-stats" ] }
+    "depends": { "acl": [ "luci-app-prism-router" ] }
   },
 
-  "admin/status/traffic-stats/overview": {
+  "admin/status/prism-router/overview": {
     "title": "总览",
     "order": 1,
-    "action": { "type": "view", "path": "traffic-stats/overview" }
+    "action": { "type": "view", "path": "prism-router/overview" }
   },
 
-  "admin/status/traffic-stats/config": {
+  "admin/status/prism-router/config": {
     "title": "设置",
     "order": 2,
-    "action": { "type": "view", "path": "traffic-stats/config" }
+    "action": { "type": "view", "path": "prism-router/config" }
   }
 }
 ```
@@ -162,7 +162,7 @@ JSON 的合法字段由 dispatcher 的 schema 校验决定，只有：`action`, 
    ```js
    'require rpc';
    const callTotals = rpc.declare({
-       object: 'traffic-stats',      // 对象名 = /usr/libexec/rpcd/traffic-stats 或 ucode 插件注册名
+       object: 'prism-router',      // 对象名 = /usr/libexec/rpcd/prism-router 或 ucode 插件注册名
        method: 'get_totals',
        params: [ 'iface', 'period' ],
        expect: { '': {} }
@@ -174,18 +174,18 @@ JSON 的合法字段由 dispatcher 的 schema 校验决定，只有：`action`, 
 2. **服务状态**：`service` 对象 `list`
    ```js
    const callServiceList = rpc.declare({ object:'service', method:'list', params:['name'], expect:{ '':{} } });
-   // data[0]['traffic-statsd']['instances']['instance1']['running']
+   // data[0]['prism-routerd']['instances']['instance1']['running']
    ```
    ⚠️ `service` 的 `list` **不在 luci-base 默认 ACL 里**，必须在自己的 `acl.d` 里给 `read.ubus.service: ["list"]`。证据：`luci-base.json` 只把 `file`/`uci` 给了普通用户，而各带状态页的 app 都单独声明了 `"service": ["list"]`。【源码确认】[luci-base.json](https://github.com/openwrt/luci/blob/openwrt-24.10/modules/luci-base/root/usr/share/rpcd/acl.d/luci-base.json)、[vnstat2 acl.d](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-vnstat2/root/usr/share/rpcd/acl.d/luci-app-vnstat2.json)、读取写法 [vnstat2/graphs.js#L14-L19](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-vnstat2/htdocs/luci-static/resources/view/vnstat2/graphs.js#L14-L19)
 
 3. **直接执行受控命令**：`fs.exec_direct()`，ACL 用"命令行前缀"白名单
    ```js
    'require fs';
-   fs.exec_direct('/usr/sbin/traffic-statsctl', [ 'dump', '--json' ], 'json')
+   fs.exec_direct('/usr/sbin/prism-routerctl', [ 'dump', '--json' ], 'json')
    ```
    对应 ACL（注意 key 是**含参数的命令行前缀**，`*` 通配）：
    ```json
-   "file": { "/usr/sbin/traffic-statsctl dump --json": [ "exec" ] }
+   "file": { "/usr/sbin/prism-routerctl dump --json": [ "exec" ] }
    ```
    【源码确认】[vnstat2 acl.d](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-vnstat2/root/usr/share/rpcd/acl.d/luci-app-vnstat2.json) 与 [graphs.js](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-vnstat2/htdocs/luci-static/resources/view/vnstat2/graphs.js)；`fs.exec` / `fs.exec_direct` 在 23.05 与 24.10 的 `fs.js` 中**行号完全一致**（268 / 405），API 无变化【源码确认】
 
@@ -245,7 +245,7 @@ A 的实证：`luci-app-nlbwmon` 用 `luci-lib-chartjs`（`LUCI_DEPENDS` 含 `+l
 
 ```sh
 #!/bin/sh
-# /usr/libexec/rpcd/traffic-stats   —— 对象名即文件名
+# /usr/libexec/rpcd/prism-router   —— 对象名即文件名
 . /lib/functions.sh
 
 case "$1" in
@@ -263,7 +263,7 @@ call)
 		printf '{"rx":0,"tx":0}\n'
 		;;
 	reset)
-		/etc/init.d/traffic-statsd restart >/dev/null 2>&1
+		/etc/init.d/prism-routerd restart >/dev/null 2>&1
 		printf '{}\n'
 		;;
 	esac
@@ -271,7 +271,7 @@ call)
 esac
 ```
 
-调试方式（官方 wiki 与 example 都给了同样套路）：`echo '{"iface":"wan"}' | /usr/libexec/rpcd/traffic-stats call get_totals`、`ubus -v list traffic-stats`、`ubus call traffic-stats get_totals '{"iface":"wan"}'`。参数类型由**示例值的类型**推断（字符串→String，true/false→Boolean，整数按大小→INT8/16/32/64）。【文档确认】[rpcd TechRef](https://openwrt.org/docs/techref/rpcd)
+调试方式（官方 wiki 与 example 都给了同样套路）：`echo '{"iface":"wan"}' | /usr/libexec/rpcd/prism-router call get_totals`、`ubus -v list prism-router`、`ubus call prism-router get_totals '{"iface":"wan"}'`。参数类型由**示例值的类型**推断（字符串→String，true/false→Boolean，整数按大小→INT8/16/32/64）。【文档确认】[rpcd TechRef](https://openwrt.org/docs/techref/rpcd)
 
 Lua 版同一协议见官方 `luci.example`（`methods` 表 + `list`/`call`/`help` 三个分支）。【源码确认】[luci.example](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-example/root/usr/libexec/rpcd/luci.example)
 
@@ -283,16 +283,16 @@ rpcd 的 ucode 插件目录在源码里硬编码为 `INSTALL_PREFIX "/share/rpcd
 
 ```ucode
 'use strict';
-// /usr/share/rpcd/ucode/traffic-stats.uc
+// /usr/share/rpcd/ucode/prism-router.uc
 import { cursor } from 'uci';
 
 return {
-	'traffic-stats': {                       // ← ubus 对象名
+	'prism-router': {                       // ← ubus 对象名
 		get_totals: {
 			args: { iface: 'wan', period: 'day' },   // 类型由示例值推断
 			call: function (request) {
 				const uci = cursor();
-				const db = uci.get('traffic_stats', 'settings', 'db_path') ?? '/var/lib/traffic-stats';
+				const db = uci.get('prism_router', 'settings', 'db_path') ?? '/var/lib/prism-router';
 				return { rx: 0, tx: 0, db: db, got: request.args };
 			}
 		},
@@ -318,8 +318,8 @@ return {
 static const struct ubus_method traffic_methods[] = {
     UBUS_METHOD("get_totals", traffic_get_totals, totals_policy),
 };
-static struct ubus_object_type traffic_obj_type = UBUS_OBJECT_TYPE("traffic-stats", traffic_methods);
-static struct ubus_object traffic_obj = { .name = "traffic-stats", .type = &traffic_obj_type,
+static struct ubus_object_type traffic_obj_type = UBUS_OBJECT_TYPE("prism-router", traffic_methods);
+static struct ubus_object traffic_obj = { .name = "prism-router", .type = &traffic_obj_type,
                                           .methods = traffic_methods,
                                           .n_methods = ARRAY_SIZE(traffic_methods) };
 /* main: ctx = ubus_connect(NULL); ubus_add_object(ctx, &traffic_obj); uloop_run(); */
@@ -377,30 +377,30 @@ static struct ubus_object traffic_obj = { .name = "traffic-stats", .type = &traf
 START=95
 STOP=10
 USE_PROCD=1
-NAME=traffic-statsd
-PROG=/usr/sbin/traffic-statsd
+NAME=prism-routerd
+PROG=/usr/sbin/prism-routerd
 
 start_service() {
-	config_load traffic_stats
+	config_load prism_router
 	config_get_bool enabled settings enabled 1
 	[ "$enabled" -eq 1 ] || return 0
 
 	procd_open_instance
-	procd_set_param command "$PROG" -d /var/lib/traffic-stats
+	procd_set_param command "$PROG" -d /var/lib/prism-router
 	procd_set_param respawn 3600 5 5        # 60 分钟内挂 5 次即停
 	procd_set_param stdout 1                # 日志进 logd
 	procd_set_param stderr 1
 	procd_set_param limits core="unlimited"
-	procd_set_param file /etc/config/traffic_stats   # 声明配置文件（变化检测参数）
+	procd_set_param file /etc/config/prism_router   # 声明配置文件（变化检测参数）
 	procd_close_instance
 }
 
 service_triggers() {
-	procd_add_reload_trigger "traffic_stats"
+	procd_add_reload_trigger "prism_router"
 }
 
 reload_service() {
-	procd_send_signal traffic-statsd        # 优雅重载；不支持 SIGHUP 就写 restart
+	procd_send_signal prism-routerd        # 优雅重载；不支持 SIGHUP 就写 restart
 }
 ```
 
@@ -432,20 +432,20 @@ reload_service() {
 ### 3.4 日志接 logd/syslog
 
 - 守护进程**直接写 stdout/stderr**，play `procd_set_param stdout 1` + `stderr 1`，procd 把它们送进 logd，用户 `logread` 可见。官方文档明确"仍需把 stdout/stderr 重定向到 logd 才能在系统日志里看到输出"。【文档确认】[procd-init-script-example](https://openwrt.org/docs/guide-developer/procd-init-script-example)
-- 脚本侧要打日志用 `logger -t traffic-statsd "..."`（rpcd 后端同理；官方 example 用 `nixio.syslog`）。【源码确认】[luci.example](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-example/root/usr/libexec/rpcd/luci.example)
+- 脚本侧要打日志用 `logger -t prism-routerd "..."`（rpcd 后端同理；官方 example 用 `nixio.syslog`）。【源码确认】[luci.example](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-example/root/usr/libexec/rpcd/luci.example)
 - 若希望日志落到独立文件（统计类常想保留历史），需要自己 `logread` 采集或用 `logd` 的 remote/文件输出，或直接用自有日志文件 + logrotate。**具体推荐方案：未查证**（未找到官方针对"守护进程独立日志文件"的标准做法）。
 
 ### 3.5 状态上报（ubus service）
 
-- `ubus call service list '{"name":"traffic-statsd"}'` 返回 `{"traffic-statsd":{"instances":{"instance1":{"running":true,...}}}}`；前端用 `rpc.declare({object:'service',method:'list'})` 读取，并从 `data[0]['<name>']['instances']['instance1']['running']` 判活（vnstat2 的原样写法）。【源码确认】[graphs.js#L100-L103](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-vnstat2/htdocs/luci-static/resources/view/vnstat2/graphs.js#L100-L103)
+- `ubus call service list '{"name":"prism-routerd"}'` 返回 `{"prism-routerd":{"instances":{"instance1":{"running":true,...}}}}`；前端用 `rpc.declare({object:'service',method:'list'})` 读取，并从 `data[0]['<name>']['instances']['instance1']['running']` 判活（vnstat2 的原样写法）。【源码确认】[graphs.js#L100-L103](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-vnstat2/htdocs/luci-static/resources/view/vnstat2/graphs.js#L100-L103)
 - 服务在 procd 里的名字默认是 init 脚本文件名（`NAME=` 可覆盖），实例名默认 `instance1`。
 - 除 `running` 外还可读到 `pid`、`command` 等；**是否需要 `service` 额外方法（如 `restart`）取决于 ACL 是否给**——本项目建议"重启"走自己的 ubus 方法，而不是给前端 `service` 的写权限。【推断】
 
 ### 3.6 优雅重启 / 热重载
 
 - `reload_service() { procd_send_signal <name> [instance] [signal] }` → 给进程发信号（如 SIGHUP 让 daemon 重读配置），不重启进程。
-- `procd_add_reload_trigger "traffic_stats"` → 精确机制（源码）：为每个配置名注册一个 `config.change` ubus 事件触发器，事件到达时执行 `/etc/init.d/<脚本名> reload`。也就是说**它依赖 `uci commit` 触发的 `config.change` 事件**，手改文件不会触发。【源码确认】[procd.sh#L454-L464](https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/system/procd/files/procd.sh#L454-L464)
-- `procd_add_interface_trigger "interface.*" <iface> /etc/init.d/traffic-statsd reload` → 接口 up/down 时 reload（nlbwmon 用它保证新接口被纳入采集）。【源码确认】[nlbwmon.init#L93-L107](https://github.com/openwrt/packages/blob/openwrt-24.10/net/nlbwmon/files/nlbwmon.init#L93-L107)
+- `procd_add_reload_trigger "prism_router"` → 精确机制（源码）：为每个配置名注册一个 `config.change` ubus 事件触发器，事件到达时执行 `/etc/init.d/<脚本名> reload`。也就是说**它依赖 `uci commit` 触发的 `config.change` 事件**，手改文件不会触发。【源码确认】[procd.sh#L454-L464](https://github.com/openwrt/openwrt/blob/openwrt-24.10/package/system/procd/files/procd.sh#L454-L464)
+- `procd_add_interface_trigger "interface.*" <iface> /etc/init.d/prism-routerd reload` → 接口 up/down 时 reload（nlbwmon 用它保证新接口被纳入采集）。【源码确认】[nlbwmon.init#L93-L107](https://github.com/openwrt/packages/blob/openwrt-24.10/net/nlbwmon/files/nlbwmon.init#L93-L107)
 - 需要"重开数据库/换文件"这类无法热处理的变更，就让 daemon 收到 SIGHUP 后自行 `execv` 重启自己，或干脆 `restart`。
 
 ### 3.7 降权与沙箱（对应"最小权限"需求）
@@ -487,7 +487,7 @@ config settings 'settings'
 2. **退出码 0 → 立刻删除**（所以只跑一次）；**非 0 → 保留，下次启动重跑**；
 3. 干净安装与**升级后**都会执行（"at every first boot (i.e. after a clean install or an upgrade)"）；
 4. 官方推荐的"不覆盖用户设置"写法：开头做存在性判断 `[ "$(uci -q get system.@system[0].zonename)" = "..." ] && exit 0`；
-5. 脚本**不需要可执行位**（由 boot 服务 `sh` 执行）；官方原文是 "Scripts should **not** be executable."。打包时放 `root/etc/uci-defaults/90_traffic_stats` 即可，靠 `luci.mk` 的 `cp -pR root/* → $(1)/` 装进包（**权限沿用源文件模式**）。
+5. 脚本**不需要可执行位**（由 boot 服务 `sh` 执行）；官方原文是 "Scripts should **not** be executable."。打包时放 `root/etc/uci-defaults/90_prism_router` 即可，靠 `luci.mk` 的 `cp -pR root/* → $(1)/` 装进包（**权限沿用源文件模式**）。
    > 勘误说明：`luci.mk` 里虽然定义了 `LUCI_DEFAULTS:=$(notdir $(wildcard ${CURDIR}/root/etc/uci-defaults/*))`，但该变量在 `luci.mk` 中**再未被引用**（仅第 11 行出现一次），别指望它做额外处理。非 LuCI 包则在自己 Makefile 的 `install` 段手动装。
 
 ### 4.3 配置格式变更怎么升级（本项目最需要自定规矩的地方）
@@ -499,14 +499,14 @@ config settings 'settings'
 1. **代码层兜底**：读配置时永远给默认值——shell 用 `config_get x settings interval 60`；ucode 用 `uci.get(..., 'interval') ?? '60'`；前端表单用 `o.default`/`o.placeholder`。这样即使旧配置缺字段也能跑。
 2. **显式版本戳 + 幂等迁移脚本**：
    ```sh
-   # /etc/uci-defaults/90_traffic_stats（首次安装时跑）
+   # /etc/uci-defaults/90_prism_router（首次安装时跑）
    #!/bin/sh
-   [ -f /etc/config/traffic_stats ] || exit 0
-   uci -q get traffic_stats.settings.interval >/dev/null || \
-       uci set traffic_stats.settings.interval='60'
-   uci -q get traffic_stats.settings.config_version >/dev/null || \
-       uci set traffic_stats.settings.config_version='2'
-   uci commit traffic_stats
+   [ -f /etc/config/prism_router ] || exit 0
+   uci -q get prism_router.settings.interval >/dev/null || \
+       uci set prism_router.settings.interval='60'
+   uci -q get prism_router.settings.config_version >/dev/null || \
+       uci set prism_router.settings.config_version='2'
+   uci commit prism_router
    exit 0
    ```
 3. **包 postinst 里做"跨版本迁移"**：`Package/<pkg>/postinst` 里判断 `config_version`，逐级 upgrade 并 `uci commit`。注意 postinst 在安装环境与目标环境都可能执行，要判 `$IPKG_INSTROOT`（ipk）——官方 `luci.mk` 的默认 postinst 就是这么写的 `[ -n "${IPKG_INSTROOT}" ] || {...}`。【源码确认】[luci.mk#L231-L240](https://github.com/openwrt/luci/blob/openwrt-24.10/luci.mk#L231-L240)
@@ -520,7 +520,7 @@ config settings 'settings'
 - **批量**：`uci -q batch <<EOF ... EOF` 减少进程数、语义原子性更好。【文档确认】[UCI defaults 示例](https://openwrt.org/docs/guide-developer/uci-defaults)
 - **不要**直接 `sed` 改 `/etc/config/*`（会绕过 uci 的 lock/暂存语义）。
 - ucode 里用 `import { cursor } from 'uci'`，`cursor()` 提供 `get/set/add/delete/commit/foreach/load`；LuCI 前端用 `uci.load()/uci.get()/uci.get_first()`。【源码确认】[uci.uc/官方 ddns.uc](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-ddns/root/usr/share/rpcd/ucode/ddns.uc#L10)
-- 变更后要通知服务：`/etc/init.d/traffic-statsd reload`，或依赖 procd 的 `reload_trigger`（3.6）。
+- 变更后要通知服务：`/etc/init.d/prism-routerd reload`，或依赖 procd 的 `reload_trigger`（3.6）。
 
 ---
 
@@ -548,8 +548,8 @@ config settings 'settings'
 
 | 包 | 内容 | 架构 |
 |---|---|---|
-| `traffic-statsd` | 守护进程二进制、init.d、默认 UCI 配置、hotplug | **架构相关**（默认 `PKGARCH=$(ARCH_PACKAGES)`） |
-| `luci-app-traffic-stats` | JS 视图、menu.d、acl.d、rpcd 后端（ucode/sh 脚本） | `LUCI_PKGARCH:=all`（纯脚本，可跨架构） |
+| `prism-routerd` | 守护进程二进制、init.d、默认 UCI 配置、hotplug | **架构相关**（默认 `PKGARCH=$(ARCH_PACKAGES)`） |
+| `luci-app-prism-router` | JS 视图、menu.d、acl.d、rpcd 后端（ucode/sh 脚本） | `LUCI_PKGARCH:=all`（纯脚本，可跨架构） |
 
 实证：`nlbwmon`（`packages` feed，C 守护进程）与 `luci-app-nlbwmon`（`luci` feed，纯前端）就是这样拆的，两者的 `LUCI_DEPENDS:=+luci-base +luci-lib-chartjs +nlbwmon` 把 UI 与 daemon 连起来。【源码确认】[nlbwmon/Makefile](https://github.com/openwrt/packages/blob/openwrt-24.10/net/nlbwmon/Makefile)、[luci-app-nlbwmon/Makefile](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-nlbwmon/Makefile)
 
@@ -580,9 +580,9 @@ config settings 'settings'
 ```make
 include $(TOPDIR)/rules.mk
 
-LUCI_TITLE:=流量统计 Web 界面
+LUCI_TITLE:=棱镜路由 Web 界面
 LUCI_DESCRIPTION:=Traffic statistics for OpenWrt
-LUCI_DEPENDS:=+luci-base +luci-lib-chartjs +traffic-statsd
+LUCI_DEPENDS:=+luci-base +luci-lib-chartjs +prism-routerd
 LUCI_PKGARCH:=all
 
 PKG_LICENSE:=Apache-2.0
@@ -633,23 +633,23 @@ include ../../luci.mk
 ### 5.7 安装段与文件类型
 
 ```make
-define Package/traffic-statsd/install
+define Package/prism-routerd/install
 	$(INSTALL_DIR)  $(1)/usr/sbin
-	$(INSTALL_BIN)  $(PKG_BUILD_DIR)/traffic-statsd $(1)/usr/sbin/
+	$(INSTALL_BIN)  $(PKG_BUILD_DIR)/prism-routerd $(1)/usr/sbin/
 	$(INSTALL_DIR)  $(1)/etc/init.d
-	$(INSTALL_BIN)  ./files/traffic-statsd.init $(1)/etc/init.d/traffic-statsd
+	$(INSTALL_BIN)  ./files/prism-routerd.init $(1)/etc/init.d/prism-routerd
 	$(INSTALL_DIR)  $(1)/etc/config
-	$(INSTALL_CONF) ./files/traffic_stats.config $(1)/etc/config/traffic_stats
+	$(INSTALL_CONF) ./files/prism_router.config $(1)/etc/config/prism_router
 	$(INSTALL_DIR)  $(1)/etc/uci-defaults
-	$(INSTALL_DATA) ./files/90_traffic_stats $(1)/etc/uci-defaults/   # 官方：不应可执行
+	$(INSTALL_DATA) ./files/90_prism_router $(1)/etc/uci-defaults/   # 官方：不应可执行
 	$(INSTALL_DIR)  $(1)/usr/share/rpcd/acl.d
-	$(INSTALL_DATA) ./files/traffic-statsd.acl.json $(1)/usr/share/rpcd/acl.d/
+	$(INSTALL_DATA) ./files/prism-routerd.acl.json $(1)/usr/share/rpcd/acl.d/
 endef
 ```
 
 - `$(INSTALL_BIN)` 0755 / `$(INSTALL_DATA)` 0644 / `$(INSTALL_CONF)` 0600-ish（配置） / `$(INSTALL_DIR)` 建目录。
 - **luci-app 包不需要手写 install 段**：`htdocs/` 与 `root/` 会被 `luci.mk` 自动装好，这正是官方推荐的"把你的文件按 `root/` 目录树摆放"的做法。【文档确认】[structure.md](https://github.com/openwrt/luci/blob/openwrt-24.10/applications/luci-app-example/structure.md)
-- `USERID:=traffic-stats:traffic-stats` 可让安装时自动创建系统用户（配合 procd 降权）。【文档确认】[packages 文档 USERID](https://openwrt.org/docs/guide-developer/packages)
+- `USERID:=prism-router:prism-router` 可让安装时自动创建系统用户（配合 procd 降权）。【文档确认】[packages 文档 USERID](https://openwrt.org/docs/guide-developer/packages)
 
 ### 5.8 C / Go 的构建集成
 
@@ -667,7 +667,7 @@ endef
 
 define Build/Compile
 	$(TARGET_CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) -Wall -O2 \
-		-o $(PKG_BUILD_DIR)/traffic-statsd \
+		-o $(PKG_BUILD_DIR)/prism-routerd \
 		$(PKG_BUILD_DIR)/*.c \
 		$(TARGET_LDFLAGS) -lubus -lubox -lblobmsg_json -luci
 endef
@@ -681,15 +681,15 @@ PKG_BUILD_PARALLEL:=1
 include $(INCLUDE_DIR)/package.mk
 include ../../lang/golang/golang-package.mk
 
-GO_PKG:=example.com/traffic-stats
+GO_PKG:=example.com/prism-router
 GO_PKG_LDFLAGS_X:=main.version=$(PKG_VERSION)
 
-define Package/traffic-statsd
+define Package/prism-routerd
   DEPENDS:=$(GO_ARCH_DEPENDS)
-  USERID:=traffic-stats:traffic-stats
+  USERID:=prism-router:prism-router
 endef
 
-define Package/traffic-statsd/install
+define Package/prism-routerd/install
 	$(call GoPackage/Package/Install/Bin,$(1))
 	# 再装 init.d / config
 endef
@@ -709,8 +709,8 @@ endef
    ```
    my-feed/
    ├── luci.mk                      # 拷贝自 openwrt/luci
-   ├── luci-app-traffic-stats/      # include ../luci.mk
-   └── traffic-statsd/              # include $(TOPDIR)/rules.mk + package.mk
+   ├── luci-app-prism-router/      # include ../luci.mk
+   └── prism-routerd/              # include $(TOPDIR)/rules.mk + package.mk
    ```
    然后 `src-git myfeed https://…/my-feed.git` 写进 `feeds.conf.default`。这与官方 luci feed 同构，最稳。
 2. **把 app 放进 luci feed 的 `applications/` 目录**（本地开发时最省事，但不便于分发）。
@@ -751,8 +751,8 @@ endef
 ### 6.4 对本项目的建议分工
 
 ```
-C 守护进程 traffic-statsd        : 采集（netlink/nft counter）、聚合、写 SQLite/自定义 binlog、SIGHUP 重载
-ucode rpcd 插件 traffic-stats.uc : 读 UCI 配置、查库（只读）、返回 JSON 给前端；破坏性操作单独方法 + root 校验
+C 守护进程 prism-routerd        : 采集（netlink/nft counter）、聚合、写 SQLite/自定义 binlog、SIGHUP 重载
+ucode rpcd 插件 prism-router.uc : 读 UCI 配置、查库（只读）、返回 JSON 给前端；破坏性操作单独方法 + root 校验
 LuCI JS 视图                      : 配置表单 + 图表（chartjs），只经 rpc.declare/fs.exec_direct
 init.d                           : procd 托管、reload trigger、interface trigger
 ```
@@ -769,29 +769,29 @@ init.d                           : procd 托管、reload trigger、interface tri
 my-feed/                                  # 自定义 feed 根（含 luci.mk 拷贝）
 ├── luci.mk                               # 从 openwrt/luci@openwrt-24.10 原样拷贝
 │
-├── traffic-statsd/                       # ① 守护进程包（架构相关）
+├── prism-routerd/                       # ① 守护进程包（架构相关）
 │   ├── Makefile
 │   ├── src/
 │   │   ├── main.c                        # 采集主循环、SIGHUP、写库
 │   │   └── …                             # 采集/存储模块
 │   └── files/
-│       ├── traffic-statsd.init           # procd init（第 3.1 节骨架）
-│       ├── traffic_stats.config          # /etc/config 默认配置（第 4.1 节）
-│       └── 90_traffic_stats              # uci-defaults，首次/升级补齐默认值（第 4.3 节）
+│       ├── prism-routerd.init           # procd init（第 3.1 节骨架）
+│       ├── prism_router.config          # /etc/config 默认配置（第 4.1 节）
+│       └── 90_prism_router              # uci-defaults，首次/升级补齐默认值（第 4.3 节）
 │
-└── luci-app-traffic-stats/               # ② LuCI 包（PKGARCH=all）
+└── luci-app-prism-router/               # ② LuCI 包（PKGARCH=all）
     ├── Makefile                          # include ../luci.mk
     ├── htdocs/luci-static/resources/
-    │   └── view/traffic-stats/
+    │   └── view/prism-router/
     │       ├── overview.js               # 图表总览（rpc.declare + chartjs）
     │       └── config.js                 # 配置表单（form.Map）
     ├── root/
-    │   ├── usr/share/luci/menu.d/luci-app-traffic-stats.json     # 菜单（第 1.4 节）
-    │   ├── usr/share/rpcd/acl.d/luci-app-traffic-stats.json      # ACL（第 2.1 节）
-    │   └── usr/share/rpcd/ucode/traffic-stats.uc                 # 后端（第 2.2 形态 B）
+    │   ├── usr/share/luci/menu.d/luci-app-prism-router.json     # 菜单（第 1.4 节）
+    │   ├── usr/share/rpcd/acl.d/luci-app-prism-router.json      # ACL（第 2.1 节）
+    │   └── usr/share/rpcd/ucode/prism-router.uc                 # 后端（第 2.2 形态 B）
     └── po/
-        ├── templates/traffic-stats.pot   # 可选：翻译模板
-        └── zh_Hans/traffic-stats.po
+        ├── templates/prism-router.pot   # 可选：翻译模板
+        └── zh_Hans/prism-router.po
 ```
 
 ### 7.2 每个文件的职责
@@ -799,17 +799,17 @@ my-feed/                                  # 自定义 feed 根（含 luci.mk 拷
 | 文件 | 职责 | 关键约束 |
 |---|---|---|
 | `luci.mk` | LuCI 包通用构建逻辑 | 原样拷贝，勿改；升级时随上游同步 |
-| `traffic-statsd/Makefile` | 编 C、装 init.d/config/uci-defaults、声明 `conffiles`/`USERID`/`DEPENDS` | `DEPENDS` 带 `+kmod-…`；不要设 `PKGARCH:=all` |
+| `prism-routerd/Makefile` | 编 C、装 init.d/config/uci-defaults、声明 `conffiles`/`USERID`/`DEPENDS` | `DEPENDS` 带 `+kmod-…`；不要设 `PKGARCH:=all` |
 | `src/main.c` | 常驻采集；信号处理；状态可观测 | 必须处理 SIGTERM（flush）与 SIGHUP（重载） |
-| `files/traffic-statsd.init` | `USE_PROCD=1`；读 UCI 拼 `command`；`respawn`/`stdout 1`/`stderr 1`；`reload_trigger`/`interface trigger` | `reload_service()` 必须存在，否则 `reload` 会走默认 restart |
-| `files/traffic_stats.config` | 默认配置（带 section！） | 与 `config`/`form.Map` 的 section 名严格一致 |
-| `files/90_traffic_stats` | 首次/升级补齐字段，幂等；**退出 0** | 用 `uci -q get … ||` 守卫，禁止无脑覆盖（4.2） |
-| `luci-app-traffic-stats/Makefile` | `LUCI_TITLE`/`LUCI_DEPENDS`/`LUCI_PKGARCH:=all`；`include ../luci.mk` | 依赖里要含 `+traffic-statsd` 与 `+luci-lib-chartjs` |
-| `view/traffic-stats/config.js` | 配置表单 | 每个 option 的 section/name 必须与 UCI 一致；给 `default`/`placeholder` |
-| `view/traffic-stats/overview.js` | 图表 + 服务状态 | `load()` 里 `Promise.all([...])`；`service.list` 判活；`prompt`/`poll` 定时刷新 |
+| `files/prism-routerd.init` | `USE_PROCD=1`；读 UCI 拼 `command`；`respawn`/`stdout 1`/`stderr 1`；`reload_trigger`/`interface trigger` | `reload_service()` 必须存在，否则 `reload` 会走默认 restart |
+| `files/prism_router.config` | 默认配置（带 section！） | 与 `config`/`form.Map` 的 section 名严格一致 |
+| `files/90_prism_router` | 首次/升级补齐字段，幂等；**退出 0** | 用 `uci -q get … ||` 守卫，禁止无脑覆盖（4.2） |
+| `luci-app-prism-router/Makefile` | `LUCI_TITLE`/`LUCI_DEPENDS`/`LUCI_PKGARCH:=all`；`include ../luci.mk` | 依赖里要含 `+prism-routerd` 与 `+luci-lib-chartjs` |
+| `view/prism-router/config.js` | 配置表单 | 每个 option 的 section/name 必须与 UCI 一致；给 `default`/`placeholder` |
+| `view/prism-router/overview.js` | 图表 + 服务状态 | `load()` 里 `Promise.all([...])`；`service.list` 判活；`prompt`/`poll` 定时刷新 |
 | `menu.d/…json` | 菜单树 | `action.type` 只用 `view`/`firstchild`/`alias`；顶级节点加 `depends.acl` |
 | `acl.d/…json` | 授权 | 读/写分离；`service:["list"]` 若需要；`file.exec` 用前缀白名单 |
-| `usr/share/rpcd/ucode/traffic-stats.uc` | 后端实现 | 返回签名对象；破坏性方法校验 `request.info.acl.user == 'root'` |
+| `usr/share/rpcd/ucode/prism-router.uc` | 后端实现 | 返回签名对象；破坏性方法校验 `request.info.acl.user == 'root'` |
 | `po/*` | i18n | 用 `_()` 包裹的字符串才会被提取；`LUCI_LANGUAGES` 自动识别 `po/<lang>/` |
 
 ### 7.3 关键文件的最小内容（可直接照抄的形态）
@@ -818,17 +818,17 @@ my-feed/                                  # 自定义 feed 根（含 luci.mk 拷
 - **acl.d**：
   ```json
   {
-    "luci-app-traffic-stats": {
+    "luci-app-prism-router": {
       "description": "Grant access to traffic statistics",
       "read": {
-        "ubus": { "traffic-stats": [ "get_totals", "get_ifaces" ],
+        "ubus": { "prism-router": [ "get_totals", "get_ifaces" ],
                   "service": [ "list" ] },
-        "uci": [ "traffic_stats" ],
-        "file": { "/usr/sbin/traffic-statsctl dump --json": [ "exec" ] }
+        "uci": [ "prism_router" ],
+        "file": { "/usr/sbin/prism-routerctl dump --json": [ "exec" ] }
       },
       "write": {
-        "ubus": { "traffic-stats": [ "reset" ] },
-        "uci": [ "traffic_stats" ]
+        "ubus": { "prism-router": [ "reset" ] },
+        "uci": [ "prism_router" ]
       }
     }
   }
@@ -846,23 +846,23 @@ echo 'src-git myfeed https://example.com/my-feed.git' >> feeds.conf.default
 ./scripts/feeds update myfeed && ./scripts/feeds install -a -p myfeed
 
 # 2) 选中
-make menuconfig      # LuCI → Applications → luci-app-traffic-stats
+make menuconfig      # LuCI → Applications → luci-app-prism-router
 
 # 3) 只编这两个包
-make package/feeds/myfeed/luci-app-traffic-stats/compile V=s
-make package/feeds/myfeed/traffic-statsd/compile V=s
+make package/feeds/myfeed/luci-app-prism-router/compile V=s
+make package/feeds/myfeed/prism-routerd/compile V=s
 
 # 4) 产物
-find bin/packages -name '*traffic-stats*'
+find bin/packages -name '*prism-router*'
 ```
 
 设备侧验证（**本次未执行，属待实测**）：
 ```sh
-opkg install /tmp/luci-app-traffic-stats*.ipk /tmp/traffic-statsd*.ipk
-ubus -v list traffic-stats
-ubus call traffic-stats get_totals '{"iface":"wan"}'
-ubus call service list '{"name":"traffic-statsd"}'
-/etc/init.d/traffic-statsd reload && logread -e traffic-statsd
+opkg install /tmp/luci-app-prism-router*.ipk /tmp/prism-routerd*.ipk
+ubus -v list prism-router
+ubus call prism-router get_totals '{"iface":"wan"}'
+ubus call service list '{"name":"prism-routerd"}'
+/etc/init.d/prism-routerd reload && logread -e prism-routerd
 ```
 
 ---
@@ -897,7 +897,7 @@ ubus call service list '{"name":"traffic-statsd"}'
 - 默认集合依赖：[collections/luci/Makefile](https://github.com/openwrt/luci/blob/openwrt-24.10/collections/luci/Makefile)、[collections/luci-light/Makefile](https://github.com/openwrt/luci/blob/openwrt-24.10/collections/luci-light/Makefile)
 - 图表库：[libs/luci-lib-chartjs](https://github.com/openwrt/luci/tree/openwrt-24.10/libs/luci-lib-chartjs)
 - 实战范本：
-  - [luci-app-nlbwmon](https://github.com/openwrt/luci/tree/openwrt-24.10/applications/luci-app-nlbwmon)（流量统计 + chartjs + exec 后端）
+  - [luci-app-nlbwmon](https://github.com/openwrt/luci/tree/openwrt-24.10/applications/luci-app-nlbwmon)（棱镜路由 + chartjs + exec 后端）
   - [luci-app-vnstat2](https://github.com/openwrt/luci/tree/openwrt-24.10/applications/luci-app-vnstat2)（流量图表 + 服务状态 + exec ACL）
   - [luci-app-statistics](https://github.com/openwrt/luci/tree/openwrt-24.10/applications/luci-app-statistics)（rrdtool 出图 + 大 ACL）
   - [luci-app-pbr](https://github.com/openwrt/luci/tree/openwrt-24.10/applications/luci-app-pbr)（shell rpcd 后端 + 读写分离 ACL）
@@ -948,8 +948,8 @@ ubus call service list '{"name":"traffic-statsd"}'
 
 ## 附：一页速查（给实现者）
 
-1. **两个包**：`traffic-statsd`（C/架构相关）+ `luci-app-traffic-stats`（`LUCI_PKGARCH:=all`）。
-2. **前端**：只写 JS，`htdocs/luci-static/resources/view/traffic-stats/*.js`；菜单写 `menu.d` JSON；绝不写 Lua CBI。
+1. **两个包**：`prism-routerd`（C/架构相关）+ `luci-app-prism-router`（`LUCI_PKGARCH:=all`）。
+2. **前端**：只写 JS，`htdocs/luci-static/resources/view/prism-router/*.js`；菜单写 `menu.d` JSON；绝不写 Lua CBI。
 3. **后端**：ucode rpcd 插件（`/usr/share/rpcd/ucode/*.uc`，依赖 `+rpcd-mod-ucode`）为主；低频/命令类用 `/usr/libexec/rpcd/<obj>`。
 4. **ACL**：`acl.d` 里读写分离、方法级白名单、`service:["list"]` 单独给、exec 用命令行前缀。
 5. **服务**：`USE_PROCD=1` + `respawn 3600 5 5` + `stdout/stderr 1` + `reload_trigger`。

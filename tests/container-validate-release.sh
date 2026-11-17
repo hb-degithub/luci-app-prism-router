@@ -46,8 +46,8 @@ DIST="$SNAP"
 echo ">>> 1/6 发布集与 SHA256SUMS"
 mapfile -t MODERN < <(find "$DIST" -maxdepth 1 -type f -name '*.ipk' ! -name '*.legacy.ipk' -printf '%f\n' | LC_ALL=C sort)
 [ "${#MODERN[@]}" -eq 2 ] || fail "dist 里应有 2 个 modern ipk，实际 ${#MODERN[@]} 个：${MODERN[*]:-无}"
-[ "${MODERN[0]}" = "luci-app-traffic-stats_1.0.0-1_all.ipk" ] || fail "modern 包名不符：${MODERN[0]}"
-[ "${MODERN[1]}" = "traffic-stats_1.0.0-1_all.ipk" ] || fail "modern 包名不符：${MODERN[1]}"
+[ "${MODERN[0]}" = "luci-app-prism-router_1.0.0-1_all.ipk" ] || fail "modern 包名不符：${MODERN[0]}"
+[ "${MODERN[1]}" = "prism-router_1.0.0-1_all.ipk" ] || fail "modern 包名不符：${MODERN[1]}"
 if find "$DIST" -maxdepth 1 -type f -name '*.legacy.ipk' -print -quit | grep -q .; then
   fail "dist 含 *.legacy.ipk：旧包不进入发布集，请重新 build（默认不生成 legacy）"
 fi
@@ -62,13 +62,13 @@ pass "2 个 modern 包 + SHA256SUMS 一致"
 echo ">>> 2/6 哈希负例（篡改 / 缺文件必须被拒绝）"
 mkdir -p "$WORK/tamper" "$WORK/missing"
 cp -a "$DIST/." "$WORK/tamper/"
-printf '\000' >> "$WORK/tamper/traffic-stats_1.0.0-1_all.ipk"
+printf '\000' >> "$WORK/tamper/prism-router_1.0.0-1_all.ipk"
 if ( cd "$WORK/tamper" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
   fail "篡改后的 ipk 仍通过 SHA256SUMS（拒绝逻辑失效）"
 fi
 pass "篡改 ipk → 哈希校验拒绝"
 cp -a "$DIST/." "$WORK/missing/"
-rm -f "$WORK/missing/luci-app-traffic-stats_1.0.0-1_all.ipk"
+rm -f "$WORK/missing/luci-app-prism-router_1.0.0-1_all.ipk"
 if ( cd "$WORK/missing" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
   fail "缺少 ipk 仍通过 SHA256SUMS（拒绝逻辑失效）"
 fi
@@ -105,11 +105,11 @@ make_deps() { # $1=Makefile $2=变量名
 
 is_exec_name() {
   case "$1" in
-    ./usr/bin/traffic-statsd|./etc/init.d/traffic-statsd|\
-    ./usr/share/traffic-stats/feishu-test.sh|\
-    ./www/cgi-bin/traffic-stats-ingest|./www/cgi-bin/traffic-stats-stations|\
-    ./www/cgi-bin/traffic-stats-metrics|\
-    ./etc/init.d/traffic-panel|./www/traffic-panel/cgi-bin/panel-api) return 0 ;;
+    ./usr/bin/prism-routerd|./etc/init.d/prism-routerd|\
+    ./usr/share/prism-router/feishu-test.sh|\
+    ./www/cgi-bin/prism-router-ingest|./www/cgi-bin/prism-router-stations|\
+    ./www/cgi-bin/prism-router-metrics|\
+    ./etc/init.d/prism-router-panel|./www/prism-router-panel/cgi-bin/panel-api) return 0 ;;
   esac
   return 1
 }
@@ -163,14 +163,14 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
   # data 归档：目录 755；普通文件 644；仅白名单可执行；owner 0/0
   bad=$(tar -tvzf "$d/data.tar.gz" | awk '
     function isexec(p) {
-      return p == "./usr/bin/traffic-statsd" ||
-             p == "./etc/init.d/traffic-statsd" ||
-             p == "./usr/share/traffic-stats/feishu-test.sh" ||
-             p == "./www/cgi-bin/traffic-stats-ingest" ||
-             p == "./www/cgi-bin/traffic-stats-stations" ||
-             p == "./www/cgi-bin/traffic-stats-metrics" ||
-             p == "./etc/init.d/traffic-panel" ||
-             p == "./www/traffic-panel/cgi-bin/panel-api"
+      return p == "./usr/bin/prism-routerd" ||
+             p == "./etc/init.d/prism-routerd" ||
+             p == "./usr/share/prism-router/feishu-test.sh" ||
+             p == "./www/cgi-bin/prism-router-ingest" ||
+             p == "./www/cgi-bin/prism-router-stations" ||
+             p == "./www/cgi-bin/prism-router-metrics" ||
+             p == "./etc/init.d/prism-router-panel" ||
+             p == "./www/prism-router-panel/cgi-bin/panel-api"
     }
     {
       mode=$1; owner=$2; name=$NF;
@@ -211,43 +211,43 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
   }
   pass "$pkg Depends 与 Makefile $depvar 一致"
   case "$pkg" in
-    traffic-stats)
-      printf '%s\n' "$ctl_deps" | grep -qx 'openssl-util' || fail "traffic-stats 缺 openssl-util（飞书/子母签名真实依赖）"
-      printf '%s\n' "$ctl_deps" | grep -qx 'curl' || fail "traffic-stats 缺 curl"
+    prism-router)
+      printf '%s\n' "$ctl_deps" | grep -qx 'openssl-util' || fail "prism-router 缺 openssl-util（飞书/子母签名真实依赖）"
+      printf '%s\n' "$ctl_deps" | grep -qx 'curl' || fail "prism-router 缺 curl"
       ;;
-    luci-app-traffic-stats)
-      for dep in curl openssl-util traffic-stats; do
-        printf '%s\n' "$ctl_deps" | grep -qx "$dep" || fail "luci-app-traffic-stats 缺 $dep"
+    luci-app-prism-router)
+      for dep in curl openssl-util prism-router; do
+        printf '%s\n' "$ctl_deps" | grep -qx "$dep" || fail "luci-app-prism-router 缺 $dep"
       done
       ;;
   esac
   pass "$pkg 关键运行时依赖齐全"
 
   # conffile
-  if [ "$pkg" = "traffic-stats" ]; then
-    [ "$(cat "$ctl/conffiles" 2>/dev/null)" = "/etc/config/traffic-stats" ] || fail "traffic-stats conffiles 不符"
-    pass "traffic-stats conffile=/etc/config/traffic-stats"
+  if [ "$pkg" = "prism-router" ]; then
+    [ "$(cat "$ctl/conffiles" 2>/dev/null)" = "/etc/config/prism-router" ] || fail "prism-router conffiles 不符"
+    pass "prism-router conffile=/etc/config/prism-router"
   else
-    [ ! -e "$ctl/conffiles" ] || fail "luci-app-traffic-stats 不应声明 conffile"
+    [ ! -e "$ctl/conffiles" ] || fail "luci-app-prism-router 不应声明 conffile"
   fi
 
   # payload 与源码一一对应（存在才打包）
   local entry
-  if [ "$pkg" = "traffic-stats" ]; then
+  if [ "$pkg" = "prism-router" ]; then
     for entry in \
-      "./usr/bin/traffic-statsd:traffic-stats/files/traffic-statsd.uc" \
-      "./etc/init.d/traffic-statsd:traffic-stats/files/traffic-statsd.init" \
-      "./etc/config/traffic-stats:traffic-stats/files/traffic-stats.config" \
-      "./usr/share/traffic-stats/feishu.uc:traffic-stats/files/feishu.uc" \
-      "./usr/share/traffic-stats/feishu-test.sh:traffic-stats/files/feishu-test.sh" \
-      "./usr/share/traffic-stats/retention.uc:traffic-stats/files/retention.uc" \
-      "./usr/share/traffic-stats/push.uc:traffic-stats/files/push.uc" \
-      "./usr/share/traffic-stats/stations.uc:traffic-stats/files/stations.uc" \
-      "./www/cgi-bin/traffic-stats-ingest:traffic-stats/files/ingest.uc" \
-      "./www/cgi-bin/traffic-stats-stations:traffic-stats/files/ingest-stations.uc" \
-      "./www/cgi-bin/traffic-stats-metrics:traffic-stats/files/traffic-stats-metrics.uc" \
-      "./etc/init.d/traffic-panel:traffic-stats/files/traffic-panel.init" \
-      "./www/traffic-panel/cgi-bin/panel-api:traffic-stats/files/panel-api.uc"; do
+      "./usr/bin/prism-routerd:prism-router/files/prism-routerd.uc" \
+      "./etc/init.d/prism-routerd:prism-router/files/prism-routerd.init" \
+      "./etc/config/prism-router:prism-router/files/prism-router.config" \
+      "./usr/share/prism-router/feishu.uc:prism-router/files/feishu.uc" \
+      "./usr/share/prism-router/feishu-test.sh:prism-router/files/feishu-test.sh" \
+      "./usr/share/prism-router/retention.uc:prism-router/files/retention.uc" \
+      "./usr/share/prism-router/push.uc:prism-router/files/push.uc" \
+      "./usr/share/prism-router/stations.uc:prism-router/files/stations.uc" \
+      "./www/cgi-bin/prism-router-ingest:prism-router/files/ingest.uc" \
+      "./www/cgi-bin/prism-router-stations:prism-router/files/ingest-stations.uc" \
+      "./www/cgi-bin/prism-router-metrics:prism-router/files/prism-router-metrics.uc" \
+      "./etc/init.d/prism-router-panel:prism-router/files/prism-router-panel.init" \
+      "./www/prism-router-panel/cgi-bin/panel-api:prism-router/files/panel-api.uc"; do
       local t="${entry%%:*}" s="${entry#*:}"
       [ -f "$ROOT/$s" ] || continue
       grep -qxF "$t" "$data_list" || fail "$pkg payload 缺少 $t（源 $s）"
@@ -255,43 +255,43 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
     done
     # 独立面板静态页面（前端任务提供；存在才要求进包，逐字节一致、权限 644）
     local f b rel
-    for f in "$ROOT"/traffic-stats/files/panel/*; do
+    for f in "$ROOT"/prism-router/files/panel/*; do
       [ -f "$f" ] || continue
-      b=$(basename "$f"); rel="www/traffic-panel/$b"
-      grep -qxF "./$rel" "$data_list" || fail "traffic-stats payload 缺面板静态文件 $rel"
+      b=$(basename "$f"); rel="www/prism-router-panel/$b"
+      grep -qxF "./$rel" "$data_list" || fail "prism-router payload 缺面板静态文件 $rel"
       cmp -s "$data/$rel" "$f" || fail "panel 静态文件 $rel 与源码不一致"
     done
-    if [ -f "$ROOT/traffic-stats/files/traffic-stats-node-auth.uc" ]; then
-      grep -qxF "./usr/share/traffic-stats/traffic-stats-node-auth.uc" "$data_list" \
-        || fail "traffic-stats payload 缺 traffic-stats-node-auth.uc（安全模块共享库）"
-      cmp -s "$data/usr/share/traffic-stats/traffic-stats-node-auth.uc" \
-        "$ROOT/traffic-stats/files/traffic-stats-node-auth.uc" \
-        || fail "traffic-stats-node-auth.uc 与源码不一致"
+    if [ -f "$ROOT/prism-router/files/prism-router-node-auth.uc" ]; then
+      grep -qxF "./usr/share/prism-router/prism-router-node-auth.uc" "$data_list" \
+        || fail "prism-router payload 缺 prism-router-node-auth.uc（安全模块共享库）"
+      cmp -s "$data/usr/share/prism-router/prism-router-node-auth.uc" \
+        "$ROOT/prism-router/files/prism-router-node-auth.uc" \
+        || fail "prism-router-node-auth.uc 与源码不一致"
     fi
   else
     for entry in \
-      "./usr/share/rpcd/ucode/traffic-stats.uc:luci-app-traffic-stats/root/usr/share/rpcd/ucode/traffic-stats.uc" \
-      "./usr/share/rpcd/acl.d/luci-app-traffic-stats.json:luci-app-traffic-stats/root/usr/share/rpcd/acl.d/luci-app-traffic-stats.json" \
-      "./usr/share/luci/menu.d/luci-app-traffic-stats.json:luci-app-traffic-stats/root/usr/share/luci/menu.d/luci-app-traffic-stats.json"; do
+      "./usr/share/rpcd/ucode/prism-router.uc:luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc" \
+      "./usr/share/rpcd/acl.d/luci-app-prism-router.json:luci-app-prism-router/root/usr/share/rpcd/acl.d/luci-app-prism-router.json" \
+      "./usr/share/luci/menu.d/luci-app-prism-router.json:luci-app-prism-router/root/usr/share/luci/menu.d/luci-app-prism-router.json"; do
       local t="${entry%%:*}" s="${entry#*:}"
       [ -f "$ROOT/$s" ] || continue
       grep -qxF "$t" "$data_list" || fail "$pkg payload 缺少 $t（源 $s）"
       cmp -s "$data/${t#./}" "$ROOT/$s" || fail "$pkg payload $t 与源码 $s 不一致"
     done
     local f b rel
-    for f in "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/view/traffic-stats/*.js; do
-      b=$(basename "$f"); rel="www/luci-static/resources/view/traffic-stats/$b"
+    for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/view/prism-router/*.js; do
+      b=$(basename "$f"); rel="www/luci-static/resources/view/prism-router/$b"
       grep -qxF "./$rel" "$data_list" || fail "payload 缺 JS $rel"
       cmp -s "$data/$rel" "$f" || fail "payload JS $rel 与源码不一致"
     done
-    for f in "$ROOT"/luci-app-traffic-stats/htdocs/luci-static/resources/traffic-stats/*; do
+    for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/prism-router/*; do
       [ -f "$f" ] || continue
-      b=$(basename "$f"); rel="www/luci-static/resources/traffic-stats/$b"
+      b=$(basename "$f"); rel="www/luci-static/resources/prism-router/$b"
       grep -qxF "./$rel" "$data_list" || fail "payload 缺 PWA 资源 $rel"
       cmp -s "$data/$rel" "$f" || fail "payload PWA $rel 与源码不一致"
     done
     # rpcd/ucode 下的所有 .uc（含安全 agent 后续新增的 node-auth）都必须进包
-    for f in "$ROOT"/luci-app-traffic-stats/root/usr/share/rpcd/ucode/*.uc; do
+    for f in "$ROOT"/luci-app-prism-router/root/usr/share/rpcd/ucode/*.uc; do
       [ -f "$f" ] || continue
       b=$(basename "$f"); rel="usr/share/rpcd/ucode/$b"
       grep -qxF "./$rel" "$data_list" || fail "payload 缺 rpcd ucode $rel"
@@ -300,19 +300,19 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
     # root/ 整树（menu/acl/rpcd ucode 以及未来新增文件）都必须进包
     while IFS= read -r f; do
       [ -f "$f" ] || continue
-      rel="${f#"$ROOT/luci-app-traffic-stats/root/"}"
+      rel="${f#"$ROOT/luci-app-prism-router/root/"}"
       grep -qxF "./$rel" "$data_list" || fail "payload 缺 root/ 文件 $rel"
       cmp -s "$data/$rel" "$f" || fail "payload root/ 文件 $rel 与源码不一致"
-    done < <(find "$ROOT/luci-app-traffic-stats/root" -type f | LC_ALL=C sort)
+    done < <(find "$ROOT/luci-app-prism-router/root" -type f | LC_ALL=C sort)
   fi
   pass "$pkg payload 与源码一致（含条件文件）"
 }
 
 echo ">>> 3/6 control 元数据 / 权限 / payload↔源码"
-check_pkg "$DIST/traffic-stats_1.0.0-1_all.ipk" traffic-stats net \
-  "$ROOT/traffic-stats/Makefile" DEPENDS
-check_pkg "$DIST/luci-app-traffic-stats_1.0.0-1_all.ipk" luci-app-traffic-stats luci \
-  "$ROOT/luci-app-traffic-stats/Makefile" LUCI_DEPENDS
+check_pkg "$DIST/prism-router_1.0.0-1_all.ipk" prism-router net \
+  "$ROOT/prism-router/Makefile" DEPENDS
+check_pkg "$DIST/luci-app-prism-router_1.0.0-1_all.ipk" luci-app-prism-router luci \
+  "$ROOT/luci-app-prism-router/Makefile" LUCI_DEPENDS
 
 echo ">>> 4/6 生成 legacy 负例（只用于验证旧格式被拒绝，不发布）"
 "$ROOT/tools/build-ipk.sh" --legacy --out "$LEGACY_DIR" >"$WORK/legacy.out" 2>"$WORK/legacy.err" \

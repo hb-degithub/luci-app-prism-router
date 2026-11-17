@@ -24,7 +24,7 @@
 **确定性验证**（隔离环境、空 conntrack）：
 
 ```
-traffic-statsd: adaptive interval -> 15s (idle_rounds=2)
+prism-routerd: adaptive interval -> 15s (idle_rounds=2)
 45 秒内轮询 4 次（固定 5s 时是 9 次）
 ```
 
@@ -43,7 +43,7 @@ traffic-statsd: adaptive interval -> 15s (idle_rounds=2)
 
 ```sh
 # 真机单轮耗时
-TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_CLASH_API=127.0.0.1:9090 \
-  TRAFFIC_STATS_STATE_DIR=/tmp/b ucode /usr/bin/traffic-statsd
+PRISM_ROUTER_ONCE=1 PRISM_ROUTER_CLASH_API=127.0.0.1:9090 \
+  PRISM_ROUTER_STATE_DIR=/tmp/b ucode /usr/bin/prism-routerd
 ucode -e "let d=json(require('fs').readfile('/tmp/b/state.json')); print(d.health.poll_ms)"
 ```

@@ -1,0 +1,31 @@
+{
+	"luci-app-prism-router": {
+		"description": "棱镜路由 —— 只读面板（不包含配置密钥）",
+		"read": {
+			"ubus": {
+				"prism-router": [ "status", "get_state", "get_history", "get_daily", "get_nodes", "get_stations", "export_csv" ]
+			}
+		}
+	},
+	"luci-app-prism-router-admin": {
+		"description": "棱镜路由 —— 管理配置（可读写节点与推送密钥）",
+		"read": {
+			"ubus": {
+				"prism-router": [ "status", "get_state", "get_history", "get_daily", "get_nodes", "get_stations", "export_csv" ]
+			},
+			"uci": [ "prism-router" ],
+			"file": {
+				"/etc/config/prism-router": [ "read" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"prism-router": [ "test_feishu", "feishu_chats", "set_config", "restart", "set_device_meta" ]
+			},
+			"uci": [ "prism-router" ],
+			"file": {
+				"/etc/config/prism-router": [ "write" ]
+			}
+		}
+	}
+}

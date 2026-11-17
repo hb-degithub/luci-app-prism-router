@@ -24,9 +24,9 @@ CGET(){ uci -q get "$1" 2>/dev/null; }
 code_of(){ F="$1" ucode -e 'let fs=require("fs"); let t=""; try { t=fs.readfile(getenv("F")) ?? ""; } catch (e) { t=""; }
   let d=null; try { d=json(t); } catch (e) { d=null; }
   print((d!=null && type(d)=="object") ? (d.code ?? "null") : "nojson");'; }
-logsize(){ wc -l < /tmp/traffic-stats/stations.log 2>/dev/null || echo 0; }
+logsize(){ wc -l < /tmp/prism-router/stations.log 2>/dev/null || echo 0; }
 
-POST_URL="http://127.0.0.1:8080/cgi-bin/traffic-stats-stations"
+POST_URL="http://127.0.0.1:8080/cgi-bin/prism-router-stations"
 TOKEN='st-token-9f3c'
 
 echo "=== 0. 安装前基线 ==="
@@ -34,19 +34,19 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=$B_CGI"
 
 echo "=== 1. 安装两个包 ==="
-opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 prism-router" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-prism-router" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新文件落位与权限 ==="
-check /usr/share/traffic-stats/stations.uc "root:root -rw-r--r--"
-check /www/cgi-bin/traffic-stats-stations "root:root -rwxr-xr-x"
+check /usr/share/prism-router/stations.uc "root:root -rw-r--r--"
+check /www/cgi-bin/prism-router-stations "root:root -rwxr-xr-x"
 check /www/cgi-bin "root:root drwxr-xr-x"
-check /usr/share/rpcd/ucode/traffic-stats.uc "root:root -rw-r--r--"
-check /etc/config/traffic-stats "root:root -rw-r--r--"
-grep -q "stations_enabled" /etc/config/traffic-stats && ok "config 含 stations_enabled" || bad "config 缺少 stations_enabled"
-grep -q "stations_token" /etc/config/traffic-stats && ok "config 含 stations_token" || bad "config 缺少 stations_token"
-grep -q "station_ifaces" /etc/config/traffic-stats && ok "config 含 station_ifaces" || bad "config 缺少 station_ifaces"
-grep -q '"get_stations"' /usr/share/rpcd/acl.d/luci-app-traffic-stats.json \
+check /usr/share/rpcd/ucode/prism-router.uc "root:root -rw-r--r--"
+check /etc/config/prism-router "root:root -rw-r--r--"
+grep -q "stations_enabled" /etc/config/prism-router && ok "config 含 stations_enabled" || bad "config 缺少 stations_enabled"
+grep -q "stations_token" /etc/config/prism-router && ok "config 含 stations_token" || bad "config 缺少 stations_token"
+grep -q "station_ifaces" /etc/config/prism-router && ok "config 含 station_ifaces" || bad "config 缺少 station_ifaces"
+grep -q '"get_stations"' /usr/share/rpcd/acl.d/luci-app-prism-router.json \
   && ok "ACL 放行 get_stations" || bad "ACL 缺少 get_stations"
 
 echo "=== 3. 系统目录权限未被改动（回归核心）==="
@@ -56,9 +56,9 @@ echo "=== 3. 系统目录权限未被改动（回归核心）==="
 [ "$B_CGI" = "$(perm /www/cgi-bin)" ] && ok "/www/cgi-bin 未变" || bad "/www/cgi-bin 被改动"
 
 echo "=== 4. ucode 语法 ==="
-ucode -c /usr/share/traffic-stats/stations.uc && ok "stations.uc 语法 OK" || bad "stations.uc 语法错误"
-ucode -c /www/cgi-bin/traffic-stats-stations && ok "ingest-stations(CGI) 语法 OK" || bad "ingest-stations 语法错误"
-ucode -c /usr/share/rpcd/ucode/traffic-stats.uc && ok "rpcd uc 语法 OK" || bad "rpcd uc 语法错误"
+ucode -c /usr/share/prism-router/stations.uc && ok "stations.uc 语法 OK" || bad "stations.uc 语法错误"
+ucode -c /www/cgi-bin/prism-router-stations && ok "ingest-stations(CGI) 语法 OK" || bad "ingest-stations 语法错误"
+ucode -c /usr/share/rpcd/ucode/prism-router.uc && ok "rpcd uc 语法 OK" || bad "rpcd uc 语法错误"
 
 echo "=== 5. 假 iw（只实现本用例需要的两个子命令）==="
 cat > /tmp/fakebin/iw <<'IW'
@@ -136,21 +136,21 @@ chmod 755 /tmp/fakebin/iw
 ok "假 iw 已就位（/tmp/fakebin/iw）"
 
 echo "=== 6. 配置（母/子同机：本容器同时扮演两边）==="
-UCI set traffic-stats.settings.lan_ranges='192.168.100.0/24'
-UCI set traffic-stats.settings.node_id='ap-1'
-UCI set traffic-stats.settings.node_name='客厅 AP'
-UCI set traffic-stats.settings.mother_url='http://127.0.0.1:8080'
-UCI set traffic-stats.settings.stations_enabled='1'
-UCI set traffic-stats.settings.stations_token="$TOKEN"
+UCI set prism-router.settings.lan_ranges='192.168.100.0/24'
+UCI set prism-router.settings.node_id='ap-1'
+UCI set prism-router.settings.node_name='客厅 AP'
+UCI set prism-router.settings.mother_url='http://127.0.0.1:8080'
+UCI set prism-router.settings.stations_enabled='1'
+UCI set prism-router.settings.stations_token="$TOKEN"
 # 本用例专门回归旧 AP 的无 nonce 通道；默认拒绝由 security-fixes 门禁覆盖。
-UCI set traffic-stats.settings.legacy_stations_token='1'
-UCI set traffic-stats.settings.station_ifaces='phy0.1-ap0,phy0.0-ap1'
-UCI commit traffic-stats
-[ "$(CGET traffic-stats.settings.stations_token)" = "$TOKEN" ] && ok "UCI 站点选项写入成功" || bad "UCI 写入失败"
+UCI set prism-router.settings.legacy_stations_token='1'
+UCI set prism-router.settings.station_ifaces='phy0.1-ap0,phy0.0-ap1'
+UCI commit prism-router
+[ "$(CGET prism-router.settings.stations_token)" = "$TOKEN" ] && ok "UCI 站点选项写入成功" || bad "UCI 写入失败"
 
 echo "=== 7. get_stations 空态（还没有 AP 上报）==="
-rm -rf /etc/traffic-stats/stations
-TRAFFIC_STATS_METHOD=get_stations ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc > /tmp/s0.json 2>/tmp/s0.err
+rm -rf /etc/prism-router/stations
+PRISM_ROUTER_METHOD=get_stations ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc > /tmp/s0.json 2>/tmp/s0.err
 R=$(F=/tmp/s0.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F")));
   print(sprintf("%d|%d|%d|%s", length(d.stations ?? []), length(d.nodes ?? []), d.count ?? -1, d.enabled));')
 OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
@@ -172,17 +172,17 @@ done
 [ $i -lt 20 ] && ok "uhttpd 就绪 (127.0.0.1:8080)" || { bad "uhttpd 未就绪"; cat /tmp/uhttpd.log; }
 
 echo "=== 9. 真跑 stations.uc（假 iw 注入 PATH）→ CGI → 落盘 ==="
-PATH=/tmp/fakebin:$PATH ucode /usr/share/traffic-stats/stations.uc
+PATH=/tmp/fakebin:$PATH ucode /usr/share/prism-router/stations.uc
 RC=$?
 [ "$RC" = "0" ] && ok "stations.uc 退出码 0" || bad "stations.uc 退出码 $RC"
-[ -f /etc/traffic-stats/stations/ap-1.json ] && ok "快照 /etc/traffic-stats/stations/ap-1.json 已落盘" \
-  || { bad "快照未落盘"; tail -3 /tmp/traffic-stats/stations.log; }
-check /etc/traffic-stats/stations "root:root drwxr-xr-x"
-check /etc/traffic-stats/stations/ap-1.json "root:root -rw-r--r--"
-[ -e /etc/traffic-stats/stations/ap-1.jsonl ] && bad "出现了 jsonl 历史（信号是瞬时量，不该落）" \
+[ -f /etc/prism-router/stations/ap-1.json ] && ok "快照 /etc/prism-router/stations/ap-1.json 已落盘" \
+  || { bad "快照未落盘"; tail -3 /tmp/prism-router/stations.log; }
+check /etc/prism-router/stations "root:root drwxr-xr-x"
+check /etc/prism-router/stations/ap-1.json "root:root -rw-r--r--"
+[ -e /etc/prism-router/stations/ap-1.jsonl ] && bad "出现了 jsonl 历史（信号是瞬时量，不该落）" \
   || ok "没有 jsonl 历史（不磨 flash）"
 
-R=$(F=/etc/traffic-stats/stations/ap-1.json ucode -e '
+R=$(F=/etc/prism-router/stations/ap-1.json ucode -e '
   let fs = require("fs"); let d = json(fs.readfile(getenv("F")));
   let s1 = null, s4 = null, s5 = null, s6 = null;
   for (let s in d.stations) {
@@ -209,27 +209,27 @@ OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
 [ "${10}" = "absent" ] && ok "rx bitrate=unknown → 跳过该字段（不崩）" || bad "rx_rate 应为 absent，实际 ${10}"
 [ "${11}" = "absent" ] && ok "signal=5 dBm 越界 → 不写该字段" || bad "越界 signal 被写入：${11}"
 [ "${12}" = "866700" ] && ok "rx_rate=866700（866.7 MBit/s 进位正确）" || bad "866.7→${12} 期望 866700"
-grep -q 'bytes' /etc/traffic-stats/stations/ap-1.json && bad "快照里出现 bytes（违反'绝不报字节'）" \
+grep -q 'bytes' /etc/prism-router/stations/ap-1.json && bad "快照里出现 bytes（违反'绝不报字节'）" \
   || ok "快照里没有 bytes 字段（只报元数据）"
 echo "=== 9.5 自动枚举（station_ifaces 留空 → 只挑 type AP 的 BSS）==="
-UCI set traffic-stats.settings.station_ifaces=''; UCI commit traffic-stats
+UCI set prism-router.settings.station_ifaces=''; UCI commit prism-router
 BEFORE=$(logsize)
-PATH=/tmp/fakebin:$PATH ucode /usr/share/traffic-stats/stations.uc; RC=$?
+PATH=/tmp/fakebin:$PATH ucode /usr/share/prism-router/stations.uc; RC=$?
 AFTER=$(logsize)
 [ "$RC" = "0" ] && ok "留空 station_ifaces → 自动枚举并上报，exit 0" || bad "自动枚举时 rc=$RC"
-NEWLOG=$(tail -n +$((BEFORE+1)) /tmp/traffic-stats/stations.log 2>/dev/null | grep -c 'br-lan')
+NEWLOG=$(tail -n +$((BEFORE+1)) /tmp/prism-router/stations.log 2>/dev/null | grep -c 'br-lan')
 [ "$NEWLOG" = "0" ] && ok "自动枚举没有把 br-lan（type AP/VLAN）当成 BSS 去 dump" \
   || bad "br-lan 被当成 AP 接口扫了（type AP/VLAN 解析错误）"
-CNT=$(F=/etc/traffic-stats/stations/ap-1.json ucode -e 'let fs=require("fs"); print(json(fs.readfile(getenv("F"))).count);')
+CNT=$(F=/etc/prism-router/stations/ap-1.json ucode -e 'let fs=require("fs"); print(json(fs.readfile(getenv("F"))).count);')
 [ "$CNT" = "6" ] && ok "自动枚举后快照仍是 6 个站点（$CNT）" || bad "自动枚举后 count=$CNT"
-UCI set traffic-stats.settings.station_ifaces='phy0.1-ap0,phy0.0-ap1'; UCI commit traffic-stats
-grep -q 'br-lan' /tmp/traffic-stats/stations.log && bad "日志里出现 br-lan（扫了非 AP 接口）" \
+UCI set prism-router.settings.station_ifaces='phy0.1-ap0,phy0.0-ap1'; UCI commit prism-router
+grep -q 'br-lan' /tmp/prism-router/stations.log && bad "日志里出现 br-lan（扫了非 AP 接口）" \
   || ok "全程没有扫过 br-lan"
 
 echo "=== 9.6 node_id 未配置时自动推导（不写回 UCI，不抢 push.uc 的活）==="
-UCI delete traffic-stats.settings.node_id; UCI commit traffic-stats
-UCI delete traffic-stats.settings.node_name; UCI commit traffic-stats
-PATH=/tmp/fakebin:$PATH TRAFFIC_STATS_STATIONS_DRY=1 ucode /usr/share/traffic-stats/stations.uc > /tmp/nid.json
+UCI delete prism-router.settings.node_id; UCI commit prism-router
+UCI delete prism-router.settings.node_name; UCI commit prism-router
+PATH=/tmp/fakebin:$PATH PRISM_ROUTER_STATIONS_DRY=1 ucode /usr/share/prism-router/stations.uc > /tmp/nid.json
 R=$(F=/tmp/nid.json ucode -e '
   let fs = require("fs"); let d = json(fs.readfile(getenv("F"))); let b = json(d.body);
   print(sprintf("%s|%s|%s|%s", b.node_id, b.name, d.headers["X-Node-Id"],
@@ -238,13 +238,13 @@ OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
 [ "$4" = "ok" ] && ok "自动推导 node_id=$1（符合母节点白名单正则）" || bad "自动 node_id 非法：$1"
 [ "$2" = "$1" ] && ok "name 缺省时回退为 node_id" || bad "name=$2 应为 node_id"
 [ "$3" = "$1" ] && ok "请求头 X-Node-Id 与 body 一致" || bad "头/体 node_id 不一致：$3 vs $1"
-[ "$(CGET traffic-stats.settings.node_id)" = "" ] && ok "没有回写 UCI（push.uc 负责写，避免抢写）" \
+[ "$(CGET prism-router.settings.node_id)" = "" ] && ok "没有回写 UCI（push.uc 负责写，避免抢写）" \
   || bad "stations.uc 改写了 node_id"
-UCI set traffic-stats.settings.node_id='ap-1'
-UCI set traffic-stats.settings.node_name='客厅 AP'; UCI commit traffic-stats
+UCI set prism-router.settings.node_id='ap-1'
+UCI set prism-router.settings.node_name='客厅 AP'; UCI commit prism-router
 
 echo "=== 10. get_stations 有数据（脚本入口 / ubus / ACL）==="
-TRAFFIC_STATS_METHOD=get_stations ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc > /tmp/s1.json 2>/tmp/s1.err
+PRISM_ROUTER_METHOD=get_stations ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc > /tmp/s1.json 2>/tmp/s1.err
 R=$(F=/tmp/s1.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F")));
   let hit=null; for (let s in d.stations) if (s.mac == "22:77:08:69:a9:1f") hit=s;
   print(sprintf("%d|%s|%s|%s|%s|%s", d.count, d.nodes[0].node_id, hit.signal, hit.rx_rate, hit.iface, (type(hit.signal)=="int" ? "int" : type(hit.signal))));')
@@ -255,10 +255,10 @@ OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
 [ "$5" = "phy0.1-ap0" ] && ok "站点带 iface（前端 tooltip 用）" || bad "iface=$5"
 [ "$6" = "int" ] && ok "signal 是整数（前端按数字分级）" || bad "signal 类型=$6"
 
-B=$(ubus call traffic-stats get_stations 2>/tmp/ubus.err)
+B=$(ubus call prism-router get_stations 2>/tmp/ubus.err)
 echo "$B" > /tmp/s2.json
 N=$(F=/tmp/s2.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F"))); print(length(d.stations ?? []));')
-[ "$N" = "6" ] && ok "ubus call traffic-stats get_stations → 6 条" || { bad "ubus 条数=$N"; cat /tmp/ubus.err; }
+[ "$N" = "6" ] && ok "ubus call prism-router get_stations → 6 条" || { bad "ubus 条数=$N"; cat /tmp/ubus.err; }
 
 LOGIN=$(curl -sS -m 5 -X POST http://127.0.0.1:8080/ubus -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"call","params":["00000000000000000000000000000000","session","login",{"username":"root","password":""}]}')
@@ -266,7 +266,7 @@ SID=$(echo "$LOGIN" | sed -n "s/.*\"ubus_rpc_session\":\"\([0-9a-f]\{32\}\)\".*/
 if [ -n "$SID" ]; then
   ok "session.login 成功"
   ACLRES=$(curl -sS -m 5 -X POST http://127.0.0.1:8080/ubus -H "Content-Type: application/json" \
-    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$SID\",\"traffic-stats\",\"get_stations\",{}]}")
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"call\",\"params\":[\"$SID\",\"prism-router\",\"get_stations\",{}]}")
   case "$ACLRES" in
     *"Access denied"*) bad "get_stations 被 ACL 拒绝（acl.d 需包含 get_stations）";;
     *'"stations"'*) ok "root 会话可调用 get_stations（ACL 正确）";;
@@ -284,11 +284,11 @@ curl -sS -m 5 -o /tmp/n1.json -X POST "$POST_URL?node_id=ap-1&ts=$TS&token=WRONG
   -H "Content-Type: application/json" --data-binary "$BODY" >/dev/null 2>&1
 C=$(code_of /tmp/n1.json); [ "$C" = "1" ] && ok "错 token → code=1" || bad "错 token → code=$C 期望 1"
 
-UCI set traffic-stats.settings.stations_enabled='0'; UCI commit traffic-stats
+UCI set prism-router.settings.stations_enabled='0'; UCI commit prism-router
 curl -sS -m 5 -o /tmp/n2.json -X POST "$POST_URL?node_id=ap-1&ts=$TS&token=$TOKEN" \
   -H "Content-Type: application/json" --data-binary "$BODY" >/dev/null 2>&1
 C=$(code_of /tmp/n2.json); [ "$C" = "3" ] && ok "stations_enabled=0 → code=3（拒绝）" || bad "关闭时 → code=$C 期望 3"
-UCI set traffic-stats.settings.stations_enabled='1'; UCI commit traffic-stats
+UCI set prism-router.settings.stations_enabled='1'; UCI commit prism-router
 
 TS_OLD=$((TS - 1000))
 curl -sS -m 5 -o /tmp/n3.json -X POST "$POST_URL?node_id=ap-1&ts=$TS_OLD&token=$TOKEN" \
@@ -303,7 +303,7 @@ C=$(code_of /tmp/n3b.json); [ "$C" = "2" ] && ok "未来时间戳 +1000 秒 → 
 curl -sS -m 5 -o /tmp/n4.json -X POST "$POST_URL?node_id=..%2Fevil&ts=$TS&token=$TOKEN" \
   -H "Content-Type: application/json" --data-binary '{"node_id":"../evil","ts":'"$TS"',"stations":[]}' >/dev/null 2>&1
 C=$(code_of /tmp/n4.json); [ "$C" = "4" ] && ok "node_id=../evil → code=4" || bad "穿越 node_id → code=$C 期望 4"
-if [ ! -e /etc/traffic-stats/evil.json ] && [ ! -e /etc/evil.json ] && [ ! -e /etc/passwd.json ]; then
+if [ ! -e /etc/prism-router/evil.json ] && [ ! -e /etc/evil.json ] && [ ! -e /etc/passwd.json ]; then
   ok "没有越权写出文件"
 else
   bad "目录穿越：出现 evil.json / passwd.json"
@@ -315,7 +315,7 @@ BIGSTATUS=$(curl -sS -m 8 -o /tmp/n5.json -w '%{http_code}' -X POST "$POST_URL?n
 CBIG=$(code_of /tmp/n5.json)
 [ "$BIGSTATUS" = "413" ] && ok "超大 body（$(( $(wc -c < /tmp/big.json) )) 字节）→ HTTP 413" \
   || { [ "$CBIG" = "413" ] && ok "超大 body → code=413（HTTP $BIGSTATUS）" || bad "超大 body 未被拒：HTTP=$BIGSTATUS code=$CBIG"; }
-[ "$(ls -l /etc/traffic-stats/stations/ap-1.json | awk '{print $5}')" -lt 65536 ] \
+[ "$(ls -l /etc/prism-router/stations/ap-1.json | awk '{print $5}')" -lt 65536 ] \
   && ok "超大 body 之后快照仍是小文件" || bad "超大 body 污染了快照"
 
 GETSTATUS=$(curl -sS -m 5 -o /tmp/n6.json -w '%{http_code}' "$POST_URL?node_id=ap-1&ts=$TS&token=$TOKEN" 2>/dev/null)
@@ -333,14 +333,14 @@ echo "=== 11.5 头路径（标准 CGI 环境：请求头传凭证，绕开 uhttp
 HB='{"node_id":"ap-9","name":"头路径 AP","ts":'"$TS"',"stations":[{"mac":"de:ad:be:ef:00:01","signal":-61,"rx_rate":1200000,"tx_rate":1000000,"connected_sec":60}]}'
 printf '%s' "$HB" | env REQUEST_METHOD=POST CONTENT_LENGTH=${#HB} CONTENT_TYPE=application/json \
   HTTP_X_NODE_ID=ap-9 HTTP_X_TIMESTAMP="$TS" HTTP_X_TOKEN="$TOKEN" \
-  ucode /www/cgi-bin/traffic-stats-stations > /tmp/hdr.out 2>&1
+  ucode /www/cgi-bin/prism-router-stations > /tmp/hdr.out 2>&1
 grep -q '^{"code":0}$' /tmp/hdr.out && ok "头路径（X-Node-Id/X-Timestamp/X-Token）→ {\"code\":0}" \
   || bad "头路径失败：$(tail -1 /tmp/hdr.out)"
-[ -f /etc/traffic-stats/stations/ap-9.json ] && ok "头路径快照已落盘" || bad "头路径快照缺失"
+[ -f /etc/prism-router/stations/ap-9.json ] && ok "头路径快照已落盘" || bad "头路径快照缺失"
 
 printf '%s' "$HB" | env REQUEST_METHOD=POST CONTENT_LENGTH=${#HB} CONTENT_TYPE=application/json \
   HTTP_X_NODE_ID=ap-9 HTTP_X_TIMESTAMP="$TS" HTTP_X_TOKEN="wrong" \
-  ucode /www/cgi-bin/traffic-stats-stations > /tmp/hdr2.out 2>&1
+  ucode /www/cgi-bin/prism-router-stations > /tmp/hdr2.out 2>&1
 grep -q '"code":1' /tmp/hdr2.out && ok "头路径错 token → code=1" || bad "头路径错 token 未被拒：$(tail -1 /tmp/hdr2.out)"
 
 echo "=== 11.6 带字节字段的 body：母节点白名单闸门（对端写错也存不进来）==="
@@ -348,22 +348,22 @@ curl -sS -m 5 -o /tmp/n9.json -X POST "$POST_URL?node_id=ap-2&ts=$TS&token=$TOKE
   -H "Content-Type: application/json" \
   --data-binary '{"node_id":"ap-2","name":"坏 AP","ts":'"$TS"',"stations":[{"mac":"22:77:08:69:a9:1f","iface":"phy0.1-ap0","signal":-53,"rx_bytes":123456789,"tx_bytes":987654,"rx_rate":866600}]}' >/dev/null 2>&1
 C=$(code_of /tmp/n9.json); [ "$C" = "0" ] && ok "带字节字段的 body 被接受（忽略多余字段）" || bad "带字节字段 → code=$C"
-grep -q 'bytes' /etc/traffic-stats/stations/ap-2.json && bad "字节字段被落盘（白名单闸门失效）" \
+grep -q 'bytes' /etc/prism-router/stations/ap-2.json && bad "字节字段被落盘（白名单闸门失效）" \
   || ok "落盘文件里没有 bytes（白名单闸门生效）"
 
 echo "=== 12. 母节点未配置 token 时拒绝（绝不匿名写入）==="
-UCI set traffic-stats.settings.stations_token=''
-UCI set traffic-stats.settings.legacy_stations_token='0'; UCI commit traffic-stats
+UCI set prism-router.settings.stations_token=''
+UCI set prism-router.settings.legacy_stations_token='0'; UCI commit prism-router
 curl -sS -m 5 -o /tmp/n10.json -X POST "$POST_URL?node_id=ap-1&ts=$(date +%s)&token=" \
   -H "Content-Type: application/json" --data-binary "$BODY" >/dev/null 2>&1
 C=$(code_of /tmp/n10.json); [ "$C" = "3" ] && ok "母节点 stations_token 为空 → code=3" || bad "空 token → code=$C 期望 3"
-UCI set traffic-stats.settings.stations_token="$TOKEN"
-UCI set traffic-stats.settings.legacy_stations_token='1'; UCI commit traffic-stats
+UCI set prism-router.settings.stations_token="$TOKEN"
+UCI set prism-router.settings.legacy_stations_token='1'; UCI commit prism-router
 
 echo "=== 13. dry-run 只打印请求、不发包 ==="
-BEFORE=$(F=/etc/traffic-stats/stations/ap-1.json ucode -e 'let fs=require("fs"); print(json(fs.readfile(getenv("F"))).received_ts);')
-PATH=/tmp/fakebin:$PATH TRAFFIC_STATS_STATIONS_DRY=1 ucode /usr/share/traffic-stats/stations.uc > /tmp/dry.json 2>/tmp/dry.err
-AFTER=$(F=/etc/traffic-stats/stations/ap-1.json ucode -e 'let fs=require("fs"); print(json(fs.readfile(getenv("F"))).received_ts);')
+BEFORE=$(F=/etc/prism-router/stations/ap-1.json ucode -e 'let fs=require("fs"); print(json(fs.readfile(getenv("F"))).received_ts);')
+PATH=/tmp/fakebin:$PATH PRISM_ROUTER_STATIONS_DRY=1 ucode /usr/share/prism-router/stations.uc > /tmp/dry.json 2>/tmp/dry.err
+AFTER=$(F=/etc/prism-router/stations/ap-1.json ucode -e 'let fs=require("fs"); print(json(fs.readfile(getenv("F"))).received_ts);')
 [ "$BEFORE" = "$AFTER" ] && ok "dry-run 没有发包（快照 received_ts 未变：$BEFORE）" \
   || bad "dry-run 竟然发包了：$BEFORE -> $AFTER"
 grep -q 'X-Token' /tmp/dry.json && grep -q '"body"' /tmp/dry.json \
@@ -374,40 +374,40 @@ DRYCOUNT=$(F=/tmp/dry.json ucode -e 'let fs=require("fs"); let d=json(fs.readfil
 echo "=== 14. 静默退出（cron 友好，绝不刷屏）==="
 # 14a. 开关关闭：退出 0 且不写日志
 BEFORE=$(logsize)
-UCI set traffic-stats.settings.stations_enabled='0'; UCI commit traffic-stats
-ucode /usr/share/traffic-stats/stations.uc; RC=$?
+UCI set prism-router.settings.stations_enabled='0'; UCI commit prism-router
+ucode /usr/share/prism-router/stations.uc; RC=$?
 AFTER=$(logsize)
 [ "$RC" = "0" ] && [ "$AFTER" = "$BEFORE" ] && ok "stations_enabled=0 → exit 0 且不写日志" \
   || bad "关闭时 rc=$RC 日志变化=$((AFTER-BEFORE))"
-UCI set traffic-stats.settings.stations_enabled='1'; UCI commit traffic-stats
+UCI set prism-router.settings.stations_enabled='1'; UCI commit prism-router
 
 # 14b. 有接口但没站点：退出 0，只记一行
-UCI set traffic-stats.settings.station_ifaces='phy9.9-ap9'; UCI commit traffic-stats
+UCI set prism-router.settings.station_ifaces='phy9.9-ap9'; UCI commit prism-router
 BEFORE=$(logsize)
-TRAFFIC_STATS_IW=/tmp/fakebin/iw ucode /usr/share/traffic-stats/stations.uc; RC=$?
+PRISM_ROUTER_IW=/tmp/fakebin/iw ucode /usr/share/prism-router/stations.uc; RC=$?
 AFTER=$(logsize)
 [ "$RC" = "0" ] && ok "无关联站点 → exit 0" || bad "无站点时 rc=$RC"
 [ "$AFTER" -eq $((BEFORE+1)) ] && ok "无站点只记 1 行日志（$BEFORE -> $AFTER）" || bad "日志行数变化 $((AFTER-BEFORE))"
-tail -1 /tmp/traffic-stats/stations.log | grep -q '无关联站点' && ok "日志写明'无关联站点'" || bad "日志内容不符"
+tail -1 /tmp/prism-router/stations.log | grep -q '无关联站点' && ok "日志写明'无关联站点'" || bad "日志内容不符"
 
 # 14c. iw 缺失：退出 0 + WARN
 BEFORE=$(logsize)
-TRAFFIC_STATS_IW=/nonexistent/iw ucode /usr/share/traffic-stats/stations.uc; RC=$?
+PRISM_ROUTER_IW=/nonexistent/iw ucode /usr/share/prism-router/stations.uc; RC=$?
 AFTER=$(logsize)
 [ "$RC" = "0" ] && ok "iw 缺失 → exit 0（不因 cron 报错）" || bad "iw 缺失时 rc=$RC"
-tail -n +$((BEFORE+1)) /tmp/traffic-stats/stations.log | grep -q 'station dump 失败' \
+tail -n +$((BEFORE+1)) /tmp/prism-router/stations.log | grep -q 'station dump 失败' \
   && ok "iw 缺失记 WARN（$BEFORE -> $AFTER 行）" || bad "iw 缺失没有 WARN 日志"
 
-UCI set traffic-stats.settings.station_ifaces='phy0.1-ap0,phy0.0-ap1'; UCI commit traffic-stats
+UCI set prism-router.settings.station_ifaces='phy0.1-ap0,phy0.0-ap1'; UCI commit prism-router
 
 echo "=== 15. 坏文件容错 + 大表裁剪（ubus 262144 字节上限）==="
-printf 'this is not json' > /etc/traffic-stats/stations/broken.json
-TRAFFIC_STATS_METHOD=get_stations ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/traffic-stats.uc > /tmp/s3.json 2>/tmp/s3.err
+printf 'this is not json' > /etc/prism-router/stations/broken.json
+PRISM_ROUTER_METHOD=get_stations ucode -L /usr/lib/ucode /usr/share/rpcd/ucode/prism-router.uc > /tmp/s3.json 2>/tmp/s3.err
 R=$(F=/tmp/s3.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F"))); let ids=[];
   for (let n in (d.nodes ?? [])) push(ids, n.node_id);
   print(sprintf("%d|%d", length(d.stations ?? []), length(d.nodes ?? [])));')
 [ "${R%%|*}" -ge 5 ] && ok "坏文件被跳过，仍返回好数据（$R）" || { bad "坏文件容错失败：$R"; cat /tmp/s3.err; }
-rm -f /etc/traffic-stats/stations/broken.json
+rm -f /etc/prism-router/stations/broken.json
 
 ucode -e '
   let fs = require("fs");
@@ -415,24 +415,24 @@ ucode -e '
   for (let i = 0; i < 500; i++)
     push(st, { mac: sprintf("02:00:00:00:%02x:%02x", int(i / 256), i % 256),
       iface: "phy0.1-ap0", signal: -50 - (i % 40), rx_rate: 866600, tx_rate: 650000, connected_sec: 3600 });
-  fs.writefile("/etc/traffic-stats/stations/stress.json", sprintf("%J", { v: 1, node_id: "stress", name: "压测 AP", ts: time() - 10, stations: st }));'
-B=$(ubus call traffic-stats get_stations 2>/tmp/ubus3.err)
+  fs.writefile("/etc/prism-router/stations/stress.json", sprintf("%J", { v: 1, node_id: "stress", name: "压测 AP", ts: time() - 10, stations: st }));'
+B=$(ubus call prism-router get_stations 2>/tmp/ubus3.err)
 SZ=$(printf '%s' "$B" | wc -c)
 echo "$B" > /tmp/s4.json
 N4=$(F=/tmp/s4.json ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F"))); print(d.count ?? -1);')
 [ "$N4" -ge 1 ] && [ "$N4" -le 400 ] && ok "500 站点被裁到 $N4 条（预算内）" || { bad "裁剪异常 count=$N4"; cat /tmp/ubus3.err; }
 [ "$SZ" -lt 262144 ] && ok "响应 $SZ 字节 < 262144（ubus 上限内）" || bad "响应 $SZ 字节超过 ubus 上限"
-rm -f /etc/traffic-stats/stations/stress.json
+rm -f /etc/prism-router/stations/stress.json
 
 echo "=== 16. 卸载后系统目录仍然正常（回滚路径）==="
-opkg remove luci-app-traffic-stats >/tmp/r1.log 2>&1 && ok "卸载 luci-app 成功" || { bad "卸载 luci-app 失败"; tail -3 /tmp/r1.log; }
-opkg remove traffic-stats >/tmp/r2.log 2>&1 && ok "卸载 traffic-stats 成功" || { bad "卸载 traffic-stats 失败"; tail -3 /tmp/r2.log; }
+opkg remove luci-app-prism-router >/tmp/r1.log 2>&1 && ok "卸载 luci-app 成功" || { bad "卸载 luci-app 失败"; tail -3 /tmp/r1.log; }
+opkg remove prism-router >/tmp/r2.log 2>&1 && ok "卸载 prism-router 成功" || { bad "卸载 prism-router 失败"; tail -3 /tmp/r2.log; }
 [ "$B_ETC" = "$(perm /etc)" ] && ok "卸载后 /etc 仍是 $B_ETC" || bad "卸载后 /etc 被改动"
 [ "$B_USR" = "$(perm /usr)" ] && ok "卸载后 /usr 仍是 $B_USR" || bad "卸载后 /usr 被改动"
 [ "$B_WWW" = "$(perm /www)" ] && ok "卸载后 /www 仍是 $B_WWW" || bad "卸载后 /www 被改动"
 [ "$B_CGI" = "$(perm /www/cgi-bin)" ] && ok "卸载后 /www/cgi-bin 仍是 $B_CGI" || bad "卸载后 /www/cgi-bin 被改动"
-[ ! -e /www/cgi-bin/traffic-stats-stations ] && ok "CGI 已随包移除" || bad "CGI 卸载后残留"
-[ ! -e /usr/share/traffic-stats/stations.uc ] && ok "stations.uc 已随包移除" || bad "stations.uc 卸载后残留"
+[ ! -e /www/cgi-bin/prism-router-stations ] && ok "CGI 已随包移除" || bad "CGI 卸载后残留"
+[ ! -e /usr/share/prism-router/stations.uc ] && ok "stations.uc 已随包移除" || bad "stations.uc 卸载后残留"
 
 echo
 echo "=== 结果：PASS $PASS / FAIL $FAIL ==="

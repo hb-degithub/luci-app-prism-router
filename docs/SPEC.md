@@ -24,26 +24,26 @@
 ## 2. 进程与文件
 
 ```
-/usr/bin/traffic-statsd            # ucode 常驻守护进程（procd 托管）
-/etc/init.d/traffic-statsd
-/etc/config/traffic-stats          # UCI 配置
-/tmp/traffic-stats/state.json      # 守护进程每 5s 原子写入（rename）
-/tmp/traffic-stats/history.json    # 当日 5 分钟桶
-/etc/traffic-stats/daily/          # 每日汇总（JSON，一天一个文件，很小）
-/etc/traffic-stats/devices.json    # 设备别名/分组/首次出现（§10.1；0644 root:root，原子写）
-/etc/traffic-stats/nodes/          # 子节点快照 <node_id>.json / 采样 <node_id>.jsonl（§9 清理）
-/etc/traffic-stats/stations/       # 哑桥 AP 站点元数据 <node_id>.json（§9 清理）
-/tmp/traffic-stats/*.log           # 各模块日志（§9 按天删 + 超限截断）
-/tmp/traffic-stats/feishu-queue/   # 飞书重试队列（§9 总量上限）
-/usr/share/traffic-stats/retention.uc     # 数据/日志保留与清理脚本（cron 调用，见 §9）
-/usr/share/rpcd/ucode/traffic-stats.uc   # rpcd 后端，读 state/history 返回 JSON
-/www/cgi-bin/traffic-stats-metrics # Prometheus 指标导出 CGI（§10.3；只读 + token 认证）
-/etc/init.d/traffic-panel         # 独立面板服务的 procd init（§11；默认关闭）
-/www/traffic-panel/               # 独立面板静态根：index.html / app.js / style.css（§11）
-/www/traffic-panel/cgi-bin/panel-api  # 独立面板只读 JSON CGI（§11；0644→0755，ucode）
-/usr/share/rpcd/acl.d/luci-app-traffic-stats.json
-/usr/share/luci/menu.d/luci-app-traffic-stats.json
-/htdocs/luci-static/resources/view/traffic-stats/*.js
+/usr/bin/prism-routerd            # ucode 常驻守护进程（procd 托管）
+/etc/init.d/prism-routerd
+/etc/config/prism-router          # UCI 配置
+/tmp/prism-router/state.json      # 守护进程每 5s 原子写入（rename）
+/tmp/prism-router/history.json    # 当日 5 分钟桶
+/etc/prism-router/daily/          # 每日汇总（JSON，一天一个文件，很小）
+/etc/prism-router/devices.json    # 设备别名/分组/首次出现（§10.1；0644 root:root，原子写）
+/etc/prism-router/nodes/          # 子节点快照 <node_id>.json / 采样 <node_id>.jsonl（§9 清理）
+/etc/prism-router/stations/       # 哑桥 AP 站点元数据 <node_id>.json（§9 清理）
+/tmp/prism-router/*.log           # 各模块日志（§9 按天删 + 超限截断）
+/tmp/prism-router/feishu-queue/   # 飞书重试队列（§9 总量上限）
+/usr/share/prism-router/retention.uc     # 数据/日志保留与清理脚本（cron 调用，见 §9）
+/usr/share/rpcd/ucode/prism-router.uc   # rpcd 后端，读 state/history 返回 JSON
+/www/cgi-bin/prism-router-metrics # Prometheus 指标导出 CGI（§10.3；只读 + token 认证）
+/etc/init.d/prism-router-panel         # 独立面板服务的 procd init（§11；默认关闭）
+/www/prism-router-panel/               # 独立面板静态根：index.html / app.js / style.css（§11）
+/www/prism-router-panel/cgi-bin/panel-api  # 独立面板只读 JSON CGI（§11；0644→0755，ucode）
+/usr/share/rpcd/acl.d/luci-app-prism-router.json
+/usr/share/luci/menu.d/luci-app-prism-router.json
+/htdocs/luci-static/resources/view/prism-router/*.js
 ```
 
 **UCI 配置项**（默认值）：
@@ -101,7 +101,7 @@ config feishu 'feishu'
 
 > 另有 `config retention 'retention'` 段（数据 / 日志保留与清理，8 个阈值 + 总开关，
 > 默认值与语义见 **§9**）。新装的默认配置末尾带这一段；**老配置升级不会被覆盖**
-> （`/etc/config/traffic-stats` 是 conffile），需要手动追加或重装配置才会出现。
+> （`/etc/config/prism-router` 是 conffile），需要手动追加或重装配置才会出现。
 
 ---
 
@@ -179,13 +179,13 @@ config feishu 'feishu'
 
 ### 3.1 语义补充（实现中发现的歧义，以此为准）
 
-- **`totals` = 进程启动以来累计**（进程重启归零），与 `uptime` 配套；"今日/历史"口径看 `history.json` 与 `/etc/traffic-stats/daily/`。UI 必须在卡片上标明这一点，不能把 `totals` 当"今日"展示。
+- **`totals` = 进程启动以来累计**（进程重启归零），与 `uptime` 配套；"今日/历史"口径看 `history.json` 与 `/etc/prism-router/daily/`。UI 必须在卡片上标明这一点，不能把 `totals` 当"今日"展示。
 - **顶层 `uptime` ≠ `system.uptime`**：顶层是**守护进程**运行秒数（`time() - started`），
   `system.uptime` 是**系统**运行秒数（`/proc/uptime`）。两者不得混用，前端标签也要写清。
 - **`accounting_confidence` 枚举固定为** `exact | degraded | unavailable`，不得新增其它值。
 - **`__other__` 桶固定为** `{ rx, tx, chain: "MIXED" }`；前端按 `chain` 过滤时必须把 `MIXED` 当作"混合"而不是节点名。
 - **历史精度现实**：`history.json` 在 tmpfs，重启即丢 → "近 7 天折线"实际是「当天 5 分钟精度 + 往日日粒度」，前端要么两段拼接，要么只画当日。SPEC 不承诺跨天 5 分钟数据。
-- **软重启连续性**：守护进程在 `/tmp/traffic-stats/baseline.json` 原子保存连接计数器基线（含采样时间与日期），启动时只接受同日且新鲜的基线；不存在/损坏/过期时首轮只采样，不将历史连接累计值当作新流量。当日 daily 在启动时恢复；每轮先成功写 daily 再保存连接基线，避免把已入账的连接差量重复计算。`/tmp` 清空后首轮重建基线，可能少计停机后的第一段流量，但不回放完整连接历史。
+- **软重启连续性**：守护进程在 `/tmp/prism-router/baseline.json` 原子保存连接计数器基线（含采样时间与日期），启动时只接受同日且新鲜的基线；不存在/损坏/过期时首轮只采样，不将历史连接累计值当作新流量。当日 daily 在启动时恢复；每轮先成功写 daily 再保存连接基线，避免把已入账的连接差量重复计算。`/tmp` 清空后首轮重建基线，可能少计停机后的第一段流量，但不回放完整连接历史。
 - **双源补充去重**：除 fake-ip 网段外，conntrack 命中本轮或上一轮 Clash 活跃连接的协议、设备/目的地址与端口时跳过；相应计数放入 `health.clash_deduped`。失效基线或读取失败必须进入降级原因，不能仍声称精确。
 - **已知漏计**：完全落在两次轮询之间的短连接（clash 从未见过它、conntrack 又因 fake-ip 去重被跳过）会两边都不计。这是当前架构的固有盲区，需在文档中如实说明；缓解手段是缩短 `poll_interval`。
 
@@ -216,7 +216,7 @@ config feishu 'feishu'
   判定结果（进程内存，重启清空），老化期间沿用，避免睡眠中的手机/音箱被翻成 `unknown`。
   配置了接入判定却暂时解析不出端口时，宁可给 `unknown` 也不武断判 `wired`。
 - **仅母路由本地有效**：`link` / 接入三桶只出现在母路由自己的 `state.json` 与 rpcd 返回里；
-  `push.uc` 的子节点快照（`/etc/traffic-stats/nodes/*.json`）不含这些字段，多节点页面也不展示，
+  `push.uc` 的子节点快照（`/etc/prism-router/nodes/*.json`）不含这些字段，多节点页面也不展示，
   这是刻意的——桥 FDB 只在母路由上存在。
 - **已知限制**：AP 的上联端口如果还下挂了有线设备（AP 的 LAN 口接 PC），这些设备会被误判为 `wifi`；
   同一个桥端口上混挂有线和无线在二层无法区分。要精确到端口只能靠 AP 侧上报，
@@ -282,7 +282,7 @@ config feishu 'feishu'
 
 ## 5. rpcd API（LuCI 前端只调这些）
 
-对象名 `traffic-stats`，方法：
+对象名 `prism-router`，方法：
 
 | 方法 | 参数 | 返回 |
 |---|---|---|
@@ -292,19 +292,19 @@ config feishu 'feishu'
 | `get_daily` | `{day}` | 当日汇总 |
 | `get_nodes` | 无 | 子节点快照（§多节点） |
 | `get_stations` | 无 | 哑桥 AP 站点元数据（只读，无字节） |
-| `set_device_meta` | `{mac, alias, group}` | `{ok, mac, alias, group, devices}`；写 `/etc/traffic-stats/devices.json`（§10.1） |
+| `set_device_meta` | `{mac, alias, group}` | `{ok, mac, alias, group, devices}`；写 `/etc/prism-router/devices.json`（§10.1） |
 | `export_csv` | `{what}` | `{ok, what, filename, rows, csv}`；what = devices\|apps\|daily（§10.3） |
 | `test_feishu` | 无 | `{ok, code, msg}` |
 | `set_config` | `{section, options}` | `{ok}`；`settings` 白名单含 `lan_bridge/wireless_ports/ap_macs/link_refresh/system_enabled/wan_iface/quota_mode/quota_monthly_gb/quota_total_gb/metrics_enabled/metrics_token` |
 | `restart` | 无 | `{ok}` |
 
-ACL：`read.ubus.traffic-stats` 给 status/get_state/get_history/get_daily/get_nodes/get_stations/**export_csv**；
-`write.ubus.traffic-stats` 给 test_feishu/feishu_chats/set_config/restart/**set_device_meta**。
+ACL：`read.ubus.prism-router` 给 status/get_state/get_history/get_daily/get_nodes/get_stations/**export_csv**；
+`write.ubus.prism-router` 给 test_feishu/feishu_chats/set_config/restart/**set_device_meta**。
 
 ### 5.1 节点 / AP 认证协议（v2）
 
 - 母节点按类型化 UCI 注册表查找凭证：`config node` + `option node_id/secret`，AP 为 `config station` + `option node_id/token`。UCI section 名不能含 `-`，带连字符的 ID 使用匿名 section + 显式 `node_id`。
-- 节点签名原文：`v2\n<node_id>\n<timestamp>\n<nonce>\n<sha256(body)>`；使用 `Authorization: TrafficStats ...` 传递，签名与 token 不进 URL。nonce 为随机 16 字节 hex，母节点以 `/tmp` 下有界 TTL 记录拒绝重放。
+- 节点签名原文：`v2\n<node_id>\n<timestamp>\n<nonce>\n<sha256(body)>`；使用 `Authorization: PrismRouter ...` 传递，签名与 token 不进 URL。nonce 为随机 16 字节 hex，母节点以 `/tmp` 下有界 TTL 记录拒绝重放。
 - 未知节点、错误凭证、重复 nonce、超限或长度不符的 body 均拒绝；`Content-Length` 在读取前检查。
 - HMAC 在 ucode 内组装，sha256sum/openssl 只接收数据，不把密钥放入 argv、环境或临时磁盘。
 - HTTPS 默认验证系统 CA 与主机名，不使用 `-k`；支持显式 CA/公钥 pin。禁止跨源和降级重定向。
@@ -316,7 +316,7 @@ ACL：`read.ubus.traffic-stats` 给 status/get_state/get_history/get_daily/get_n
 
 | 路由 | 文件 | 内容 |
 |---|---|---|
-| `admin/services/traffic-stats/overview` | `overview.js` | 总览卡片（总流量/代理/直连/实时速率）、**代理 vs 直连环形图**、**接入方式（无线/有线/未知）两张卡 + 三段环形图**、Top 应用、Top 设备、健康状态条 |
+| `admin/services/prism-router/overview` | `overview.js` | 总览卡片（总流量/代理/直连/实时速率）、**代理 vs 直连环形图**、**接入方式（无线/有线/未知）两张卡 + 三段环形图**、Top 应用、Top 设备、健康状态条 |
 | `.../devices` | `devices.js` | 设备表（主机名/MAC/IP/**接入**/直连/代理/合计/速率/信号），点开抽屉看该设备应用分布 |
 | `.../apps` | `apps.js` | 应用（域名）排行，可按 直连/代理/节点 过滤，可下钻到设备 |
 | `.../settings` | `settings.js` | 采集参数、clash secret、**接入方式（lan_bridge / wireless_ports / ap_macs / link_refresh）**、飞书 webhook+测试、报表时间 |
@@ -330,7 +330,7 @@ ACL：`read.ubus.traffic-stats` 给 status/get_state/get_history/get_daily/get_n
 
 ## 7. 飞书推送（日报 / 周报 / 告警）：内容、时间、条件均可配
 
-模块：`/usr/share/traffic-stats/feishu.uc`（ucode + curl + openssl，无 python/jq）。
+模块：`/usr/share/prism-router/feishu.uc`（ucode + curl + openssl，无 python/jq）。
 卡片 JSON 2.0，`schema:"2.0"`，元素放 `body.elements`；**绝不**使用 `note`/`action`（2.0 已移除）。
 发消息必须解析响应 `code`，非 0 视为失败（19021/19024/11232 都是 HTTP 200）。
 
@@ -346,8 +346,8 @@ ACL：`read.ubus.traffic-stats` 给 status/get_state/get_history/get_daily/get_n
 cron（用户自己加；`scheduled` 才按配置判定）：
 
 ```sh
-30 8 * * *    ucode /usr/share/traffic-stats/feishu.uc scheduled          # daily 模式
-30 8 * * 1    ucode /usr/share/traffic-stats/feishu.uc scheduled          # weekly 模式
+30 8 * * *    ucode /usr/share/prism-router/feishu.uc scheduled          # daily 模式
+30 8 * * 1    ucode /usr/share/prism-router/feishu.uc scheduled          # weekly 模式
 3,8,...,58 * * * *  ucode ... scheduled --window 10                        # 有容错、且不会重复发
 3,13,23,33,43,53 * * * *  ucode ... alerts
 ```
@@ -410,10 +410,10 @@ cron（用户自己加；`scheduled` 才按配置判定）：
 - 系统类告警（CPU/内存/磁盘）与 `system` 区块都依赖 `state.system`（§3.3）；**字段缺失时静默跳过，不报错**。
   字段名兼容 `cpu_pct|cpu`、`mem_pct|mem_percent`、`disk_pct|disk`、`load1|loadavg`、`temp_c|temp`，
   以及 `mem_total+mem_avail`（换算成 used）、`wan_rx_rate/wan_tx_rate`。
-- 突增基线来自 `/etc/traffic-stats/daily/*.json`（`--daily-dir` 可覆盖，取最近 7 天、不含今天）；
+- 突增基线来自 `/etc/prism-router/daily/*.json`（`--daily-dir` 可覆盖，取最近 7 天、不含今天）；
   基线 < 1 MB/小时或当前小时还没有桶时**不判定**（避免小样本噪声/开机误报）。
 - 「持续超过 N%」用**冷却窗口**近似：值超阈值即发，之后同规则在 `alert_cooldown` 内不再重复。
-- 每条告警仍然走原有冷却去重（`/tmp/traffic-stats/alert-state.json` 的 `cooldown`），
+- 每条告警仍然走原有冷却去重（`/tmp/prism-router/alert-state.json` 的 `cooldown`），
   可重试错误入队重试（1→5→15 分钟，最多 3 次）。
 
 ### 7.4 兼容与自检
@@ -455,24 +455,24 @@ cron（用户自己加；`scheduled` 才按配置判定）：
 
 ## 9. 数据 / 日志保留与清理（retention）
 
-模块：`/usr/share/traffic-stats/retention.uc`（ucode，只用 `fs`/`uci` 内建，不需要 curl/openssl）。
+模块：`/usr/share/prism-router/retention.uc`（ucode，只用 `fs`/`uci` 内建，不需要 curl/openssl）。
 **cron 由用户自己加**，脚本不改 crontab；`retention.enabled=0` 或整段删掉即回到旧行为。
 
 ### 9.1 清理范围（白名单硬编码）
 
 | 目录（硬编码） | 匹配 | 年龄依据 | 配置项 |
 |---|---|---|---|
-| `/etc/traffic-stats/daily/` | `*.json`（一天一个） | **文件名日期** | `daily_days` |
-| `/etc/traffic-stats/nodes/` | `*.json` / `*.jsonl` | 文件名日期，没有就 mtime | `nodes_days` |
-| `/etc/traffic-stats/stations/` | `*.json` | 同上 | `stations_days` |
-| `/tmp/traffic-stats/` | `*.log` | mtime | `log_days` |
-| `/tmp/traffic-stats/` | `*.log` | 大小 | `log_max_kb`（超限截断） |
-| `/tmp/traffic-stats/feishu-queue/` | 目录内全部普通文件 | 总量 | `spool_max_kb`（从最旧删） |
+| `/etc/prism-router/daily/` | `*.json`（一天一个） | **文件名日期** | `daily_days` |
+| `/etc/prism-router/nodes/` | `*.json` / `*.jsonl` | 文件名日期，没有就 mtime | `nodes_days` |
+| `/etc/prism-router/stations/` | `*.json` | 同上 | `stations_days` |
+| `/tmp/prism-router/` | `*.log` | mtime | `log_days` |
+| `/tmp/prism-router/` | `*.log` | 大小 | `log_max_kb`（超限截断） |
+| `/tmp/prism-router/feishu-queue/` | 目录内全部普通文件 | 总量 | `spool_max_kb`（从最旧删） |
 
 配置段**只有阈值，没有任何路径项**，所以清理范围不可能被配置改到系统目录。
 只处理上表目录的**直接子文件**，不递归。
 
-### 9.2 配置（UCI `traffic-stats`，section `retention`）
+### 9.2 配置（UCI `prism-router`，section `retention`）
 
 ```
 config retention 'retention'
@@ -489,10 +489,10 @@ config retention 'retention'
 | 选项 | 默认 | 取值范围 | 语义 |
 |---|---|---|---|
 | `enabled` | `1` | 0/1 | `0` = 本次运行什么都不删、不截断（等于回到旧行为） |
-| `daily_days` | `400` | 0–36500 | `/etc/traffic-stats/daily/*.json` 保留天数 |
-| `nodes_days` | `30` | 0–36500 | `/etc/traffic-stats/nodes/*` 保留天数 |
-| `stations_days` | `7` | 0–36500 | `/etc/traffic-stats/stations/*` 保留天数 |
-| `log_days` | `7` | 0–36500 | `/tmp/traffic-stats/*.log` 按 mtime 的保留天数 |
+| `daily_days` | `400` | 0–36500 | `/etc/prism-router/daily/*.json` 保留天数 |
+| `nodes_days` | `30` | 0–36500 | `/etc/prism-router/nodes/*` 保留天数 |
+| `stations_days` | `7` | 0–36500 | `/etc/prism-router/stations/*` 保留天数 |
+| `log_days` | `7` | 0–36500 | `/tmp/prism-router/*.log` 按 mtime 的保留天数 |
 | `log_max_kb` | `512` | 0–16777216 | 单个日志超过就截断，只留尾部一半（KB） |
 | `spool_max_kb` | `2048` | 0–16777216 | `feishu-queue` 目录总量上限（KB） |
 | `dry_run` | `0` | 0/1 | `1` = 只打印将要删除/截断的清单，不动任何文件 |
@@ -517,10 +517,10 @@ config retention 'retention'
 
 ### 9.4 日志截断
 
-- 只处理 `/tmp/traffic-stats/*.log`，`size > log_max_kb*1024`（严格大于）才截断。
+- 只处理 `/tmp/prism-router/*.log`，`size > log_max_kb*1024`（严格大于）才截断。
 - 保留**尾部** `size/2` 字节；若起点切在半行上，丢掉这半行（最多丢一行），保证新文件从整行开始。
 - 「同目录临时文件 + `rename`」原子替换，保持原文件权限（通常 0644），不会出现半截日志。
-- 脚本自己的 `/tmp/traffic-stats/retention.log` 也在范围内，会被自己一起截断，不会无限增长。
+- 脚本自己的 `/tmp/prism-router/retention.log` 也在范围内，会被自己一起截断，不会无限增长。
 
 ### 9.5 飞书重试队列上限
 
@@ -536,7 +536,7 @@ config retention 'retention'
 - 白名单根**不能是符号链接**：`realpath(root)` 必须等于 `realpath(parent) + 相对路径`；
   目录不存在则静默跳过（还没产生数据），不是普通目录则 WARN 后跳过。
 - 不跟随符号链接：符号链接条目本身不删、其目标也不会被删。
-- 调试用的目录覆盖（`--daily-dir` 等）必须落在 `/etc/traffic-stats/` 或 `/tmp/traffic-stats/` 之下，
+- 调试用的目录覆盖（`--daily-dir` 等）必须落在 `/etc/prism-router/` 或 `/tmp/prism-router/` 之下，
   路径里不允许 `.` / `..` 段，字符限于 `[A-Za-z0-9._/-]`；被拒绝时只 WARN 并跳过该目录，
   **绝不回退到默认目录**（否则等于绕过白名单）。
 - 不使用 `rm -rf`、不 fork 删除命令：只用 `fs.unlink` / `fs.rename`。
@@ -550,7 +550,7 @@ config retention 'retention'
   - `retention: 截断 <路径>（<旧> KB → <新> KB，保留尾部）` / `retention: 将截断 …`
   - `retention: 删除 <队列条目>（队列 <总量> KB > <上限> KB）`
 - WARN 也走 **stdout**（前缀 `retention: WARN `），这样 `2>&1` 下顺序确定；
-  同时写 `/tmp/traffic-stats/retention.log` 与 syslog（`logger -t traffic-stats-retention -p daemon.warn`）。
+  同时写 `/tmp/prism-router/retention.log` 与 syslog（`logger -t prism-router-retention -p daemon.warn`）。
 - dry-run 额外一行计划汇总：
   `retention: dry-run：计划删除 P 个文件、截断 T 个日志，共 B 字节（未改动任何文件）`
 - **stdout 最后一行永远是摘要**：
@@ -570,24 +570,24 @@ config retention 'retention'
 
 `daily/` 的清理只能有**一个**负责人，否则 `daily_days=400` 会被老逻辑悄悄删掉：
 
-- `retention` 段**存在**且 `enabled != 0` → `traffic-statsd` **不再执行** `daily_prune`
+- `retention` 段**存在**且 `enabled != 0` → `prism-routerd` **不再执行** `daily_prune`
   （原来按 `settings.history_days` 做「只留 N 个文件」的计数裁剪）；`daily/` 的清理
   完全由 `retention.uc` 按 `daily_days` 的**日期**语义负责。
 - `retention` 段**不存在**（老配置升级、conffile 未被覆盖）或 `enabled=0` → 行为与从前
   完全一致（守护进程按 `history_days` 计数裁剪）。
 - 结论：升级后想用新策略，必须**手动追加** `retention` 段（或重装配置）并加 cron；
   只装脚本不配段 = 老行为不变。
-- 门禁用的测试钩子：`TRAFFIC_STATS_PRUNE_NOW=1` 让守护进程启动时立刻跑一次清理判定
+- 门禁用的测试钩子：`PRISM_ROUTER_PRUNE_NOW=1` 让守护进程启动时立刻跑一次清理判定
   （正常只在跨天时跑），生产环境不要设置。
 
 ### 9.9 cron（用户自己加，包不改 crontab）
 
 ```sh
 # 每天 03:30 清理一次；stdout 是给人的清单，cron 里丢掉即可
-30 3 * * * /usr/bin/ucode /usr/share/traffic-stats/retention.uc >/dev/null 2>&1
+30 3 * * * /usr/bin/ucode /usr/share/prism-router/retention.uc >/dev/null 2>&1
 
 # 首次启用建议先看清单（只打印、不动文件），再上正式 cron：
-ucode /usr/share/traffic-stats/retention.uc --dry-run
+ucode /usr/share/prism-router/retention.uc --dry-run
 ```
 
 ### 9.10 调试参数（不写 UCI）
@@ -620,7 +620,7 @@ ucode /usr/share/traffic-stats/retention.uc --dry-run
 ### 9.12 已知不足
 
 - `/tmp` 是 tmpfs：日志与队列重启即丢，`log_days` 只对「本次开机期间」有意义；
-  真正长期留存的是 `/etc/traffic-stats/` 下的 daily/nodes/stations。
+  真正长期留存的是 `/etc/prism-router/` 下的 daily/nodes/stations。
 - 队列按 **mtime** 排序（不是条目里的 `created`/`next_at`）；人工 `touch` 过会改变顺序。
 - `*.processing` 不删，卡住的条目要等 `feishu.uc` 的 10 分钟回收逻辑放回队列后才会被清理。
 - 目录大小按文件 `st_size` 求和，不含目录项/块对齐开销（与 `du` 有少许差异）。
@@ -636,7 +636,7 @@ ucode /usr/share/traffic-stats/retention.uc --dry-run
 三块能力都**只追加**：`state.json` 一个字段都没变（新字段只在 rpcd 的 `get_state` 返回体里拼上去），
 老前端、飞书卡片、`push.uc` 子节点快照完全无感。
 
-### 10.1 设备元数据 `/etc/traffic-stats/devices.json`
+### 10.1 设备元数据 `/etc/prism-router/devices.json`
 
 **唯一权威文件**，守护进程与 rpcd 共用：
 
@@ -653,7 +653,7 @@ ucode /usr/share/traffic-stats/retention.uc --dry-run
   读取端最多认 1024 条。
 - 两个写者都在共享 mkdir 锁内走「读盘 → 只改自己那几个键 → 原子写回」，互不覆盖：
   * rpcd `set_device_meta` 写 `alias` / `group`；
-  * `traffic-statsd` 在**新 MAC 首次出现**时写 `first_seen`（绝不碰 alias/group）。
+  * `prism-routerd` 在**新 MAC 首次出现**时写 `first_seen`（绝不碰 alias/group）。
 
 `get_state` 的 `devices[]` 里**有值才带** `alias` / `group` / `first_seen`（没有就整个键不出现）。
 
@@ -678,7 +678,7 @@ UCI `settings` 段：
 
 **计算口径**（rpcd 侧，`get_state` 内）：
 
-- 只读 `/etc/traffic-stats/daily/YYYY-MM-DD.json`，且**文件名年月 == 当前本地月**（1 号至今）；
+- 只读 `/etc/prism-router/daily/YYYY-MM-DD.json`，且**文件名年月 == 当前本地月**（1 号至今）；
 - 文件名日期 **> 今天**（时钟错乱产生的未来文件）跳过；
 - 每天的 `devices[].rx/tx` 按 MAC 累加（`mac` 为空则用 IP 作键，state 侧同样 MAC 优先、IP 回退）；
 - **月度总账始终使用 daily 的 `totals.rx/tx`**（缺失再取 direct+proxy），不能按被 Top N 截断的设备行求和；设备行只用于单设备配额；
@@ -709,7 +709,7 @@ UCI `settings` 段：
 #### 10.3.1 CSV —— rpcd `export_csv {what}`
 
 参数 `what` ∈ `devices` | `apps` | `daily`（缺省 `devices`；非法 → `{ok:false, error}`）。
-返回 `{ok, what, filename, rows, csv}`，文件名 `traffic-stats-<what>-YYYY-MM-DD.csv`。
+返回 `{ok, what, filename, rows, csv}`，文件名 `prism-router-<what>-YYYY-MM-DD.csv`。
 前端只需把 `csv` 字符串存成 `.csv` 文件（已带 BOM，不要再自己加）。
 
 CSV 规则（门禁逐条验）：
@@ -731,9 +731,9 @@ CSV 规则（门禁逐条验）：
 
 `接入` 只会是 `wifi` / `wired` / `unknown` / 空；`首次出现` 是本地时间 `YYYY-MM-DD HH:MM:SS`（没有就空）。
 
-#### 10.3.2 Prometheus —— CGI `/cgi-bin/traffic-stats-metrics`
+#### 10.3.2 Prometheus —— CGI `/cgi-bin/prism-router-metrics`
 
-安装为 `/www/cgi-bin/traffic-stats-metrics`（ucode，**只读**：只读 state.json 与 devices.json，
+安装为 `/www/cgi-bin/prism-router-metrics`（ucode，**只读**：只读 state.json 与 devices.json，
 不写文件、不 fork 子进程）。
 
 **认证**：`metrics_enabled=1` **且** `metrics_token` 非空；请求带 `?token=<tok>` 或
@@ -765,7 +765,7 @@ CSV 规则（门禁逐条验）：
 
 ### 10.4 陌生设备标记 `first_seen`
 
-- 由 `traffic-statsd` 在每轮 poll 末尾记录：只针对**有 MAC** 的设备
+- 由 `prism-routerd` 在每轮 poll 末尾记录：只针对**有 MAC** 的设备
   （没有 DHCP 租约 → MAC 为空 → 没有 `first_seen`）。
 - 已有 `first_seen` **绝不覆盖**；`alias` / `group` 不动；同一进程内不会重复写
   （重复运行后 `devices.json` 字节级不变）。
@@ -786,9 +786,9 @@ CSV 规则（门禁逐条验）：
 
 | 环境变量 | 作用 |
 |---|---|
-| `TRAFFIC_STATS_DEVICES_FILE` | 覆盖 `devices.json` 路径（daemon / rpcd / metrics CGI 都用） |
-| `TRAFFIC_STATS_STATE_FILE` | 覆盖 rpcd 与 metrics CGI 读的 state.json 路径 |
-| `TRAFFIC_STATS_DAILY_DIR` | 覆盖 rpcd 读的 daily 目录（daemon 侧本来就是它的写目录） |
+| `PRISM_ROUTER_DEVICES_FILE` | 覆盖 `devices.json` 路径（daemon / rpcd / metrics CGI 都用） |
+| `PRISM_ROUTER_STATE_FILE` | 覆盖 rpcd 与 metrics CGI 读的 state.json 路径 |
+| `PRISM_ROUTER_DAILY_DIR` | 覆盖 rpcd 读的 daily 目录（daemon 侧本来就是它的写目录） |
 
 ### 10.7 已知不足
 
@@ -802,7 +802,7 @@ CSV 规则（门禁逐条验）：
 - CSV 的公式注入防护会在文本前多一个 `'`（安全换可读性）；Excel 里看起来是多一个字符。
 - Prometheus 指标是**进程生命周期累计**（重启 reset），不是持久计数器；也没有做多抓取端缓存/限流，
   每次抓取读两个小文件（`state.json` ~10KB、`devices.json` ~几 KB）。
-- `metrics_token` 明文存放于 `/etc/config/traffic-stats`；走 URL 查询串时会进 web 服务器访问日志；
+- `metrics_token` 明文存放于 `/etc/config/prism-router`；走 URL 查询串时会进 web 服务器访问日志；
   通道无 TLS、不防重放 —— **仅限内网**，不要把 web 端口暴露到 WAN。
 - 月口径跟随本机时区（`/etc/TZ`），与 `daily/` 文件名口径一致；改时区后同一天可能重复/漏算一次。
 
@@ -810,7 +810,7 @@ CSV 规则（门禁逐条验）：
 
 `tests/container-validate-features.sh`（隔离容器、`--network none`，**156 项**）覆盖：
 
-- 安装后 `/etc /usr /www /www/cgi-bin` 权限不变；`traffic-stats-metrics` 0644/0755 落位；
+- 安装后 `/etc /usr /www /www/cgi-bin` 权限不变；`prism-router-metrics` 0644/0755 落位；
   三份 ucode（daemon / rpcd / CGI）语法检查；5 个新配置项与默认值
 - `set_device_meta` 往返：大写+短横线 MAC 归一、0644 root:root、无 `.tmp` 残留、
   alias 空串清除、全空删除记录、非法 MAC / 空更新拒绝、`\n \t` 清洗、128 字节截断
@@ -831,7 +831,7 @@ CSV 规则（门禁逐条验）：
 
 ---
 
-## 11. 独立面板服务（`traffic-panel`，脱离 LuCI）
+## 11. 独立面板服务（`prism-router-panel`，脱离 LuCI）
 
 一个**独立的只读 HTTP 服务**：procd 启动一个专门的 uhttpd 实例，浏览器直接访问
 `http://<路由器LAN地址>:8099/` 就能看面板，不需要 LuCI 会话，也不经过 LuCI 的 uhttpd 实例。
@@ -839,18 +839,18 @@ CSV 规则（门禁逐条验）：
 ### 11.1 安装内容
 
 ```
-/etc/init.d/traffic-panel            0755   procd init（USE_PROCD=1，START=95）
-/www/traffic-panel/index.html        0644   静态页面（由 files/panel/ 安装）
-/www/traffic-panel/app.js            0644
-/www/traffic-panel/style.css         0644
-/www/traffic-panel/cgi-bin/panel-api 0755   只读 ucode CGI（#!/usr/bin/ucode）
+/etc/init.d/prism-router-panel            0755   procd init（USE_PROCD=1，START=95）
+/www/prism-router-panel/index.html        0644   静态页面（由 files/panel/ 安装）
+/www/prism-router-panel/app.js            0644
+/www/prism-router-panel/style.css         0644
+/www/prism-router-panel/cgi-bin/panel-api 0755   只读 ucode CGI（#!/usr/bin/ucode）
 ```
 
-`traffic-stats` 的 `DEPENDS` 因此包含 `uhttpd`（系统自带的 web 服务器，不是 LuCI）。
-面板数据来自 rpcd 的 `traffic-stats` ubus 对象，所以 **`luci-app-traffic-stats` 必须安装**
-（该包提供 `/usr/share/rpcd/ucode/traffic-stats.uc`）；面板本身不读 LuCI 的会话/菜单/ACL。
+`prism-router` 的 `DEPENDS` 因此包含 `uhttpd`（系统自带的 web 服务器，不是 LuCI）。
+面板数据来自 rpcd 的 `prism-router` ubus 对象，所以 **`luci-app-prism-router` 必须安装**
+（该包提供 `/usr/share/rpcd/ucode/prism-router.uc`）；面板本身不读 LuCI 的会话/菜单/ACL。
 
-### 11.2 配置（UCI `traffic-stats`，section `panel`）
+### 11.2 配置（UCI `prism-router`，section `panel`）
 
 ```
 config panel 'panel'
@@ -860,22 +860,22 @@ config panel 'panel'
     option token ''        # 空 = 不做应用层认证（只依赖网络边界）
 ```
 
-- **默认关闭**：`enabled=0` 时 `/etc/init.d/traffic-panel start` 直接 `return 0`，不监听任何端口；
+- **默认关闭**：`enabled=0` 时 `/etc/init.d/prism-router-panel start` 直接 `return 0`，不监听任何端口；
   postinst/prerm 只按 `panel.enabled` 做 `enable`/`disable`，**绝不强制启动**。
 - 老配置升级后没有 `panel` 段，`config_get_bool` 取默认 0 —— 行为与未安装前一致。
-- 修改 `port`/`bind` 后需要 `/etc/init.d/traffic-panel restart`（uhttpd 的监听参数在启动时确定）；
+- 修改 `port`/`bind` 后需要 `/etc/init.d/prism-router-panel restart`（uhttpd 的监听参数在启动时确定）；
   修改 `token` 不需要重启（CGI 每个请求重新读 UCI）。
 
 ### 11.3 启动命令（procd）
 
 ```
-/usr/sbin/uhttpd -f -h /www/traffic-panel -x /cgi-bin \
+/usr/sbin/uhttpd -f -h /www/prism-router-panel -x /cgi-bin \
     -p <listen> -t 60 -T 60 -A 1
 ```
 
 - `-f` 前台运行（由 procd 托管），`-p` 在有 bind 时是 `addr:port`，否则只给 `port`（所有接口）；
 - `respawn 3600 5 0`（异常退出自动拉起），stdout/stderr 转 syslog；
-- `reload_service` = `stop` + `start`；`service_triggers` 注册 `traffic-stats` 的 reload 触发器。
+- `reload_service` = `stop` + `start`；`service_triggers` 注册 `prism-router` 的 reload 触发器。
 - `bind` 只接受 IPv4 字面量（四段 0–255）；主机名/IPv6/带端口的写法一律记一条日志后
   回退为监听所有接口 —— 绝不把 UCI 原文拼进 argv。
 
@@ -898,7 +898,7 @@ config panel 'panel'
   响应体不含堆栈/路径/命令输出。
 - 响应头固定：`Content-Type: application/json; charset=utf-8`、`Content-Length`、
   `Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`。
-- **只读**：不写任何文件；除 `ubus call traffic-stats <只读方法>` 之外不执行外部命令。
+- **只读**：不写任何文件；除 `ubus call prism-router <只读方法>` 之外不执行外部命令。
   CGI 不做任何日志（不记录 token）。
 
 ### 11.5 安全边界
@@ -920,7 +920,7 @@ config panel 'panel'
 
 - 装包后落位/权限（init 755、CGI 755、静态 644）、`sh -n`/`ucode -c`、panel 段默认值；
 - **默认关闭**：`enabled=0` 时 start 退出码 0 且 18099 无监听；
-- 真实 `ubusd + procd + rpcd` → `/etc/init.d/traffic-panel start` 拉起独立 uhttpd →
+- 真实 `ubusd + procd + rpcd` → `/etc/init.d/prism-router-panel start` 拉起独立 uhttpd →
   `?what=state` 200 + `application/json` + 四个安全头 + `Content-Length` + `totals`；
 - 白名单/默认 what/`what=bad`→400/写方法名→400；POST→405（经 uhttpd）；
   HEAD→200 且 CGI 层不输出 body；

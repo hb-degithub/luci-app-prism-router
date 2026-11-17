@@ -1,4 +1,4 @@
-# AP（192.168.100.3）在流量统计中的角色
+# AP（192.168.100.3）在棱镜路由中的角色
 
 > 结论先说：**AP 不应该跑流量计费/统计的采集端**，否则会与主路由重复计数。
 > 它唯一有价值的贡献是「无线侧元数据」（信号强度、协商速率、BSS）。
@@ -18,7 +18,7 @@
 
 1. **网络路径**：AP 是纯二层桥，所有客户端流量经桥接转发到主路由，由主路由做 NAT。
    主路由的 conntrack 已经统计了这些流量。
-2. **会重复计数**：若 AP 也跑 `traffic-statsd`，同一份流量会在两个节点各记一次；
+2. **会重复计数**：若 AP 也跑 `prism-routerd`，同一份流量会在两个节点各记一次；
    子母汇总时总量翻倍（与代理腿重复计数是不同原因，但现象相同）。
 3. **已验证主路由覆盖无线客户端**：同一个 MAC（如 `22:77:08:69:a9:1f` = OnePlus-8-Pro）
    同时出现在 AP 的 `iw station dump` 和主路由的 DHCP 租约 / 状态文件里。
@@ -31,7 +31,7 @@
 **方案 B（可选增强，未实现）**：AP 只上报「无线站点元数据」，不上报字节：
 
 ```
-POST /cgi-bin/traffic-stats-stations
+POST /cgi-bin/prism-router-stations
 {
   "node_id": "ap-1",
   "ts": 1794700000,
@@ -51,7 +51,7 @@ POST /cgi-bin/traffic-stats-stations
 
 AP 无 apk 源，无法 `apk add`；有 ucode/curl，所以：
 
-- 用**文件级部署**（scp 到 `/usr/share/traffic-stats/`），不打包
+- 用**文件级部署**（scp 到 `/usr/share/prism-router/`），不打包
 - 或先在带包源的构建环境里 `apk mkpkg` 生成 `.apk`（apk-tools 3.x 支持），再离线安装
 - 无论哪种，都必须先在容器里验证文件属主/权限（参考 `docs/DEPLOY-RULES.md`）
 
@@ -68,16 +68,16 @@ AP 无 apk 源，无法 `apk add`；有 ucode/curl，所以：
 
 | 位置 | 改动 |
 |---|---|
-| AP `192.168.100.3` | `/usr/share/traffic-stats/stations.uc`（root:root 644）、`/etc/config/traffic-stats`（600）、crontab 一行每分钟 |
+| AP `192.168.100.3` | `/usr/share/prism-router/stations.uc`（root:root 644）、`/etc/config/prism-router`（600）、crontab 一行每分钟 |
 | 母节点 `192.168.100.1` | `stations_enabled=1` + `stations_token`，接收端与界面此前已随包部署 |
 
 验证结果：
 ```
 AP 上报：站点=3 请求体=418 字节  exit=0
-母节点：/etc/traffic-stats/stations/ap-1.json (root:root 644)
+母节点：/etc/prism-router/stations/ap-1.json (root:root 644)
 get_stations：node ap-1「客厅 AP」，3 个站点（signal -48/-40 dBm、rx/tx 速率、连接时长）
-设备页：信号列已显示（-xx dBm），接入列 无线/有线 与流量统计无关地独立呈现
-AP 权限：/etc /usr /www /usr/share/traffic-stats 全部 root:root 755 未变
+设备页：信号列已显示（-xx dBm），接入列 无线/有线 与棱镜路由无关地独立呈现
+AP 权限：/etc /usr /www /usr/share/prism-router 全部 root:root 755 未变
 WiFi：3 个 BSS 正常
 ```
 

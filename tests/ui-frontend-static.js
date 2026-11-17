@@ -31,7 +31,7 @@ const path = require('path');
 const vm = require('vm');
 
 const ROOT = path.resolve(__dirname, '..');
-const VIEW_DIR = path.join(ROOT, 'luci-app-traffic-stats/htdocs/luci-static/resources/view/traffic-stats');
+const VIEW_DIR = path.join(ROOT, 'luci-app-prism-router/htdocs/luci-static/resources/view/prism-router');
 const VIEWS = [ 'overview', 'devices', 'apps', 'nodes', 'settings', 'mobile', 'panel', 'diagnostics' ];
 
 let passed = 0;
@@ -462,7 +462,7 @@ async function testExports() {
 	devices.env.__responses.export_csv = {
 		ok: true,
 		what: 'devices',
-		filename: 'traffic-stats-devices-2026-11-16.csv',
+		filename: 'prism-router-devices-2026-11-16.csv',
 		rows: 2,
 		csv: '主机名,IP\r\nrouter,192.168.1.1\r\n'
 	};
@@ -483,7 +483,7 @@ async function testExports() {
 	const devAnchor = devices.env.__anchors.find(function (a) { return a.download; });
 
 	check('devices 下载使用后端 filename',
-		devAnchor != null && devAnchor.download === 'traffic-stats-devices-2026-11-16.csv',
+		devAnchor != null && devAnchor.download === 'prism-router-devices-2026-11-16.csv',
 		devAnchor && devAnchor.download);
 
 	const apps = loadView('apps');
@@ -491,7 +491,7 @@ async function testExports() {
 	apps.env.__responses.export_csv = {
 		ok: true,
 		what: 'apps',
-		filename: 'traffic-stats-apps-2026-11-16.csv',
+		filename: 'prism-router-apps-2026-11-16.csv',
 		rows: 1,
 		csv: '应用,出口\r\nyoutube.com,DIRECT\r\n'
 	};
@@ -514,7 +514,7 @@ async function testExports() {
 	settings.env.__responses.export_csv = {
 		ok: true,
 		what: 'daily',
-		filename: 'traffic-stats-daily-2026-11-16.csv',
+		filename: 'prism-router-daily-2026-11-16.csv',
 		rows: 3,
 		csv: '日期,下载\r\n2026-11-16,1\r\n'
 	};
@@ -643,15 +643,15 @@ async function testSemantics() {
 
 	/* 详细面板是独立页面：概览/手机版/诊断都用真链接 + 新标签，不走 window.open。 */
 	check('三处入口都用新标签链接打开详细面板',
-		/traffic-stats\/panel/.test(overview) && /target: '_blank'/.test(overview) &&
-		/traffic-stats\/panel/.test(mobile) && /target: '_blank'/.test(mobile) &&
-		/traffic-stats\/panel/.test(diagnosticsPage) && /target: '_blank'/.test(diagnosticsPage));
+		/prism-router\/panel/.test(overview) && /target: '_blank'/.test(overview) &&
+		/prism-router\/panel/.test(mobile) && /target: '_blank'/.test(mobile) &&
+		/prism-router\/panel/.test(diagnosticsPage) && /target: '_blank'/.test(diagnosticsPage));
 	check('概览不用 window.open 打开详细面板',
-		!/window\.open\(\s*L\.url\('admin\/services\/traffic-stats\/panel'\)/.test(overview));
+		!/window\.open\(\s*L\.url\('admin\/services\/prism-router\/panel'\)/.test(overview));
 	check('menu.d 含诊断页且 order 在手机版与面板之间',
-		/"admin\/services\/traffic-stats\/diagnostics"/.test(readView('diagnostics')) === false &&
-		/"path": "traffic-stats\/diagnostics"/.test(
-			require('fs').readFileSync(path.join(ROOT, 'luci-app-traffic-stats/root/usr/share/luci/menu.d/luci-app-traffic-stats.json'), 'utf8')));
+		/"admin\/services\/prism-router\/diagnostics"/.test(readView('diagnostics')) === false &&
+		/"path": "prism-router\/diagnostics"/.test(
+			require('fs').readFileSync(path.join(ROOT, 'luci-app-prism-router/root/usr/share/luci/menu.d/luci-app-prism-router.json'), 'utf8')));
 
 	/* ---- 拓扑：懒加载 / 下钻 / 可读性（静态断言，不启动浏览器） ---- */
 	const loadBody = (panel.match(/load:\s*function\s*\(\)\s*\{([\s\S]*?)\n\t\},/) || [])[1] || '';
@@ -695,9 +695,9 @@ async function testSemantics() {
 		/ts-topo-card/.test(panel) && /ts-topo-layer/.test(panel));
 
 	check('mobile PWA 路径使用 L.resource',
-		/L\.resource\('traffic-stats\/'/.test(mobile) && /pwaAsset/.test(mobile));
+		/L\.resource\('prism-router\/'/.test(mobile) && /pwaAsset/.test(mobile));
 	check('mobile 明确根部署回退',
-		/\/luci-static\/resources\/traffic-stats\//.test(mobile));
+		/\/luci-static\/resources\/prism-router\//.test(mobile));
 }
 
 // ---------------------------------------------------------------- 6b. 概览纯函数
@@ -969,7 +969,7 @@ async function testSettingsUciGuard() {
 	const roCtx = Object.create(roLoaded.view);
 
 	roCtx.uciOk = true;
-	roLoaded.env.L.env = { acls: [ 'luci-app-traffic-stats' ] };
+	roLoaded.env.L.env = { acls: [ 'luci-app-prism-router' ] };
 	roLoaded.view.render.call(roCtx);
 
 	const roApply = findNode(roCtx.root, function (n) { return n.attrs && n.attrs.id === 'ts-settings-save-apply'; });
@@ -999,7 +999,7 @@ async function testSettingsUciGuard() {
 	const adminCtx = Object.create(adminLoaded.view);
 
 	adminCtx.uciOk = true;
-	adminLoaded.env.L.env = { acls: [ 'luci-app-traffic-stats', 'luci-app-traffic-stats-admin' ] };
+	adminLoaded.env.L.env = { acls: [ 'luci-app-prism-router', 'luci-app-prism-router-admin' ] };
 	adminLoaded.view.render.call(adminCtx);
 
 	const adminApply = findNode(adminCtx.root, function (n) { return n.attrs && n.attrs.id === 'ts-settings-save-apply'; });
@@ -1071,12 +1071,12 @@ async function testDevicesMetaPermissions() {
 		tests.isAdmin() === false);
 
 	delete env.L.env;
-	env.L.env = { trafficStatsCanManage: true };
+	env.L.env = { prismRouterCanManage: true };
 	check('无 ACL 列表时用只读 RPC 的 can_manage 能力', tests.isAdmin() === true);
-	env.L.env.trafficStatsCanManage = false;
+	env.L.env.prismRouterCanManage = false;
 	check('RPC 明确非管理员时隐藏写入口', tests.isAdmin() === false);
 
-	env.L.env = { acls: [ 'luci-app-traffic-stats' ] };
+	env.L.env = { acls: [ 'luci-app-prism-router' ] };
 
 	check('只读 ACL 组 → 非管理员', tests.isAdmin() === false);
 
@@ -1087,7 +1087,7 @@ async function testDevicesMetaPermissions() {
 	check('只读用户看到的别名格没有「编辑」按钮',
 		containsText(readonlyTree, '编辑') === false);
 
-	env.L.env = { acls: [ 'luci-app-traffic-stats', 'luci-app-traffic-stats-admin' ] };
+	env.L.env = { acls: [ 'luci-app-prism-router', 'luci-app-prism-router-admin' ] };
 
 	check('admin ACL 组 → 管理员', tests.isAdmin() === true);
 
@@ -1098,7 +1098,7 @@ async function testDevicesMetaPermissions() {
 		containsText(adminTree, '编辑') === true);
 
 	/* 直接调用编辑入口也要被 admin 闸门挡住（避免只靠按钮隐藏）。 */
-	env.L.env = { acls: [ 'luci-app-traffic-stats' ] };
+	env.L.env = { acls: [ 'luci-app-prism-router' ] };
 
 	const guardCtx = { dialog: null, drafts: {} };
 	const beforeNotify = env.__notifications.length;
@@ -1114,7 +1114,7 @@ async function testDevicesMetaPermissions() {
 async function testMenu() {
 	console.log('\n[7] 菜单 JSON');
 
-	const file = path.join(ROOT, 'luci-app-traffic-stats/root/usr/share/luci/menu.d/luci-app-traffic-stats.json');
+	const file = path.join(ROOT, 'luci-app-prism-router/root/usr/share/luci/menu.d/luci-app-prism-router.json');
 
 	try {
 		const menu = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -1122,25 +1122,25 @@ async function testMenu() {
 		check('menu.d JSON 可解析', menu != null && typeof menu === 'object');
 
 		const paths = VIEWS.map(function (name) {
-			return menu['admin/services/traffic-stats/' + name];
+			return menu['admin/services/prism-router/' + name];
 		});
 
 		check('menu.d 含全部 view 路径',
 			paths.every(function (item) { return item && item.action && item.action.type === 'view'; }));
 
-		const root = menu['admin/services/traffic-stats'];
+		const root = menu['admin/services/prism-router'];
 		const rootAcl = root && root.depends && root.depends.acl;
 
-		check('根菜单保留 luci-app-traffic-stats 依赖',
-			Array.isArray(rootAcl) && rootAcl.length === 1 && rootAcl[0] === 'luci-app-traffic-stats',
+		check('根菜单保留 luci-app-prism-router 依赖',
+			Array.isArray(rootAcl) && rootAcl.length === 1 && rootAcl[0] === 'luci-app-prism-router',
 			JSON.stringify(rootAcl));
 
-		const settings = menu['admin/services/traffic-stats/settings'];
+		const settings = menu['admin/services/prism-router/settings'];
 		const settingsAcl = settings && settings.depends && settings.depends.acl;
 
-		check('设置页子路由 depends.acl=luci-app-traffic-stats-admin',
+		check('设置页子路由 depends.acl=luci-app-prism-router-admin',
 			Array.isArray(settingsAcl) && settingsAcl.length === 1 &&
-			settingsAcl[0] === 'luci-app-traffic-stats-admin',
+			settingsAcl[0] === 'luci-app-prism-router-admin',
 			JSON.stringify(settingsAcl));
 
 		/*

@@ -14,7 +14,7 @@
 #   9. 摘要行格式正确；没有东西可删也 exit 0；enabled=0 时什么都不动
 #  10. 守护进程：retention 段存在时不再按 history_days 计数裁剪 daily（否则 new 策略失效）
 #
-# 隔离：--network none，不访问外网、不接触任何真机；数据全部落容器 /etc/traffic-stats 与 /tmp。
+# 隔离：--network none，不访问外网、不接触任何真机；数据全部落容器 /etc/prism-router 与 /tmp。
 mkdir -p /var/lock /var/run /tmp
 
 PASS=0; FAIL=0
@@ -24,12 +24,12 @@ perm(){ ls -ld "$1" 2>/dev/null | awk '{print $1,$3":"$4}'; }
 check(){ local got; got=$(ls -ld "$1" 2>/dev/null | awk '{print $3":"$4" "$1}')
   [ "$got" = "$2" ] && ok "$1 -> $got" || bad "$1 期望[$2] 实际[${got:-不存在}]"; }
 UCI(){ uci "$@" >/dev/null 2>&1; }
-cfg_commit(){ uci commit traffic-stats >/dev/null 2>&1; }
-cfg_get(){ uci -q get "traffic-stats.retention.$1" 2>/dev/null; }
+cfg_commit(){ uci commit prism-router >/dev/null 2>&1; }
+cfg_get(){ uci -q get "prism-router.retention.$1" 2>/dev/null; }
 
-RT=/usr/share/traffic-stats/retention.uc
-D=/etc/traffic-stats
-T=/tmp/traffic-stats
+RT=/usr/share/prism-router/retention.uc
+D=/etc/prism-router
+T=/tmp/prism-router
 OUT=/tmp/rt-out.txt
 ERR=/tmp/rt-err.txt
 
@@ -58,14 +58,14 @@ reset_dirs(){
 
 # 每个用例前把 UCI 恢复成默认值（retention 段全部选项）
 reset_cfg(){
-  UCI set traffic-stats.retention.enabled='1'
-  UCI set traffic-stats.retention.daily_days='400'
-  UCI set traffic-stats.retention.nodes_days='30'
-  UCI set traffic-stats.retention.stations_days='7'
-  UCI set traffic-stats.retention.log_days='7'
-  UCI set traffic-stats.retention.log_max_kb='512'
-  UCI set traffic-stats.retention.spool_max_kb='2048'
-  UCI set traffic-stats.retention.dry_run='0'
+  UCI set prism-router.retention.enabled='1'
+  UCI set prism-router.retention.daily_days='400'
+  UCI set prism-router.retention.nodes_days='30'
+  UCI set prism-router.retention.stations_days='7'
+  UCI set prism-router.retention.log_days='7'
+  UCI set prism-router.retention.log_max_kb='512'
+  UCI set prism-router.retention.spool_max_kb='2048'
+  UCI set prism-router.retention.dry_run='0'
   cfg_commit
 }
 
@@ -74,9 +74,9 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www)
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW"
 
 echo "=== 1. 安装两个包 ==="
-opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
-  && ok "traffic-stats 安装成功" || { bad "traffic-stats 安装失败"; tail -5 /tmp/i1.log; }
-opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 \
+opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
+  && ok "prism-router 安装成功" || { bad "prism-router 安装失败"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 \
   && ok "luci-app 安装成功" || { bad "luci-app 安装失败"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 系统目录权限未被改动（回归核心）==="
@@ -101,12 +101,12 @@ for kv in enabled=1 daily_days=400 nodes_days=30 stations_days=7 log_days=7 \
   [ "$got" = "$want" ] && ok "retention.$k=$got" || bad "retention.$k 期望[$want] 实际[${got:-缺失}]"
 done
 # 原有 section 一行都没被改动（追加而非重写）
-grep -q "^config settings 'settings'" /etc/config/traffic-stats \
-  && grep -q "^config feishu 'feishu'" /etc/config/traffic-stats \
-  && grep -q "^config retention 'retention'" /etc/config/traffic-stats \
+grep -q "^config settings 'settings'" /etc/config/prism-router \
+  && grep -q "^config feishu 'feishu'" /etc/config/prism-router \
+  && grep -q "^config retention 'retention'" /etc/config/prism-router \
   && ok "config 里 settings / feishu / retention 三个 section 都在" \
   || bad "config 的 section 结构被破坏"
-check /etc/config/traffic-stats "root:root -rw-r--r--"
+check /etc/config/prism-router "root:root -rw-r--r--"
 
 echo "=== 5. 离线自检（日期解析 / 白名单判定）==="
 RC=$(ucode "$RT" --selftest >/tmp/rt-self.txt 2>&1; echo $?)
@@ -224,18 +224,18 @@ summary_ok && ok "dry-run 摘要行格式正确 ($(tail -n 1 "$OUT"))" || bad "d
 [ -s "$ERR" ] && bad "stderr 有输出：$(head -2 "$ERR")" || ok "dry-run 无 stderr 噪声"
 
 echo "=== 11. UCI dry_run=1 与 --dry-run 等价 ==="
-UCI set traffic-stats.retention.dry_run='1'; cfg_commit
+UCI set prism-router.retention.dry_run='1'; cfg_commit
 OLD6=$(dayago 600); printf 'z\n' > "$D/daily/$OLD6.json"
 RC=$(run_rt)
 [ "$RC" = "0" ] && [ -e "$D/daily/$OLD6.json" ] && ok "dry_run=1：文件保留" || bad "dry_run=1 竟然删了文件"
 grep -q "retention: 将删除 $D/daily/$OLD6.json" "$OUT" && ok "dry_run=1：清单里是「将删除」" \
   || bad "dry_run=1 没走 dry-run 分支"
-UCI set traffic-stats.retention.dry_run='0'; cfg_commit
+UCI set prism-router.retention.dry_run='0'; cfg_commit
 
 echo "=== 12. 越权保护：白名单外 / 符号链接 / 目录 / 覆盖尝试 ==="
 reset_cfg; reset_dirs
 NOW_D=$(dayago 500)
-# (a) 白名单外的文件：/etc/escape.json 与白名单目录的父目录 /etc/traffic-stats/escape.json
+# (a) 白名单外的文件：/etc/escape.json 与白名单目录的父目录 /etc/prism-router/escape.json
 printf 'escape\n' > /etc/escape.json;            age 900 /etc/escape.json
 printf 'escape2\n' > "$D/escape.json";           age 900 "$D/escape.json"
 # (b) 白名单目录里的符号链接（名字是超期日期，指向白名单外）
@@ -260,7 +260,7 @@ grep -q "retention: 删除 $D/daily/$REAL.json（700 天前）" "$OUT" && ok "�
 # (e) 目录覆盖尝试：/etc、上跳、白名单外的 tmp 目录 一律拒绝，系统目录不受影响
 printf 'keep\n' > /etc/rt-keep.json; age 900 /etc/rt-keep.json
 OLD8=$(dayago 700); printf 'nofallback\n' > "$D/daily/$OLD8.json"
-RC=$(run_rt --daily-dir /etc --nodes-dir "$D/../.." --stations-dir /etc/traffic-stats/../../etc \
+RC=$(run_rt --daily-dir /etc --nodes-dir "$D/../.." --stations-dir /etc/prism-router/../../etc \
            --log-dir /etc --queue-dir /tmp)
 [ "$RC" = "0" ] && ok "非法目录覆盖也退出 0（不崩）" || bad "非法目录覆盖退出码 $RC"
 [ -f /etc/rt-keep.json ] && ok "/etc/rt-keep.json 未被删（--daily-dir /etc 被拒绝）" \
@@ -290,7 +290,7 @@ summary_ok && ok "空目录摘要行仍正确 ($(tail -n 1 "$OUT"))" || bad "空
 [ "$(sum_field files_deleted)" = "0" ] && [ "$(sum_field bytes_freed)" = "0" ] \
   && [ "$(sum_field logs_truncated)" = "0" ] && ok "摘要全 0" || bad "空目录摘要不全 0"
 
-UCI set traffic-stats.retention.enabled='0'; cfg_commit
+UCI set prism-router.retention.enabled='0'; cfg_commit
 OLD7=$(dayago 500); printf 'q\n' > "$D/daily/$OLD7.json"
 { echo HEADMARK; seq 1 100000; echo TAILMARK; } > "$T/feishu.log"
 BEFORE_LOG=$(size "$T/feishu.log")
@@ -304,17 +304,17 @@ reset_cfg
 
 echo "=== 13.5 安全阀：days=0 关闭 / 非法值回落默认 ==="
 reset_dirs
-UCI set traffic-stats.retention.daily_days='0'; cfg_commit
+UCI set prism-router.retention.daily_days='0'; cfg_commit
 OLD9=$(dayago 500); printf 'safe\n' > "$D/daily/$OLD9.json"
 { echo HEADMARK; seq 1 100000; echo TAILMARK; } > "$T/feishu.log"
 BEFORE_LOG=$(size "$T/feishu.log")
-UCI set traffic-stats.retention.log_max_kb='0'; cfg_commit
+UCI set prism-router.retention.log_max_kb='0'; cfg_commit
 RC=$(run_rt)
 [ "$RC" = "0" ] && ok "0 值退出码 0" || bad "0 值退出码 $RC"
 [ -e "$D/daily/$OLD9.json" ] && ok "daily_days=0 -> 关闭按天清理（500 天前的文件保留）" \
   || bad "daily_days=0 竟然还在删"
 [ "$(size "$T/feishu.log")" = "$BEFORE_LOG" ] && ok "log_max_kb=0 -> 关闭截断" || bad "log_max_kb=0 竟然截断了"
-UCI set traffic-stats.retention.daily_days='abc'; cfg_commit
+UCI set prism-router.retention.daily_days='abc'; cfg_commit
 RC=$(run_rt)
 grep -q '配置 daily_days=abc 不是整数，用默认值 400' "$OUT" && ok "非法值回落默认并 WARN" \
   || { bad "非法值没有回落到默认"; grep WARN "$OUT"; }
@@ -325,28 +325,28 @@ reset_cfg
 echo "=== 14. 守护进程：retention 段接管 daily 清理（新策略才生效）==="
 # 老行为：按 settings.history_days 计数裁剪（默认 7 个文件）
 # 新行为：retention.enabled=1 时不裁剪，交给 retention.uc 按 daily_days 日期清理
-# TRAFFIC_STATS_PRUNE_NOW=1 让守护进程在启动时立刻跑一次清理判定（等价于跨天那次，
+# PRISM_ROUTER_PRUNE_NOW=1 让守护进程在启动时立刻跑一次清理判定（等价于跨天那次，
 # 容器里等不到零点；正常运行时它只在 day_rollover_check 里跑）。
 rm -rf /tmp/rt-daily; mkdir -p /tmp/rt-daily
 for i in 1 2 3 4 5 6 7 8 9 10; do
   printf '{"day":"2024-01-%02d"}\n' "$i" > "/tmp/rt-daily/2024-01-$(printf '%02d' $i).json"
 done
-UCI set traffic-stats.settings.lan_ranges='192.168.100.0/24'
-UCI set traffic-stats.retention.enabled='1'; cfg_commit
+UCI set prism-router.settings.lan_ranges='192.168.100.0/24'
+UCI set prism-router.retention.enabled='1'; cfg_commit
 TODAY_F=$(date +%Y-%m-%d)
-TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_PRUNE_NOW=1 TRAFFIC_STATS_DAILY_DIR=/tmp/rt-daily \
-  TRAFFIC_STATS_CONNTRACK_FILE=/fixtures/nf_conntrack \
-  TRAFFIC_STATS_CLASH_API=127.0.0.1:1 \
-  ucode /usr/bin/traffic-statsd >/tmp/rt-daemon1.log 2>&1
+PRISM_ROUTER_ONCE=1 PRISM_ROUTER_PRUNE_NOW=1 PRISM_ROUTER_DAILY_DIR=/tmp/rt-daily \
+  PRISM_ROUTER_CONNTRACK_FILE=/fixtures/nf_conntrack \
+  PRISM_ROUTER_CLASH_API=127.0.0.1:1 \
+  ucode /usr/bin/prism-routerd >/tmp/rt-daemon1.log 2>&1
 N1=$(cnt /tmp/rt-daily)
 [ "$N1" = "11" ] && ok "retention 段存在 -> 守护进程不裁剪（10 个历史 + 今天 = 11）" \
   || bad "retention 段存在时仍被裁剪：剩 $N1 个（期望 11）"
 
-UCI set traffic-stats.retention.enabled='0'; cfg_commit
-TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_PRUNE_NOW=1 TRAFFIC_STATS_DAILY_DIR=/tmp/rt-daily \
-  TRAFFIC_STATS_CONNTRACK_FILE=/fixtures/nf_conntrack \
-  TRAFFIC_STATS_CLASH_API=127.0.0.1:1 \
-  ucode /usr/bin/traffic-statsd >/tmp/rt-daemon2.log 2>&1
+UCI set prism-router.retention.enabled='0'; cfg_commit
+PRISM_ROUTER_ONCE=1 PRISM_ROUTER_PRUNE_NOW=1 PRISM_ROUTER_DAILY_DIR=/tmp/rt-daily \
+  PRISM_ROUTER_CONNTRACK_FILE=/fixtures/nf_conntrack \
+  PRISM_ROUTER_CLASH_API=127.0.0.1:1 \
+  ucode /usr/bin/prism-routerd >/tmp/rt-daemon2.log 2>&1
 N2=$(cnt /tmp/rt-daily)
 # 本次启动时目录里已有 11 个（10 个历史 + 今天那份）-> 按 history_days=7 裁到 7 个
 [ "$N2" = "7" ] && ok "retention 段关闭 -> 回到 history_days=7 计数裁剪（剩 7 个）" \

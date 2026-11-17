@@ -43,7 +43,7 @@ const vm = require('vm');
 const ROOT = path.resolve(__dirname, '..');
 const MOBILE = path.join(
 	ROOT,
-	'luci-app-traffic-stats/htdocs/luci-static/resources/view/traffic-stats/mobile.js'
+	'luci-app-prism-router/htdocs/luci-static/resources/view/prism-router/mobile.js'
 );
 const SOURCE = fs.readFileSync(MOBILE, 'utf8');
 
@@ -417,7 +417,7 @@ function makeEnvironment() {
 
 		window: {
 			location: {
-				href: 'https://192.168.1.1/cgi-bin/luci/admin/services/traffic-stats/mobile'
+				href: 'https://192.168.1.1/cgi-bin/luci/admin/services/prism-router/mobile'
 			},
 			navigator: {
 				/* 固定 Android UA，安装屏走 Android 分步文案，不依赖本机浏览器。 */
@@ -2979,9 +2979,9 @@ async function testSafetyAndHealth() {
 
 	sameList('mobile 只声明 get_state / get_nodes / get_stations 三个只读 RPC',
 		methods, [ 'get_nodes', 'get_state', 'get_stations' ]);
-	check('三个 RPC 都走 traffic-stats 对象',
+	check('三个 RPC 都走 prism-router 对象',
 		loaded.env.__declarations.every(function (item) {
-			return item.object === 'traffic-stats';
+			return item.object === 'prism-router';
 		}),
 		'declarations=' + repr(loaded.env.__declarations));
 
@@ -3191,8 +3191,8 @@ async function testStaleState() {
 	const stopped = await boot({ state: baseState({ running: false, devices: [] }) });
 	const stoppedText = textOf(stopped.ctx.noticeNode);
 
-	check('state.running=false → 提示 traffic-statsd 未运行',
-		stoppedText.indexOf('traffic-statsd 未运行') >= 0, 'notice=' + repr(stoppedText));
+	check('state.running=false → 提示 prism-routerd 未运行',
+		stoppedText.indexOf('prism-routerd 未运行') >= 0, 'notice=' + repr(stoppedText));
 	same('未运行时 notice 可见', stopped.ctx.noticeNode.style.display, 'block');
 	check('running=false 且数据新鲜时不提「未更新」',
 		stoppedText.indexOf('未更新') < 0, 'notice=' + repr(stoppedText));

@@ -1,4 +1,4 @@
-# 横向盘点：别人的流量统计是怎么做的
+# 横向盘点：别人的棱镜路由是怎么做的
 
 > 目的：为一个 OpenWrt 用量统计插件提供"测量点 / 维度 / 存储 / 报表 / 告警"的横向参照。
 > 调研时间：2026-11-14。**只做调研，不含业务代码。**
@@ -106,7 +106,7 @@
 5. **`/ip accounting` 在 7.26 新手册里已无对应章节**（我核对过 sitemap 与 `/cli-reference/ip/` 的 158 个条目，没有 accounting）。v6 时代的老文档（`mikrotik.com/testdocs`）有该功能。**v7 是否仍保留、是否有行为变化：未查证。**
 6. 还有一条容易被忽略的：FastTrack 生效的条件之一是"**Sniffer、torch 或 traffic generator 没在运行**"——**即：要抓就得放弃加速**，这是 RouterOS 自己写进文档的取舍。
 7. **Queues 统计（最容易被忽略的一路）**：simple queue 的只读字段有 `bytes{upload,download}`、`total-bytes`、`packets`、**`dropped`**、`rate`、`queued-bytes`（[queue/simple](https://manual.mikrotik.com/docs/cli-reference/queue/simple/)）。**这是"整形点测量"的第二例**（第一例是 LibreQoS）：它数的是"实际放行 + 实际丢弃"，conntrack 口径给不了丢弃数。
-   - 注意绕过清单的原文是 "**Simple queues**" 与 "**Queue tree with parent=global**"（[Connection tracking](https://manual.mikrotik.com/docs/firewall-and-quality-of-service/connection-tracking)）。按字面理解，**挂在接口上的 queue tree 不在绕过清单内**，可能仍在快路径上计数——**这是我的推论，未实测**；但它能解释为什么 RouterOS 社区常用"按接口挂 queue tree"做长期流量统计。
+   - 注意绕过清单的原文是 "**Simple queues**" 与 "**Queue tree with parent=global**"（[Connection tracking](https://manual.mikrotik.com/docs/firewall-and-quality-of-service/connection-tracking)）。按字面理解，**挂在接口上的 queue tree 不在绕过清单内**，可能仍在快路径上计数——**这是我的推论，未实测**；但它能解释为什么 RouterOS 社区常用"按接口挂 queue tree"做长期棱镜路由。
 
 - **对我们**：MikroTik 是"静默失效"最典型的反面教材——功能还在、文档也写了"会绕过"，但产品层面没有拦截，用户看到的是 0 或偏小。我们的 `strict_accounting` 默认关 offload + 检测告警，正是针对这一点。
 

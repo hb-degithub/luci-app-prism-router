@@ -1,4 +1,4 @@
-# OpenWrt 流量统计插件 · 方案设计 v1.2
+# OpenWrt 棱镜路由插件 · 方案设计 v1.2
 
 > 状态：**待用户确认**（确认后进入 P0 实现）
 > 依据：`docs/research-traffic-capture.md`、`docs/research-feishu-api.md`、`docs/research-openwrt-packaging.md`、`docs/research-industry-approaches.md`、`docs/research-app-identification.md`、`docs/research-l2-counters.md`、`docs/REVIEW-alternatives.md`（均带出处，2026-11）
@@ -12,7 +12,7 @@
 
 | 需求 | 决策 |
 |---|---|
-| 每设备流量统计 | ✅ 做，以 `MAC` 为主身份，`IP` 为辅 |
+| 每设备棱镜路由 | ✅ 做，以 `MAC` 为主身份，`IP` 为辅 |
 | 每设备 × 每应用/网站 | ✅ 做，域名级归因（DNS 为主 + SNI 可选） |
 | 多台 OpenWrt 共享数据 | ✅ 做，子→母 出站 push，母节点由一台路由器兼任 |
 | 子母插件控制 | ✅ 做，母下发配置/规则/报表计划，子拉取执行 |
@@ -32,10 +32,10 @@
 ```
 ┌─ 每台 OpenWrt（standalone 或 child 角色）───────────────────────┐
 │                                                                │
-│  LuCI JS 页面 ──rpc.declare──▶ rpcd ──▶ ucode 后端 (traffic-stats.uc) │
+│  LuCI JS 页面 ──rpc.declare──▶ rpcd ──▶ ucode 后端 (prism-router.uc) │
 │                                        │                       │
 │                                        ▼                       │
-│  traffic-statsd (C 守护进程, procd)  ◀── ubus 查询 API          │
+│  prism-routerd (C 守护进程, procd)  ◀── ubus 查询 API          │
 │    ├─ L1 采集：ctnetlink 事件 + 30s 快照                        │
 │    ├─ L2 归因：DNS 嗅探 / SNI(可选) / 应用规则库                │
 │    ├─ L3 聚合：1m(RAM) → 5m → 1h → 1d                          │
@@ -50,7 +50,7 @@
                             │ GET  /api/v1/config  (60s 轮询)
                             ▼
 ┌─ 母节点（其中一台路由器，master 角色）─────────────────────────┐
-│  traffic-statsd 内置 HTTP API（LAN 绑定）                      │
+│  prism-routerd 内置 HTTP API（LAN 绑定）                      │
 │  汇总库 SQLite(WAL)：node_id 维度                              │
 │  report.uc  ：日/周报 → 飞书卡片（chart + table）              │
 │  alert.uc   ：跨节点规则、去重静默、恢复通知                    │
@@ -189,7 +189,7 @@ accounting_confidence = exact | degraded | unknown
 
 ### 3.2 域名 → 应用
 
-规则库为 JSON（可放 `/etc/traffic-stats/apps.json`），结构：
+规则库为 JSON（可放 `/etc/prism-router/apps.json`），结构：
 
 ```json
 { "version": "2026.11.1",
@@ -248,7 +248,7 @@ accounting_confidence = exact | degraded | unknown
 - 写入批量化：**RAM 每 15 秒、flash 每小时**提交一次（GL.iNet 的现成节奏）；软重启/reload 前强制落盘，硬重启最多丢 1 小时。这比"每 5 分钟一个事务"更省 flash，且丢失窗口可接受。
 - **按分辨率分文件**（抄 OPNsense）：`t5m.sqlite` / `t1h.sqlite` / `t1d.sqlite` 各自独立，过期数据直接删文件，不需要 VACUUM、不会让单个库无限膨胀。
 - 估算：批写约 1 MB/天 → ~365 MB/年。lite 档默认关闭 5m 落盘，只剩 1h/1d，写入降到每天几十 KB。
-- DB 路径可配：默认 `/etc/traffic-stats/`（持久），可选 `/tmp`（零 flash 磨损、重启丢历史——**作为选项而不是默认**，因为日报需要跨天数据）。
+- DB 路径可配：默认 `/etc/prism-router/`（持久），可选 `/tmp`（零 flash 磨损、重启丢历史——**作为选项而不是默认**，因为日报需要跨天数据）。
 
 ### 4.4 表结构草案
 
@@ -304,7 +304,7 @@ CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);  -- schema_version / node_id / se
 
 ### 5.3 配置下发内容
 
-`report_schedule`（日/周报时间与接收群）、`alert_rules`、`app_rules`（含版本号）、`retention`、`attribution` 开关、`feishu` 模板参数。子端把母下发的部分写入 `/etc/config/traffic-stats` 的 `remote` section，与本地配置分离，避免互相覆盖。
+`report_schedule`（日/周报时间与接收群）、`alert_rules`、`app_rules`（含版本号）、`retention`、`attribution` 开关、`feishu` 模板参数。子端把母下发的部分写入 `/etc/config/prism-router` 的 `remote` section，与本地配置分离，避免互相覆盖。
 
 ### 5.4 漫游与重复计数
 
@@ -375,7 +375,7 @@ div+note    数据口径说明 + 生成时间
 
 图表库：24.10 用自带 `luci-lib-chartjs`（`L.resource('nlbw.chart.min.js')` 注入后全局 `Chart`）；⚠️ **23.05 没有该包**，23.05 需自带 chart.js（约 90KB gzip）或用简洁 SVG 自绘。决策：第一版只在 24.10 使用 chartjs，23.05 用自绘 SVG（避免打包体积翻倍）。
 
-后端调用：LuCI JS → `rpc.declare()` → rpcd ucode 插件（`/usr/share/rpcd/ucode/traffic-stats.uc`）→ ubus 调 C 守护进程。
+后端调用：LuCI JS → `rpc.declare()` → rpcd ucode 插件（`/usr/share/rpcd/ucode/prism-router.uc`）→ ubus 调 C 守护进程。
 ACL：读写分离 + 方法级白名单；`read.ubus.service:["list"]` 必须显式授予。
 
 ---
@@ -383,20 +383,20 @@ ACL：读写分离 + 方法级白名单；`read.ubus.service:["list"]` 必须显
 ## 8. 工程结构（双包，OpenWrt 标准）
 
 ```
-openwrt-traffic-stats/
-├── traffic-statsd/                    # 架构相关包（C）
+openwrt-prism-router/
+├── prism-routerd/                    # 架构相关包（C）
 │   ├── Makefile
 │   ├── src/{main.c,ctnetlink.c,flows.c,dns.c,sni.c,agg.c,db.c,http.c,ubus_iface.c,util.c}
-│   ├── files/{traffic-statsd.init, traffic-stats.config, uci-defaults/90-traffic-stats}
-│   └── files/sysctl/11-traffic-stats.conf
-├── luci-app-traffic-stats/            # LUCI_PKGARCH:=all
+│   ├── files/{prism-routerd.init, prism-router.config, uci-defaults/90-prism-router}
+│   └── files/sysctl/11-prism-router.conf
+├── luci-app-prism-router/            # LUCI_PKGARCH:=all
 │   ├── Makefile
-│   ├── htdocs/luci-static/resources/view/traffic-stats/*.js
-│   ├── root/usr/share/luci/menu.d/luci-app-traffic-stats.json
-│   ├── root/usr/share/rpcd/ucode/traffic-stats.uc
-│   ├── root/usr/share/rpcd/acl.d/luci-app-traffic-stats.json
-│   └── root/usr/share/traffic-stats/{apps.json, locales/}
-├── ucode/                             # 报表/告警/上报（装进 traffic-statsd 包）
+│   ├── htdocs/luci-static/resources/view/prism-router/*.js
+│   ├── root/usr/share/luci/menu.d/luci-app-prism-router.json
+│   ├── root/usr/share/rpcd/ucode/prism-router.uc
+│   ├── root/usr/share/rpcd/acl.d/luci-app-prism-router.json
+│   └── root/usr/share/prism-router/{apps.json, locales/}
+├── ucode/                             # 报表/告警/上报（装进 prism-routerd 包）
 │   ├── feishu.uc  report.uc  alert.uc  push.uc  render.uc
 ├── docs/
 ├── tests/
@@ -446,7 +446,7 @@ openwrt-traffic-stats/
 
 | 决策 | 结论 | 日期 |
 |---|---|---|
-| 包名 | `traffic-statsd`（架构相关）+ `luci-app-traffic-stats`（all） | 2026-11-14 |
+| 包名 | `prism-routerd`（架构相关）+ `luci-app-prism-router`（all） | 2026-11-14 |
 | 母节点形态 | 由其中一台 OpenWrt 路由器兼任 | 2026-11-14 |
 | 飞书路线 | 群自定义机器人 Webhook（签名 secret），不建自建应用 | 2026-11-14 |
 | 归因精度 | 分档可配置：DNS 常开，SNI 按档位（full 默认开，详见下） | 2026-11-14 |

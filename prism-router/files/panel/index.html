@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="description" content="OpenWrt 棱镜路由独立面板：直连与代理分账的设备、应用、出口与健康状态。">
+<title>棱镜路由 · 独立面板</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">跳到主要内容</a>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <span class="brand__mark" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+        <path d="M4 19V9"></path>
+        <path d="M9.5 19V5"></path>
+        <path d="M15 19v-7"></path>
+        <path d="M20.5 19V3"></path>
+      </svg>
+    </span>
+    <div class="brand__text">
+      <h1>棱镜路由 · 独立面板</h1>
+      <p class="brand__sub">直连 / 代理分账 · 设备 · 应用 · 出口</p>
+    </div>
+  </div>
+
+  <div class="topbar__status">
+    <span class="status-item">
+      <span class="status-item__label">服务</span>
+      <span id="state-pill" class="pill pill--unknown">未知</span>
+    </span>
+    <span class="status-item">
+      <span class="status-item__label">记账</span>
+      <span id="confidence-pill" class="pill pill--unknown">未知</span>
+    </span>
+    <span class="status-item">
+      <span class="status-item__label">更新</span>
+      <time id="last-updated" class="status-time" datetime="">—</time>
+    </span>
+    <div class="topbar__actions">
+      <button id="refresh-btn" type="button" class="btn btn--icon" aria-label="立即刷新数据" title="立即刷新">
+        <svg class="btn__icon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+          <path d="M20 11a8 8 0 1 0-2.6 5.9"></path>
+          <path d="M20 4v7h-7"></path>
+        </svg>
+        <span class="btn__label">刷新</span>
+      </button>
+      <label class="switch" for="auto-refresh">
+        <input id="auto-refresh" class="switch__input" type="checkbox" checked aria-label="自动刷新，每 15 秒一次">
+        <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
+        <span class="switch__label">自动刷新 <span class="muted">15s</span></span>
+      </label>
+    </div>
+  </div>
+</header>
+
+<p id="aria-live" class="visually-hidden" role="status" aria-live="polite"></p>
+
+<div id="error-bar" class="errorbar" role="alert" hidden>
+  <span class="errorbar__icon" aria-hidden="true">!</span>
+  <p id="error-text" class="errorbar__text"></p>
+  <button id="error-retry" type="button" class="btn btn--small" aria-label="重新请求面板数据">重试</button>
+</div>
+
+<section id="auth-panel" class="authpanel" aria-labelledby="auth-title" hidden>
+  <h2 id="auth-title" class="authpanel__title">需要访问令牌</h2>
+  <p id="auth-desc" class="authpanel__desc">面板服务要求令牌。令牌只保存在本机浏览器中，用于请求本机面板接口。</p>
+  <form id="auth-form" class="authpanel__form" novalidate>
+    <label class="field" for="token-input">
+      <span class="field__label">访问令牌</span>
+      <input id="token-input" class="field__input" type="password" name="token" autocomplete="off" spellcheck="false" placeholder="粘贴面板令牌" aria-describedby="auth-hint">
+    </label>
+    <div class="authpanel__actions">
+      <button type="submit" class="btn btn--primary" aria-label="保存令牌并重试">保存并重试</button>
+      <button type="button" id="token-clear" class="btn btn--ghost" aria-label="清除已保存的令牌">清除令牌</button>
+    </div>
+    <p id="auth-hint" class="field__hint">也可在地址后附加 <code>?token=…</code> 打开，页面会自动记住并从地址栏移除。</p>
+  </form>
+</section>
+
+<main id="main" class="layout" tabindex="-1">
+  <h2 class="visually-hidden">概览</h2>
+  <section class="cards" aria-labelledby="cards-title">
+    <h3 id="cards-title" class="visually-hidden">速率与总量</h3>
+
+    <article class="card">
+      <div class="card__head">
+        <span class="card__label">下载速率</span>
+        <span class="card__icon card__icon--down" aria-hidden="true">↓</span>
+      </div>
+      <p class="card__value"><span id="card-rx">—</span><span class="card__unit" id="card-rx-unit">Mbps</span></p>
+      <p class="card__sub" id="card-rx-sub">等待数据</p>
+    </article>
+
+    <article class="card">
+      <div class="card__head">
+        <span class="card__label">上传速率</span>
+        <span class="card__icon card__icon--up" aria-hidden="true">↑</span>
+      </div>
+      <p class="card__value"><span id="card-tx">—</span><span class="card__unit" id="card-tx-unit">Mbps</span></p>
+      <p class="card__sub" id="card-tx-sub">等待数据</p>
+    </article>
+
+    <article class="card">
+      <div class="card__head">
+        <span class="card__label">今日流量</span>
+        <span class="card__icon" aria-hidden="true">◷</span>
+      </div>
+      <p class="card__value"><span id="card-today">—</span></p>
+      <p class="card__sub" id="card-today-sub">按今日 5 分钟桶累计</p>
+    </article>
+
+    <article class="card">
+      <div class="card__head">
+        <span class="card__label">本月累计</span>
+        <span class="card__icon" aria-hidden="true">Σ</span>
+      </div>
+      <p class="card__value"><span id="card-month">—</span></p>
+      <p class="card__sub" id="card-month-sub">直连与代理合计</p>
+    </article>
+
+    <article class="card">
+      <div class="card__head">
+        <span class="card__label">在线设备</span>
+        <span class="card__icon" aria-hidden="true">◉</span>
+      </div>
+      <p class="card__value"><span id="card-devices">—</span><span class="card__unit" id="card-devices-unit"></span></p>
+      <p class="card__sub" id="card-devices-sub">近 3 分钟有活动</p>
+    </article>
+
+    <article class="card">
+      <div class="card__head">
+        <span class="card__label">Clash 连接数</span>
+        <span class="card__icon" aria-hidden="true">⇄</span>
+      </div>
+      <p class="card__value"><span id="card-clash">—</span></p>
+      <p class="card__sub" id="card-clash-sub">mihomo /connections</p>
+    </article>
+  </section>
+
+  <div class="columns">
+    <section class="panel panel--chart" aria-labelledby="chart-title">
+      <header class="panel__head">
+        <div class="panel__titles">
+          <h2 id="chart-title" class="panel__title">实时速率趋势</h2>
+          <p class="panel__sub">页面本地采样 · 最近 <span id="chart-window">60</span> 次</p>
+        </div>
+        <span class="panel__meta" id="chart-meta">采样中</span>
+      </header>
+      <div class="chart">
+        <canvas id="rate-chart" width="640" height="240" role="img" aria-label="实时上下行速率趋势图"></canvas>
+        <p id="chart-empty" class="chart__empty">正在采集采样点（至少需要 2 个采样）</p>
+      </div>
+      <div class="legend" aria-hidden="false">
+        <span class="legend__item"><span class="legend__dot legend__dot--rx" aria-hidden="true"></span>下载</span>
+        <span class="legend__item"><span class="legend__dot legend__dot--tx" aria-hidden="true"></span>上传</span>
+        <span class="legend__note" id="chart-legend-note">纵轴：速率 · 横轴：采样时间</span>
+      </div>
+    </section>
+
+    <section class="panel panel--nodes" aria-labelledby="nodes-title">
+      <header class="panel__head">
+        <div class="panel__titles">
+          <h2 id="nodes-title" class="panel__title">节点 / 出口</h2>
+          <p class="panel__sub">按流量排序，DIRECT 为直连</p>
+        </div>
+        <span class="panel__meta" id="nodes-meta"></span>
+      </header>
+      <div id="nodes-list" class="nodelist"></div>
+    </section>
+  </div>
+
+  <div class="columns columns--tables">
+    <section class="panel" aria-labelledby="devices-title">
+      <header class="panel__head">
+        <div class="panel__titles">
+          <h2 id="devices-title" class="panel__title">设备榜</h2>
+          <p class="panel__sub">按累计流量 Top 10 · 点击行展开应用明细</p>
+        </div>
+        <span class="panel__meta" id="devices-meta"></span>
+      </header>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="设备榜表格，列较多时可横向滚动">
+        <table class="dtable">
+          <caption class="visually-hidden">按累计流量排序的前 10 台设备，点击行可展开该设备应用明细</caption>
+          <thead>
+            <tr>
+              <th scope="col">设备</th>
+              <th scope="col" class="col-link">接入</th>
+              <th scope="col" class="num col-speed">上下行</th>
+              <th scope="col" class="num">累计</th>
+              <th scope="col" class="num">本月</th>
+            </tr>
+          </thead>
+          <tbody id="devices-body">
+            <tr><td colspan="5" class="placeholder">正在加载…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="scroll-hint">表格可左右滑动查看全部列</p>
+    </section>
+
+    <section class="panel" aria-labelledby="apps-title">
+      <header class="panel__head">
+        <div class="panel__titles">
+          <h2 id="apps-title" class="panel__title">应用榜</h2>
+          <p class="panel__sub">按域名 Top 10</p>
+        </div>
+        <span class="panel__meta" id="apps-meta"></span>
+      </header>
+      <div class="table-scroll" tabindex="0" role="region" aria-label="应用榜表格，列较多时可横向滚动">
+        <table class="dtable dtable--apps">
+          <caption class="visually-hidden">按下载流量排序的前 10 个应用域名</caption>
+          <thead>
+            <tr>
+              <th scope="col">域名 / 应用</th>
+              <th scope="col" class="num">下载</th>
+              <th scope="col" class="num">上传</th>
+              <th scope="col" class="num">设备数</th>
+            </tr>
+          </thead>
+          <tbody id="apps-body">
+            <tr><td colspan="4" class="placeholder">正在加载…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="scroll-hint">表格可左右滑动查看全部列</p>
+    </section>
+  </div>
+
+  <section class="panel panel--health" aria-labelledby="health-title">
+    <header class="panel__head">
+      <div class="panel__titles">
+        <h2 id="health-title" class="panel__title">健康与告警</h2>
+        <p class="panel__sub">采集源、记账可信度与逐条告警</p>
+      </div>
+      <span class="panel__meta" id="health-meta"></span>
+    </header>
+    <div id="health-sources" class="sources"></div>
+    <div id="health-reasons" class="reasons"></div>
+  </section>
+</main>
+
+<footer class="footer">
+  <p>独立面板 · 端口 8099 · 数据源 Clash <code>/connections</code> 与 <code>nf_conntrack</code></p>
+  <p class="footer__note">纯静态页面，无外部资源；后端异常时保留上一次数据。</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

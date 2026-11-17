@@ -31,7 +31,7 @@ check(){ local got; got=$(ls -ld "$1" 2>/dev/null | awk '{print $3":"$4" "$1}')
   [ "$got" = "$2" ] && ok "$1 -> $got" || bad "$1 期望[$2] 实际[${got:-不存在}]"; }
 UCI(){ uci "$@" >/dev/null 2>&1; }
 CGET(){ uci -q get "$1" 2>/dev/null; }
-cfg_commit(){ uci commit traffic-stats >/dev/null 2>&1; }
+cfg_commit(){ uci commit prism-router >/dev/null 2>&1; }
 jget(){ # $1=file $2=ucode 单个表达式（d = 解析后的对象）；其余参数是额外 env
   local f="$1" expr="$2"; shift 2
   env F="$f" "$@" ucode -e "let fs=require('fs'); let d=json(fs.readfile(getenv('F'))); print($expr);" 2>/dev/null
@@ -45,8 +45,8 @@ ROOT=/tmp/ft
 STATE=$ROOT/state/state.json
 DAILY=$ROOT/daily
 DEVMETA=$ROOT/devices.json
-RPCD=/usr/share/rpcd/ucode/traffic-stats.uc
-METRICS_CGI=/www/cgi-bin/traffic-stats-metrics
+RPCD=/usr/share/rpcd/ucode/prism-router.uc
+METRICS_CGI=/www/cgi-bin/prism-router-metrics
 mkdir -p "$ROOT"
 
 TODAY=$(date +%Y-%m-%d); MON=$(date +%Y-%m)
@@ -60,15 +60,15 @@ M115=70:70:fc:07:11:13
 
 # rpcd 调用（测试钩子把状态/日汇总/元数据三个路径指向 fixture）
 rpc(){ # $1=method [$2=args json]
-  env TRAFFIC_STATS_STATE_FILE="$STATE" TRAFFIC_STATS_DAILY_DIR="$DAILY" \
-      TRAFFIC_STATS_DEVICES_FILE="$DEVMETA" \
-      TRAFFIC_STATS_METHOD="$1" TRAFFIC_STATS_ARGS="${2:-}" \
+  env PRISM_ROUTER_STATE_FILE="$STATE" PRISM_ROUTER_DAILY_DIR="$DAILY" \
+      PRISM_ROUTER_DEVICES_FILE="$DEVMETA" \
+      PRISM_ROUTER_METHOD="$1" PRISM_ROUTER_ARGS="${2:-}" \
       ucode -L /usr/lib/ucode "$RPCD" 2>>"$ROOT/rpc.err"
 }
 export_rpc(){ # $1=what
-  env TRAFFIC_STATS_STATE_FILE="$STATE" TRAFFIC_STATS_DAILY_DIR="$DAILY" \
-      TRAFFIC_STATS_DEVICES_FILE="$DEVMETA" \
-      TRAFFIC_STATS_METHOD=export_csv TRAFFIC_STATS_ARGS="{\"what\":\"$1\"}" \
+  env PRISM_ROUTER_STATE_FILE="$STATE" PRISM_ROUTER_DAILY_DIR="$DAILY" \
+      PRISM_ROUTER_DEVICES_FILE="$DEVMETA" \
+      PRISM_ROUTER_METHOD=export_csv PRISM_ROUTER_ARGS="{\"what\":\"$1\"}" \
       ucode -L /usr/lib/ucode "$RPCD" 2>>"$ROOT/rpc.err"
 }
 field(){ sed -n "s/^$1=//p" "$ROOT/gs.txt" 2>/dev/null | head -1; }
@@ -128,20 +128,20 @@ echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 echo "=== 1. 安装两个包 ==="
 # 严格依赖安装：不使用 --force-depends。前端已改用内置 SVG，不再依赖
 # luci-lib-chartjs；其余依赖 deps 镜像都有，所以不需要任何占位包。
-opkg install /src/dist/traffic-stats_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 traffic-stats（严格依赖）" || { bad "安装 traffic-stats"; tail -5 /tmp/i1.log; }
-opkg install /src/dist/luci-app-traffic-stats_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-traffic-stats（严格依赖）" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 prism-router（严格依赖）" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-prism-router（严格依赖）" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新配置项 / 文件落位 / 权限 / 语法 ==="
 for k in quota_mode quota_monthly_gb quota_total_gb metrics_enabled metrics_token; do
-  grep -q "option $k" /etc/config/traffic-stats && ok "config 含 $k" || bad "config 缺少 $k"
+  grep -q "option $k" /etc/config/prism-router && ok "config 含 $k" || bad "config 缺少 $k"
 done
-grep -q "option quota_mode 'none'" /etc/config/traffic-stats && ok "quota_mode 默认 none" || bad "quota_mode 默认值不对"
-grep -q "option metrics_enabled '0'" /etc/config/traffic-stats && ok "metrics_enabled 默认 0（默认关闭）" || bad "metrics_enabled 默认值不对"
-check /usr/bin/traffic-statsd "root:root -rwxr-xr-x"
-check /usr/share/rpcd/ucode/traffic-stats.uc "root:root -rw-r--r--"
+grep -q "option quota_mode 'none'" /etc/config/prism-router && ok "quota_mode 默认 none" || bad "quota_mode 默认值不对"
+grep -q "option metrics_enabled '0'" /etc/config/prism-router && ok "metrics_enabled 默认 0（默认关闭）" || bad "metrics_enabled 默认值不对"
+check /usr/bin/prism-routerd "root:root -rwxr-xr-x"
+check /usr/share/rpcd/ucode/prism-router.uc "root:root -rw-r--r--"
 check "$METRICS_CGI" "root:root -rwxr-xr-x"
-check /etc/traffic-stats "root:root drwxr-xr-x"
-ucode -c /usr/bin/traffic-statsd && ok "traffic-statsd 语法 OK" || bad "traffic-statsd 语法错误"
+check /etc/prism-router "root:root drwxr-xr-x"
+ucode -c /usr/bin/prism-routerd && ok "prism-routerd 语法 OK" || bad "prism-routerd 语法错误"
 ucode -c "$RPCD" && ok "rpcd uc 语法 OK" || bad "rpcd uc 语法错误"
 ucode -c "$METRICS_CGI" && ok "metrics CGI 语法 OK" || bad "metrics CGI 语法错误"
 
@@ -251,8 +251,8 @@ write_one "$MON-31.json" 777777 77777
 mv "$DAILY/$MON-31.json" "$ROOT/daily_d/$MON-31.json"                                      # 未来日期
 
 probe_month(){ # $1=每日目录 -> 打印 month_total
-  env TRAFFIC_STATS_STATE_FILE="$STATE" TRAFFIC_STATS_DAILY_DIR="$1" \
-      TRAFFIC_STATS_DEVICES_FILE="$DEVMETA" TRAFFIC_STATS_METHOD=get_state TRAFFIC_STATS_ARGS='{}' \
+  env PRISM_ROUTER_STATE_FILE="$STATE" PRISM_ROUTER_DAILY_DIR="$1" \
+      PRISM_ROUTER_DEVICES_FILE="$DEVMETA" PRISM_ROUTER_METHOD=get_state PRISM_ROUTER_ARGS='{}' \
       ucode -L /usr/lib/ucode "$RPCD" > "$ROOT/probe.json" 2>>"$ROOT/rpc.err"
   jget "$ROOT/probe.json" 'd.totals.month_total'
 }
@@ -269,9 +269,9 @@ R2=$(jget "$ROOT/probe.json" 'sprintf("%d|%d", length(d.devices), d.totals.direc
 
 echo "=== 7. 配额配置：none / device / total / 小数 / 非法 / 空 ==="
 quota_probe(){ # $1=mode $2=monthly $3=total -> "mode|device_limit|total_limit|带 quota_limit 的设备数"
-  UCI set "traffic-stats.settings.quota_mode=$1"
-  UCI set "traffic-stats.settings.quota_monthly_gb=$2"
-  UCI set "traffic-stats.settings.quota_total_gb=$3"
+  UCI set "prism-router.settings.quota_mode=$1"
+  UCI set "prism-router.settings.quota_monthly_gb=$2"
+  UCI set "prism-router.settings.quota_total_gb=$3"
   cfg_commit
   rpc get_state > "$ROOT/gq.json" 2>/dev/null
   jget "$ROOT/gq.json" 'sprintf("%s|%s|%s|%d", d.quota.mode, d.quota.device_limit, d.quota.total_limit, length(filter(d.devices, x => x.quota_limit != null)))'
@@ -284,8 +284,8 @@ R=$(quota_probe total '' '');      [ "$R" = "total|0|0|0" ] && ok "mode=total �
 R=$(quota_probe bogus 5 '');       [ "$R" = "none|0|0|0" ] && ok "非法 mode -> none" || bad "非法 mode -> $R"
 R=$(quota_probe device abc '');    [ "$R" = "device|0|0|0" ] && ok "非数字 GB -> 0（不猜）" || bad "非数字 GB -> $R"
 R=$(quota_probe device -5 '');     [ "$R" = "device|0|0|0" ] && ok "负数 GB -> 0" || bad "负数 GB -> $R"
-UCI set traffic-stats.settings.quota_mode='none'; UCI set traffic-stats.settings.quota_monthly_gb=''
-UCI set traffic-stats.settings.quota_total_gb=''; cfg_commit
+UCI set prism-router.settings.quota_mode='none'; UCI set prism-router.settings.quota_monthly_gb=''
+UCI set prism-router.settings.quota_total_gb=''; cfg_commit
 
 echo "=== 8. 别名 / 分组：set_device_meta 往返 ==="
 R=$(rpc set_device_meta '{"mac":"DC-56-7B-89-FB-31","alias":"客厅电视","group":"家人"}')
@@ -325,8 +325,8 @@ ALEN=$(jget "$DEVMETA" "length(d[getenv('M')]?.alias ?? '')" M="$M190")
 echo "=== 8.5 devices.json 容错：坏文件 / 非法条目 / 超长 / 超大 ==="
 WEIRD=$ROOT/devices_weird.json
 printf 'garbage { not json\n' > "$WEIRD"
-env TRAFFIC_STATS_STATE_FILE="$STATE" TRAFFIC_STATS_DAILY_DIR="$DAILY" \
-    TRAFFIC_STATS_DEVICES_FILE="$WEIRD" TRAFFIC_STATS_METHOD=get_state TRAFFIC_STATS_ARGS='{}' \
+env PRISM_ROUTER_STATE_FILE="$STATE" PRISM_ROUTER_DAILY_DIR="$DAILY" \
+    PRISM_ROUTER_DEVICES_FILE="$WEIRD" PRISM_ROUTER_METHOD=get_state PRISM_ROUTER_ARGS='{}' \
     ucode -L /usr/lib/ucode "$RPCD" > "$ROOT/gw.json" 2>"$ROOT/gw.err"
 R=$(jget "$ROOT/gw.json" 'sprintf("%d|%d", length(d.devices), length(filter(d.devices, x => x.alias != null)))')
 [ "$R" = "3|0" ] && ok "devices.json 损坏：get_state 仍返回 3 台设备、无 alias 键（不崩）" || bad "坏 devices.json：$R"
@@ -334,8 +334,8 @@ LONGVAL=$(printf 'b%.0s' $(seq 1 300))
 cat > "$WEIRD" <<JSON
 {"zz:zz:zz:zz:zz:zz":{"alias":"非法 MAC 键"},"not-an-object":1,"$M190":{"alias":"$LONGVAL","group":"g","first_seen":"abc","extra":"ignored"},"$M115":{"alias":123,"group":"x","first_seen":-5}}
 JSON
-env TRAFFIC_STATS_STATE_FILE="$STATE" TRAFFIC_STATS_DAILY_DIR="$DAILY" \
-    TRAFFIC_STATS_DEVICES_FILE="$WEIRD" TRAFFIC_STATS_METHOD=get_state TRAFFIC_STATS_ARGS='{}' \
+env PRISM_ROUTER_STATE_FILE="$STATE" PRISM_ROUTER_DAILY_DIR="$DAILY" \
+    PRISM_ROUTER_DEVICES_FILE="$WEIRD" PRISM_ROUTER_METHOD=get_state PRISM_ROUTER_ARGS='{}' \
     ucode -L /usr/lib/ucode "$RPCD" > "$ROOT/gw2.json" 2>>"$ROOT/gw.err"
 R=$(jget "$ROOT/gw2.json" 'sprintf("%d|%d|%s|%s", length(d.devices), length(filter(d.devices, x => x.alias != null)), length(d.devices[0].alias ?? ""), (d.devices[0].first_seen ?? "MISSING"))')
 OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
@@ -343,8 +343,8 @@ OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
 [ "$2" = "2" ] && ok "只有合法 MAC 的条目生效（非法 MAC 键/非对象条目被丢弃）" || bad "生效条目数 $2 期望 2"
 [ "$3" = "128" ] && ok "别名按 128 字节截断（UTF-8 安全）" || bad "别名长度 $3 期望 128"
 [ "$4" = "MISSING" ] && ok "非法 first_seen（字符串/负数）被丢弃，不输出" || bad "first_seen=$4 应省略"
-env TRAFFIC_STATS_DEVICES_FILE="$WEIRD" TRAFFIC_STATS_METHOD=set_device_meta \
-    TRAFFIC_STATS_ARGS='{"mac":"'"$M190"'","alias":"读-改-写保留","group":"g"}' \
+env PRISM_ROUTER_DEVICES_FILE="$WEIRD" PRISM_ROUTER_METHOD=set_device_meta \
+    PRISM_ROUTER_ARGS='{"mac":"'"$M190"'","alias":"读-改-写保留","group":"g"}' \
     ucode -L /usr/lib/ucode "$RPCD" > "$ROOT/gw_rw.json" 2>>"$ROOT/rpc.err"
 R=$(F="$WEIRD" M="$M190" ucode -e 'let fs=require("fs"); let d=json(fs.readfile(getenv("F")));
   print(sprintf("%d|%s|%s|%s", length(keys(d)), d[getenv("M")].alias,
@@ -355,8 +355,8 @@ F="$WEIRD" ucode -e '
 let fs=require("fs"); let o={};
 for (let i = 0; i < 1100; i++) o[sprintf("%02x:%02x:00:00:00:00", int(i / 256), i % 256)] = { alias: sprintf("dev-%d", i) };
 fs.writefile(getenv("F"), sprintf("%J", o));' 2>/dev/null
-env TRAFFIC_STATS_STATE_FILE="$STATE" TRAFFIC_STATS_DAILY_DIR="$DAILY" \
-    TRAFFIC_STATS_DEVICES_FILE="$WEIRD" TRAFFIC_STATS_METHOD=get_state TRAFFIC_STATS_ARGS='{}' \
+env PRISM_ROUTER_STATE_FILE="$STATE" PRISM_ROUTER_DAILY_DIR="$DAILY" \
+    PRISM_ROUTER_DEVICES_FILE="$WEIRD" PRISM_ROUTER_METHOD=get_state PRISM_ROUTER_ARGS='{}' \
     ucode -L /usr/lib/ucode "$RPCD" > "$ROOT/gw3.json" 2>>"$ROOT/gw.err"
 R=$(jget "$ROOT/gw3.json" 'sprintf("%d|%d", length(d.devices), length(d.quota ? keys(d.quota) : []))')
 [ "$R" = "3|6" ] && ok "1100 条 devices.json 仍正常返回（读取上限内）" || bad "超大 devices.json：$R"
@@ -364,14 +364,14 @@ R=$(jget "$ROOT/gw3.json" 'sprintf("%d|%d", length(d.devices), length(d.quota ? 
 
 echo "=== 9. first_seen：守护进程记录首次出现 ==="
 cp -f /fixtures/dhcp.leases /tmp/dhcp.leases 2>/dev/null
-UCI set traffic-stats.settings.lan_ranges='192.168.100.0/24'; cfg_commit
+UCI set prism-router.settings.lan_ranges='192.168.100.0/24'; cfg_commit
 DM2=$ROOT/devices_daemon.json
 OLDDEV=aa:bb:cc:dd:ee:ff
 printf '{"%s":{"alias":"老设备","group":"家人","first_seen":1000}}\n' "$OLDDEV" > "$DM2"
 run_daemon(){ # $1=state dir
-  env TRAFFIC_STATS_ONCE=1 TRAFFIC_STATS_STATE_DIR="$1" TRAFFIC_STATS_DAILY_DIR="$ROOT/daily_run" \
-      TRAFFIC_STATS_DEVICES_FILE="$DM2" TRAFFIC_STATS_CONNTRACK_FILE=/fixtures/nf_conntrack \
-      TRAFFIC_STATS_CLASH_API=127.0.0.1:1 ucode /usr/bin/traffic-statsd >"$1.log" 2>&1
+  env PRISM_ROUTER_ONCE=1 PRISM_ROUTER_STATE_DIR="$1" PRISM_ROUTER_DAILY_DIR="$ROOT/daily_run" \
+      PRISM_ROUTER_DEVICES_FILE="$DM2" PRISM_ROUTER_CONNTRACK_FILE=/fixtures/nf_conntrack \
+      PRISM_ROUTER_CLASH_API=127.0.0.1:1 ucode /usr/bin/prism-routerd >"$1.log" 2>&1
 }
 rm -rf "$ROOT/run1"
 run_daemon "$ROOT/run1" && ok "守护进程 --once 退出码 0" || { bad "守护进程退出码非 0"; tail -5 "$ROOT/run1.log"; }
@@ -410,7 +410,7 @@ OLDIFS=$IFS; IFS='|'; set -- $R; IFS=$OLDIFS
 [ "$4" = "3" ] && ok "devices CSV 3 行数据" || bad "devices CSV 行数 $4 期望 3"
 [ "$5" = "5" ] && ok "CRLF 行尾：表头+3 行+末尾空段 = 5 段" || bad "CRLF 分段 $5 期望 5"
 FN=$(jget "$ROOT/csv_dev.json" 'd.filename')
-case "$FN" in traffic-stats-devices-????-??-??.csv) ok "文件名 $FN";; *) bad "文件名 $FN 不符合 traffic-stats-devices-YYYY-MM-DD.csv";; esac
+case "$FN" in prism-router-devices-????-??-??.csv) ok "文件名 $FN";; *) bad "文件名 $FN 不符合 prism-router-devices-YYYY-MM-DD.csv";; esac
 csv_of "$ROOT/csv_dev.json" "$ROOT/csv_dev.csv"
 grep -qF '"a""b\c"' "$ROOT/csv_dev.csv" && ok 'hostname 里的 " 按 RFC4180 双写（a""b\c）' || bad 'hostname 引号未按 RFC4180 转义'
 grep -qF '"hb,plus"' "$ROOT/csv_dev.csv" && ok '别名含逗号 -> 整体加引号' || bad '逗号别名未加引号'
@@ -419,12 +419,12 @@ export_rpc devices > "$ROOT/csv_dev2.json"
 csv_of "$ROOT/csv_dev2.json" "$ROOT/csv_dev2.csv"
 grep -qF "'=1+1" "$ROOT/csv_dev2.csv" && ok "以 = 开头的别名加了 ' 前缀（防 Excel 公式注入）" || bad "公式注入未防护"
 
-R=$(env TRAFFIC_STATS_STATE_FILE="$ROOT/state_bad_csv.json" TRAFFIC_STATS_DAILY_DIR="$DAILY" \
-      TRAFFIC_STATS_DEVICES_FILE="$DEVMETA" TRAFFIC_STATS_METHOD=export_csv TRAFFIC_STATS_ARGS='{"what":"devices"}' \
+R=$(env PRISM_ROUTER_STATE_FILE="$ROOT/state_bad_csv.json" PRISM_ROUTER_DAILY_DIR="$DAILY" \
+      PRISM_ROUTER_DEVICES_FILE="$DEVMETA" PRISM_ROUTER_METHOD=export_csv PRISM_ROUTER_ARGS='{"what":"devices"}' \
       ucode -L /usr/lib/ucode "$RPCD" 2>/dev/null)
 printf 'corrupted {{{\n' > "$ROOT/state_bad_csv.json"
-R=$(env TRAFFIC_STATS_STATE_FILE="$ROOT/state_bad_csv.json" TRAFFIC_STATS_DAILY_DIR="$DAILY" \
-      TRAFFIC_STATS_DEVICES_FILE="$DEVMETA" TRAFFIC_STATS_METHOD=export_csv TRAFFIC_STATS_ARGS='{"what":"devices"}' \
+R=$(env PRISM_ROUTER_STATE_FILE="$ROOT/state_bad_csv.json" PRISM_ROUTER_DAILY_DIR="$DAILY" \
+      PRISM_ROUTER_DEVICES_FILE="$DEVMETA" PRISM_ROUTER_METHOD=export_csv PRISM_ROUTER_ARGS='{"what":"devices"}' \
       ucode -L /usr/lib/ucode "$RPCD" 2>/dev/null)
 echo "$R" > "$ROOT/csv_bad_state.json"
 R=$(jget "$ROOT/csv_bad_state.json" 'sprintf("%d|%d", (d.ok==true)?1:0, d.rows)')
@@ -450,8 +450,8 @@ EXP_ROWS=2; [ "$YDAY_IN_MONTH" = "1" ] && EXP_ROWS=3
 [ "$3" = "$EXP_ROWS" ] && ok "daily 行数 $3（跨月文件也导出，按日期升序）" || bad "daily 行数 $3 期望 $EXP_ROWS"
 SORTED=$(echo "$4" | tr ',' '\n' | sort | tr '\n' ',')
 [ "$4," = "$SORTED" ] && ok "按日期升序：$4" || bad "未按日期升序：$4"
-R=$(env TRAFFIC_STATS_STATE_FILE="$STATE" TRAFFIC_STATS_DAILY_DIR="$ROOT/daily_c" \
-      TRAFFIC_STATS_DEVICES_FILE="$DEVMETA" TRAFFIC_STATS_METHOD=export_csv TRAFFIC_STATS_ARGS='{"what":"daily"}' \
+R=$(env PRISM_ROUTER_STATE_FILE="$STATE" PRISM_ROUTER_DAILY_DIR="$ROOT/daily_c" \
+      PRISM_ROUTER_DEVICES_FILE="$DEVMETA" PRISM_ROUTER_METHOD=export_csv PRISM_ROUTER_ARGS='{"what":"daily"}' \
       ucode -L /usr/lib/ucode "$RPCD" 2>/dev/null)
 echo "$R" > "$ROOT/csv_daily_bad.json"
 R=$(jget "$ROOT/csv_daily_bad.json" 'sprintf("%s|%d", (d.ok==true)?"1":"0", d.rows)')
@@ -465,16 +465,16 @@ echo "=== 13. Prometheus CGI：认证 ==="
 rm -f "$DEVMETA"
 rpc set_device_meta '{"mac":"dc:56:7b:89:fb:31","alias":"客厅电视","group":"家人"}' >/dev/null
 TOK=gate-token-7f3a
-UCI set traffic-stats.settings.metrics_enabled='0'; UCI set traffic-stats.settings.metrics_token=''; cfg_commit
+UCI set prism-router.settings.metrics_enabled='0'; UCI set prism-router.settings.metrics_token=''; cfg_commit
 mrun(){ env REQUEST_METHOD="$1" QUERY_STRING="$2" HTTP_AUTHORIZATION="$3" \
-        TRAFFIC_STATS_STATE_FILE="$STATE" TRAFFIC_STATS_DEVICES_FILE="$DEVMETA" "$METRICS_CGI"; }
+        PRISM_ROUTER_STATE_FILE="$STATE" PRISM_ROUTER_DEVICES_FILE="$DEVMETA" "$METRICS_CGI"; }
 hstatus(){ head -1 "$1" | tr -d '\r'; }
 mrun GET "token=abc" "" > "$ROOT/m0.txt"
 [ "$(hstatus "$ROOT/m0.txt")" = "Status: 403 Forbidden" ] && ok "未启用（enabled=0）-> 403" || bad "未启用返回 $(hstatus "$ROOT/m0.txt")"
-UCI set traffic-stats.settings.metrics_enabled='1'; UCI set traffic-stats.settings.metrics_token=''; cfg_commit
+UCI set prism-router.settings.metrics_enabled='1'; UCI set prism-router.settings.metrics_token=''; cfg_commit
 mrun GET "token=" "" > "$ROOT/m1.txt"
 [ "$(hstatus "$ROOT/m1.txt")" = "Status: 403 Forbidden" ] && ok "已启用但 token 为空 -> 403" || bad "空 token 返回 $(hstatus "$ROOT/m1.txt")"
-UCI set "traffic-stats.settings.metrics_token=$TOK"; cfg_commit
+UCI set "prism-router.settings.metrics_token=$TOK"; cfg_commit
 mrun GET "" "" > "$ROOT/m2.txt"
 [ "$(hstatus "$ROOT/m2.txt")" = "Status: 403 Forbidden" ] && ok "请求没带 token -> 403" || bad "缺 token 返回 $(hstatus "$ROOT/m2.txt")"
 mrun GET "token=wrong" "" > "$ROOT/m3.txt"
@@ -576,7 +576,7 @@ grep -qx 'traffic_devices_online 3' "$ROOT/ok1.body" && ok "traffic_devices_onli
 echo "=== 15. Prometheus：缺数据降级 ==="
 mkdir -p "$ROOT/state_missing"
 mrun2(){ env REQUEST_METHOD=GET QUERY_STRING="token=$TOK" \
-          TRAFFIC_STATS_STATE_FILE="$1" TRAFFIC_STATS_DEVICES_FILE="$2" "$METRICS_CGI"; }
+          PRISM_ROUTER_STATE_FILE="$1" PRISM_ROUTER_DEVICES_FILE="$2" "$METRICS_CGI"; }
 mrun2 "$ROOT/state_missing/state.json" "$DEVMETA" > "$ROOT/m5.txt"
 vbody "$ROOT/m5.txt" "$ROOT/m5.body"
 [ "$(hstatus "$ROOT/m5.txt")" = "Content-Type: text/plain; version=0.0.4; charset=utf-8" ] && ok "state.json 缺失仍是 200" || bad "缺 state 状态行 $(hstatus "$ROOT/m5.txt")"
@@ -619,53 +619,53 @@ SZ=$(wc -c < "$ROOT/gs.json")
 grep -q '"csv"' "$ROOT/csv_dev.json" && ok "CSV 文本随返回值下发（前端可直接存文件）" || bad "返回值缺 csv"
 
 echo "=== 17. ACL 与 set_config 白名单 ==="
-ACL=/usr/share/rpcd/acl.d/luci-app-traffic-stats.json
+ACL=/usr/share/rpcd/acl.d/luci-app-prism-router.json
 grep -q '"export_csv"' "$ACL" && ok "ACL read 含 export_csv" || bad "ACL read 缺 export_csv"
 grep -q '"set_device_meta"' "$ACL" && ok "ACL write 含 set_device_meta" || bad "ACL write 缺 set_device_meta"
-ucode -e 'let fs=require("fs"); json(fs.readfile("/usr/share/rpcd/acl.d/luci-app-traffic-stats.json"));' 2>/dev/null \
+ucode -e 'let fs=require("fs"); json(fs.readfile("/usr/share/rpcd/acl.d/luci-app-prism-router.json"));' 2>/dev/null \
   && ok "ACL 是合法 JSON" || bad "ACL JSON 坏了"
 SC=$(rpc set_config '{"section":"settings","options":"{\"quota_mode\":\"device\",\"quota_monthly_gb\":\"20\",\"quota_total_gb\":\"200\",\"metrics_enabled\":\"1\",\"metrics_token\":\"tok2\"}"}')
 echo "$SC" | tr -d ' \n' | grep -q '"ok":true' && ok "set_config 放行 5 个新配置项" || bad "set_config 返回 $SC"
-[ "$(CGET traffic-stats.settings.quota_mode)" = "device" ] && ok "uci quota_mode=device" || bad "quota_mode=$(CGET traffic-stats.settings.quota_mode)"
-[ "$(CGET traffic-stats.settings.quota_monthly_gb)" = "20" ] && ok "uci quota_monthly_gb=20" || bad "quota_monthly_gb 写入失败"
-[ "$(CGET traffic-stats.settings.metrics_token)" = "tok2" ] && ok "uci metrics_token 写入成功" || bad "metrics_token 写入失败"
+[ "$(CGET prism-router.settings.quota_mode)" = "device" ] && ok "uci quota_mode=device" || bad "quota_mode=$(CGET prism-router.settings.quota_mode)"
+[ "$(CGET prism-router.settings.quota_monthly_gb)" = "20" ] && ok "uci quota_monthly_gb=20" || bad "quota_monthly_gb 写入失败"
+[ "$(CGET prism-router.settings.metrics_token)" = "tok2" ] && ok "uci metrics_token 写入成功" || bad "metrics_token 写入失败"
 BAD=$(rpc set_config '{"section":"settings","options":"{\"quota_magic\":\"1\"}"}')
 echo "$BAD" | grep -q 'no valid options' && ok "非白名单字段仍被拒绝" || bad "非白名单字段未被拒绝：$BAD"
-UCI set traffic-stats.settings.quota_mode='none'; UCI set traffic-stats.settings.quota_monthly_gb=''
-UCI set traffic-stats.settings.quota_total_gb=''; UCI set traffic-stats.settings.metrics_enabled='0'
-UCI set traffic-stats.settings.metrics_token=''; cfg_commit
+UCI set prism-router.settings.quota_mode='none'; UCI set prism-router.settings.quota_monthly_gb=''
+UCI set prism-router.settings.quota_total_gb=''; UCI set prism-router.settings.metrics_enabled='0'
+UCI set prism-router.settings.metrics_token=''; cfg_commit
 
 echo "=== 18. 真实 ubus → rpcd 插件（注册 / 参数策略 / 端到端）==="
-mkdir -p /var/run/ubus /tmp/traffic-stats /etc/traffic-stats
-cp -f "$STATE" /tmp/traffic-stats/state.json
-rm -rf /etc/traffic-stats/daily; mkdir -p /etc/traffic-stats/daily
-cp -f "$DAILY"/*.json /etc/traffic-stats/daily/ 2>/dev/null
-rm -f /etc/traffic-stats/devices.json
+mkdir -p /var/run/ubus /tmp/prism-router /etc/prism-router
+cp -f "$STATE" /tmp/prism-router/state.json
+rm -rf /etc/prism-router/daily; mkdir -p /etc/prism-router/daily
+cp -f "$DAILY"/*.json /etc/prism-router/daily/ 2>/dev/null
+rm -f /etc/prism-router/devices.json
 /sbin/ubusd -s /var/run/ubus/ubus.sock >/tmp/ubusd.log 2>&1 &
 sleep 1
 /sbin/rpcd -s /var/run/ubus/ubus.sock >/tmp/rpcd.log 2>&1 &
 sleep 3
-if ubus list 2>/dev/null | grep -qx traffic-stats; then
-  ok "rpcd 注册 ubus 对象 traffic-stats"
+if ubus list 2>/dev/null | grep -qx prism-router; then
+  ok "rpcd 注册 ubus 对象 prism-router"
 else
-  bad "rpcd 未注册 traffic-stats（插件加载失败）"; head -3 /tmp/rpcd.log
+  bad "rpcd 未注册 prism-router（插件加载失败）"; head -3 /tmp/rpcd.log
 fi
 grep -q 'Skipping registration' /tmp/rpcd.log && bad "rpcd 日志出现 Skipping registration" || ok "rpcd 日志无注册失败"
-ubus call traffic-stats get_state > "$ROOT/ubus_gs.json" 2>"$ROOT/ubus_gs.err"
+ubus call prism-router get_state > "$ROOT/ubus_gs.json" 2>"$ROOT/ubus_gs.err"
 R=$(jget "$ROOT/ubus_gs.json" 'sprintf("%d|%d|%s", d.totals.month_total, length(d.devices), d.quota.mode)')
 [ "$R" = "$EXP_MONTH_TOTAL|3|none" ] && ok "ubus get_state：month_total=$EXP_MONTH_TOTAL、3 台设备、quota.mode=none" || bad "ubus get_state = $R"
-R=$(ubus call traffic-stats set_device_meta '{"mac":"dc:56:7b:89:fb:31","alias":"ubus 别名","group":"ubus 组"}' 2>&1)
+R=$(ubus call prism-router set_device_meta '{"mac":"dc:56:7b:89:fb:31","alias":"ubus 别名","group":"ubus 组"}' 2>&1)
 echo "$R" | tr -d ' \n' | grep -q '"ok":true' && ok "ubus set_device_meta 成功" || bad "ubus set_device_meta 失败：$R"
-grep -q 'ubus 别名' /etc/traffic-stats/devices.json && ok "别名落到 /etc/traffic-stats/devices.json" || bad "别名未落盘"
-check /etc/traffic-stats/devices.json "root:root -rw-r--r--"
-R=$(ubus call traffic-stats set_device_meta '{"mac":"dc:56:7b:89:fb:31"}' 2>&1)
+grep -q 'ubus 别名' /etc/prism-router/devices.json && ok "别名落到 /etc/prism-router/devices.json" || bad "别名未落盘"
+check /etc/prism-router/devices.json "root:root -rw-r--r--"
+R=$(ubus call prism-router set_device_meta '{"mac":"dc:56:7b:89:fb:31"}' 2>&1)
 echo "$R" | grep -q 'nothing to update' && ok "ubus 缺省参数字段 = 不改（不误清）" || bad "ubus 只传 mac 的处理：$R"
-R=$(ubus call traffic-stats set_device_meta '{"mac":"dc:56:7b:89:fb:31","alias":"","group":"ubus 组"}' 2>&1)
-grep -q 'ubus 别名' /etc/traffic-stats/devices.json && bad "空串 alias 未清除" || ok "ubus 空串 alias = 清除、group 保留"
-ubus call traffic-stats export_csv '{"what":"apps"}' > "$ROOT/ubus_csv.json" 2>/dev/null
+R=$(ubus call prism-router set_device_meta '{"mac":"dc:56:7b:89:fb:31","alias":"","group":"ubus 组"}' 2>&1)
+grep -q 'ubus 别名' /etc/prism-router/devices.json && bad "空串 alias 未清除" || ok "ubus 空串 alias = 清除、group 保留"
+ubus call prism-router export_csv '{"what":"apps"}' > "$ROOT/ubus_csv.json" 2>/dev/null
 R=$(jget "$ROOT/ubus_csv.json" 'sprintf("%d|%d", (d.ok==true)?1:0, d.rows)')
 [ "$R" = "1|2" ] && ok "ubus export_csv apps 端到端（2 行）" || bad "ubus export_csv = $R"
-ubus call traffic-stats export_csv '{}' > "$ROOT/ubus_csv2.json" 2>/dev/null
+ubus call prism-router export_csv '{}' > "$ROOT/ubus_csv2.json" 2>/dev/null
 R=$(jget "$ROOT/ubus_csv2.json" 'sprintf("%s|%d", d.what, d.rows)')
 [ "$R" = "devices|3" ] && ok "ubus export_csv 省略 what = devices" || bad "ubus export_csv 缺省 = $R"
 

@@ -1,0 +1,83 @@
+{
+	"admin/services/prism-router": {
+		"title": "棱镜路由",
+		"order": 90,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-prism-router"
+			]
+		}
+	},
+	"admin/services/prism-router/overview": {
+		"title": "概览",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "prism-router/overview"
+		}
+	},
+	"admin/services/prism-router/devices": {
+		"title": "设备",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "prism-router/devices"
+		}
+	},
+	"admin/services/prism-router/apps": {
+		"title": "应用",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "prism-router/apps"
+		}
+	},
+	"admin/services/prism-router/nodes": {
+		"title": "节点",
+		"order": 35,
+		"action": {
+			"type": "view",
+			"path": "prism-router/nodes"
+		}
+	},
+	"admin/services/prism-router/settings": {
+		"title": "设置",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "prism-router/settings"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-prism-router-admin"
+			]
+		}
+	},
+	"admin/services/prism-router/mobile": {
+		"title": "手机版",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "prism-router/mobile"
+		}
+	},
+	"admin/services/prism-router/diagnostics": {
+		"title": "诊断",
+		"order": 55,
+		"action": {
+			"type": "view",
+			"path": "prism-router/diagnostics"
+		}
+	},
+	"admin/services/prism-router/panel": {
+		"title": "详细面板",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "prism-router/panel"
+		}
+	}
+}

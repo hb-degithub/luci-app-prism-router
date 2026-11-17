@@ -1,6 +1,6 @@
 # 收尾报告（2026-11-15）
 
-> 目标：完成 OpenWrt 流量统计插件（按设备 + 代理/直连分离 + 界面 + 飞书 + 子母多节点 + 双机部署 + 性能优化）。
+> 目标：完成 OpenWrt 棱镜路由插件（按设备 + 代理/直连分离 + 界面 + 飞书 + 子母多节点 + 双机部署 + 性能优化）。
 > 结论：**核心功能全部完成并在真机验证**。剩余两项需用户输入（飞书凭据、AP 部署授权），
 > 其余项已交付并有可复跑的证据。
 
@@ -10,8 +10,8 @@
 
 | 包 | 内容 |
 |---|---|
-| `traffic-stats` | 采集守护进程 `traffic-statsd.uc`、飞书 `feishu.uc`、子节点推送 `push.uc`、母节点接收 CGI `traffic-stats-ingest`、AP 站点脚本 `stations.uc` + 接收 CGI `traffic-stats-stations`、init/UCI 配置 |
-| `luci-app-traffic-stats` | 5 个页面（概览/设备/应用/节点/设置）、rpcd 后端（8 个方法）、菜单与 ACL |
+| `prism-router` | 采集守护进程 `prism-routerd.uc`、飞书 `feishu.uc`、子节点推送 `push.uc`、母节点接收 CGI `prism-router-ingest`、AP 站点脚本 `stations.uc` + 接收 CGI `prism-router-stations`、init/UCI 配置 |
+| `luci-app-prism-router` | 5 个页面（概览/设备/应用/节点/设置）、rpcd 后端（8 个方法）、菜单与 ACL |
 
 仓库：16 次提交、54 个文件、约 11.9k 行代码、16 份文档。
 
@@ -19,11 +19,11 @@
 
 ```
 主路由（母节点）
-  traffic-statsd.uc ── 每 5s 一轮
+  prism-routerd.uc ── 每 5s 一轮
     ├─ OpenClash /connections  → 代理链路：真实域名 + 出口节点 + 每连接字节
     ├─ /proc/net/nf_conntrack  → 直连流量（orig dst 落在 fake-ip 段则跳过，绝不双计）
     └─ 自适应轮询：连续 2 轮无流量 → 5s 降为 15s，有流量立即恢复
-  ↓ 原子写 /tmp/traffic-stats/{state,history}.json
+  ↓ 原子写 /tmp/prism-router/{state,history}.json
   rpcd (ucode) → LuCI 5 页；飞书日报/告警（app 或 webhook 两条路线）
   CGI 接收端 ← 子节点 push.uc（HMAC）/ 哑桥 AP stations.uc（token，仅元数据）
 ```
@@ -49,8 +49,8 @@
 
 ```
 服务 running, confidence=exact, clash=ok conntrack=ok
-设备/应用维度正常；每日汇总 /etc/traffic-stats/daily/{2026-11-14,2026-11-15}.json
-/etc /usr /www /www/cgi-bin /usr/share/traffic-stats → 全部 root:root 755
+设备/应用维度正常；每日汇总 /etc/prism-router/daily/{2026-11-14,2026-11-15}.json
+/etc /usr /www /www/cgi-bin /usr/share/prism-router → 全部 root:root 755
 网络正常；cron 2 条（08:32 日报、每 10 分钟告警）
 ```
 
@@ -85,12 +85,12 @@
 
 ```sh
 # 配飞书（二选一）
-uci set traffic-stats.feishu.app_id='cli_xxx'
-uci set traffic-stats.feishu.app_secret='xxx'
-uci commit traffic-stats
-ucode /usr/share/traffic-stats/feishu.uc chats     # 拿 chat_id
-uci set traffic-stats.feishu.chat_id='oc_xxx'; uci commit traffic-stats
-ucode /usr/share/traffic-stats/feishu.uc test
+uci set prism-router.feishu.app_id='cli_xxx'
+uci set prism-router.feishu.app_secret='xxx'
+uci commit prism-router
+ucode /usr/share/prism-router/feishu.uc chats     # 拿 chat_id
+uci set prism-router.feishu.chat_id='oc_xxx'; uci commit prism-router
+ucode /usr/share/prism-router/feishu.uc test
 
 # 装 AP 站点模式（文件级，见 docs/AP-ROLE.md「部署」一节）
 ```
