@@ -159,6 +159,12 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=nodes")
   && ok "what=nodes -> 200 且含 nodes[]" || bad "what=nodes -> $code"
 code=$(req "$PANEL/cgi-bin/panel-api?what=stations")
 [ "$code" = "200" ] && ok "what=stations -> 200" || bad "what=stations -> $code"
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings")
+[ "$code" = "200" ] && ok "what=settings -> 200" || bad "what=settings -> $code"
+[ "$(json_expr 'type(d.settings)=="object" && type(d.panel)=="object" && type(d.panel.port)=="string"')" = "1" ] \
+  && ok "settings 含 settings/panel 字段" || bad "settings 结构异常"
+[ "$(json_expr 'd.write!=null && d.write.enabled==false')" = "1" ] \
+  && ok "settings.write.enabled=false（写能力未开放）" || bad "settings.write 异常"
 code=$(req "$PANEL/cgi-bin/panel-api?what=bad")
 [ "$code" = "400" ] && [ "$(json_expr 'd?.error=="bad_request"')" = "1" ] \
   && ok "what=bad -> 400 bad_request" || bad "what=bad -> $code / $(head -c 120 "$B")"
@@ -194,6 +200,9 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=history&days=abc")
 [ "$code" = "200" ] && ok "days=abc 回退默认（不报错）" || bad "days=abc -> $code"
 
 echo "=== 10. token：未设 vs 设置后 ==="
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings&token=$TOK")
+[ "$code" = "200" ] && ok "settings 带 token -> 200" || bad "settings 带 token -> $code"
+if grep -q "$TOK" "$B" 2>/dev/null; then bad "settings 响应泄漏 token 明文"; else ok "settings 不含 token 明文"; fi
 UCI set prism-router.panel.token="$TOK"
 UCI commit prism-router
 code=$(req "$PANEL/cgi-bin/panel-api?what=state")

@@ -57,6 +57,37 @@ const HEADERS = [
 
 let SENT = false;
 
+/* settings 只读投影：只回传非敏感的配置项，绝不回传 token/密钥原值。 */
+const SETTINGS_FIELDS = [
+	'poll_interval', 'history_days', 'retention_daily_days',
+	'metrics_enabled', 'feishu_enabled', 'mother_enabled', 'stations_enabled',
+	'legacy_shared_secret', 'legacy_stations_token'
+];
+
+function read_settings() {
+	const c = cursor();
+	const out = { settings: {}, panel: {}, write: { enabled: false } };
+
+	for (let k in SETTINGS_FIELDS) {
+		const v = c.get(UCI_CONFIG, 'settings', k);
+		if (type(v) == 'string') out.settings[k] = v;
+	}
+
+	const enabled = c.get(UCI_CONFIG, 'panel', 'enabled');
+	const port = c.get(UCI_CONFIG, 'panel', 'port');
+	const bind = c.get(UCI_CONFIG, 'panel', 'bind');
+	const token = c.get(UCI_CONFIG, 'panel', 'token');
+
+	out.panel = {
+		enabled: (enabled == '1'),
+		port: (type(port) == 'string' && length(port) > 0) ? port : '8099',
+		bind: (type(bind) == 'string') ? bind : '',
+		has_token: (type(token) == 'string' && length(token) > 0)
+	};
+
+	return out;
+}
+
 // ───────────────────────────── 基础工具 ─────────────────────────────
 
 function env(name) {
@@ -301,6 +332,9 @@ function handle(query) {
 
 	if (length(what) == 0)
 		what = 'state';
+
+	if (what == 'settings')
+		return { code: 200, reason: 'OK', body: read_settings() };
 
 	if (ALLOWED[what] == null)
 		return { code: 400, reason: 'Bad Request', body: { error: 'bad_request' } };

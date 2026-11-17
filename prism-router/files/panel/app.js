@@ -25,6 +25,18 @@
 	var ONLINE_WINDOW = 180;        /* 秒：超过这个时间没有活动就不算在线 */
 	var HISTORY_DAYS = 7;
 	var HISTORY_REFRESH = 300000;   /* 历史数据 5 分钟刷新一次 */
+	var NODES_REFRESH = 300000;     /* 节点上报状态 5 分钟刷新一次 */
+	var SETTINGS_REFRESH = 300000;  /* 只读设置 5 分钟刷新一次 */
+
+	/* 告警中心阈值（与 SPEC/需求保持一致） */
+	var ALERT_STALE_SEC = 90;       /* 数据陈旧：now - ts > 90s */
+	var ALERT_OFFLINE_SEC = 600;    /* 设备离线：last_seen <= 0 或 > 600s */
+	var ALERT_NODE_STALE_SEC = 300; /* 节点上报超时：age_sec > 300s */
+	var ALERT_QUOTA_WARN = 0.8;     /* 配额接近：>= 80% */
+	var ALERT_UNKNOWN_ONLINE = 3;   /* 未知接入设备较多：在线 > 3 台 */
+	var ALERT_MAX = 8;              /* 告警中心最多展示条数 */
+	var ALERT_DEVICE_NAMES = 3;     /* 离线/节点告警详情最多列出的名字数 */
+	var ALERT_FLASH_MS = 2000;      /* 点击告警后的高亮时长 */
 
 	var CONFIDENCE = {
 		exact: { label: '精确', cls: 'pill--ok' },
@@ -49,6 +61,12 @@
 		state: null,
 		history: null,
 		historyAt: 0,
+		nodes: null,
+		nodesAt: 0,
+		settings: null,
+		settingsAt: 0,
+		settingsBusy: false,
+		settingsError: null,
 		samples: [],
 		prevTotals: null,
 		lastSampleTs: 0,
@@ -303,6 +321,16 @@
 
 	function fetchHistory() {
 		return requestJson(apiUrl('history', 'days=' + HISTORY_DAYS));
+	}
+
+	/* /what=nodes 的节点列表带 age_sec（子节点上报新鲜度），用于告警中心。 */
+	function fetchNodes() {
+		return requestJson(apiUrl('nodes'));
+	}
+
+	/* /what=settings 的只读投影（只含非敏感项，写操作恒为未开放）。 */
+	function fetchSettings() {
+		return requestJson(apiUrl('settings'));
 	}
 
 	/* ------------------------------------------------------------------ *
@@ -763,6 +791,13 @@
 		return str(dev.mac) || str(dev.ip) || ('idx-' + idx);
 	}
 
+	/* 设备榜与告警中心共用同一排序与 key，保证点击告警能定位到对应行。 */
+	function sortedDevices(state) {
+		var devices = (state && Array.isArray(state.devices)) ? state.devices.slice() : [];
+		devices.sort(function (a, b) { return devTotal(b) - devTotal(a); });
+		return devices;
+	}
+
 	function buildDeviceDetail(dev) {
 		var wrap = el('div', 'detail');
 		var grid = el('div', 'detail__grid');
@@ -863,8 +898,7 @@
 		clear(body);
 
 		var state = app.state;
-		var devices = (state && Array.isArray(state.devices)) ? state.devices.slice() : [];
-		devices.sort(function (a, b) { return devTotal(b) - devTotal(a); });
+		var devices = sortedDevices(state);
 		var list = devices.slice(0, TOP_DEVICES);
 
 		var meta = devices.length ? '共 ' + devices.length + ' 台' : '';
@@ -1148,6 +1182,487 @@
 	}
 
 	/* ------------------------------------------------------------------ *
+	 * 告警中心（完全在前端从 state / nodes 计算）
+	 * ------------------------------------------------------------------ */
+	var SEVERITY_RANK = { danger: 0, warn: 1, info: 2 };
+
+	function nowSec() {
+		return Math.floor(Date.now() / 1000);
+	}
+
+	/* 采集源状态：只有明确的非 ok 值才算异常；字段缺失按"未知"处理，不误报。 */
+	function sourceBad(value) {
+		var s = str(value).toLowerCase();
+		return s !== '' && s !== 'ok';
+	}
+
+	function pushNodeAge(out, seen, name, age) {
+		var label = str(name).trim();
+		if (!label) return;
+		var value = Number(age);
+		if (!isFinite(value) || value <= ALERT_NODE_STALE_SEC) return;
+		if (seen[label]) return;
+		seen[label] = true;
+		out.push({ name: label, age: value });
+	}
+
+	/* 优先用 ?what=nodes 的 age_sec；同时兼容 state.nodes 直接带 age_sec/ts 的形态。 */
+	function collectStaleNodes(state, now) {
+		var out = [];
+		var seen = {};
+
+		function scanList(list) {
+			if (!Array.isArray(list)) return;
+			list.forEach(function (item) {
+				if (!item || typeof item !== 'object') return;
+				var name = str(item.name) || str(item.node_name) || str(item.node_id);
+				var age = item.age_sec;
+				if (age === undefined || age === null) {
+					var itemTs = toSec(item.ts);
+					if (itemTs > 0) age = now - itemTs;
+				}
+				pushNodeAge(out, seen, name, age);
+			});
+		}
+
+		if (app.nodes && typeof app.nodes === 'object') scanList(app.nodes.nodes);
+
+		var local = state && state.nodes;
+		if (Array.isArray(local)) {
+			scanList(local);
+		} else if (local && typeof local === 'object') {
+			scanList(local.nodes);
+			Object.keys(local).forEach(function (name) {
+				if (name === 'nodes') return;
+				var item = local[name];
+				if (!item || typeof item !== 'object') return;
+				var age = item.age_sec;
+				if (age === undefined || age === null) {
+					var itemTs = toSec(item.ts);
+					if (itemTs > 0) age = now - itemTs;
+				}
+				pushNodeAge(out, seen, name, age);
+			});
+		}
+
+		out.sort(function (a, b) { return b.age - a.age; });
+		return out;
+	}
+
+	function buildAlerts(state) {
+		var out = [];
+		var now = nowSec();
+		var health = (state && state.health && typeof state.health === 'object') ? state.health : {};
+		var source = (state && state.source && typeof state.source === 'object') ? state.source : {};
+		var devices = sortedDevices(state);
+
+		/* 1) 记账不可用 */
+		if (str(health.accounting_confidence).toLowerCase() === 'unavailable') {
+			out.push({
+				severity: 'danger',
+				title: '记账不可用',
+				detail: '记账可信度为「不可用」，流量分账结果可能缺失。',
+				target: { type: 'health' }
+			});
+		}
+
+		/* 2) 数据源不可用 */
+		var failedSources = [];
+		if (sourceBad(source.clash)) failedSources.push('Clash');
+		if (sourceBad(source.conntrack)) failedSources.push('conntrack');
+		if (failedSources.length) {
+			out.push({
+				severity: 'danger',
+				title: '数据源不可用',
+				detail: '采集源异常：' + failedSources.join(' / ') + '，流量统计可能不完整。',
+				target: { type: 'health' }
+			});
+		}
+
+		/* 3) 数据陈旧 */
+		var ts = toSec(state.ts);
+		if (ts > 0) {
+			var age = now - ts;
+			if (age > ALERT_STALE_SEC) {
+				out.push({
+					severity: 'warn',
+					title: '数据陈旧',
+					detail: '最近一次更新在 ' + age + ' 秒前（阈值 ' + ALERT_STALE_SEC + ' 秒），当前内容可能已过期。',
+					target: { type: 'health' }
+				});
+			}
+		}
+
+		/* 4)/5) 月配额超限 / 接近上限 */
+		devices.forEach(function (dev, idx) {
+			var limit = n0(dev.quota_limit);
+			if (!(limit > 0)) return;
+
+			var used = n0(dev.month_total);
+			var ratio = used / limit;
+			if (ratio < ALERT_QUOTA_WARN) return;
+
+			var over = ratio >= 1;
+			out.push({
+				severity: over ? 'danger' : 'warn',
+				title: over ? '配额超限' : '配额接近上限',
+				detail: deviceName(dev) + ' 本月 ' + fmtPct(ratio * 100) +
+					'（' + fmtBytes(used) + ' / ' + fmtBytes(limit) + '）',
+				target: { type: 'devices', keys: [ deviceKey(dev, idx) ] }
+			});
+		});
+
+		/* 6) 设备离线 */
+		var offline = [];
+		devices.forEach(function (dev, idx) {
+			var seen = toSec(dev.last_seen);
+			if (seen > 0 && now - seen <= ALERT_OFFLINE_SEC) return;
+			offline.push({ name: deviceName(dev), key: deviceKey(dev, idx) });
+		});
+		if (offline.length) {
+			var offlineNames = offline.slice(0, ALERT_DEVICE_NAMES).map(function (item) { return item.name; });
+			out.push({
+				severity: 'warn',
+				title: '设备离线',
+				detail: offline.length + ' 台设备超过 10 分钟无活动：' + offlineNames.join('、') +
+					(offline.length > ALERT_DEVICE_NAMES ? ' 等' : ''),
+				target: { type: 'devices', keys: offline.map(function (item) { return item.key; }) }
+			});
+		}
+
+		/* 7) 未知接入设备较多 */
+		var unknownKeys = [];
+		devices.forEach(function (dev, idx) {
+			if (str(dev.link).toLowerCase() !== 'unknown') return;
+			if (!isOnline(dev, state)) return;
+			unknownKeys.push(deviceKey(dev, idx));
+		});
+		if (unknownKeys.length > ALERT_UNKNOWN_ONLINE) {
+			out.push({
+				severity: 'info',
+				title: '接入方式未知',
+				detail: unknownKeys.length + ' 台在线设备的接入方式未识别，建议检查 lan_bridge / wireless_ports 配置。',
+				target: { type: 'devices', keys: unknownKeys }
+			});
+		}
+
+		/* 8) 节点上报超时 */
+		var staleNodes = collectStaleNodes(state, now);
+		if (staleNodes.length) {
+			var nodeNames = staleNodes.slice(0, ALERT_DEVICE_NAMES).map(function (item) { return item.name; });
+			out.push({
+				severity: 'warn',
+				title: '节点上报超时',
+				detail: staleNodes.length + ' 个节点超过 5 分钟未上报：' + nodeNames.join('、') +
+					(staleNodes.length > ALERT_DEVICE_NAMES ? ' 等' : ''),
+				target: { type: 'nodes' }
+			});
+		}
+
+		/* 严重度排序（同级保持规则顺序） */
+		out.forEach(function (item, idx) { item.order = idx; });
+		out.sort(function (a, b) {
+			var diff = SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity];
+			return diff !== 0 ? diff : a.order - b.order;
+		});
+		return out;
+	}
+
+	function panelOf(node) {
+		var current = node;
+		while (current && current.nodeType === 1) {
+			if (current.classList && current.classList.contains('panel')) return current;
+			current = current.parentNode;
+		}
+		return null;
+	}
+
+	function scrollToNode(node) {
+		if (!node) return;
+		try {
+			node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+		} catch (e) {
+			try { node.scrollIntoView(); } catch (e2) { /* 忽略 */ }
+		}
+	}
+
+	function flashNode(node) {
+		if (!node || !node.classList) return;
+		node.classList.add('is-flash');
+		window.setTimeout(function () {
+			if (node.classList) node.classList.remove('is-flash');
+		}, ALERT_FLASH_MS);
+	}
+
+	function deviceRowByKey(key) {
+		if (!dom.devicesBody) return null;
+		var rows = dom.devicesBody.querySelectorAll('tr.drow');
+		for (var i = 0; i < rows.length; i++) {
+			if (rows[i].getAttribute('data-key') === key) return rows[i];
+		}
+		return null;
+	}
+
+	/* 点击告警：设备行滚动并高亮 2 秒；节点/健康区块滚动。 */
+	function jumpToAlert(target) {
+		if (!target) return;
+
+		if (target.type === 'devices') {
+			var rows = [];
+			(target.keys || []).forEach(function (key) {
+				var row = deviceRowByKey(key);
+				if (row) rows.push(row);
+			});
+
+			if (rows.length) {
+				scrollToNode(rows[0]);
+				rows.forEach(function (row) { flashNode(row); });
+				announce('已定位到设备榜。');
+				return;
+			}
+
+			var devicesPanel = panelOf(dom.devicesBody);
+			scrollToNode(devicesPanel || dom.devicesBody);
+			flashNode(devicesPanel);
+			announce('已定位到设备榜。');
+			return;
+		}
+
+		if (target.type === 'nodes') {
+			var nodesPanel = panelOf(dom.nodesList);
+			scrollToNode(nodesPanel || dom.nodesList);
+			flashNode(nodesPanel);
+			announce('已定位到节点 / 出口。');
+			return;
+		}
+
+		var healthPanel = panelOf(dom.healthSources);
+		scrollToNode(healthPanel || dom.healthSources);
+		flashNode(healthPanel);
+		announce('已定位到健康与告警。');
+	}
+
+	function alertButton(item) {
+		var btn = el('button', 'alert alert--' + item.severity);
+		btn.type = 'button';
+		if (item.target && item.target.type === 'nodes') btn.title = '跳转到节点 / 出口';
+		else if (item.target && item.target.type === 'health') btn.title = '跳转到健康与告警';
+		else btn.title = '跳转到设备榜';
+
+		var dot = el('span', 'alert__dot');
+		dot.setAttribute('aria-hidden', 'true');
+		btn.appendChild(dot);
+
+		var body = el('span', 'alert__body');
+		body.appendChild(el('span', 'alert__title', item.title));
+		body.appendChild(el('span', 'alert__detail', item.detail));
+		btn.appendChild(body);
+
+		var cue = el('span', 'alert__cue', '›');
+		cue.setAttribute('aria-hidden', 'true');
+		btn.appendChild(cue);
+
+		btn.addEventListener('click', function () { jumpToAlert(item.target); });
+		return btn;
+	}
+
+	function renderAlerts() {
+		var list = dom.alertsList;
+		if (!list) return;
+		clear(list);
+
+		var state = app.state;
+		if (!state) {
+			setMeta(dom.alertsMeta, app.inflight ? '统计中' : '暂无数据');
+			list.appendChild(el('p', 'alerts__loading',
+				app.inflight ? '正在读取面板数据…' : '暂无面板数据，无法统计告警'));
+			return;
+		}
+
+		var alerts = buildAlerts(state);
+		var shown = alerts.slice(0, ALERT_MAX);
+		setMeta(dom.alertsMeta, shown.length + ' 项需要关注');
+
+		if (!shown.length) {
+			var box = el('div', 'alerts__empty');
+			var check = el('span', 'alerts__empty-check', '✓');
+			check.setAttribute('aria-hidden', 'true');
+			box.appendChild(check);
+
+			var text = el('span', 'alerts__empty-text');
+			text.appendChild(el('span', 'alerts__empty-title', '一切正常'));
+			text.appendChild(el('span', 'alerts__empty-sub', '未发现需要关注的项'));
+			box.appendChild(text);
+			list.appendChild(box);
+			return;
+		}
+
+		shown.forEach(function (item) {
+			list.appendChild(alertButton(item));
+		});
+	}
+
+	/* ------------------------------------------------------------------ *
+	 * 设置（只读投影）
+	 * ------------------------------------------------------------------ */
+	function settingRaw(value) {
+		var s = str(value).trim();
+		return s === '' ? '—' : s;
+	}
+
+	function settingWithUnit(value, unit) {
+		var s = str(value).trim();
+		if (s === '') return '—';
+		var n = Number(s);
+		if (!isFinite(n)) return s;
+		return n + ' ' + unit;
+	}
+
+	function onOffValue(value) {
+		var s = str(value).trim().toLowerCase();
+		if (s === '1' || s === 'true' || s === 'on' || s === 'yes' || s === 'enabled') {
+			return { text: '开', cls: 'settings__v--on' };
+		}
+		if (s === '0' || s === 'false' || s === 'off' || s === 'no' || s === 'disabled') {
+			return { text: '关', cls: 'settings__v--off' };
+		}
+		return { text: s === '' ? '—' : s, cls: '' };
+	}
+
+	function settingsGroup(title, rows) {
+		var group = el('div', 'settings__group');
+		group.appendChild(el('h3', 'settings__group-title', title));
+
+		var list = el('dl', 'settings__list');
+		rows.forEach(function (row) {
+			var item = el('div', 'settings__row');
+			item.appendChild(el('dt', 'settings__k', row.label));
+			var value = el('dd', 'settings__v' + (row.cls ? ' ' + row.cls : ''), row.value);
+			if (row.title) value.title = row.title;
+			item.appendChild(value);
+			list.appendChild(item);
+		});
+
+		group.appendChild(list);
+		return group;
+	}
+
+	function settingsErrorBox() {
+		var box = el('div', 'settings__error');
+		var text = el('div', 'settings__error-text');
+		text.appendChild(el('p', 'settings__error-title', '设置数据不可用'));
+		text.appendChild(el('p', 'settings__error-detail',
+			app.settingsError ? errText(app.settingsError) : '未知错误'));
+		box.appendChild(text);
+
+		var retry = el('button', 'btn btn--small', '重试');
+		retry.type = 'button';
+		retry.setAttribute('aria-label', '重新加载设置数据');
+		retry.addEventListener('click', function () { loadSettings(true); });
+		box.appendChild(retry);
+		return box;
+	}
+
+	function renderSettings() {
+		var body = dom.settingsBody;
+		if (!body) return;
+		clear(body);
+
+		if (!app.settings) {
+			setMeta(dom.settingsMeta, app.settingsError ? '不可用' : '加载中');
+			body.appendChild(app.settingsError
+				? settingsErrorBox()
+				: el('p', 'settings__loading', '正在读取设置…'));
+			return;
+		}
+
+		var data = app.settings;
+		var settings = (data.settings && typeof data.settings === 'object') ? data.settings : {};
+		var panelCfg = (data.panel && typeof data.panel === 'object') ? data.panel : {};
+		var write = (data.write && typeof data.write === 'object') ? data.write : {};
+
+		setMeta(dom.settingsMeta, '只读');
+
+		if (write.enabled === false) {
+			var writeBox = el('p', 'settings__write');
+			var writeDot = el('span', 'settings__write-dot');
+			writeDot.setAttribute('aria-hidden', 'true');
+			writeBox.appendChild(writeDot);
+			writeBox.appendChild(el('span', '', '写操作未开放'));
+			body.appendChild(writeBox);
+		}
+
+		body.appendChild(settingsGroup('采集与保留', [
+			{ label: '轮询间隔', value: settingWithUnit(settings.poll_interval, '秒') },
+			{ label: '历史保留天数', value: settingWithUnit(settings.history_days, '天') },
+			{ label: '日文件保留', value: settingWithUnit(settings.retention_daily_days, '天') }
+		]));
+
+		var bind = str(panelCfg.bind).trim();
+		body.appendChild(settingsGroup('面板服务', [
+			{ label: '面板端口', value: settingRaw(panelCfg.port) },
+			{ label: '绑定地址', value: bind === '' ? '全部地址' : bind },
+			{ label: '是否设置令牌', value: panelCfg.has_token ? '是' : '否' }
+		]));
+
+		var feishu = onOffValue(settings.feishu_enabled);
+		var mother = onOffValue(settings.mother_enabled);
+		var stations = onOffValue(settings.stations_enabled);
+		var legacyOn = str(settings.legacy_shared_secret) === '1' || str(settings.legacy_stations_token) === '1';
+		var legacy = onOffValue(legacyOn ? '1' : '0');
+
+		body.appendChild(settingsGroup('功能开关', [
+			{ label: '飞书', value: feishu.text, cls: feishu.cls },
+			{ label: '副节点', value: mother.text, cls: mother.cls },
+			{ label: 'AP上报', value: stations.text, cls: stations.cls },
+			{
+				label: '旧版兼容',
+				value: legacy.text,
+				cls: legacy.cls,
+				title: '旧共享密钥：' + (str(settings.legacy_shared_secret) === '1' ? '开' : '关') +
+					' · 旧站点令牌：' + (str(settings.legacy_stations_token) === '1' ? '开' : '关')
+			}
+		]));
+
+		/* 刷新失败但已有旧数据：保留数据，在底部补一条错误与重试。 */
+		if (app.settingsError) body.appendChild(settingsErrorBox());
+	}
+
+	function loadSettings(force) {
+		if (app.settingsBusy) return;
+		if (!force && app.settings && (Date.now() - app.settingsAt) < SETTINGS_REFRESH) return;
+
+		app.settingsBusy = true;
+		app.settingsError = null;
+		renderSettings();
+
+		fetchSettings().then(function (data) {
+			if (!data || typeof data !== 'object') {
+				app.settingsError = {
+					panelError: true,
+					kind: 'parse',
+					status: 200,
+					message: '设置接口返回的数据结构异常'
+				};
+				return;
+			}
+			app.settings = data;
+			app.settingsAt = Date.now();
+			app.settingsError = null;
+		}, function (err) {
+			app.settingsError = (err && err.panelError) ? err : {
+				panelError: true,
+				kind: 'network',
+				status: 0,
+				message: '无法连接到面板服务'
+			};
+		}).then(function () {
+			app.settingsBusy = false;
+			renderSettings();
+		});
+	}
+
+	/* ------------------------------------------------------------------ *
 	 * 错误 / 令牌
 	 * ------------------------------------------------------------------ */
 	function errText(err) {
@@ -1209,6 +1724,8 @@
 		renderApps();
 		renderNodes();
 		renderHealth();
+		renderAlerts();
+		renderSettings();
 		renderNotices();
 	}
 
@@ -1261,6 +1778,17 @@
 			app.lastErr = null;
 			app.lastOk = Date.now();
 			recordSample(state);
+
+			/* 节点上报状态只是辅助数据：单独请求，失败不影响主流程。 */
+			var needNodes = manual || !app.nodes || (Date.now() - app.nodesAt) > NODES_REFRESH;
+			if (needNodes) {
+				fetchNodes().then(function (nodes) {
+					if (!nodes || typeof nodes !== 'object') return;
+					app.nodes = nodes;
+					app.nodesAt = Date.now();
+					renderAlerts();
+				}, function () { /* 节点数据不可用时保留上一次结果 */ });
+			}
 
 			if (!needHistory) return null;
 			return fetchHistory().then(function (history) {
@@ -1320,6 +1848,7 @@
 	function onRefreshClick() {
 		announce('正在刷新数据…');
 		load(true);
+		loadSettings(true);
 	}
 
 	function onAutoChange() {
@@ -1432,7 +1961,9 @@
 			'nodes-meta', 'nodes-list',
 			'devices-meta', 'devices-body',
 			'apps-meta', 'apps-body',
-			'health-meta', 'health-sources', 'health-reasons'
+			'health-meta', 'health-sources', 'health-reasons',
+			'alerts-meta', 'alerts-list',
+			'settings-meta', 'settings-body'
 		];
 
 		ids.forEach(function (id) {
@@ -1465,6 +1996,7 @@
 
 		renderAll();
 		load(false);
+		loadSettings(false);
 		startTimer();
 	}
 

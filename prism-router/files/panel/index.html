@@ -243,6 +243,30 @@
     <div id="health-sources" class="sources"></div>
     <div id="health-reasons" class="reasons"></div>
   </section>
+
+  <div class="columns columns--bottom">
+    <section class="panel panel--alerts" aria-labelledby="alerts-title">
+      <header class="panel__head">
+        <div class="panel__titles">
+          <h2 id="alerts-title" class="panel__title">告警中心</h2>
+          <p class="panel__sub">按严重度排序 · 点击条目跳转到对应区块</p>
+        </div>
+        <span class="panel__meta" id="alerts-meta">统计中</span>
+      </header>
+      <div id="alerts-list" class="alertlist"></div>
+    </section>
+
+    <section class="panel panel--settings" aria-labelledby="settings-title">
+      <header class="panel__head">
+        <div class="panel__titles">
+          <h2 id="settings-title" class="panel__title">设置</h2>
+          <p class="panel__sub">只读展示；修改配置请使用 uci 命令行（后续版本控制台支持写入）</p>
+        </div>
+        <span class="panel__meta" id="settings-meta">只读</span>
+      </header>
+      <div id="settings-body" class="settings"></div>
+    </section>
+  </div>
 </main>
 
 <footer class="footer">
