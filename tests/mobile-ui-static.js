@@ -514,7 +514,6 @@ const HOOK_NAMES = [
 	'isGuestDevice',
 	'deviceKindOf',
 	'deviceKindSvg',
-	'topoBusSvg',
 	'classifyDevice',
 	'groupDevices',
 	'sortDevices',
@@ -1515,6 +1514,34 @@ function topoDrillNames(root) {
 	});
 }
 
+/*
+ * CSS 树状连线的 DOM 结构：.tsm-ttree > .tsm-ttrunk + 每行 .tsm-trow + 行间 .tsm-tstem。
+ * 行内多节点时带一个 .tsm-trow-bus；单节点行 is-single 且没有总线。
+ */
+function topoTree(root) {
+	return findByClass(root, 'tsm-ttree');
+}
+
+function topoTreeRows(root) {
+	const tree = topoTree(root);
+
+	return tree ? findAll(tree, function (node) { return hasClass(node, 'tsm-trow'); }) : [];
+}
+
+function topoRowNodes(row) {
+	return findAll(row, function (node) { return hasClass(node, 'tsm-dnode'); });
+}
+
+function topoRowBus(row) {
+	return findByClass(row, 'tsm-trow-bus');
+}
+
+function topoTreeStems(root) {
+	const tree = topoTree(root);
+
+	return tree ? findAll(tree, function (node) { return hasClass(node, 'tsm-tstem'); }) : [];
+}
+
 function clickNode(node) {
 	if (node != null && node.listeners != null && Array.isArray(node.listeners.click) &&
 		typeof node.listeners.click[0] === 'function')
@@ -1655,22 +1682,75 @@ async function testTopology() {
 		textOf(findByClass(wiredGroup, 'tsm-tgroup-h')).indexOf('有线 1') >= 0,
 		'h=' + repr([ textOf(findByClass(wifiGroup, 'tsm-tgroup-h')),
 			textOf(findByClass(wiredGroup, 'tsm-tgroup-h')) ]));
-	check('L5 每组都有 SVG 连线覆盖层（树干 + 分叉，按 link 上色）',
-		[ [ wifiGroup, 'wifi' ], [ wiredGroup, 'wired' ], [ unknownGroup, 'unknown' ] ]
-			.every(function (pair) {
-				const bus = findByClass(pair[0], 'tsm-tbus');
-				const lines = bus ? findAll(bus, function (n) { return hasClass(n, 'tsm-tline'); }) : [];
+	/* 连线改成 CSS 树：树干 → 每行总线 → 节点，不再有 SVG 覆盖层 */
+	const wifiTree = topoTree(wifiGroup);
+	const wifiTreeRows = topoTreeRows(wifiGroup);
 
-				return bus != null && bus.tag === 'svg' && lines.length >= 2 &&
-					findAll(bus, function (n) {
-						return hasClass(n, 'tsm-tline-' + pair[1]);
-					}).length >= 1;
-			}),
-		'bus=' + repr([ wifiGroup, wiredGroup, unknownGroup ].map(function (group) {
-			const bus = findByClass(group, 'tsm-tbus');
+	check('L5 每组都有 CSS 树 + 树干（.tsm-ttree > .tsm-ttrunk）',
+		[ wifiGroup, wiredGroup, unknownGroup ].every(function (group) {
+			const tree = topoTree(group);
 
-			return bus ? findAll(bus, function (n) { return hasClass(n, 'tsm-tline'); }).length : -1;
+			return tree != null && findByClass(tree, 'tsm-ttrunk') != null &&
+				findByClass(tree, 'tsm-tbus') == null;
+		}),
+		'trees=' + repr([ wifiGroup, wiredGroup, unknownGroup ].map(function (group) {
+			return topoTree(group) != null;
 		})));
+	sameList('L5 无线组 5 台 → 3 行，行节点数 2/2/1',
+		wifiTreeRows.map(function (row) { return topoRowNodes(row).length; }), [ 2, 2, 1 ]);
+	check('L5 两列行各有 1 条行内总线，单节点行没有总线',
+		wifiTreeRows.every(function (row) {
+			const multi = topoRowNodes(row).length > 1;
+
+			return multi
+				? (topoRowBus(row) != null && !hasClass(row, 'is-single'))
+				: (topoRowBus(row) == null && hasClass(row, 'is-single'));
+		}),
+		'rows=' + repr(wifiTreeRows.map(function (row) {
+			return { nodes: topoRowNodes(row).length, single: hasClass(row, 'is-single'),
+				bus: topoRowBus(row) != null };
+		})));
+	same('L5 3 行之间 2 根竖干', topoTreeStems(wifiGroup).length, 2);
+	check('L5 树干在最前、紧接第一行（DOM 顺序就是连线顺序）',
+		wifiTree != null && wifiTree.children[0].attrs['class'] === 'tsm-ttrunk' &&
+		wifiTree.children[1] === wifiTreeRows[0] &&
+		wifiTree.children[2].attrs['class'] === 'tsm-tstem' &&
+		wifiTree.children[3] === wifiTreeRows[1],
+		'children=' + repr(wifiTree && wifiTree.children.map(function (n) {
+			return n.attrs['class'];
+		})));
+	check('L5 「还有 2 台」在最后一行之后，不参与连线',
+		wifiTree != null && wifiTree.children[wifiTree.children.length - 1] ===
+			findByClass(wifiGroup, 'tsm-dmore') &&
+		wifiTreeRows.every(function (row) {
+			return !hasClass(row, 'tsm-dmore') &&
+				findAll(row, function (n) { return hasClass(n, 'tsm-dmore'); }).length === 0;
+		}),
+		'last=' + repr(wifiTree && wifiTree.children[wifiTree.children.length - 1].attrs));
+	check('L5 单节点组：1 行 is-single、无总线、节点铺满两列',
+		topoTreeRows(wiredGroup).length === 1 &&
+		hasClass(topoTreeRows(wiredGroup)[0], 'is-single') &&
+		topoRowBus(topoTreeRows(wiredGroup)[0]) == null,
+		'rows=' + repr(topoTreeRows(wiredGroup).map(function (row) { return row.attrs['class']; })));
+	check('L5 不再有 SVG 连线 / .tsm-tline',
+		[ wifiGroup, wiredGroup, unknownGroup ].every(function (group) {
+			return findByClass(group, 'tsm-tbus') == null &&
+				findAll(group, function (n) { return hasClass(n, 'tsm-tline'); }).length === 0;
+		}),
+		'bus=' + repr([ wifiGroup, wiredGroup, unknownGroup ].map(function (group) {
+			return findByClass(group, 'tsm-tbus') != null;
+		})));
+	const rowOrder = [];
+
+	wifiTreeRows.forEach(function (row) {
+		topoRowNodes(row).forEach(function (node) {
+			rowOrder.push(textOf(findByClass(node, 'tsm-dnode-name')));
+		});
+	});
+	sameList('L5 行内节点顺序与拓扑设备顺序一致（分行不重排）', rowOrder,
+		topoRows(ctx).slice(0, 5).map(function (node) {
+			return textOf(findByClass(node, 'tsm-dnode-name'));
+		}));
 	check('L5 设备节点带状态环、类型图标、名称与速率',
 		textOf(wifiRows[0]).indexOf('↓') >= 0 &&
 		findAll(wifiRows[0], function (n) { return hasClass(n, 'tsm-dnode-ring'); }).length === 1 &&
@@ -1846,7 +1926,7 @@ function overviewTopoDevices(list) {
 }
 
 async function testOverviewTopo() {
-	console.log('\n[7e] 概览设备拓扑：主路由根节点 + 两列在线节点 + SVG 连线 + 点击下钻');
+	console.log('\n[7e] 概览设备拓扑：主路由根节点 + 两列在线节点 + CSS 树状连线 + 点击下钻');
 
 	const devices = overviewTopoDevices([
 		{ hostname: 'iPhone 15', link: 'wifi', rx_rate: 150000, tx_rate: 20000 },
@@ -1865,7 +1945,7 @@ async function testOverviewTopo() {
 		hasClass(ctx.ovTopoHost, 'tsm-otopo'), 'host=' + repr(ctx.ovTopoHost && ctx.ovTopoHost.attrs));
 
 	const root = findByClass(ctx.ovTopoHost, 'tsm-otop-root');
-	const grid = findByClass(ctx.ovTopoHost, 'tsm-otop-grid');
+	const tree = topoTree(ctx.ovTopoHost);
 
 	check('主路由根节点存在且显示 hostname',
 		root != null && textOf(root).indexOf('R4S-主路由') >= 0 &&
@@ -1902,17 +1982,31 @@ async function testOverviewTopo() {
 		}),
 		'nodes=' + repr(ovTopoRows(ctx).map(function (n) { return textOf(n); })));
 
-	const bus = findByClass(ctx.ovTopoHost, 'tsm-tbus');
-	const lines = bus ? findAll(bus, function (n) { return hasClass(n, 'tsm-tline'); }) : [];
-
-	check('根节点与设备之间有 SVG 连线（树干 + 3 条分叉）',
-		grid != null && bus != null && bus.tag === 'svg' && lines.length === 4,
-		'lines=' + repr(lines.map(function (n) { return n.attrs['class']; })));
-	check('连线按链路类型着色：无线蓝 / 有线绿',
-		findAll(bus, function (n) { return hasClass(n, 'tsm-tline-wifi'); }).length === 2 &&
-		findAll(bus, function (n) { return hasClass(n, 'tsm-tline-wired'); }).length === 1,
-		'links=' + repr(findAll(bus, function (n) { return hasClass(n, 'tsm-tline'); })
-			.map(function (n) { return n.attrs['class']; })));
+	check('根节点与设备之间是 CSS 树（树干 + 每行总线），没有 SVG 连线',
+		tree != null && findByClass(tree, 'tsm-ttrunk') != null &&
+		findByClass(ctx.ovTopoHost, 'tsm-tbus') == null &&
+		findByClass(ctx.ovTopoHost, 'tsm-otop-grid') == null &&
+		findAll(ctx.ovTopoHost, function (n) { return hasClass(n, 'tsm-tline'); }).length === 0,
+		'tree=' + repr(tree && tree.attrs));
+	check('3 台在线 → 2 行（2/1），第一行有行内总线',
+		topoTreeRows(ctx.ovTopoHost).length === 2 &&
+		topoTreeRows(ctx.ovTopoHost).map(function (row) {
+			return topoRowNodes(row).length;
+		}).join(',') === '2,1' &&
+		topoRowBus(topoTreeRows(ctx.ovTopoHost)[0]) != null,
+		'rows=' + repr(topoTreeRows(ctx.ovTopoHost).map(function (row) {
+			return topoRowNodes(row).length;
+		})));
+	check('最后一行单节点：is-single + 无总线（节点铺满两列）',
+		hasClass(topoTreeRows(ctx.ovTopoHost)[1], 'is-single') &&
+		topoRowBus(topoTreeRows(ctx.ovTopoHost)[1]) == null,
+		'row=' + repr(topoTreeRows(ctx.ovTopoHost)[1] && topoTreeRows(ctx.ovTopoHost)[1].attrs));
+	same('行与行之间 1 根竖干', topoTreeStems(ctx.ovTopoHost).length, 1);
+	check('树顶树干在第一行之前（DOM 顺序与视觉连线一致）',
+		tree != null && tree.children[0].attrs['class'] === 'tsm-ttrunk' &&
+		tree.children[1] === topoTreeRows(ctx.ovTopoHost)[0] &&
+		tree.children[2].attrs['class'] === 'tsm-tstem',
+		'children=' + repr(tree && tree.children.map(function (n) { return n.attrs['class']; })));
 
 	const node = ovTopoRowByName(ctx, '客厅电视');
 
@@ -1951,7 +2045,8 @@ async function testOverviewTopo() {
 	same('0 台在线 → 0 个设备节点', ovTopoRows(emptyBoot.ctx).length, 0);
 	check('0 台在线 → 根节点仍在（不伪造子节点）',
 		findByClass(emptyBoot.ctx.ovTopoHost, 'tsm-otop-root') != null &&
-		findByClass(emptyBoot.ctx.ovTopoHost, 'tsm-tbus') == null,
+		topoTree(emptyBoot.ctx.ovTopoHost) == null &&
+		topoTreeRows(emptyBoot.ctx.ovTopoHost).length === 0,
 		'root=' + repr(textOf(emptyBoot.ctx.ovTopoHost)));
 
 	/* 9 台在线：8 个节点 + 「还有 1 台」 */
@@ -1972,6 +2067,155 @@ async function testOverviewTopo() {
 		'names=' + repr(ovTopoRows(manyCtx).map(function (n) {
 			return textOf(findByClass(n, 'tsm-dnode-name'));
 		})));
+	sameList('9 台在线 → 8 个节点排 4 行（2/2/2/2）',
+		topoTreeRows(manyCtx.ovTopoHost).map(function (row) {
+			return topoRowNodes(row).length;
+		}), [ 2, 2, 2, 2 ]);
+	same('4 行之间 3 根竖干', topoTreeStems(manyCtx.ovTopoHost).length, 3);
+	check('「还有 1 台」是树里最后一项，不在任何行内',
+		topoTree(manyCtx.ovTopoHost).children[topoTree(manyCtx.ovTopoHost).children.length - 1] ===
+			findByClass(manyCtx.ovTopoHost, 'tsm-dmore') &&
+		topoTreeRows(manyCtx.ovTopoHost).every(function (row) {
+			return findAll(row, function (n) { return hasClass(n, 'tsm-dmore'); }).length === 0;
+		}),
+		'last=' + repr(topoTree(manyCtx.ovTopoHost).children.map(function (n) {
+			return n.attrs['class'];
+		})));
+}
+
+// ---------------------------------------------------------------- 7f. CSS 树状连线
+
+function topoTreeState(count) {
+	const list = [];
+
+	for (let i = 1; i <= count; i++)
+		list.push({ hostname: '终端' + i, link: (i % 2) ? 'wifi' : 'wired', rx_rate: i * 1000, tx_rate: 0 });
+
+	return topoState({ devices: overviewTopoDevices(list) });
+}
+
+/*
+ * 回归截图里的「连线在节点之间横向乱穿」：旧实现用 viewBox 0 0 100 100 +
+ * preserveAspectRatio=none 的百分比 SVG，行高一变竖线就落不到节点顶部，
+ * 多行时每行独立横线看起来像节点串联。现在断言旧代码彻底删掉，并且新 DOM 的
+ * 「trunk → row(bus) → stem → row(bus) ...」顺序与每行节点数都正确。
+ */
+async function testTopoTree() {
+	console.log('\n[7f] CSS 树状连线：删掉百分比 SVG，行总线 / 竖干 / 单节点行');
+
+	check('源码不再有 topoBusSvg', !/function topoBusSvg|topoBusSvg\(/.test(SOURCE),
+		'match=' + repr(SOURCE.match(/topoBusSvg/g)));
+	check('源码不再有 .tsm-tline / tsm-tbus / tsm-otop-grid / tsm-otop-stem',
+		SOURCE.indexOf('.tsm-tline') < 0 && SOURCE.indexOf('tsm-tbus') < 0 &&
+		SOURCE.indexOf('tsm-otop-grid') < 0 && SOURCE.indexOf('tsm-otop-stem') < 0,
+		'hits=' + repr([ '.tsm-tline', 'tsm-tbus', 'tsm-otop-grid', 'tsm-otop-stem' ]
+			.filter(function (needle) { return SOURCE.indexOf(needle) >= 0; })));
+	check('不再用 viewBox 0 0 100 100 / preserveAspectRatio=none 画连线',
+		SOURCE.indexOf("viewBox: '0 0 100 100'") < 0 &&
+		SOURCE.indexOf("preserveAspectRatio: 'none'") < 0 &&
+		SOURCE.indexOf('preserveAspectRatio="none"') < 0,
+		'viewBox=' + repr(SOURCE.match(/viewBox:\s*'[^']*'/g)));
+
+	/* CSS：树 / 树干 / 竖干 / 行 / 总线 / 节点上挑线 / 单节点行 */
+	const treeRule = SOURCE.match(/\.tsm-ttree\{[^}]*\}/);
+	const trunkRule = SOURCE.match(/\.tsm-ttrunk\{[^}]*\}/);
+	const stemRule = SOURCE.match(/\.tsm-tstem\{[^}]*\}/);
+	const rowRule = SOURCE.match(/\.tsm-trow\{[^}]*\}/);
+	const busRule = SOURCE.match(/\.tsm-trow-bus\{[^}]*\}/);
+	const nodeLineRule = SOURCE.match(/\.tsm-dnode::before\{[^}]*\}/);
+
+	check('树容器是纵向 flex、水平居中',
+		treeRule != null && treeRule[0].indexOf('display:flex') >= 0 &&
+		treeRule[0].indexOf('flex-direction:column') >= 0 &&
+		treeRule[0].indexOf('align-items:center') >= 0,
+		'tree=' + repr(treeRule));
+	check('树干 12px、行间竖干 10px、都是不缩放的 1px',
+		SOURCE.indexOf('.tsm-ttrunk{height:12px}') >= 0 &&
+		SOURCE.indexOf('.tsm-tstem{height:10px}') >= 0 &&
+		SOURCE.indexOf('.tsm-ttrunk,.tsm-tstem{flex:none;width:1px;') >= 0,
+		'trunk=' + repr(trunkRule) + ' stem=' + repr(stemRule));
+	check('每行一条总线：absolute top:0 left:25% width:50% 1px',
+		busRule != null && busRule[0].indexOf('position:absolute') >= 0 &&
+		busRule[0].indexOf('top:0') >= 0 && busRule[0].indexOf('left:25%') >= 0 &&
+		busRule[0].indexOf('width:50%') >= 0 && busRule[0].indexOf('height:1px') >= 0,
+		'bus=' + repr(busRule));
+	check('节点从自身顶部向上 12px 连到本行总线（不画进节点内部）',
+		nodeLineRule != null && nodeLineRule[0].indexOf('top:-12px') >= 0 &&
+		nodeLineRule[0].indexOf('left:50%') >= 0 &&
+		nodeLineRule[0].indexOf('height:12px') >= 0 &&
+		nodeLineRule[0].indexOf('translateX(-50%)') >= 0,
+		'nodeLine=' + repr(nodeLineRule));
+	check('行 padding-top 与节点上挑线同高（12px 对齐）',
+		rowRule != null && rowRule[0].indexOf('padding-top:12px') >= 0 &&
+		nodeLineRule != null && nodeLineRule[0].indexOf('height:12px') >= 0,
+		'row=' + repr(rowRule));
+	check('单节点行隐藏总线、节点铺满两列',
+		SOURCE.indexOf('.tsm-trow.is-single .tsm-trow-bus{display:none}') >= 0 &&
+		SOURCE.indexOf('.tsm-trow.is-single .tsm-dnode{grid-column:1 / -1}') >= 0,
+		'single=' + repr(SOURCE.match(/\.tsm-trow\.is-single[^{]*\{[^}]*\}/g)));
+
+	/* 5 台在线：3 行 2/2/1，最后一行 is-single，节点顺序与数据一致 */
+	const five = await boot({ state: topoTreeState(5) });
+	const fiveRows = topoTreeRows(five.ctx.ovTopoHost);
+
+	sameList('5 台 → 3 行（2/2/1）',
+		fiveRows.map(function (row) { return topoRowNodes(row).length; }), [ 2, 2, 1 ]);
+	check('前两行各有 1 条总线，最后一行 is-single 无总线',
+		topoRowBus(fiveRows[0]) != null && topoRowBus(fiveRows[1]) != null &&
+		topoRowBus(fiveRows[2]) == null && hasClass(fiveRows[2], 'is-single') &&
+		!hasClass(fiveRows[0], 'is-single'),
+		'rows=' + repr(fiveRows.map(function (row) {
+			return { n: topoRowNodes(row).length, single: hasClass(row, 'is-single'),
+				bus: topoRowBus(row) != null };
+		})));
+	same('5 台 3 行 → 2 根竖干', topoTreeStems(five.ctx.ovTopoHost).length, 2);
+	check('节点按数据顺序排在行里（终端1..终端5）',
+		fiveRows.map(function (row) {
+			return topoRowNodes(row).map(function (node) {
+				return textOf(findByClass(node, 'tsm-dnode-name'));
+			}).join(',');
+		}).join('|') === '终端1,终端2|终端3,终端4|终端5',
+		'order=' + repr(fiveRows.map(function (row) {
+			return topoRowNodes(row).map(function (node) {
+				return textOf(findByClass(node, 'tsm-dnode-name'));
+			});
+		})));
+	check('树结构顺序：trunk → row → stem → row → stem → row(is-single)',
+		topoTree(five.ctx.ovTopoHost).children.map(function (node) {
+			return node.attrs['class'].split(/\s+/)[0];
+		}).join('|') === 'tsm-ttrunk|tsm-trow|tsm-tstem|tsm-trow|tsm-tstem|tsm-trow' &&
+		hasClass(topoTree(five.ctx.ovTopoHost).children[5], 'is-single'),
+		'children=' + repr(topoTree(five.ctx.ovTopoHost).children.map(function (node) {
+			return node.attrs['class'];
+		})));
+
+	/* 单台：只有一行，is-single，没有总线也没有行间竖干 */
+	const one = await boot({ state: topoTreeState(1) });
+	const oneRows = topoTreeRows(one.ctx.ovTopoHost);
+
+	same('单台 → 1 行', oneRows.length, 1);
+	check('单台行 is-single、无总线、无行间竖干',
+		hasClass(oneRows[0], 'is-single') && topoRowBus(oneRows[0]) == null &&
+		topoTreeStems(one.ctx.ovTopoHost).length === 0,
+		'row=' + repr(oneRows[0] && oneRows[0].attrs));
+	check('单台树干仍在第一行之前',
+		topoTree(one.ctx.ovTopoHost).children[0].attrs['class'] === 'tsm-ttrunk' &&
+		topoTree(one.ctx.ovTopoHost).children[1] === oneRows[0],
+		'children=' + repr(topoTree(one.ctx.ovTopoHost).children.map(function (node) {
+			return node.attrs['class'];
+		})));
+
+	/* 320px：两列不降级、没有固定像素宽度 */
+	const small = SOURCE.match(/@media \(max-width:320px\)\{[\s\S]*?\}\}/);
+
+	check('320px 下 .tsm-trow 仍是两列',
+		small != null && small[0].indexOf('.tsm-trow{grid-template-columns:repeat(2,minmax(0,1fr))}') >= 0,
+		'small=' + repr(small && small[0].match(/\.tsm-trow\{[^}]*\}/g)));
+	check('树/行/总线都没有固定像素宽度',
+		!/\.tsm-ttree\{[^}]*\bwidth:\s*\d+px/.test(SOURCE) &&
+		!/\.tsm-trow\{[^}]*\bwidth:\s*\d+px/.test(SOURCE) &&
+		!/\.tsm-trow-bus\{[^}]*\bwidth:\s*\d+px/.test(SOURCE),
+		'tree=' + repr(treeRule) + ' row=' + repr(rowRule));
 }
 
 async function testTopologyDegrade() {
@@ -2104,34 +2348,38 @@ async function testTopoStyles() {
 		small != null && small[0].indexOf('.tsm-topo .tsm-conn{height:14px}') >= 0,
 		'small=' + repr(small && small[0].slice(0, 240)));
 
-	/* 设备节点 / 连线：两列网格、1.5px 状态环、1px 连线、按 link 上色 */
-	const gridRule = SOURCE.match(/\.tsm-tgroup-body,\.tsm-tnodes,\.tsm-otop-grid\{[^}]*\}/);
+	/* 设备节点 / 连线：两列行网格、1.5px 状态环、1px CSS 连接线、统一线色 */
+	const rowRule = SOURCE.match(/\.tsm-trow\{[^}]*\}/);
 	const ringRule = SOURCE.match(/\.tsm-dnode-ring\{[^}]*\}/);
-	const lineRule = SOURCE.match(/\.tsm-tline\{[^}]*\}/);
+	const busRule = SOURCE.match(/\.tsm-trow-bus\{[^}]*\}/);
+	const nodeLineRule = SOURCE.match(/\.tsm-dnode::before\{[^}]*\}/);
 
-	check('设备节点网格固定两列（minmax(0,1fr) 不横向溢出）',
-		gridRule != null && gridRule[0].indexOf('grid-template-columns:repeat(2,minmax(0,1fr))') >= 0,
-		'grid=' + repr(gridRule));
+	check('设备节点行固定两列（minmax(0,1fr) 不横向溢出）',
+		rowRule != null && rowRule[0].indexOf('grid-template-columns:repeat(2,minmax(0,1fr))') >= 0,
+		'row=' + repr(rowRule));
 	check('设备节点自身没有固定像素宽度（靠网格自适应）',
 		!/\.tsm-dnode\{[^}]*\bwidth:\s*\d+px/.test(SOURCE) &&
 		/\.tsm-dnode\{[^}]*min-width:0/.test(SOURCE),
 		'node=' + repr(SOURCE.match(/\.tsm-dnode\{[^}]*\}/)));
-	check('状态环 1.5px、连线 1px（线宽符合要求）',
+	check('状态环 1.5px、连接线 1px（线宽符合要求）',
 		ringRule != null && ringRule[0].indexOf('border:1.5px solid') >= 0 &&
-		lineRule != null && lineRule[0].indexOf('stroke-width:1;') >= 0,
-		'ring=' + repr(ringRule) + ' line=' + repr(lineRule));
-	check('连线颜色：无线 --tsm-blue / 有线 --tsm-green / 未知 --tsm-sub',
-		/\.tsm-tline-wifi\{[^}]*stroke:var\(--tsm-blue\)/.test(SOURCE) &&
-		/\.tsm-tline-wired\{[^}]*stroke:var\(--tsm-green\)/.test(SOURCE) &&
-		/\.tsm-tline-unknown\{[^}]*stroke:var\(--tsm-sub\)/.test(SOURCE),
-		'lines=' + repr(SOURCE.match(/\.tsm-tline-[a-z]+\{[^}]*\}/g)));
-	check('320px 媒体查询仍把节点网格钉成两列',
+		busRule != null && busRule[0].indexOf('height:1px') >= 0 &&
+		nodeLineRule != null && nodeLineRule[0].indexOf('width:1px') >= 0 &&
+		nodeLineRule[0].indexOf('height:12px') >= 0,
+		'ring=' + repr(ringRule) + ' bus=' + repr(busRule) + ' node=' + repr(nodeLineRule));
+	check('连接线统一用 --tsm-line-strong（不再按 link 给线条上色）',
+		busRule != null && busRule[0].indexOf('background:var(--tsm-line-strong)') >= 0 &&
+		nodeLineRule != null && nodeLineRule[0].indexOf('background:var(--tsm-line-strong)') >= 0 &&
+		!/\.tsm-tline/.test(SOURCE) && SOURCE.indexOf('tsm-tbus') < 0,
+		'bus=' + repr(busRule) + ' node=' + repr(nodeLineRule));
+	check('320px 媒体查询仍把节点行钉成两列',
 		small != null &&
-		small[0].indexOf('.tsm-tgroup-body,.tsm-otop-grid{grid-template-columns:repeat(2,minmax(0,1fr))}') >= 0,
-		'small=' + repr(small && small[0].slice(0, 240)));
-	check('深色主题下连线仍走变量（--tsm-line-strong 由深色块覆盖）',
+		small[0].indexOf('.tsm-trow{grid-template-columns:repeat(2,minmax(0,1fr))}') >= 0,
+		'small=' + repr(small && small[0].slice(0, 300)));
+	check('深色主题下连接线仍走变量（--tsm-line-strong 由深色块覆盖）',
 		dark != null && dark[0].indexOf('--tsm-line-strong:rgba(255,255,255,.18)') >= 0 &&
-		lineRule != null && lineRule[0].indexOf('stroke:var(--tsm-line-strong)') >= 0,
+		busRule != null && busRule[0].indexOf('var(--tsm-line-strong)') >= 0 &&
+		nodeLineRule != null && nodeLineRule[0].indexOf('var(--tsm-line-strong)') >= 0,
 		'dark=' + repr(dark && dark[0].slice(0, 160)));
 
 	const booted = await boot({ state: topoState(), stations: topoStations() });
@@ -2931,6 +3179,7 @@ async function testTouchTargets() {
 		await testTopology();
 		await testDeviceKindOf();
 		await testOverviewTopo();
+		await testTopoTree();
 		await testTopologyDegrade();
 		await testSafetyAndHealth();
 		await testPolling();

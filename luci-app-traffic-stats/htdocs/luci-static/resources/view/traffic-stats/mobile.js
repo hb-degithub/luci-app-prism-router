@@ -879,22 +879,26 @@ var CSS = [
 	'.tsm-xname{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--tsm-text)}',
 	'.tsm-xrate{flex:none;white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--tsm-sub)}',
 	'.tsm-xempty{margin:4px 0 0;font-size:11px;line-height:1.5;color:var(--tsm-sub)}',
-	/* L5 设备：三组；组内是两列「设备节点」网格，节点用 SVG 父子细线连到组头 */
+	/* L5 设备：三组；组内是 CSS 树状连线（树干 → 每行总线 → 节点），行高变化也不会脱节 */
 	'.tsm-tgroups{display:flex;flex-direction:column;gap:10px;min-width:0}',
 	'.tsm-tgroup{min-width:0;padding:2px 10px 8px;border-radius:12px;border:1px solid var(--tsm-line)}',
 	'.tsm-tgroup-h{font-size:11.5px;padding:6px 0 4px;border-bottom:1px solid var(--tsm-line);color:var(--tsm-sub)}',
-	'.tsm-tgroup-body,.tsm-tnodes,.tsm-otop-grid{position:relative;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 8px;min-width:0}',
-	'.tsm-tgroup-body{padding-top:10px}',
-	'.tsm-otop-grid{padding-top:8px}',
-	/* 父子连线：absolute SVG 覆盖层，百分比坐标 + 1px 非缩放描边 */
-	'.tsm-tbus{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;overflow:visible}',
-	'.tsm-tline{fill:none;stroke:var(--tsm-line-strong);stroke-width:1;vector-effect:non-scaling-stroke;stroke-linecap:round}',
-	'.tsm-tline-wifi{stroke:var(--tsm-blue)}',
-	'.tsm-tline-wired{stroke:var(--tsm-green)}',
-	'.tsm-tline-unknown{stroke:var(--tsm-sub)}',
+	'.tsm-tgroup-body{min-width:0}',
+	/* 树：父节点 → 每行一条总线 → 总线向下连到本行每个节点；连接线不跨行、不跨节点 */
+	'.tsm-ttree{position:relative;display:flex;flex-direction:column;align-items:center;width:100%;min-width:0}',
+	'.tsm-ttrunk,.tsm-tstem{flex:none;width:1px;background:var(--tsm-line-strong)}',
+	'.tsm-ttrunk{height:12px}',
+	'.tsm-tstem{height:10px}',
+	'.tsm-trow{position:relative;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:8px;row-gap:0;width:100%;min-width:0;padding-top:12px}',
+	'.tsm-trow-bus{position:absolute;top:0;left:25%;width:50%;height:1px;background:var(--tsm-line-strong);pointer-events:none}',
+	'.tsm-trow.is-single .tsm-trow-bus{display:none}',
+	'.tsm-trow.is-single .tsm-dnode{grid-column:1 / -1}',
+	'.tsm-ttree>.tsm-dmore{align-self:stretch;margin-top:8px}',
 	/* 设备节点：状态环 + 类型图标 + 名称（2 行省略）+ 速率 */
 	'.tsm-dnode{position:relative;display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0;padding:4px 2px;border-radius:10px;cursor:pointer;text-align:center}',
 	'.tsm-dnode:active{background:var(--tsm-soft)}',
+	/* 节点到本行总线的竖线：从节点顶部向上 12px（正好是 .tsm-trow 的 padding-top） */
+	'.tsm-dnode::before{content:"";position:absolute;top:-12px;left:50%;width:1px;height:12px;background:var(--tsm-line-strong);transform:translateX(-50%);pointer-events:none}',
 	'.tsm-dnode-ring{flex:none;width:46px;height:46px;border-radius:50%;border:1.5px solid var(--tsm-line-strong);display:flex;align-items:center;justify-content:center;background:var(--tsm-card-bg);color:var(--tsm-sub)}',
 	'.tsm-dnode.is-wifi .tsm-dnode-ring{border-color:var(--tsm-blue);color:var(--tsm-blue)}',
 	'.tsm-dnode.is-wired .tsm-dnode-ring{border-color:var(--tsm-green);color:var(--tsm-green)}',
@@ -906,19 +910,16 @@ var CSS = [
 	'.tsm-dnode-name{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;font-size:11.5px;line-height:1.35;overflow-wrap:break-word;color:var(--tsm-text);max-width:100%}',
 	'.tsm-dnode-rate{font-size:10.5px;line-height:1.3;color:var(--tsm-sub);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}',
 	'.tsm-dmore{display:flex;align-items:center;justify-content:center;min-height:46px;padding:2px 4px;border-radius:10px;border:1px dashed var(--tsm-line-strong);font-size:11px;line-height:1.4;color:var(--tsm-sub);text-align:center}',
-	/* 只有一个节点时居中铺满两列，和单根分叉线对齐 */
-	'.tsm-tgroup-body>.tsm-dnode:only-of-type,.tsm-otop-grid>.tsm-dnode:only-of-type{grid-column:1 / -1}',
-	/* 概览屏「设备拓扑」：主路由根节点 → 树干 → 两列节点 */
+	/* 概览屏「设备拓扑」：主路由根节点 → 树干 → 每行总线 → 两列节点 */
 	'.tsm-otopo{margin:10px 0 0;padding:12px 10px 10px;border-radius:14px;border:1px solid var(--tsm-line);background:var(--tsm-card-bg);min-width:0}',
 	'.tsm-otop-root{display:flex;flex-direction:column;align-items:center;gap:5px;min-width:0}',
 	'.tsm-otop-ico{flex:none;width:46px;height:46px;border-radius:50%;background:var(--tsm-green);display:flex;align-items:center;justify-content:center}',
 	'.tsm-otop-ico svg{display:block;width:28px;height:28px}',
 	'.tsm-otop-name{max-width:100%;font-size:11.5px;line-height:1.4;color:var(--tsm-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-	'.tsm-otop-stem{width:1px;height:10px;margin:0 auto;background:var(--tsm-line-strong)}',
 	'.tsm-otop-empty{margin:6px 0 0;text-align:center;font-size:12px;line-height:1.5;color:var(--tsm-sub)}',
 	/* 320px 窄屏：拓扑卡片全部省略号 + 收紧层间距，绝不横向溢出 */
 	'@media (max-width:359px){.tsm-exits{grid-template-columns:1fr 1fr}.tsm-exit{padding:8px}.tsm-exit-name{font-size:12px}.tsm-aps{grid-template-columns:1fr}.tsm-tl-h{margin-bottom:4px}.tsm-conn{height:16px}.tsm-dnode-name{font-size:11px}}',
-	'@media (max-width:320px){.tsm-topo .tsm-exits{grid-template-columns:1fr}.tsm-topo .tsm-exit{padding:7px 8px}.tsm-topo .tsm-exit-name,.tsm-topo .tsm-ap-name,.tsm-topo .tsm-router-name,.tsm-topo .tsm-inet-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-topo .tsm-conn{height:14px}.tsm-topo .tsm-tl-h{margin-bottom:4px}.tsm-topo .tsm-ap{padding:8px}.tsm-topo .tsm-router-card{gap:8px;padding:10px}.tsm-topo .tsm-router-ico{width:38px;height:38px}.tsm-topo .tsm-router-ico svg{width:24px;height:24px}.tsm-topo .tsm-xname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-tgroup-body,.tsm-otop-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.tsm-dnode-ring{width:40px;height:40px}.tsm-dnode-ico,.tsm-dnode-ico svg{width:20px;height:20px}.tsm-otopo{padding:10px 8px 8px}.tsm-dsearch{padding:0 8px;gap:4px;margin-left:0;margin-right:0}}',
+	'@media (max-width:320px){.tsm-topo .tsm-exits{grid-template-columns:1fr}.tsm-topo .tsm-exit{padding:7px 8px}.tsm-topo .tsm-exit-name,.tsm-topo .tsm-ap-name,.tsm-topo .tsm-router-name,.tsm-topo .tsm-inet-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-topo .tsm-conn{height:14px}.tsm-topo .tsm-tl-h{margin-bottom:4px}.tsm-topo .tsm-ap{padding:8px}.tsm-topo .tsm-router-card{gap:8px;padding:10px}.tsm-topo .tsm-router-ico{width:38px;height:38px}.tsm-topo .tsm-router-ico svg{width:24px;height:24px}.tsm-topo .tsm-xname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-trow{grid-template-columns:repeat(2,minmax(0,1fr))}.tsm-dnode-ring{width:40px;height:40px}.tsm-dnode-ico,.tsm-dnode-ico svg{width:20px;height:20px}.tsm-otopo{padding:10px 8px 8px}.tsm-dsearch{padding:0 8px;gap:4px;margin-left:0;margin-right:0}}',
 	/* 深色主题：只改背景/分隔线/次级文字，橙/绿/蓝强调色保持不变；不用纯黑 */
 	'@media (prefers-color-scheme: dark){#ts-mobile{--tsm-card-bg:#1c2026;--tsm-line:rgba(255,255,255,.1);--tsm-line-strong:rgba(255,255,255,.18);--tsm-text:#e7eaee;--tsm-sub:#a4abb5;--tsm-soft:rgba(255,255,255,.06);--tsm-dots-bg:linear-gradient(to top,rgba(20,23,27,.99) 55%,rgba(20,23,27,.86));background:#14171b;color:#e7eaee}#ts-mobile .tsm-tabs,#ts-mobile .tsm-dtabs{background:#1c2026}#ts-mobile .tsm-dot-i{background:rgba(255,255,255,.22)}#ts-mobile .tsm-dot-i.on{background:#e7eaee}#ts-mobile .tsm-nhero{background:linear-gradient(180deg,rgba(255,111,0,.14) 0%,rgba(255,111,0,.05) 60%,rgba(20,23,27,0) 100%)}#ts-mobile .tsm-tab.on{color:#e7eaee}#ts-mobile .tsm-health{background:rgba(255,255,255,.05)}}'
 ].join('\n');
@@ -1612,44 +1613,43 @@ var TOPO_NODE_COLS = 2;      /* 设备节点网格固定两列（320px 也不降
 var OVERVIEW_TOPO_MAX = 8;   /* 概览屏设备拓扑最多 8 个节点 */
 
 /*
- * 父子细线：在 position:relative 容器里铺一张 absolute SVG，
- * 用 0..100 百分比坐标从顶部中点画出「树干 → 每行分叉 → 每个节点」。
- * preserveAspectRatio=none + non-scaling-stroke，线条始终 1px 不随屏幕拉伸。
+ * 树状连线：纯 CSS 布局线（.tsm-ttrunk / .tsm-tstem / .tsm-trow-bus + 节点 ::before）。
+ *
+ * 之前用 position:absolute 的 SVG + viewBox 0 0 100 100 百分比坐标画线：设备名一/两行
+ * 会让真实行高和百分比错位，竖线落不到节点顶部；每行横线是独立路径，多行时看起来
+ * 像在节点之间横向串联。改成「父节点竖干 → 每行自己的总线 → 总线向下连本行每个节点」
+ * 的 DOM 结构后，线跟着 grid 行高走：行内只有一条总线，行与行之间只有一根竖干，
+ * 不再有任何跨节点的横向连线。
+ *
+ * nodes 按 TOPO_NODE_COLS 分行：两列 → 总线落在 25%/75%（两列中心）；单节点行去掉
+ * 总线并让节点铺满两列，竖线自然落在正中。tail（「还有 N 台」）放在最后一行之后，
+ * 不参与连线。
  */
-function topoBusSvg(count, cols, links, cls) {
-	var n = Math.max(0, Math.floor(num(count)));
-	/* 只有 1 个节点时不占两列（节点本身会横向铺满，线从正中下来）。 */
-	var c = (n <= 1) ? 1 : ((typeof cols === 'number' && cols > 0) ? Math.floor(cols) : TOPO_NODE_COLS);
-	var rows = Math.max(1, Math.ceil(n / c));
-	var drop = Math.min(6, 100 / rows / 2);
-	var list = Array.isArray(links) ? links : [];
-	var fallback = (typeof links === 'string') ? links : '';
-	var svg = svgEl('svg', {
-		'class': 'tsm-tbus' + ((cls != null && ('' + cls).length) ? ' ' + cls : ''),
-		viewBox: '0 0 100 100', preserveAspectRatio: 'none',
-		'aria-hidden': 'true', focusable: 'false'
-	});
-	var i, link, x, rowTop;
+function topoTree(nodes, tail) {
+	var cols = TOPO_NODE_COLS;
+	var list = Array.isArray(nodes) ? nodes : [];
+	var tree = E('div', { 'class': 'tsm-ttree' }, [
+		E('div', { 'class': 'tsm-ttrunk' }, '')
+	]);
+	var i, row, single, children = [];
 
-	function line(d, kind) {
-		svg.appendChild(svgEl('path', {
-			d: d,
-			'class': 'tsm-tline' + (kind ? ' tsm-tline-' + kind : ''),
-			'vector-effect': 'non-scaling-stroke'
-		}));
+	for (i = 0; i < list.length; i += cols) {
+		row = list.slice(i, i + cols);
+		single = row.length < 2;
+		children = single ? [] : [ E('div', { 'class': 'tsm-trow-bus' }, '') ];
+
+		if (i > 0)
+			tree.appendChild(E('div', { 'class': 'tsm-tstem' }, ''));
+
+		tree.appendChild(E('div', {
+			'class': 'tsm-trow' + (single ? ' is-single' : '')
+		}, children.concat(row)));
 	}
 
-	/* 树干：从父节点/组头正下方一路到最后一行的分叉高度。 */
-	line('M50 0V' + ((rows - 1) * 100 / rows + drop).toFixed(2), '');
+	if (tail)
+		tree.appendChild(tail);
 
-	for (i = 0; i < n; i++) {
-		link = list[i] || fallback;
-		x = (((i % c) + 0.5) * 100 / c).toFixed(2);
-		rowTop = (Math.floor(i / c) * 100 / rows).toFixed(2);
-		line('M50 ' + rowTop + 'H' + x + 'V' + (Number(rowTop) + drop).toFixed(2), link);
-	}
-
-	return svg;
+	return tree;
 }
 
 /* 节点速率小字：一格只放一行，下行优先；上行放在 title 里。 */
@@ -2642,14 +2642,12 @@ return view.extend({
 			var shown = list.slice(0, TOPO_MAX_DEVICES);
 			var rest = list.length - shown.length;
 			var nodes = shown.map(function(dev) { return self.renderDeviceNode(dev); });
-
-			if (rest > 0)
-				nodes.push(E('div', { 'class': 'tsm-dmore' }, _('还有') + ' ' + rest + ' ' + _('台')));
+			var tail = (rest > 0) ?
+				E('div', { 'class': 'tsm-dmore' }, _('还有') + ' ' + rest + ' ' + _('台')) : null;
 
 			blocks.push(E('div', { 'class': 'tsm-tgroup tsm-tgroup-' + id }, [
 				E('div', { 'class': 'tsm-tgroup-h' }, _(LINK_STYLE[id].label) + ' ' + list.length),
-				E('div', { 'class': 'tsm-tgroup-body' },
-					[ topoBusSvg(shown.length, TOPO_NODE_COLS, id) ].concat(nodes))
+				E('div', { 'class': 'tsm-tgroup-body' }, topoTree(nodes, tail))
 			]));
 		});
 
@@ -3343,7 +3341,7 @@ return view.extend({
 		dom.content(host, this.renderOverviewTopo(shown, rest, name, now));
 	},
 
-	/* 主路由根节点 + 树干 + 两列节点；0 台在线时只给占位，不造假节点。 */
+	/* 主路由根节点 → 树（树干/每行总线/节点）；0 台在线时只给占位，不造假节点。 */
 	renderOverviewTopo: function(shown, rest, hostname, now) {
 		var self = this;
 		var root = E('div', { 'class': 'tsm-otop-root' }, [
@@ -3351,6 +3349,7 @@ return view.extend({
 			E('span', { 'class': 'tsm-otop-name', title: hostname }, hostname)
 		]);
 		var nodes;
+		var tail;
 
 		if (!shown.length) {
 			return E('div', {}, [
@@ -3360,15 +3359,12 @@ return view.extend({
 		}
 
 		nodes = shown.map(function(dev) { return self.renderDeviceNode(dev, now); });
-
-		if (rest > 0)
-			nodes.push(E('div', { 'class': 'tsm-dmore' }, _('还有') + ' ' + rest + ' ' + _('台')));
+		tail = (rest > 0) ?
+			E('div', { 'class': 'tsm-dmore' }, _('还有') + ' ' + rest + ' ' + _('台')) : null;
 
 		return E('div', {}, [
 			root,
-			E('div', { 'class': 'tsm-otop-stem' }, ''),
-			E('div', { 'class': 'tsm-otop-grid' },
-				[ topoBusSvg(shown.length, TOPO_NODE_COLS, shown.map(linkOf)) ].concat(nodes))
+			topoTree(nodes, tail)
 		]);
 	},
 
