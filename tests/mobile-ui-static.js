@@ -13,6 +13,7 @@
  * 这些都只是浏览器原语的替身，不复制 mobile.js 的任何业务判断。
  *
  * 覆盖：
+ *   0. 环境：localStorage 桩（memory / throw / getter-throw / none）供离线快照测试
  *   1. 结构：根 #ts-mobile.tsm-app、5 个 .tsm-page、5 个 .tsm-dot-btn、默认第 1 屏
  *   2. 分页 setPage 夹紧，只改 class，不发 RPC
  *   3. 概览数据：上传/下载速率、出口节点、连接数角标、在线台数
@@ -27,6 +28,18 @@
  *  11. get_nodes 先成功后失败：旧卡片保留 + 顶部错误提示
  *  12. 后端裁剪：state.truncated / dev.apps_truncated 提示
  *  13. 静态样式：关键点击区 ≥44×44、概览数字不被旧规则压暗、拓扑主题变量
+ *  14~21. 懒加载 / 下钻 / 搜索 / 下拉刷新 / 骨架屏 / 切屏过渡 / 安全区 / 迷你趋势 / Top3
+ *  23. 离线快照写入：键名、字段白名单（不含 apps/token/secret）、不超 64KB
+ *  24. 64KB 上限：devices 截断到 200 条并标 truncated
+ *  25. 首屏失败：读快照渲染 + 离线条文案与时间
+ *  26. online 事件：清除离线条并重新请求
+ *  27. 连续 3 次自动失败停表，手动重试仍可用
+ *  28. 快照过期：24 小时不再使用、清掉并提示「快照已过期」
+ *  29. 损坏 JSON / 结构不对：删除且不崩
+ *  30. localStorage 不可用（抛错 / 取不到 / 不存在）：静默降级
+ *  31. 「清除离线数据」删除 localStorage 键
+ *  32. 安全：无危险 DOM、快照不进 title / 属性 / DOM 文本
+ *  33. 运行中刷新失败：顶部离线条，恢复后自动收起
  *
  * 时钟：mobile.js 用真实时间（Date.now）判断在线/陈旧，所以沙箱里的 Date 固定成 NOW，
  * 让 NOW 相对的 last_seen 断言不随真实时钟漂移。
@@ -315,7 +328,28 @@ function findByClass(root, name) {
 
 // ---------------------------------------------------------------- 环境桩
 
-function makeEnvironment() {
+/*
+ * localStorage 的最小可信替身：只存文本，不做配额模拟。
+ * 三种「不可用」模式由 makeEnvironment({ storage }) 选择：
+ *   'memory'（默认，正常浏览器）/ 'throw'（读写抛错，配额满或安全策略）
+ *   / 'getter-throw'（连 window.localStorage 都取不到）/ 'none'（属性不存在）。
+ */
+function makeMemoryStore(seed) {
+	const map = new Map();
+
+	Object.keys(seed || {}).forEach(function (key) { map.set(key, '' + seed[key]); });
+
+	return {
+		getItem: function (key) { return map.has(key) ? map.get(key) : null; },
+		setItem: function (key, value) { map.set(key, '' + value); },
+		removeItem: function (key) { map.delete(key); },
+		clear: function () { map.clear(); },
+		__map: map
+	};
+}
+
+function makeEnvironment(options) {
+	const opts = options || {};
 	const declarations = [];
 	const calls = [];
 	const responses = {};
@@ -497,6 +531,35 @@ function makeEnvironment() {
 	env.__body = body;
 	env.__head = head;
 
+	/*
+	 * 离线快照用的 localStorage：默认可用；'throw' / 'getter-throw' / 'none'
+	 * 模拟隐私模式、配额满、被策略禁掉的浏览器。种子数据用来复现"上次成功"的快照。
+	 */
+	const store = makeMemoryStore(opts.seed || {});
+	const storageMode = opts.storage || 'memory';
+
+	if (storageMode === 'throw') {
+		store.getItem = function () { throw new Error('SecurityError: localStorage is not available'); };
+		store.setItem = function () { throw new Error('QuotaExceededError: quota exceeded'); };
+		store.removeItem = function () { throw new Error('SecurityError: localStorage is not available'); };
+	}
+
+	if (storageMode === 'getter-throw') {
+		Object.defineProperty(env.window, 'localStorage', {
+			configurable: true,
+			get: function () { throw new Error('SecurityError: access denied'); }
+		});
+	}
+	else if (storageMode === 'none') {
+		env.window.localStorage = undefined;
+	}
+	else {
+		env.window.localStorage = store;
+	}
+
+	env.__store = store;
+	env.__storageMode = storageMode;
+
 	return env;
 }
 
@@ -547,11 +610,25 @@ const HOOK_NAMES = [
 	'stationFreshness',
 	'stationNodeKey',
 	'stationNodeName',
-	'apOnlineCount'
+	'apOnlineCount',
+	'offlineText',
+	'fmtHHMM',
+	'buildSnapshot',
+	'snapshotJson',
+	'writeSnapshot',
+	'readSnapshot',
+	'removeSnapshot',
+	'stateFromSnapshot',
+	'snapStore',
+	'snapBytes',
+	'SNAPSHOT_KEY',
+	'SNAPSHOT_MAX_BYTES',
+	'SNAPSHOT_MAX_AGE_SEC',
+	'SNAPSHOT_MAX_DEVICES'
 ];
 
-function loadMobile() {
-	const env = makeEnvironment();
+function loadMobile(options) {
+	const env = makeEnvironment(options);
 	const context = vm.createContext(env);
 	const marker = '\nreturn view.extend({';
 	const patched = SOURCE.replace(
@@ -600,7 +677,7 @@ function baseState(overrides) {
 
 async function boot(options) {
 	const opts = options || {};
-	const loaded = loadMobile();
+	const loaded = loadMobile({ storage: opts.storage, seed: opts.seed });
 	const env = loaded.env;
 
 	env.__responses.get_state = (opts.state !== undefined) ? opts.state : baseState();
@@ -3841,6 +3918,602 @@ async function testOverviewTop3() {
 		findAll(emptyCtx.topDevBox, function (n) { return n.listeners && n.listeners.click; }).length, 0);
 }
 
+// ---------------------------------------------------------------- 23~33. 离线快照
+
+/* 键名在这里写死：这是需求约定，不能只信 mobile.js 自己导出的常量。 */
+const SNAPSHOT_KEY = 'prismRouterMobileSnapshot.v1';
+
+const SNAPSHOT_TOTALS_OK = [
+	'rx_rate', 'tx_rate',
+	'direct_rx', 'direct_tx', 'proxy_rx', 'proxy_tx',
+	'wifi_rx', 'wifi_tx', 'wired_rx', 'wired_tx', 'unknown_rx', 'unknown_tx'
+];
+const SNAPSHOT_DEVICE_OK = [ 'name', 'mac', 'ip', 'link', 'rx_rate', 'tx_rate', 'last_seen' ];
+const SNAPSHOT_TOP_OK = [ 'v', 'ts', 'totals', 'devices', 'health', 'nodes', 'quota', 'truncated' ];
+
+function two(n) { return (n < 10 ? '0' : '') + n; }
+
+function hhmm(ts) {
+	const d = new Date(ts * 1000);
+
+	return two(d.getHours()) + ':' + two(d.getMinutes());
+}
+
+/* 一份"真实"的 state：带 node/health/quota，也带绝不该落盘的 token/secret/apps。 */
+function offlineState() {
+	return baseState({
+		totals: {
+			direct_rx: 1024, direct_tx: 2048, proxy_rx: 4096, proxy_tx: 8192,
+			wifi_rx: 100, wifi_tx: 200, wired_rx: 300, wired_tx: 400,
+			unknown_rx: 0, unknown_tx: 0,
+			rx_rate: 125000, tx_rate: 250000
+		},
+		health: { accounting_confidence: 'degraded', reasons: [ 'nft 计数回退' ] },
+		nodes: { 'HK-01': { rx: 4096, tx: 8192 }, 'JP-02': { rx: 1024, tx: 2048 } },
+		quota: { total_limit: 1073741824, period: '2026-11' },
+		devices: [
+			{
+				hostname: '客厅电视', mac: 'AA:BB:CC:00:00:01', ip: '192.168.1.11', link: 'wifi',
+				rx_rate: 1000, tx_rate: 2000, last_seen: NOW - 30, direct_rx: 11,
+				apps: [ { host: 'secret.example.com', rx: 1 } ], token: 'tok-device-SHOULD-NOT-LEAK'
+			},
+			{
+				hostname: '书房台式', mac: 'AA:BB:CC:00:00:02', ip: '192.168.1.12', link: 'wired',
+				rx_rate: 3000, tx_rate: 4000, last_seen: NOW - 20, token: 'tok-device-2'
+			}
+		],
+		token: 'tok-state-SHOULD-NOT-LEAK',
+		secret: 'sec-SHOULD-NOT-LEAK',
+		apps: [ { host: 'secret.example.com', rx: 9, tx: 9 } ]
+	});
+}
+
+/* 造一批设备：名称够长，3000 台足以把 JSON 撑过 64KB。 */
+function bulkDevices(count) {
+	const list = [];
+
+	for (let i = 0; i < count; i++) {
+		list.push({
+			hostname: 'bulk-device-' + i + '-' + 'x'.repeat(60),
+			mac: 'AA:BB:CC:11:22:' + (i % 256),
+			ip: '10.0.' + Math.floor(i / 250) + '.' + (i % 250),
+			link: (i % 2) ? 'wifi' : 'wired',
+			rx_rate: i, tx_rate: i + 1, last_seen: NOW - 5,
+			direct_rx: i, proxy_rx: i
+		});
+	}
+
+	return list;
+}
+
+/* 成功同步一次拿到的快照文本（模拟"上次能连上后端时留下的副本"）。 */
+async function snapshotFixture(state) {
+	const first = await boot({ state: state || offlineState() });
+
+	return first.env.__store.getItem(SNAPSHOT_KEY);
+}
+
+async function testSnapshotWrite() {
+	console.log('\n[23] 快照写入：键正确 / 字段白名单 / 不含 apps·token·secret');
+
+	const booted = await boot({ state: offlineState() });
+	const env = booted.env;
+	const hooks = booted.hooks;
+	const key = hooks.SNAPSHOT_KEY;
+	const raw = env.__store.getItem(key);
+
+	check('成功同步后写入了快照', raw != null, 'raw=' + repr(raw && raw.slice(0, 80)));
+	same('导出的键名正确', key, SNAPSHOT_KEY);
+	check('源码里用的是约定键名', SOURCE.indexOf("'" + SNAPSHOT_KEY + "'") >= 0,
+		'match=' + repr((SOURCE.match(/SNAPSHOT_KEY\s*=\s*'[^']*'/) || [])[0]));
+	same('写入的是同一个键', env.__store.getItem(SNAPSHOT_KEY), raw);
+
+	if (raw == null) return;
+
+	const snap = JSON.parse(raw);
+
+	same('快照版本 v=1', snap.v, 1);
+	same('快照 ts = state.ts', snap.ts, NOW);
+	sameList('快照顶层字段都在白名单内',
+		Object.keys(snap).filter(function (k) { return SNAPSHOT_TOP_OK.indexOf(k) < 0; }), []);
+
+	check('totals 保留速率与累计',
+		snap.totals.rx_rate === 125000 && snap.totals.tx_rate === 250000 &&
+		snap.totals.direct_rx === 1024 && snap.totals.proxy_tx === 8192,
+		'totals=' + repr(snap.totals));
+	sameList('totals 只含白名单字段',
+		Object.keys(snap.totals).filter(function (k) { return SNAPSHOT_TOTALS_OK.indexOf(k) < 0; }), []);
+
+	same('devices 条数', snap.devices.length, 2);
+	sameList('devices 只含白名单字段',
+		snap.devices.reduce(function (acc, dev) {
+			return acc.concat(Object.keys(dev).filter(function (k) {
+				return SNAPSHOT_DEVICE_OK.indexOf(k) < 0;
+			}));
+		}, []), []);
+	same('设备名写在 name 字段', snap.devices[0].name, '客厅电视');
+	same('设备名不再是 hostname 字段', Object.prototype.hasOwnProperty.call(snap.devices[0], 'hostname'), false);
+	same('设备不存 apps', Object.prototype.hasOwnProperty.call(snap.devices[0], 'apps'), false);
+	check('设备速率 / 链路 / last_seen 保留',
+		snap.devices[1].rx_rate === 3000 && snap.devices[1].tx_rate === 4000 &&
+		snap.devices[1].link === 'wired' && snap.devices[1].last_seen === NOW - 20,
+		'dev=' + repr(snap.devices[1]));
+
+	sameList('health 只含 confidence / reasons', Object.keys(snap.health).sort(), [ 'confidence', 'reasons' ]);
+	same('health.confidence 取自 accounting_confidence', snap.health.confidence, 'degraded');
+	sameList('health.reasons 原样保留', snap.health.reasons, [ 'nft 计数回退' ]);
+	same('nodes 保留出口 rx', snap.nodes['HK-01'].rx, 4096);
+	same('nodes 保留出口 tx', snap.nodes['HK-01'].tx, 8192);
+	same('quota 保留 total_limit', snap.quota.total_limit, 1073741824);
+	same('quota 保留 period', snap.quota.period, '2026-11');
+
+	check('快照文本不含 token / secret',
+		raw.indexOf('token') < 0 && raw.indexOf('secret') < 0 && raw.indexOf('SHOULD-NOT-LEAK') < 0,
+		'raw=' + repr(raw.slice(0, 200)));
+	check('快照文本不含 apps 明细',
+		raw.indexOf('apps') < 0 && raw.indexOf('secret.example.com') < 0,
+		'raw=' + repr(raw.slice(0, 200)));
+	check('快照 JSON 在 64KB 以内',
+		hooks.snapBytes(raw) <= hooks.SNAPSHOT_MAX_BYTES,
+		'bytes=' + hooks.snapBytes(raw) + ' 上限=' + hooks.SNAPSHOT_MAX_BYTES);
+	check('小快照不标 truncated', snap.truncated !== true, 'truncated=' + repr(snap.truncated));
+	same('snapBytes 按 UTF-8 计（中文 3 字节）', hooks.snapBytes('中'), 3);
+}
+
+async function testSnapshotTruncate() {
+	console.log('\n[24] 64KB 上限：devices 截断到 200 条并标 truncated');
+
+	const booted = await boot({ state: baseState() });
+	const env = booted.env;
+	const hooks = booted.hooks;
+
+	same('超限快照仍然写入成功', hooks.writeSnapshot(baseState({ devices: bulkDevices(3000) })), true);
+
+	const raw = env.__store.getItem(SNAPSHOT_KEY);
+
+	check('超限时 JSON 不超过 64KB',
+		hooks.snapBytes(raw) <= hooks.SNAPSHOT_MAX_BYTES,
+		'bytes=' + hooks.snapBytes(raw) + ' 上限=' + hooks.SNAPSHOT_MAX_BYTES);
+
+	const snap = JSON.parse(raw);
+
+	same('truncated 标记为 true', snap.truncated, true);
+	same('devices 截断到 200 条', snap.devices.length, hooks.SNAPSHOT_MAX_DEVICES);
+	same('截断后仍是 200 条上限常量', hooks.SNAPSHOT_MAX_DEVICES, 200);
+	same('截断后 ts 仍保留', snap.ts, NOW);
+	check('截断后 totals 仍保留', snap.totals.rx_rate === 0 && snap.totals.tx_rate === 0,
+		'totals=' + repr(snap.totals));
+
+	/* 小数据不该被截断：3 台设备原样保留，也没有 truncated 标记 */
+	hooks.writeSnapshot(baseState({ devices: bulkDevices(3) }));
+
+	const small = JSON.parse(env.__store.getItem(SNAPSHOT_KEY));
+
+	same('小数据 devices 全保留', small.devices.length, 3);
+	check('小数据没有 truncated 标记', small.truncated !== true, 'truncated=' + repr(small.truncated));
+
+	/* snapshotJson 是纯函数：超限时自己就能收敛到上限内 */
+	const huge = hooks.snapshotJson(hooks.buildSnapshot(baseState({ devices: bulkDevices(3000) })));
+
+	check('snapshotJson 自己就收敛到 64KB',
+		huge != null && hooks.snapBytes(huge) <= hooks.SNAPSHOT_MAX_BYTES,
+		'bytes=' + (huge == null ? 'null' : hooks.snapBytes(huge)));
+	same('snapshotJson 结果的 devices 也是 200 条', JSON.parse(huge).devices.length, 200);
+	same('还原后的 state 也带 truncated（设备屏提示列表已裁剪）',
+		hooks.stateFromSnapshot(snap).truncated, true);
+}
+
+async function testSnapshotRestore() {
+	console.log('\n[25] 首屏失败：读快照渲染 + 离线条文案与时间');
+
+	const raw = await snapshotFixture();
+	const booted = await boot({
+		rejectState: new Error('NetworkError: offline'),
+		seed: { [SNAPSHOT_KEY]: raw }
+	});
+	const ctx = booted.ctx;
+
+	check('callState reject 后仍渲染出快照数据', ctx.state != null, 'state=' + repr(ctx.state));
+	check('离线条可见（display=flex）', ctx.offlineBar.style.display === 'flex',
+		'display=' + repr(ctx.offlineBar.style.display));
+	check('根节点带 tsm-offline-on（顶部 tab 下移，不遮内容）', hasClass(ctx.root, 'tsm-offline-on'),
+		'class=' + repr(ctx.root.attrs['class']));
+	same('离线条文案', textOf(ctx.offlineTextNode),
+		'离线数据 · 更新于 ' + hhmm(NOW) + '（0 分钟前）');
+	same('重试按钮文案', textOf(ctx.offlineRetryBtn), '重试');
+	same('概览上传速率来自快照', textOf(ctx.txNum), '2.0');
+	same('概览下载速率来自快照', textOf(ctx.rxNum), '1.0');
+
+	const names = deviceNames(ctx);
+
+	check('设备屏渲染出快照里的设备',
+		names.indexOf('客厅电视') >= 0 && names.indexOf('书房台式') >= 0,
+		'names=' + repr(names));
+	same('在线终端数按 last_seen 算', textOf(ctx.devPill), '2 台终端');
+	check('「更新于」用的是快照时间', textOf(ctx.updatedNode).indexOf(hhmm(NOW)) === 0,
+		'updated=' + repr(textOf(ctx.updatedNode)));
+	check('顶部不显示「暂无数据」', textOf(ctx.noticeNode).indexOf('暂无数据') < 0,
+		'notice=' + repr(textOf(ctx.noticeNode)));
+
+	/* N 分钟前：按快照 ts 与真实时间算，不看 state */
+	const oldState = offlineState();
+
+	oldState.ts = NOW - 900;
+
+	const older = await boot({ state: oldState });
+	const olderBoot = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: older.env.__store.getItem(SNAPSHOT_KEY) }
+	});
+
+	same('15 分钟前的快照文案', textOf(olderBoot.ctx.offlineTextNode),
+		'离线数据 · 更新于 ' + hhmm(NOW - 900) + '（15 分钟前）');
+
+	/* 首屏成功时不显示离线条 */
+	const online = await boot({ state: offlineState() });
+
+	same('成功首屏不显示离线条', online.ctx.offlineBar.style.display, 'none');
+	check('成功首屏不加 tsm-offline-on', !hasClass(online.ctx.root, 'tsm-offline-on'),
+		'class=' + repr(online.ctx.root.attrs['class']));
+}
+
+async function testSnapshotOnline() {
+	console.log('\n[26] online 事件：清除离线条并重新请求');
+
+	const raw = await snapshotFixture();
+	const booted = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: raw }
+	});
+	const ctx = booted.ctx;
+	const env = booted.env;
+
+	same('离线条初始可见', ctx.offlineBar.style.display, 'flex');
+
+	const onlineFns = env.__windowEvents
+		.filter(function (e) { return e.action === 'add' && e.type === 'online'; })
+		.map(function (e) { return e.fn; });
+
+	same('注册了恰好一个 online 监听', onlineFns.length, 1);
+
+	env.__responses.get_state = baseState({
+		totals: {
+			direct_rx: 0, direct_tx: 0, proxy_rx: 0, proxy_tx: 0,
+			rx_rate: 2500000, tx_rate: 5000000
+		}
+	});
+	delete env.__rejections.get_state;
+
+	const before = countCalls(env, 'get_state');
+
+	onlineFns[0]();
+	await flush();
+	await flush();
+
+	same('online 后重新请求 get_state', countCalls(env, 'get_state'), before + 1);
+	same('online 后清除离线条', ctx.offlineBar.style.display, 'none');
+	check('online 后去掉 tsm-offline-on', !hasClass(ctx.root, 'tsm-offline-on'),
+		'class=' + repr(ctx.root.attrs['class']));
+	same('online 后 offlineInfo 清空', ctx.offlineInfo, null);
+	same('恢复后数字来自新数据（上传）', textOf(ctx.txNum), '40.0');
+	same('恢复后数字来自新数据（下载）', textOf(ctx.rxNum), '20.0');
+	check('恢复后快照被覆盖为最新数据',
+		JSON.parse(env.__store.getItem(SNAPSHOT_KEY)).totals.tx_rate === 5000000,
+		'snap=' + repr(env.__store.getItem(SNAPSHOT_KEY)));
+}
+
+async function testOfflineGiveUp() {
+	console.log('\n[27] 连续 3 次自动失败：停止轮询，保留手动重试');
+
+	const raw = await snapshotFixture();
+	const booted = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: raw }
+	});
+	const ctx = booted.ctx;
+	const env = booted.env;
+	const timer = Array.from(env.__timers.active.values())[0];
+
+	check('轮询在跑', timer != null && env.__timers.active.size === 1,
+		'active=' + env.__timers.active.size);
+
+	for (let i = 1; i <= 3; i++) {
+		timer.fn();
+		await flush();
+		await flush();
+
+		same('第 ' + i + ' 次自动失败后 offlineFails=' + i, ctx.offlineFails, i);
+	}
+
+	same('3 次失败后停表', env.__timers.active.size, 0);
+	same('3 次失败后 timer=null', ctx.timer, null);
+	same('3 次失败后标记 offlineGivenUp', ctx.offlineGivenUp, true);
+	same('停表后离线条仍在（数据仍可用）', ctx.offlineBar.style.display, 'flex');
+
+	/* 手动重试不受 3 次限制 */
+	const before = countCalls(env, 'get_state');
+
+	ctx.retryOffline();
+	await flush();
+	await flush();
+
+	same('手动重试仍会发请求', countCalls(env, 'get_state'), before + 1);
+	same('手动重试把失败计数清零', ctx.offlineFails, 0);
+
+	/* 成功一次：离线条消失 + 轮询恢复 */
+	env.__responses.get_state = baseState();
+	delete env.__rejections.get_state;
+
+	ctx.retryOffline();
+	await flush();
+	await flush();
+
+	same('成功后轮询恢复', env.__timers.active.size, 1);
+	same('成功后离线条消失', ctx.offlineBar.style.display, 'none');
+	same('成功后 offlineGivenUp 复位', ctx.offlineGivenUp, false);
+}
+
+async function testSnapshotExpiry() {
+	console.log('\n[28] 快照过期（>24h）：清掉、不渲染、显示「快照已过期」');
+
+	/*
+	 * 直接造一份过期快照文本：boot 成功那一次自己也会在安装屏 syncOfflineData
+	 * 里发现过期并删掉，所以不能靠"先同步一次"拿到它。
+	 */
+	const maker = await boot({ state: baseState() });
+	const expiredSnap = maker.hooks.buildSnapshot(offlineState());
+
+	expiredSnap.ts = NOW - 25 * 3600;
+
+	const raw = JSON.stringify(expiredSnap);
+	const booted = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: raw }
+	});
+	const ctx = booted.ctx;
+
+	same('过期快照不渲染', ctx.state, null);
+	same('过期快照不显示离线条', ctx.offlineBar.style.display, 'none');
+	same('过期快照被删除', booted.env.__store.getItem(SNAPSHOT_KEY), null);
+	check('顶部提示暂无数据', textOf(ctx.noticeNode).indexOf('暂无数据') >= 0,
+		'notice=' + repr(textOf(ctx.noticeNode)));
+	check('顶部同时说明「快照已过期」', textOf(ctx.noticeNode).indexOf('快照已过期') >= 0,
+		'notice=' + repr(textOf(ctx.noticeNode)));
+	check('安装屏显示「快照已过期」', textOf(ctx.offlineDataNote).indexOf('快照已过期') >= 0,
+		'note=' + repr(textOf(ctx.offlineDataNote)));
+
+	/* readSnapshot 自己也要给出 expired 并删除 */
+	const direct = await boot({ storage: 'memory' });
+
+	direct.env.__store.setItem(SNAPSHOT_KEY, raw);
+	sameList('readSnapshot 返回 expired', Object.keys(direct.hooks.readSnapshot()).sort(), [ 'expired', 'ts' ]);
+	same('readSnapshot 顺手删除过期键', direct.env.__store.getItem(SNAPSHOT_KEY), null);
+
+	/* 边界：23h59m 仍然可用 */
+	const freshSnap = maker.hooks.buildSnapshot(offlineState());
+
+	freshSnap.ts = NOW - (24 * 3600 - 60);
+
+	const freshBoot = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: JSON.stringify(freshSnap) }
+	});
+
+	check('24 小时内的快照仍可用', freshBoot.ctx.state != null, 'state=' + repr(freshBoot.ctx.state));
+	same('24 小时内不误报过期', freshBoot.ctx.offlineBar.style.display, 'flex');
+}
+
+async function testSnapshotCorrupt() {
+	console.log('\n[29] 损坏 / 结构不对的快照：删除且不崩');
+
+	const corrupt = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: '{not-json' }
+	});
+
+	same('损坏 JSON：state 仍为 null', corrupt.ctx.state, null);
+	same('损坏 JSON：键被删除', corrupt.env.__store.getItem(SNAPSHOT_KEY), null);
+	check('损坏 JSON：页面照常渲染占位',
+		corrupt.ctx.root != null && textOf(corrupt.ctx.noticeNode).indexOf('暂无数据') >= 0,
+		'notice=' + repr(textOf(corrupt.ctx.noticeNode)));
+	same('损坏 JSON：仍是 5 屏',
+		findAll(corrupt.ctx.root, function (n) { return hasClass(n, 'tsm-page'); }).length, 5);
+
+	const wrongVersion = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: JSON.stringify({ v: 9, ts: NOW, totals: {} }) }
+	});
+
+	same('版本不对的快照被删除', wrongVersion.env.__store.getItem(SNAPSHOT_KEY), null);
+	same('版本不对：state 为 null', wrongVersion.ctx.state, null);
+
+	const arrayJson = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: '[]' }
+	});
+
+	same('数组快照被删除', arrayJson.env.__store.getItem(SNAPSHOT_KEY), null);
+
+	const noTs = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: JSON.stringify({ v: 1, ts: 0, totals: {} }) }
+	});
+
+	same('缺少 ts 的快照被删除', noTs.env.__store.getItem(SNAPSHOT_KEY), null);
+	check('三种脏数据都不会抛异常', arrayJson.ctx.root != null && noTs.ctx.root != null, 'ok');
+}
+
+async function testSnapshotStorageUnavailable() {
+	console.log('\n[30] localStorage 不可用：静默降级，页面照常');
+
+	const throwing = await boot({ storage: 'throw' });
+
+	same('setItem 抛错：写快照返回 false', throwing.hooks.writeSnapshot(baseState()), false);
+	same('getItem 抛错：读快照返回 null', throwing.hooks.readSnapshot(), null);
+	check('页面照常渲染数据', throwing.ctx.state != null && textOf(throwing.ctx.rxNum) === '0.0',
+		'state=' + repr(throwing.ctx.state && throwing.ctx.state.ts) + ' rx=' + repr(textOf(throwing.ctx.rxNum)));
+	check('写快照失败不弹错误提示', textOf(throwing.ctx.noticeNode) === '',
+		'notice=' + repr(textOf(throwing.ctx.noticeNode)));
+	same('异常模式下也没有写进存储', throwing.env.__store.__map.size, 0);
+
+	const denied = await boot({ storage: 'getter-throw' });
+
+	same('取不到 localStorage：snapStore 返回 null', denied.hooks.snapStore(), null);
+	same('取不到 localStorage：读快照 null', denied.hooks.readSnapshot(), null);
+	check('安装屏说明本地存储不可用',
+		textOf(denied.ctx.offlineDataNote).indexOf('不可用') >= 0,
+		'note=' + repr(textOf(denied.ctx.offlineDataNote)));
+	same('不可用时隐藏清除按钮', denied.ctx.offlineClearBtn.style.display, 'none');
+	check('不可用时页面照常渲染', denied.ctx.state != null, 'state=' + repr(denied.ctx.state));
+
+	const missing = await boot({ storage: 'none' });
+
+	same('没有 localStorage 属性：读快照 null', missing.hooks.readSnapshot(), null);
+	check('没有 localStorage 属性：页面照常渲染', missing.ctx.state != null, 'state=' + repr(missing.ctx.state));
+}
+
+async function testSnapshotClear() {
+	console.log('\n[31] 「清除离线数据」删除 localStorage 键');
+
+	const raw = await snapshotFixture();
+	const booted = await boot({ state: offlineState() });
+	const ctx = booted.ctx;
+	const env = booted.env;
+
+	check('成功同步后键存在', env.__store.getItem(SNAPSHOT_KEY) != null, 'ok');
+	check('安装屏显示已保存离线快照',
+		textOf(ctx.offlineDataNote).indexOf('已保存离线快照') >= 0,
+		'note=' + repr(textOf(ctx.offlineDataNote)));
+
+	ctx.setPage(4);
+
+	const btn = findAll(ctx.pages[4], function (n) { return hasClass(n, 'tsm-offline-clear'); })[0];
+
+	check('安装屏有「清除离线数据」按钮', btn != null && textOf(btn) === '清除离线数据',
+		'btn=' + repr(btn && textOf(btn)));
+
+	if (btn == null) return;
+
+	const notesBefore = env.__notifications.length;
+
+	btn.attrs.click();
+
+	same('点击后键被删除', env.__store.getItem(SNAPSHOT_KEY), null);
+	check('状态回写为暂无离线快照',
+		textOf(ctx.offlineDataNote).indexOf('暂无离线快照') >= 0,
+		'note=' + repr(textOf(ctx.offlineDataNote)));
+	check('清除后给出提示', env.__notifications.length === notesBefore + 1,
+		'notifications=' + env.__notifications.length);
+
+	/* 离线状态下清除：离线条收起，键也没了 */
+	const offlineBoot = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: raw }
+	});
+
+	same('离线时键存在', offlineBoot.env.__store.getItem(SNAPSHOT_KEY) != null, true);
+	same('离线时离线条可见', offlineBoot.ctx.offlineBar.style.display, 'flex');
+
+	offlineBoot.ctx.setPage(4);
+
+	const btn2 = findAll(offlineBoot.ctx.pages[4], function (n) {
+		return hasClass(n, 'tsm-offline-clear');
+	})[0];
+
+	btn2.attrs.click();
+
+	same('清除后离线条隐藏', offlineBoot.ctx.offlineBar.style.display, 'none');
+	same('清除后键消失', offlineBoot.env.__store.getItem(SNAPSHOT_KEY), null);
+	check('清除后去掉 tsm-offline-on', !hasClass(offlineBoot.ctx.root, 'tsm-offline-on'),
+		'class=' + repr(offlineBoot.ctx.root.attrs['class']));
+}
+
+async function testSnapshotSafety() {
+	console.log('\n[32] 快照安全：无危险 DOM、快照不进 title / 属性');
+
+	check('mobile.js 不含 innerHTML', !/innerHTML/.test(SOURCE));
+	check('mobile.js 不含 .outerHTML =', !/\.outerHTML\s*=/.test(SOURCE));
+	check('mobile.js 不含 insertAdjacentHTML', !/insertAdjacentHTML/.test(SOURCE));
+	check('mobile.js 不含 document.write(', !/document\.write\s*\(/.test(SOURCE));
+	check('mobile.js 不含 eval(', !/\beval\s*\(/.test(SOURCE));
+	check('mobile.js 不含 new Function', !/new\s+Function\s*\(/.test(SOURCE));
+
+	const raw = await snapshotFixture();
+	const booted = await boot({
+		rejectState: new Error('offline'),
+		seed: { [SNAPSHOT_KEY]: raw }
+	});
+	const bar = booted.ctx.offlineBar;
+
+	sameList('离线条只挂固定属性', Object.keys(bar.attrs).sort(), [ 'aria-live', 'class', 'role', 'style' ]);
+	same('离线条本身没有 title 属性', bar.attrs.title == null, true);
+	same('离线条子节点没有 title 属性',
+		findAll(bar, function (n) { return n.attrs && n.attrs.title != null; }).length, 0);
+	check('页面 title 不含快照内容',
+		('' + booted.env.document.title).indexOf('{') < 0 &&
+		('' + booted.env.document.title).indexOf('devices') < 0,
+		'title=' + repr(booted.env.document.title));
+	check('离线条文本不含 JSON 结构',
+		textOf(bar).indexOf('{') < 0 && textOf(bar).indexOf('"') < 0,
+		'text=' + repr(textOf(bar)));
+	same('快照键没有出现在任何节点属性里',
+		findAll(booted.ctx.root, function (n) {
+			return JSON.stringify(n.attrs || {}).indexOf(SNAPSHOT_KEY) >= 0;
+		}).length, 0);
+	same('快照 JSON 原文没有进入 DOM',
+		findAll(booted.ctx.root, function (n) {
+			return textOf(n).indexOf('"totals"') >= 0;
+		}).length, 0);
+}
+
+async function testSnapshotStaleRefresh() {
+	console.log('\n[33] 运行中刷新失败：顶部离线条 + 恢复后自动收起');
+
+	const staleState = offlineState();
+
+	staleState.ts = NOW - 120;
+
+	const booted = await boot({ state: staleState, rejectState: null });
+	const ctx = booted.ctx;
+	const env = booted.env;
+	const timer = Array.from(env.__timers.active.values())[0];
+
+	same('首屏成功时没有离线条', ctx.offlineBar.style.display, 'none');
+
+	/* 断网：下一轮轮询失败，页面保留上次数据并亮出离线条 */
+	env.__rejections.get_state = new Error('offline');
+
+	timer.fn();
+	await flush();
+	await flush();
+
+	same('刷新失败后离线条可见', ctx.offlineBar.style.display, 'flex');
+	same('离线条时间用上次成功的 ts', textOf(ctx.offlineTextNode),
+		'离线数据 · 更新于 ' + hhmm(NOW - 120) + '（2 分钟前）');
+	check('顶部同时提示刷新失败', textOf(ctx.noticeNode).indexOf('刷新失败') >= 0,
+		'notice=' + repr(textOf(ctx.noticeNode)));
+	check('数字没有被清空', textOf(ctx.txNum) === '2.0', 'tx=' + repr(textOf(ctx.txNum)));
+
+	/* 恢复：成功一次后自动收起 */
+	env.__responses.get_state = baseState({
+		ts: NOW,
+		totals: {
+			direct_rx: 0, direct_tx: 0, proxy_rx: 0, proxy_tx: 0,
+			rx_rate: 2500000, tx_rate: 5000000
+		}
+	});
+	delete env.__rejections.get_state;
+
+	ctx.retryOffline();
+	await flush();
+	await flush();
+
+	same('恢复后离线条收起', ctx.offlineBar.style.display, 'none');
+	check('恢复后去掉 tsm-offline-on', !hasClass(ctx.root, 'tsm-offline-on'),
+		'class=' + repr(ctx.root.attrs['class']));
+	same('恢复后显示新数据', textOf(ctx.txNum), '40.0');
+}
+
 // ---------------------------------------------------------------- main
 
 (async function main() {
@@ -3876,6 +4549,17 @@ async function testOverviewTop3() {
 		await testSafeArea();
 		await testSparkline();
 		await testOverviewTop3();
+		await testSnapshotWrite();
+		await testSnapshotTruncate();
+		await testSnapshotRestore();
+		await testSnapshotOnline();
+		await testOfflineGiveUp();
+		await testSnapshotExpiry();
+		await testSnapshotCorrupt();
+		await testSnapshotStorageUnavailable();
+		await testSnapshotClear();
+		await testSnapshotSafety();
+		await testSnapshotStaleRefresh();
 	}
 	catch (err) {
 		console.error('\n测试自身异常：', err && err.stack ? err.stack : err);

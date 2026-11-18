@@ -109,6 +109,17 @@ function fmtClock(ts) {
 	return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
 }
 
+/* HH:MM（离线提示只精确到分钟，秒没有意义）。 */
+function fmtHHMM(ts) {
+	var t = num(ts);
+
+	if (!t) return '—';
+
+	var d = new Date(t * 1000);
+
+	return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+}
+
 /* 真实当前时间（秒）：分类/计数/相对时间一律以它为准，state.ts 只用于「更新于」显示。 */
 function nowSec() {
 	return Math.floor(Date.now() / 1000);
@@ -967,6 +978,20 @@ var CSS = [
 	'.tsm-topval{flex:none;font-size:11.5px;color:var(--tsm-sub);font-variant-numeric:tabular-nums;white-space:nowrap}',
 	'.tsm-toprow-empty{display:flex;align-items:center;min-height:40px;font-size:12px;color:var(--tsm-sub)}',
 	'@media (max-width:359px){.tsm-top3{grid-template-columns:1fr}.tsm-spark-cap{display:none}}',
+	/* ---- 离线快照提示条：sticky 顶部 + 安全区；出现时把顶部分段 tab 顺次下移 40px，不遮内容 ---- */
+	'.tsm-offline{display:none;align-items:center;justify-content:space-between;gap:10px;position:sticky;top:env(safe-area-inset-top,0px);z-index:20;min-height:40px;padding:5px 14px;background:rgba(249,171,0,.16);border-bottom:1px solid rgba(249,171,0,.42);color:#8a5a00;font-size:12px;line-height:1.3}',
+	'.tsm-offline-t{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+	'.tsm-offline-btn{position:relative;flex:none;font:inherit;font-size:12px;line-height:1;padding:0 12px;min-height:30px;border-radius:15px;color:#8a5a00;background:rgba(249,171,0,.22);border:1px solid rgba(178,106,0,.5);cursor:pointer}',
+	'.tsm-offline-btn::before{content:"";position:absolute;left:0;right:0;top:-7px;height:44px}',
+	'.tsm-offline-btn:active{background:rgba(249,171,0,.38)}',
+	'.tsm-app.tsm-offline-on .tsm-tabs{top:calc(env(safe-area-inset-top,0px) + 40px)}',
+	/* ---- 安装屏「离线数据」：状态一行 + 清除按钮 ---- */
+	'.tsm-offline-card{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:12px;background:var(--tsm-soft);border:1px solid var(--tsm-line)}',
+	'.tsm-offline-note{flex:1 1 auto;min-width:0;font-size:12px;line-height:1.4;color:var(--tsm-sub);word-break:break-word}',
+	'.tsm-offline-clear{position:relative;flex:none;font:inherit;font-size:12.5px;line-height:1;padding:0 12px;min-height:32px;border-radius:16px;color:#c62828;background:rgba(198,40,40,.08);border:1px solid rgba(198,40,40,.36);cursor:pointer}',
+	'.tsm-offline-clear::before{content:"";position:absolute;left:0;right:0;top:-6px;height:44px}',
+	'.tsm-offline-clear:active{background:rgba(198,40,40,.18)}',
+	'@media (prefers-color-scheme: dark){#ts-mobile .tsm-offline{background:rgba(249,171,0,.2);color:#f3c675}#ts-mobile .tsm-offline-btn{color:#f3c675;background:rgba(249,171,0,.24)}}',
 	/* ---- 减少动态偏好：新增的动画 / 过渡一律关闭 ---- */
 	'@media (prefers-reduced-motion: reduce){.tsm-skel::after{animation:none;background:none}}',
 	'@media (prefers-reduced-motion: reduce){.tsm-page.on.is-enter-next,.tsm-page.on.is-enter-prev{animation:none}}',
@@ -1923,6 +1948,413 @@ function sparkPoints(samples, field) {
 	return out.join(' ');
 }
 
+// ---------------------------------------------------------------- 离线快照
+
+/*
+ * 离线快照：断网 / 接口失败时，手机版显示最近一次成功的数据（PWA 装到桌面后最常见）。
+ *
+ * 只写**展示需要的字段**的精简快照，键 'prismRouterMobileSnapshot.v1'：
+ *   v / ts / totals（速率与累计）/ nodes（出口名 → rx,tx）/
+ *   devices（name,mac,ip,link,rx_rate,tx_rate,last_seen）/
+ *   health（confidence,reasons）/ quota。
+ * **绝不写密钥、token、应用全量明细**；JSON 上限 64KB，超了把 devices 截到 200 条并标 truncated。
+ * 快照超过 24 小时一律作废并删除。
+ *
+ * 存储不可用（隐私模式 / 被策略禁掉 / 配额满）时全部静默降级：离线能力是增强，
+ * 任何异常都不能影响正常页面渲染。
+ */
+var SNAPSHOT_KEY = 'prismRouterMobileSnapshot.v1';
+var SNAPSHOT_VERSION = 1;
+var SNAPSHOT_MAX_BYTES = 65536;         /* 64KB：localStorage 配额小，别撑爆 */
+var SNAPSHOT_MAX_DEVICES = 200;         /* 超限时 devices 截断条数 */
+var SNAPSHOT_MAX_NODES = 64;            /* 出口节点条目上限 */
+var SNAPSHOT_MAX_AGE_SEC = 24 * 3600;   /* 超过 24 小时不再使用 */
+var SNAPSHOT_TEXT_MAX = 64;             /* 单个字符串字段最多 64 字符 */
+
+/* 连续失败多少次后停止自动轮询（手机上省电），手动「重试 / 刷新」始终可用。 */
+var OFFLINE_GIVEUP_FAILS = 3;
+
+/* 累计与速率字段白名单：手机版概览/展开区用到的全在这里，多余的字段一律不落盘。 */
+var SNAPSHOT_TOTAL_FIELDS = [
+	'rx_rate', 'tx_rate',
+	'direct_rx', 'direct_tx', 'proxy_rx', 'proxy_tx',
+	'wifi_rx', 'wifi_tx', 'wired_rx', 'wired_tx', 'unknown_rx', 'unknown_tx'
+];
+
+/* 去掉首尾空白并截断：快照是"够看就行"的副本，不追求原样。 */
+function snapText(value, max) {
+	var text = (value == null) ? '' : ('' + value);
+
+	text = text.replace(/^\s+|\s+$/g, '');
+
+	if (text.length > max) text = text.slice(0, max);
+
+	return text;
+}
+
+/* UTF-8 字节数：localStorage 配额按字节算，只看 length 会低估中文（一个字符 3 字节）。 */
+function snapBytes(text) {
+	var s = (text == null) ? '' : ('' + text);
+	var total = 0;
+	var i, c;
+
+	for (i = 0; i < s.length; i++) {
+		c = s.charCodeAt(i);
+
+		if (c < 0x80) total += 1;
+		else if (c < 0x800) total += 2;
+		else if (c >= 0xd800 && c <= 0xdbff) { total += 4; i++; }
+		else total += 3;
+	}
+
+	return total;
+}
+
+/* localStorage 句柄：不可用（隐私模式 / 被禁 / 非浏览器）返回 null，调用方一律静默降级。 */
+function snapStore() {
+	var store = null;
+
+	try {
+		if (typeof window === 'undefined' || window == null) return null;
+
+		store = window.localStorage;   /* 隐私模式下取这个属性本身就可能抛错 */
+	}
+	catch (e) {
+		return null;
+	}
+
+	if (store == null) return null;
+	if (typeof store.getItem != 'function' || typeof store.setItem != 'function' ||
+		typeof store.removeItem != 'function')
+		return null;
+
+	return store;
+}
+
+function snapTotals(totals) {
+	var src = (totals != null && typeof totals == 'object') ? totals : {};
+	var out = {};
+	var i, field;
+
+	for (i = 0; i < SNAPSHOT_TOTAL_FIELDS.length; i++) {
+		field = SNAPSHOT_TOTAL_FIELDS[i];
+
+		if (present(src[field])) out[field] = num(src[field]);
+	}
+
+	return out;
+}
+
+/* 一台设备只留展示字段；连 name/mac/ip 都没有的行没有展示价值，直接丢。 */
+function snapDevice(dev) {
+	var out = {};
+	var name, mac, ip, link;
+
+	if (dev == null || typeof dev != 'object') return null;
+
+	name = snapText(dev.hostname != null ? dev.hostname : dev.name, SNAPSHOT_TEXT_MAX);
+	if (name.length) out.name = name;
+
+	mac = snapText(dev.mac, 32);
+	if (mac.length) out.mac = mac;
+
+	ip = snapText(dev.ip, 46);
+	if (ip.length) out.ip = ip;
+
+	link = snapText(dev.link, 8);
+	if (link.length) out.link = link;
+
+	if (present(dev.rx_rate)) out.rx_rate = num(dev.rx_rate);
+	if (present(dev.tx_rate)) out.tx_rate = num(dev.tx_rate);
+	if (present(dev.last_seen)) out.last_seen = num(dev.last_seen);
+
+	if (!out.name && !out.mac && !out.ip) return null;
+
+	return out;
+}
+
+/* state.nodes 是「出口名 → {rx,tx}」对象：只留这两个数字，条目数封顶。 */
+function snapNodes(nodes) {
+	var src = (nodes != null && typeof nodes == 'object') ? nodes : null;
+	var out = {};
+	var count = 0;
+	var key, name, entry;
+
+	if (src == null) return out;
+
+	for (key in src) {
+		if (!Object.prototype.hasOwnProperty.call(src, key)) continue;
+		if (count >= SNAPSHOT_MAX_NODES) break;
+
+		name = snapText(key, SNAPSHOT_TEXT_MAX);
+		if (!name.length) continue;
+
+		/* 这些键会改对象原型，不能当普通键写回去 */
+		if (name == '__proto__' || name == 'constructor' || name == 'prototype') continue;
+
+		entry = (src[key] != null && typeof src[key] == 'object') ? src[key] : {};
+
+		out[name] = { rx: num(entry.rx), tx: num(entry.tx) };
+		count++;
+	}
+
+	return out;
+}
+
+function snapHealth(health) {
+	var src = (health != null && typeof health == 'object') ? health : {};
+	var reasons = Array.isArray(src.reasons) ? src.reasons : [];
+	var out = {
+		confidence: snapText(src.accounting_confidence != null ? src.accounting_confidence : 'unknown', 24)
+	};
+	var list = [];
+	var i, reason;
+
+	for (i = 0; i < reasons.length && list.length < 8; i++) {
+		reason = snapText(reasons[i], 120);
+
+		if (reason.length) list.push(reason);
+	}
+
+	out.reasons = list;
+
+	return out;
+}
+
+function snapQuota(quota) {
+	var src = (quota != null && typeof quota == 'object') ? quota : null;
+	var out = {};
+	var period, mode;
+
+	if (src == null) return null;
+
+	if (present(src.total_limit)) out.total_limit = num(src.total_limit);
+
+	period = snapText(src.period, 24);
+	if (period.length) out.period = period;
+
+	mode = snapText(src.mode, 16);
+	if (mode.length) out.mode = mode;
+
+	return Object.keys(out).length ? out : null;
+}
+
+/* 后端 state → 精简快照对象（纯函数，不碰存储）。 */
+function buildSnapshot(state) {
+	var src = (state != null && typeof state == 'object') ? state : {};
+	var devices = Array.isArray(src.devices) ? src.devices : [];
+	var list = [];
+	var i, item, nodes, quota;
+	var snap;
+
+	for (i = 0; i < devices.length; i++) {
+		item = snapDevice(devices[i]);
+
+		if (item != null) list.push(item);
+	}
+
+	snap = {
+		v: SNAPSHOT_VERSION,
+		ts: num(src.ts),
+		totals: snapTotals(src.totals),
+		devices: list,
+		health: snapHealth(src.health)
+	};
+
+	nodes = snapNodes(src.nodes);
+	if (Object.keys(nodes).length) snap.nodes = nodes;
+
+	quota = snapQuota(src.quota);
+	if (quota != null) snap.quota = quota;
+
+	return snap;
+}
+
+/*
+ * 序列化 + 64KB 上限（超了先截 devices 到 200 条并标 truncated）：
+ *   1. 正常写；
+ *   2. 超限 → devices 截到 200 条 + truncated:true；
+ *   3. 还超 → 丢掉 nodes；
+ *   4. 再超 → devices 清空，只留总量。
+ * 仍然超（不现实）返回 null：宁可不写，也不写一条读不回来的记录。
+ */
+function snapshotJson(snap) {
+	var text, bytes;
+
+	if (snap == null || typeof snap != 'object') return null;
+
+	text = JSON.stringify(snap);
+	bytes = snapBytes(text);
+
+	if (bytes <= SNAPSHOT_MAX_BYTES) return text;
+
+	snap.truncated = true;
+
+	if (Array.isArray(snap.devices) && snap.devices.length > SNAPSHOT_MAX_DEVICES)
+		snap.devices = snap.devices.slice(0, SNAPSHOT_MAX_DEVICES);
+
+	text = JSON.stringify(snap);
+	if (snapBytes(text) <= SNAPSHOT_MAX_BYTES) return text;
+
+	delete snap.nodes;
+
+	text = JSON.stringify(snap);
+	if (snapBytes(text) <= SNAPSHOT_MAX_BYTES) return text;
+
+	snap.devices = [];
+
+	text = JSON.stringify(snap);
+
+	return (snapBytes(text) <= SNAPSHOT_MAX_BYTES) ? text : null;
+}
+
+/* 写快照：成功返回 true；存储不可用 / 配额满 / 序列化异常一律吞掉并返回 false。 */
+function writeSnapshot(state) {
+	var store = snapStore();
+	var text;
+
+	if (store == null) return false;
+
+	try {
+		text = snapshotJson(buildSnapshot(state));
+
+		if (text == null) return false;
+
+		store.setItem(SNAPSHOT_KEY, text);
+
+		return true;
+	}
+	catch (e) {
+		return false;
+	}
+}
+
+function removeSnapshot() {
+	var store = snapStore();
+
+	if (store == null) return false;
+
+	try {
+		store.removeItem(SNAPSHOT_KEY);
+
+		return true;
+	}
+	catch (e) {
+		return false;
+	}
+}
+
+/* 精简快照 → 页面渲染用的 state（字段名映射回后端口径，缺失一律给安全默认值）。 */
+function stateFromSnapshot(snap) {
+	var src = (snap != null && typeof snap == 'object') ? snap : {};
+	var list = Array.isArray(src.devices) ? src.devices : [];
+	var health = (src.health != null && typeof src.health == 'object') ? src.health : {};
+	var nodes = (src.nodes != null && typeof src.nodes == 'object') ? src.nodes : {};
+	var quota = (src.quota != null && typeof src.quota == 'object') ? src.quota : {};
+	var devices = [];
+	var i, dev;
+
+	for (i = 0; i < list.length; i++) {
+		dev = (list[i] != null && typeof list[i] == 'object') ? list[i] : null;
+
+		if (dev == null) continue;
+
+		devices.push({
+			hostname: (dev.name != null) ? '' + dev.name : '',
+			mac: (dev.mac != null) ? '' + dev.mac : '',
+			ip: (dev.ip != null) ? '' + dev.ip : '',
+			link: (dev.link != null) ? '' + dev.link : '',
+			rx_rate: num(dev.rx_rate),
+			tx_rate: num(dev.tx_rate),
+			last_seen: num(dev.last_seen)
+		});
+	}
+
+	return {
+		ts: num(src.ts),
+		totals: snapTotals(src.totals),
+		nodes: nodes,
+		devices: devices,
+		health: {
+			accounting_confidence: (health.confidence != null) ? '' + health.confidence : 'unknown',
+			reasons: Array.isArray(health.reasons) ? health.reasons.slice(0, 8) : []
+		},
+		quota: quota,
+		truncated: (src.truncated === true),
+		snapshot: true
+	};
+}
+
+/*
+ * 读快照：
+ *   - 没有 / 存储不可用 → null；
+ *   - JSON 损坏或结构不对 → 删掉并返回 null（绝不让页面因为一条脏数据崩掉）；
+ *   - 超过 24 小时 → 删掉并返回 { expired:true }（调用方据此显示「快照已过期」）；
+ *   - 正常 → { state, ts, truncated }。
+ */
+function readSnapshot() {
+	var store = snapStore();
+	var raw = null;
+	var snap = null;
+	var ts;
+
+	if (store == null) return null;
+
+	try { raw = store.getItem(SNAPSHOT_KEY); }
+	catch (e) { return null; }
+
+	if (raw == null || ('' + raw).length === 0) return null;
+
+	try { snap = JSON.parse('' + raw); }
+	catch (e) {
+		removeSnapshot();
+
+		return null;
+	}
+
+	if (snap == null || typeof snap !== 'object' || Array.isArray(snap) ||
+		num(snap.v) !== SNAPSHOT_VERSION ||
+		snap.totals == null || typeof snap.totals !== 'object' || Array.isArray(snap.totals)) {
+		removeSnapshot();
+
+		return null;
+	}
+
+	ts = num(snap.ts);
+
+	if (!(ts > 0)) {
+		removeSnapshot();
+
+		return null;
+	}
+
+	if ((nowSec() - ts) > SNAPSHOT_MAX_AGE_SEC) {
+		removeSnapshot();
+
+		return { expired: true, ts: ts };
+	}
+
+	return {
+		state: stateFromSnapshot(snap),
+		ts: ts,
+		truncated: (snap.truncated === true)
+	};
+}
+
+/* 「离线数据 · 更新于 HH:MM（N 分钟前）」：分钟数只按快照时间算。 */
+function offlineText(ts, now) {
+	var base = (num(now) > 0) ? num(now) : nowSec();
+	var age = base - num(ts);
+	var minutes;
+
+	if (age < 0) age = 0;
+
+	minutes = Math.floor(age / 60);
+
+	return _('离线数据') + ' · ' + _('更新于') + ' ' + fmtHHMM(ts) +
+		'（' + minutes + ' ' + _('分钟前') + '）';
+}
+
 // ---------------------------------------------------------------- 视图
 
 return view.extend({
@@ -1933,20 +2365,37 @@ return view.extend({
 		 * 首屏只取主数据（get_state）。节点 / AP 数据改成懒加载：
 		 * 首次切到「节点」或「拓扑」屏时由 ensureNodeData() 并行补拉，
 		 * 免得概览/设备/安装屏白等两个额外 RPC。
+		 *
+		 * 离线：成功就把精简快照写进 localStorage；失败则尝试读回最近一次快照，
+		 * 让首屏显示「上次已知的数据」而不是空白页（快照过期/损坏/存储不可用时仍走占位）。
 		 */
 		return callState().then(function(state) {
+			if (state != null && typeof state == 'object' && state.totals != null) {
+				self.persistSnapshot(state);
+
+				return {
+					state: state,
+					error: null,
+					offline: null
+				};
+			}
+
 			return {
-				state: (state != null && typeof state == 'object' && state.totals != null) ? state : null,
-				error: null
+				state: null,
+				error: null,
+				offline: self.restoreSnapshot()
 			};
 		}, function(err) {
 			return {
 				state: null,
-				error: (err != null && err.message) ? err.message : '' + err
+				error: (err != null && err.message) ? err.message : '' + err,
+				offline: self.restoreSnapshot()
 			};
 		}).then(function(res) {
-			self.state = res.state;
+			/* 有快照就用快照顶上，同时记下离线信息（由 render 画提示条）。 */
+			self.state = (res.offline != null) ? res.offline.state : res.state;
 			self.error = res.error;
+			self.offlineInfo = (res.offline != null) ? res.offline : null;
 		});
 	},
 
@@ -1999,9 +2448,17 @@ return view.extend({
 		this.sparkSamples = [];
 		this.top3Sig = null;
 
+		/* 离线：快照提示条状态 + 连续失败计数（load 可能已经塞过 offlineInfo） */
+		this.offlineInfo = (this.offlineInfo != null && typeof this.offlineInfo == 'object')
+			? this.offlineInfo : null;
+		this.offlineFails = 0;
+		this.offlineGivenUp = false;
+		if (this.snapshotExpired !== true) this.snapshotExpired = false;
+
 		root = E('div', { 'id': 'ts-mobile', 'class': 'tsm-app' }, [
 			E('style', {}, CSS),
 			this.renderHead(),
+			this.renderOfflineBar(),
 			this.renderTabs(),
 			this.renderNotice(),
 			this.renderPages(),
@@ -2018,9 +2475,25 @@ return view.extend({
 			this.syncNotice('');
 		}
 		else {
-			this.syncUnavailable(this.error);
+			/* 首屏没数据：先看有没有 24 小时内的离线快照，有就渲染它，绝不留白屏。 */
+			var snap = this.restoreSnapshot();
+
+			if (snap != null) {
+				this.state = snap.state;
+				this.offlineInfo = snap;
+				this.syncAll(this.state);
+				this.syncNotice('');
+			}
+			else {
+				this.syncUnavailable(this.error, this.snapshotExpired === true);
+			}
 		}
 
+		if (this.offlineInfo != null) this.showOfflineBar(this.offlineInfo);
+		else this.hideOfflineBar();
+
+		this.syncOfflineData();
+		this.bindOnline();
 		this.startRefresh();
 
 		return root;
@@ -2061,6 +2534,31 @@ return view.extend({
 		this.noticeNode = E('div', { 'class': 'tsm-notice' }, '');
 
 		return this.noticeNode;
+	},
+
+	/*
+	 * 离线快照提示条：sticky 在标题行下方（出现时顶部 tab 顺次下移，不压内容）。
+	 * 只写文本节点与固定的 class/role/aria-live —— 快照内容绝不进 title / data-* 属性，
+	 * 免得被截图工具、辅助信息或调试面板当成可见元数据读出去。
+	 */
+	renderOfflineBar: function() {
+		var self = this;
+
+		this.offlineTextNode = E('span', { 'class': 'tsm-offline-t' }, '');
+		this.offlineRetryBtn = E('button', {
+			type: 'button',
+			'class': 'tsm-offline-btn',
+			click: function() { self.retryOffline(); }
+		}, _('重试'));
+
+		this.offlineBar = E('div', {
+			'class': 'tsm-offline',
+			role: 'status',
+			'aria-live': 'polite',
+			style: 'display:none'
+		}, [ this.offlineTextNode, this.offlineRetryBtn ]);
+
+		return this.offlineBar;
 	},
 
 	// ------------------------------------------------------------ 五屏骨架
@@ -3532,16 +4030,19 @@ return view.extend({
 		this.renderQr(this.qrHost, url);
 		this.syncInstall();
 
-		return E('div', { 'class': 'tsm-section' }, [
-			E('h3', { 'class': 'tsm-h3' }, _('安装到手机')),
-			E('div', { 'class': 'tsm-install-card' }, [
-				this.qrHost,
-				E('div', { 'class': 'tsm-qr-cap' }, _('用另一台手机扫码打开')),
-				this.installHost,
-				E('div', { 'class': 'tsm-url-row' }, [ this.urlNode, this.copyBtn ])
+		return E('div', {}, [
+			E('div', { 'class': 'tsm-section' }, [
+				E('h3', { 'class': 'tsm-h3' }, _('安装到手机')),
+				E('div', { 'class': 'tsm-install-card' }, [
+					this.qrHost,
+					E('div', { 'class': 'tsm-qr-cap' }, _('用另一台手机扫码打开')),
+					this.installHost,
+					E('div', { 'class': 'tsm-url-row' }, [ this.urlNode, this.copyBtn ])
+				]),
+				E('p', { 'class': 'tsm-note tsm-install-note' },
+					_('内网 https 自签地址：另一台手机第一次打开会提示证书不受信任，选择「继续访问」即可。'))
 			]),
-			E('p', { 'class': 'tsm-note tsm-install-note' },
-				_('内网 https 自签地址：另一台手机第一次打开会提示证书不受信任，选择「继续访问」即可。'))
+			this.renderOfflineData()
 		]);
 	},
 
@@ -3723,6 +4224,89 @@ return view.extend({
 		catch (e) { }
 
 		this.syncInstall();
+	},
+
+	/* ------------------------------------------------------------ 离线数据（安装 / 关于屏） */
+
+	/*
+	 * 离线快照的说明 + 清除入口：断网首屏要用它，所以放在「安装 / 关于」屏，
+	 * 用户随时能自己删掉（隐私敏感的场景尤其需要）。
+	 */
+	renderOfflineData: function() {
+		var self = this;
+
+		this.offlineDataNote = E('div', { 'class': 'tsm-offline-note' }, '');
+		this.offlineClearBtn = E('button', {
+			type: 'button',
+			'class': 'tsm-offline-clear',
+			click: function() { self.clearOfflineData(); }
+		}, _('清除离线数据'));
+
+		this.syncOfflineData();
+
+		return E('div', { 'class': 'tsm-section' }, [
+			E('h3', { 'class': 'tsm-h3' }, _('离线数据')),
+			E('div', { 'class': 'tsm-offline-card' }, [
+				this.offlineDataNote,
+				this.offlineClearBtn
+			]),
+			E('p', { 'class': 'tsm-note' },
+				_('断网或接口失败时显示最近一次成功的数据快照（最多保留 24 小时，只含展示字段，不含密钥）。'))
+		]);
+	},
+
+	/* 只回写文本：快照时间 / 过期 / 不可用一律不进 title、data-* 等属性。 */
+	syncOfflineData: function() {
+		var note = this.offlineDataNote;
+		var snap;
+
+		if (note == null) return;
+
+		if (snapStore() == null) {
+			note.textContent = _('当前浏览器不允许本地存储（如隐私模式），离线快照不可用');
+
+			if (this.offlineClearBtn != null) this.offlineClearBtn.style.display = 'none';
+
+			return;
+		}
+
+		if (this.offlineClearBtn != null) this.offlineClearBtn.style.display = '';
+
+		snap = readSnapshot();
+
+		if (snap != null && snap.expired === true) {
+			this.snapshotExpired = true;
+			note.textContent = _('快照已过期');
+
+			return;
+		}
+
+		if (snap != null && snap.state != null) {
+			this.snapshotExpired = false;
+			note.textContent = _('已保存离线快照') + ' · ' + _('更新于') + ' ' +
+				fmtHHMM(snap.ts) + '（' + fmtAgo(snap.ts, 0) + '）';
+
+			return;
+		}
+
+		note.textContent = (this.snapshotExpired === true) ? _('快照已过期') : _('暂无离线快照');
+	},
+
+	/* 清掉 localStorage 里的快照键：清完当次页面仍显示内存里的数据，下次刷新回到实时。 */
+	clearOfflineData: function() {
+		var ok = removeSnapshot();
+
+		this.snapshotExpired = false;
+		this.hideOfflineBar();
+		this.syncOfflineData();
+
+		if (typeof ui != 'undefined' && ui != null && typeof ui.addNotification == 'function') {
+			ui.addNotification(null, E('p', {}, ok
+				? _('已清除离线数据')
+				: _('当前浏览器不允许本地存储（如隐私模式），没有可清除的数据')), 'info');
+		}
+
+		return ok;
 	},
 
 	copyUrl: function() {
@@ -4605,8 +5189,11 @@ return view.extend({
 	},
 
 	/* 没有数据时把每个区块都填成占位符，绝不留白屏。 */
-	syncUnavailable: function(reason) {
+	syncUnavailable: function(reason, expired) {
 		var msg = ('' + (reason == null ? '' : reason)).replace(/^\s+|\s+$/g, '');
+		var head = msg.length
+			? (_('暂无数据') + '：' + msg)
+			: _('暂无数据：后端 prism-router.get_state 不可用，或 prism-routerd 尚未写入 state.json。');
 
 		this.setUpdated(0);
 
@@ -4644,9 +5231,7 @@ return view.extend({
 		this.syncTopoEmpty();
 
 		this.syncHealth({ accounting_confidence: 'unavailable', reasons: [] });
-		this.syncNotice(msg.length
-			? (_('暂无数据') + '：' + msg)
-			: _('暂无数据：后端 prism-router.get_state 不可用，或 prism-routerd 尚未写入 state.json。'));
+		this.syncNotice((expired === true) ? (_('快照已过期') + '；' + head) : head);
 	},
 
 	setBusy: function(busy) {
@@ -4654,6 +5239,125 @@ return view.extend({
 
 		this.refreshBtn.disabled = (busy === true);
 		this.refreshBtn.textContent = (busy === true) ? _('刷新中…') : _('刷新');
+	},
+
+	// ------------------------------------------------------------ 离线快照
+
+	/* 成功一次就覆盖快照：永远是「最近一次成功的数据」。 */
+	persistSnapshot: function(state) {
+		if (state == null || typeof state != 'object') return false;
+
+		return writeSnapshot(state);
+	},
+
+	/* 读快照：过期 / 损坏 / 存储不可用都返回 null（readSnapshot 内部已清理过脏数据）。 */
+	restoreSnapshot: function() {
+		var snap = readSnapshot();
+
+		if (snap == null) return null;
+
+		if (snap.expired === true) {
+			this.snapshotExpired = true;
+
+			return null;
+		}
+
+		this.snapshotExpired = false;
+
+		return snap;
+	},
+
+	/* 显示离线条：「离线数据 · 更新于 HH:MM（N 分钟前）」+ 重试 */
+	showOfflineBar: function(info) {
+		var snap = (info != null && typeof info == 'object') ? info : {};
+
+		this.offlineInfo = snap;
+
+		if (this.offlineTextNode != null)
+			this.offlineTextNode.textContent = offlineText(snap.ts, nowSec());
+
+		if (this.offlineBar != null) this.offlineBar.style.display = 'flex';
+
+		/* 顶部 tab 的 sticky top 靠这个 class 顺次下移，提示条不会盖住内容 */
+		this.toggleClass(this.root, 'tsm-offline-on', true);
+	},
+
+	/* 刷新失败但页面上还有上次成功的数据：时间取数据自己的 ts，没有可信 ts 就不摆条。 */
+	showStaleBar: function() {
+		var ts = num(this.state != null ? this.state.ts : 0);
+
+		if (!(ts > 0)) return;
+
+		this.showOfflineBar({ ts: ts, state: this.state });
+	},
+
+	hideOfflineBar: function() {
+		this.offlineInfo = null;
+
+		if (this.offlineBar != null) this.offlineBar.style.display = 'none';
+
+		this.toggleClass(this.root, 'tsm-offline-on', false);
+	},
+
+	/* 手动重试：调 refresh(true)，失败不计数（用户已经知道在离线）。 */
+	retryOffline: function() {
+		return this.refresh(true);
+	},
+
+	/*
+	 * 连续失败计数：自动轮询失败 3 次就停表（手机上省电），
+	 * 手动「重试 / 刷新」随时可用，任何一次成功后自动把轮询接回来。
+	 */
+	noteOfflineFailure: function() {
+		this.offlineFails = num(this.offlineFails) + 1;
+
+		if (this.offlineFails < OFFLINE_GIVEUP_FAILS) return this.offlineFails;
+
+		this.offlineGivenUp = true;
+		this.stopRefresh();
+
+		return this.offlineFails;
+	},
+
+	/*
+	 * 网络恢复：清掉离线条并立刻重拉一次；被停表的顺手把轮询接回来。
+	 * 监听只挂一次，页面被替换后由 handleOnline 自己摘掉。
+	 */
+	bindOnline: function() {
+		var self = this;
+
+		if (typeof window.addEventListener != 'function') return;
+
+		this.unbindOnline();
+
+		this.onlineFn = function() { return self.handleOnline(); };
+
+		window.addEventListener('online', this.onlineFn);
+	},
+
+	unbindOnline: function() {
+		if (this.onlineFn == null || typeof window.removeEventListener != 'function') return;
+
+		window.removeEventListener('online', this.onlineFn);
+		this.onlineFn = null;
+	},
+
+	handleOnline: function() {
+		/* #view 被整体替换后 root 不在文档里：顺手摘掉监听，避免旧实例继续跑 */
+		if (this.root == null || (typeof document != 'undefined' && document.body != null &&
+			typeof document.body.contains == 'function' && !document.body.contains(this.root))) {
+			this.unbindOnline();
+
+			return null;
+		}
+
+		this.offlineFails = 0;
+		this.offlineGivenUp = false;
+		this.hideOfflineBar();
+
+		if (this.timer == null) this.startRefresh();
+
+		return this.refresh(true);
 	},
 
 	// ------------------------------------------------------------ 刷新
@@ -4666,7 +5370,12 @@ return view.extend({
 
 		this.refreshing = true;
 
-		if (manual === true) this.setBusy(true);
+		/* 手动刷新等于「我现在就想再试一次」：清掉连续失败计数，成功后轮询自动恢复。 */
+		if (manual === true) {
+			this.offlineFails = 0;
+			this.offlineGivenUp = false;
+			this.setBusy(true);
+		}
 
 		/*
 		 * get_state 始终刷新；节点 / AP 上报只在「当前屏是节点或拓扑且已经懒加载过」
@@ -4711,8 +5420,18 @@ return view.extend({
 				typeof state.state == 'object' && state.state.totals != null) {
 				self.state = state.state;
 				self.error = null;
+
+				/* 成功一次：覆盖快照、清掉离线标记与失败计数，被停掉的轮询接回来。 */
+				self.persistSnapshot(state.state);
+				self.offlineFails = 0;
+				self.offlineGivenUp = false;
+				self.snapshotExpired = false;
+				self.hideOfflineBar();
 				self.syncAll(state.state);
 				self.syncNotice('');
+				self.syncOfflineData();
+
+				if (self.timer == null) self.startRefresh();
 			}
 			else if (state.ok === true) {
 				self.syncUnavailable(_('后端返回了空数据'));
@@ -4720,25 +5439,51 @@ return view.extend({
 			else {
 				self.error = (state.err != null && state.err.message) ? state.err.message : '' + state.err;
 
-				/* 有旧数据就保留着，只在顶部提示刷新失败；从来没有数据才铺占位符。 */
-				if (self.state != null)
-					self.syncNotice(_('刷新失败') + '：' + self.error);
-				else
-					self.syncUnavailable(self.error);
+				self.applyRefreshFailure(manual);
 			}
 		}).catch(function(err) {
 			self.error = (err != null && err.message) ? err.message : '' + err;
 
-			/* 有旧数据就保留着，只在顶部提示刷新失败；从来没有数据才铺占位符。 */
-			if (self.state != null)
-				self.syncNotice(_('刷新失败') + '：' + self.error);
-			else
-				self.syncUnavailable(self.error);
+			self.applyRefreshFailure(manual);
 		}).then(function() {
 			self.refreshing = false;
 
 			if (manual === true) self.setBusy(false);
 		});
+	},
+
+	/*
+	 * 刷新失败的统一处理：
+	 *   - 已经有数据（含离线快照）→ 只提示「刷新失败」，页面不清空；
+	 *   - 一点数据都没有 → 先试离线快照，再退到占位符；
+	 *   - 自动轮询连续失败 3 次 → 停表省电，等用户手动重试或网络恢复。
+	 */
+	applyRefreshFailure: function(manual) {
+		var snap;
+
+		if (this.state != null) {
+			this.syncNotice(_('刷新失败') + '：' + this.error);
+
+			/* 页面上的数字仍是"上次成功"的：把离线条摆出来，恢复后自动收起 */
+			this.showStaleBar();
+		}
+		else {
+			snap = this.restoreSnapshot();
+
+			if (snap != null) {
+				this.state = snap.state;
+				this.offlineInfo = snap;
+				this.syncAll(this.state);
+				this.syncNotice('');
+				this.showOfflineBar(snap);
+			}
+			else {
+				this.syncUnavailable(this.error, this.snapshotExpired === true);
+			}
+		}
+
+		/* 只有自动轮询才计数：手动重试是用户主动行为，不该被「3 次」挡住。 */
+		if (manual !== true) this.noteOfflineFailure();
 	},
 
 	startRefresh: function() {

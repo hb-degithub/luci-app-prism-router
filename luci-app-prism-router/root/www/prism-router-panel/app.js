@@ -38,6 +38,14 @@
 	var ALERT_DEVICE_NAMES = 3;     /* 离线/节点告警详情最多列出的名字数 */
 	var ALERT_FLASH_MS = 2000;      /* 点击告警后的高亮时长 */
 
+	/* 移动端：底部导航 / 下拉刷新 / 离线提示 */
+	var PULL_TRIGGER = 64;          /* 下拉超过这个距离（像素）才触发刷新 */
+	var PULL_MAX = 96;              /* 指示器最大位移，避免越拉越远 */
+	var PULL_DAMPING = 0.55;        /* 下拉阻尼：手指位移的 55% 计入指示器 */
+	var TAB_LOCK_MS = 700;          /* 点击 tab 后锁定高亮，避免平滑滚动途中来回跳 */
+	var TAB_PROBE_GAP = 20;         /* 区块顶部越过顶栏底边多少像素算「当前区块」 */
+	var NET_REFRESH_MIN = 1500;     /* 网络恢复后的刷新去抖 */
+
 	var CONFIDENCE = {
 		exact: { label: '精确', cls: 'pill--ok' },
 		degraded: { label: '降级', cls: 'pill--warn' },
@@ -71,7 +79,9 @@
 		prevTotals: null,
 		lastSampleTs: 0,
 		expanded: {},
-		manual: false
+		manual: false,
+		offlineSeen: false,     /* 是否已经因为断网提示过（用于恢复后只刷新一次） */
+		lastRecoverAt: 0
 	};
 
 	var dom = {};
@@ -922,7 +932,7 @@
 			var row = el('tr', 'drow');
 			row.setAttribute('data-key', key);
 
-			var nameCell = el('td');
+			var nameCell = el('td', 'cell-name');
 			var nameWrap = el('div', 'name-wrap');
 			var nameText = el('div', 'name-wrap__text');
 			nameText.appendChild(el('span', 'cell-main', name));
@@ -943,18 +953,26 @@
 			nameCell.appendChild(nameWrap);
 			row.appendChild(nameCell);
 
-			var linkCell = el('td', 'col-link');
+			var linkCell = el('td', 'col-link cell-link');
+			linkCell.setAttribute('data-label', '接入');
 			var link = linkMeta(dev.link);
 			linkCell.appendChild(badge(link.text, link.cls));
 			row.appendChild(linkCell);
 
-			var speedCell = el('td', 'num col-speed');
+			var speedCell = el('td', 'num col-speed cell-speed');
+			speedCell.setAttribute('data-label', '上下行');
 			speedCell.appendChild(el('span', 'speed speed--down', '↓ ' + fmtRate(dev.rx_rate)));
 			speedCell.appendChild(el('span', 'speed speed--up', '↑ ' + fmtRate(dev.tx_rate)));
 			row.appendChild(speedCell);
 
-			row.appendChild(el('td', 'num', fmtBytes(devTotal(dev))));
-			row.appendChild(el('td', 'num', dev.month_total === undefined ? '—' : fmtBytes(dev.month_total)));
+			var totalCell = el('td', 'num cell-total', fmtBytes(devTotal(dev)));
+			totalCell.setAttribute('data-label', '累计');
+			row.appendChild(totalCell);
+
+			var monthCell = el('td', 'num cell-month',
+				dev.month_total === undefined ? '—' : fmtBytes(dev.month_total));
+			monthCell.setAttribute('data-label', '本月');
+			row.appendChild(monthCell);
 
 			body.appendChild(row);
 
@@ -999,7 +1017,8 @@
 			var host = str(item.host) || '未知域名';
 			var row = el('tr');
 
-			var hostCell = el('td');
+			var hostCell = el('td', 'cell-host');
+			hostCell.setAttribute('data-label', '域名');
 			var main = el('span', 'cell-main', host);
 			main.title = host;
 			hostCell.appendChild(main);
@@ -1010,9 +1029,17 @@
 			hostCell.appendChild(sub);
 			row.appendChild(hostCell);
 
-			row.appendChild(el('td', 'num', fmtBytes(item.rx)));
-			row.appendChild(el('td', 'num', fmtBytes(item.tx)));
-			row.appendChild(el('td', 'num', String(n0(item.devices))));
+			var rxCell = el('td', 'num cell-dl', fmtBytes(item.rx));
+			rxCell.setAttribute('data-label', '下载');
+			row.appendChild(rxCell);
+
+			var txCell = el('td', 'num cell-ul', fmtBytes(item.tx));
+			txCell.setAttribute('data-label', '上传');
+			row.appendChild(txCell);
+
+			var devCell = el('td', 'num cell-devices', String(n0(item.devices)));
+			devCell.setAttribute('data-label', '设备数');
+			row.appendChild(devCell);
 			body.appendChild(row);
 		});
 	}
@@ -1383,21 +1410,30 @@
 		return (h > 0 ? h : 0) + 12;
 	}
 
+	function prefersReducedMotion() {
+		try {
+			return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+		} catch (e) {
+			return false;
+		}
+	}
+
 	function scrollToNode(node, block) {
 		if (!node) return;
+		var behavior = prefersReducedMotion() ? 'auto' : 'smooth';
 
 		/* 区块跳到顶：按当前顶栏实际高度留出空间（窄屏顶栏会换行变高）。 */
 		if (block === 'start') {
 			var docTop = window.pageYOffset || document.documentElement.scrollTop || 0;
 			var top = node.getBoundingClientRect().top + docTop - topbarOffset();
 			try {
-				window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+				window.scrollTo({ top: Math.max(0, top), behavior: behavior });
 				return;
 			} catch (e) { /* 回退到 scrollIntoView */ }
 		}
 
 		try {
-			node.scrollIntoView({ behavior: 'smooth', block: block || 'center' });
+			node.scrollIntoView({ behavior: behavior, block: block || 'center' });
 		} catch (e) {
 			try { node.scrollIntoView(); } catch (e2) { /* 忽略 */ }
 		}
@@ -1710,13 +1746,14 @@
 	}
 
 	function renderNotices() {
-		if (app.lastErr) {
-			dom.errorBar.hidden = false;
-			setText(dom.errorText, errText(app.lastErr));
-		} else {
-			dom.errorBar.hidden = true;
-			setText(dom.errorText, '');
-		}
+		var down = netDown();
+		renderNetBar();
+
+		/* 断网/超时的提示已经由顶部网络条承担，避免两条横幅说同一件事。 */
+		var err = app.lastErr;
+		var suppress = down && err && (err.kind === 'network' || err.kind === 'timeout');
+		if (dom.errorBar) dom.errorBar.hidden = !err || suppress;
+		setText(dom.errorText, (!err || suppress) ? '' : errText(err));
 
 		dom.authPanel.hidden = !app.authBlocked;
 		if (app.authBlocked) {
@@ -1746,6 +1783,7 @@
 		renderAlerts();
 		renderSettings();
 		renderNotices();
+		updateActiveTab();
 	}
 
 	/* ------------------------------------------------------------------ *
@@ -1864,10 +1902,16 @@
 	/* ------------------------------------------------------------------ *
 	 * 事件
 	 * ------------------------------------------------------------------ */
-	function onRefreshClick() {
+	/* 手动刷新入口：按钮、错误条重试、下拉刷新、网络恢复都走这里。
+	   只做一次强制 load，不碰自动刷新开关（app.auto / 复选框）。 */
+	function refresh() {
 		announce('正在刷新数据…');
 		load(true);
 		loadSettings(true);
+	}
+
+	function onRefreshClick() {
+		refresh();
 	}
 
 	function onAutoChange() {
@@ -1957,11 +2001,257 @@
 	function bindEvents() {
 		if (dom.refreshBtn) dom.refreshBtn.addEventListener('click', onRefreshClick);
 		if (dom.errorRetry) dom.errorRetry.addEventListener('click', onRefreshClick);
+		if (dom.netRetry) dom.netRetry.addEventListener('click', onRefreshClick);
 		if (dom.autoInput) dom.autoInput.addEventListener('change', onAutoChange);
 		if (dom.authForm) dom.authForm.addEventListener('submit', onTokenSubmit);
 		if (dom.tokenClear) dom.tokenClear.addEventListener('click', onTokenClear);
 		if (dom.devicesBody) dom.devicesBody.addEventListener('click', onDevicesClick);
 		document.addEventListener('visibilitychange', onVisibilityChange);
+	}
+
+	/* ------------------------------------------------------------------ *
+	 * 移动端：底部导航（≤760px 由 CSS 显示，桌面 display:none）
+	 * 锚点复用页面已有的标题 id，避免新增区块 id；滚动位置按顶栏实际高度补偿。
+	 * ------------------------------------------------------------------ */
+	var TABS = [
+		{ key: 'overview', label: '概览', head: 'cards-title', cards: true },
+		{ key: 'devices', label: '设备', head: 'devices-title' },
+		{ key: 'apps', label: '应用', head: 'apps-title' },
+		{ key: 'settings', label: '设置', head: 'settings-title' }
+	];
+
+	var tabState = { entries: [], active: '', raf: 0, lockUntil: 0 };
+
+	function tabTarget(item) {
+		var head = document.getElementById(item.head);
+		if (!head) return null;
+		if (item.cards) return head.parentNode || head;   /* 概览 = 概览卡所在的 section */
+		return panelOf(head) || head.parentNode || head;
+	}
+
+	function setActiveTab(key, force) {
+		if (!key) return;
+		if (!force && tabState.active === key) return;
+		tabState.active = key;
+
+		tabState.entries.forEach(function (entry) {
+			var on = entry.item.key === key;
+			if (on) {
+				entry.node.classList.add('is-active');
+				entry.node.setAttribute('aria-current', 'page');
+			} else {
+				entry.node.classList.remove('is-active');
+				entry.node.removeAttribute('aria-current');
+			}
+		});
+	}
+
+	/* 以「顶栏底边 + TAB_PROBE_GAP」为判定线：越过这条线的最后一个区块就是当前区块。 */
+	function updateActiveTab() {
+		if (!tabState.entries.length) return;
+		if (Date.now() < tabState.lockUntil) return;
+
+		var barRect = dom.topbar ? dom.topbar.getBoundingClientRect() : null;
+		var probe = (barRect ? barRect.bottom : 0) + TAB_PROBE_GAP;
+		var best = TABS[0].key;
+
+		TABS.forEach(function (item) {
+			var node = tabTarget(item);
+			if (!node) return;
+			if (node.getBoundingClientRect().top <= probe) best = item.key;
+		});
+
+		/* 滚到底部时最后一屏（设置）可能只露出一半，直接判为当前项更符合直觉。 */
+		var doc = document.documentElement;
+		var top = window.pageYOffset || doc.scrollTop || 0;
+		if (doc.scrollHeight && top + (window.innerHeight || 0) >= doc.scrollHeight - 4) {
+			best = TABS[TABS.length - 1].key;
+		}
+
+		setActiveTab(best);
+	}
+
+	/* scroll 事件用 rAF 节流：一帧最多算一次几何。 */
+	function onScrollThrottled() {
+		if (tabState.raf) return;
+		tabState.raf = window.requestAnimationFrame(function () {
+			tabState.raf = 0;
+			updateActiveTab();
+		});
+	}
+
+	function bindTabClick(entry) {
+		return function (ev) {
+			if (ev && ev.preventDefault) ev.preventDefault();
+			var target = tabTarget(entry.item);
+			setActiveTab(entry.item.key, true);
+			tabState.lockUntil = Date.now() + TAB_LOCK_MS;
+			if (target) scrollToNode(target, 'start');
+			announce('已跳转到「' + entry.item.label + '」。');
+			window.setTimeout(updateActiveTab, TAB_LOCK_MS + 60);
+		};
+	}
+
+	function setupTabs() {
+		var bar = document.querySelector('.tabbar');
+		if (!bar) return;
+
+		var links = bar.querySelectorAll('.tabbar__link');
+		for (var i = 0; i < links.length; i++) {
+			var key = links[i].getAttribute('data-tab') || '';
+			var item = null;
+			for (var j = 0; j < TABS.length; j++) {
+				if (TABS[j].key === key) item = TABS[j];
+			}
+			if (!item) continue;
+
+			var entry = { node: links[i], item: item };
+			tabState.entries.push(entry);
+			links[i].addEventListener('click', bindTabClick(entry));
+		}
+
+		setActiveTab(TABS[0].key, true);
+		window.addEventListener('scroll', onScrollThrottled, { passive: true });
+		window.addEventListener('resize', onScrollThrottled);
+		updateActiveTab();
+	}
+
+	/* ------------------------------------------------------------------ *
+	 * 移动端：下拉刷新
+	 * 只在「页面在最顶部且单指下拉」时接管，超过 PULL_TRIGGER 才刷新；
+	 * 触发的是 refresh()（手动刷新），自动刷新开关与定时器都不受影响。
+	 * ------------------------------------------------------------------ */
+	var pullState = { tracking: false, startY: 0, distance: 0 };
+
+	function pageAtTop() {
+		var doc = document.documentElement;
+		return (window.pageYOffset || doc.scrollTop || 0) <= 0;
+	}
+
+	function paintPull(dist, dragging) {
+		pullState.distance = dist;
+
+		var hint = dom.pullHint;
+		if (!hint) return;
+
+		hint.style.setProperty('--pull-y', Math.round(dist) + 'px');
+		if (dragging) hint.classList.add('is-dragging');
+		else hint.classList.remove('is-dragging');
+
+		if (dist > 2) hint.classList.add('is-visible');
+		else hint.classList.remove('is-visible');
+
+		if (dist >= PULL_TRIGGER) hint.classList.add('is-armed');
+		else hint.classList.remove('is-armed');
+
+		setText(dom.pullHintText, dist >= PULL_TRIGGER ? '松开刷新' : '下拉刷新');
+	}
+
+	function onTouchStart(ev) {
+		if (!ev.touches || ev.touches.length !== 1) { pullState.tracking = false; return; }
+		if (!pageAtTop()) { pullState.tracking = false; return; }
+		pullState.tracking = true;
+		pullState.startY = ev.touches[0].clientY;
+		pullState.distance = 0;
+	}
+
+	function onTouchMove(ev) {
+		if (!pullState.tracking) return;
+		if (!ev.touches || ev.touches.length !== 1) { onTouchEnd(); return; }
+		if (!pageAtTop()) { pullState.tracking = false; paintPull(0, false); return; }
+
+		var dy = ev.touches[0].clientY - pullState.startY;
+		if (dy <= 0) {
+			if (pullState.distance) paintPull(0, true);
+			return;
+		}
+
+		var dist = Math.min(PULL_MAX, dy * PULL_DAMPING);
+		if (dist > 4 && ev.cancelable) {
+			try { ev.preventDefault(); } catch (e) { /* 忽略 */ }
+		}
+		paintPull(dist, true);
+	}
+
+	function onTouchEnd() {
+		if (!pullState.tracking) return;
+		var dist = pullState.distance;
+		pullState.tracking = false;
+		paintPull(0, false);
+		if (dist >= PULL_TRIGGER) refresh();
+	}
+
+	function setupPullRefresh() {
+		if (!dom.pullHint) return;
+		document.addEventListener('touchstart', onTouchStart, { passive: true });
+		document.addEventListener('touchmove', onTouchMove, { passive: false });
+		document.addEventListener('touchend', onTouchEnd);
+		document.addEventListener('touchcancel', function () {
+			pullState.tracking = false;
+			paintPull(0, false);
+		});
+	}
+
+	/* ------------------------------------------------------------------ *
+	 * 离线 / 弱网提示
+	 * navigator.onLine === false 或请求失败（network / timeout）时显示，
+	 * 恢复联网事件后自动隐藏并刷新一次（NET_REFRESH_MIN 去抖，避免重复刷新）。
+	 * ------------------------------------------------------------------ */
+	function netDown() {
+		if (window.navigator && window.navigator.onLine === false) return true;
+		var err = app.lastErr;
+		return !!(err && (err.kind === 'network' || err.kind === 'timeout'));
+	}
+
+	function renderNetBar() {
+		if (!dom.netBar) return;
+
+		if (!netDown()) {
+			if (!dom.netBar.hidden) dom.netBar.hidden = true;
+			setText(dom.netText, '');
+			return;
+		}
+
+		var when = app.lastOk ? fmtClockMs(app.lastOk) : '';
+		var offline = !!(window.navigator && window.navigator.onLine === false);
+		var reason = offline ? '网络已断开' : '网络响应超时';
+		var text = reason + (when
+			? '，显示的是上次数据（' + when + '）'
+			: '，暂无可用数据');
+
+		setText(dom.netText, text);
+		dom.netBar.hidden = false;
+	}
+
+	function onOffline() {
+		app.offlineSeen = true;
+		renderNotices();
+		announce('网络已断开，显示的是上次数据。');
+	}
+
+	function onOnline() {
+		var wasDown = app.offlineSeen || netDown();
+		app.offlineSeen = false;
+
+		/* 旧的断网错误已经不代表现状，先清掉，让提示条即时消失。 */
+		if (app.lastErr && (app.lastErr.kind === 'network' || app.lastErr.kind === 'timeout')) {
+			app.lastErr = null;
+		}
+		renderNotices();
+
+		if (!wasDown) return;
+
+		var now = Date.now();
+		if (now - app.lastRecoverAt < NET_REFRESH_MIN) return;
+		app.lastRecoverAt = now;
+
+		announce('网络已恢复，正在刷新数据。');
+		refresh();
+	}
+
+	function setupNetwork() {
+		window.addEventListener('online', onOnline);
+		window.addEventListener('offline', onOffline);
 	}
 
 	/* ------------------------------------------------------------------ *
@@ -1971,6 +2261,7 @@
 		var ids = [
 			'state-pill', 'confidence-pill', 'last-updated', 'refresh-btn', 'auto-refresh',
 			'aria-live', 'error-bar', 'error-text', 'error-retry',
+			'net-bar', 'net-text', 'net-retry', 'pull-hint', 'pull-hint-text',
 			'auth-panel', 'auth-desc', 'auth-form', 'token-input', 'token-clear', 'auth-hint',
 			'card-rx', 'card-rx-sub', 'card-rx-unit', 'card-tx', 'card-tx-sub', 'card-tx-unit',
 			'card-today', 'card-today-sub', 'card-month', 'card-month-sub',
@@ -1993,6 +2284,7 @@
 		dom.canvas = dom.rateChart;
 		dom.live = dom.ariaLive;
 		dom.autoInput = dom.autoRefresh;
+		dom.topbar = document.querySelector('.topbar');
 	}
 
 	function camel(id) {
@@ -2012,6 +2304,9 @@
 		bindEvents();
 		setupThemeListener();
 		setupResize();
+		setupTabs();
+		setupPullRefresh();
+		setupNetwork();
 
 		renderAll();
 		load(false);

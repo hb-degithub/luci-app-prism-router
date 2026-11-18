@@ -950,10 +950,12 @@ main:focus { outline: none; }
   .panel__head { flex-wrap: wrap; }
 }
 
-/* ≤390：概览卡单列，表格整表横向滚动 */
+/* ≤390：概览卡保持 2 列（一屏看全 6 项），长数字缩字号，不换行 */
 @media (max-width: 390px) {
-  .cards { grid-template-columns: minmax(0, 1fr); }
-  .card { padding: 14px; }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .card { padding: 11px; }
+  .card__value { font-size: 17px; }
+  .card__value > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .brand__mark { width: 36px; height: 36px; }
   .btn { min-height: 44px; padding: 10px 14px; }
   .btn--icon { min-width: 44px; }
@@ -1165,4 +1167,359 @@ main:focus { outline: none; }
 @media (max-width: 480px) {
   .alert__cue { display: none; }
   .settings__v { text-align: left; }
+}
+
+/* =========================================================================
+ * 移动优先增强（≤760px）
+ * 新增规则全部落在媒体查询内（或默认隐藏的组件上），>760px 的桌面布局不变。
+ * ========================================================================= */
+
+/* ------------------------------------------------------------------ *
+ * 离线 / 弱网提示条（断网或请求失败时出现在顶栏下方，恢复后自动消失）
+ * ------------------------------------------------------------------ */
+.netbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px clamp(12px, 3vw, 28px) 0;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--text);
+  font-size: 13px;
+}
+.netbar__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--warn);
+  color: #fff;
+}
+.netbar__text { flex: 1 1 auto; min-width: 0; line-height: 1.4; }
+.netbar__retry { flex: none; }
+
+/* ------------------------------------------------------------------ *
+ * 下拉刷新指示器：窄屏专用，默认藏在顶栏上方
+ * ------------------------------------------------------------------ */
+.pullhint {
+  position: fixed;
+  left: 50%;
+  top: calc(env(safe-area-inset-top, 0px) + 10px);
+  z-index: 12;
+  display: none;
+  align-items: center;
+  gap: 7px;
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, calc(-58px + var(--pull-y, 0px)));
+  transition: transform .2s ease, opacity .2s ease, color .15s ease, border-color .15s ease;
+}
+.pullhint.is-visible { opacity: 1; }
+.pullhint.is-dragging { transition: none; }
+.pullhint.is-armed { color: var(--accent); border-color: var(--accent); }
+.pullhint__spinner {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+}
+.pullhint.is-armed .pullhint__spinner { animation: spin .8s linear infinite; }
+
+/* ------------------------------------------------------------------ *
+ * 底部导航：桌面隐藏，≤760px 固定贴底
+ * ------------------------------------------------------------------ */
+.tabbar { display: none; }
+
+@media (max-width: 760px) {
+  /* ---- 安全区：顶部刘海 / 底部 Home 条 ---- */
+  body { padding-bottom: calc(62px + env(safe-area-inset-bottom, 0px)); }
+
+  .topbar {
+    padding-top: max(12px, env(safe-area-inset-top, 0px));
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+    padding-right: max(12px, env(safe-area-inset-right, 0px));
+  }
+  .layout {
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+    padding-right: max(12px, env(safe-area-inset-right, 0px));
+  }
+  .netbar, .errorbar, .authpanel {
+    margin-left: max(12px, env(safe-area-inset-left, 0px));
+    margin-right: max(12px, env(safe-area-inset-right, 0px));
+  }
+  .footer {
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+    padding-right: max(12px, env(safe-area-inset-right, 0px));
+  }
+
+  /* ---- 底部 tab 栏 ---- */
+  .tabbar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 2px;
+    padding: 4px max(6px, env(safe-area-inset-right, 0px))
+             calc(4px + env(safe-area-inset-bottom, 0px))
+             max(6px, env(safe-area-inset-left, 0px));
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+    background: color-mix(in srgb, var(--panel) 94%, transparent);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 -8px 20px rgba(16, 24, 40, .10);
+  }
+  .tabbar__link {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    min-height: 50px;
+    padding: 4px 2px;
+    border-radius: 10px;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: .2px;
+    text-decoration: none;
+    -webkit-tap-highlight-color: transparent;
+    transition: color .15s ease, background-color .15s ease;
+  }
+  .tabbar__link:active { background: var(--panel-2); }
+  .tabbar__link.is-active { color: var(--accent); }
+  .tabbar__link[aria-current="page"]::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    width: 26px;
+    height: 3px;
+    border-radius: 0 0 3px 3px;
+    background: currentColor;
+  }
+  .tabbar__icon { width: 22px; height: 22px; }
+  .tabbar__text { line-height: 1; }
+
+  /* ---- 下拉刷新指示器 ---- */
+  .pullhint { display: inline-flex; }
+
+  /* ---- 触控目标 ---- */
+  .btn { min-height: 44px; }
+  .btn--icon { min-width: 44px; min-height: 44px; padding: 10px 12px; }
+  .btn--small { min-height: 40px; }
+  .row-toggle { width: 44px; height: 44px; }
+  .switch { min-height: 44px; }
+
+  /* ---- 概览卡：数字不换行、单位跟随、长数值缩字号 ---- */
+  .cards { gap: 10px; }
+  .card { padding: 12px; }
+  .card__label { font-size: 11px; }
+  .card__value {
+    font-size: clamp(15px, 4.6vw, 22px);
+    gap: 4px;
+    flex-wrap: nowrap;
+    white-space: nowrap;
+    word-break: normal;
+    overflow: hidden;
+  }
+  .card__value > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .card__unit { flex: none; font-size: 10px; }
+  .card__sub { min-height: 2.7em; font-size: 11px; }
+  /* 今日 / 本月是长数值，单独允许更小字号（用 nth-of-type：区块首个子节点是 h3） */
+  .card:nth-of-type(3) .card__value,
+  .card:nth-of-type(4) .card__value { font-size: clamp(13px, 4vw, 20px); }
+
+  /* ------------------------------------------------------------------ *
+   * 表格 → 卡片：仅改 display 与 data-label 伪元素，不复制任何 DOM
+   * ------------------------------------------------------------------ */
+  .table-scroll { overflow: visible; }
+  .scroll-hint { display: none !important; }
+
+  .dtable {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    border-collapse: separate;
+    border-spacing: 0;
+    table-layout: auto;
+    font-size: 14px;
+  }
+  .dtable caption { display: block; }
+
+  /* 表头保留在 DOM 与无障碍树里（scope=col 不变），只做视觉隐藏 */
+  .dtable thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  /* 注意：全部用直接子选择器 —— 设备明细里的 .mini-table 是嵌套表格，
+     若用后代选择器会把它的 th/td 也变成 block，明细表会被拆成一行一个字段。 */
+  .dtable > tbody { display: block; }
+  .dtable > tbody > tr { display: block; margin: 0 0 10px; }
+  .dtable > tbody > tr:last-child { margin-bottom: 0; }
+
+  .dtable > tbody > tr > td {
+    display: block;
+    width: auto;
+    max-width: none;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    text-align: left;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
+  .dtable > tbody > tr > td.num,
+  .dtable > tbody > tr > td.col-link,
+  .dtable > tbody > tr > td.col-speed { width: auto; max-width: none; }
+  .dtable > tbody > tr > td.num { text-align: left; }
+  .dtable > tbody > tr > td[colspan] { grid-column: 1 / -1; }
+
+  /* 字段名由 data-label 生成，等价于「标签 + 值」的卡片行 */
+  .dtable > tbody > tr > td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 2px;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .3px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  /* ---- 设备卡 ---- */
+  .dtable > tbody > tr.drow {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 12px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel-2);
+  }
+  .dtable > tbody > tr.drow > td.cell-name { grid-column: 1 / -1; }
+  .dtable > tbody > tr.drow > td.cell-link {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .dtable > tbody > tr.drow > td.cell-speed {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+  }
+  .dtable > tbody > tr.drow > td.cell-link[data-label]::before,
+  .dtable > tbody > tr.drow > td.cell-speed[data-label]::before { margin-bottom: 0; }
+  .dtable > tbody > tr.drow > td.cell-total,
+  .dtable > tbody > tr.drow > td.cell-month {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .dtable > tbody > tr.drow .speed { white-space: nowrap; }
+  .dtable > tbody > tr.drow.is-flash { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* 展开后的应用明细：紧贴卡片下沿；不支持 :has 时退化为独立小卡片 */
+  .dtable > tbody > tr.detail-row {
+    margin: 0 0 10px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel-2);
+    overflow: hidden;
+  }
+  .dtable > tbody > tr.drow:has(+ tr.detail-row:not([hidden])) {
+    margin-bottom: 0;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    border-bottom-color: transparent;
+  }
+  .dtable > tbody > tr.drow:has(+ tr.detail-row:not([hidden])) + tr.detail-row:not([hidden]) {
+    border-top: 0;
+    border-top-left-radius: 0;
+    border-top-right-radius: 0;
+  }
+  .dtable > tbody > tr.detail-row > td {
+    display: block;
+    padding: 12px 14px;
+    border: 0;
+    background: transparent;
+  }
+  .detail__grid { gap: 6px 14px; margin-bottom: 10px; font-size: 12px; }
+  .quota { min-width: 0; }
+  .mini-table { table-layout: fixed; font-size: 12px; }
+  .mini-table th, .mini-table td {
+    padding: 6px 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .mini-table th.num, .mini-table td.num { width: 56px; }
+  .mini-table .badge { max-width: 100%; }
+  .detail__host { max-width: none; }
+
+  /* ---- 应用卡 ---- */
+  .dtable--apps > tbody > tr {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel-2);
+  }
+  .dtable--apps > tbody > tr > td.cell-host { grid-column: 1 / -1; }
+  .dtable--apps > tbody > tr > td.num { text-align: left; }
+  .dtable--apps > tbody > tr > td.cell-host .cell-sub { margin-top: 4px; }
+
+  /* 空态行不套卡片内边距 */
+  .dtable > tbody > tr > td.placeholder { padding: 18px 8px; }
+}
+
+/* ------------------------------------------------------------------ *
+ * 减少动态效果：关闭新增组件的过渡与旋转
+ * ------------------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  .tabbar,
+  .tabbar__link,
+  .pullhint,
+  .dtable > tbody > tr > td::before,
+  .card,
+  .drow { transition: none !important; animation: none !important; }
+  .pullhint.is-armed .pullhint__spinner { animation: none !important; }
 }

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <meta name="color-scheme" content="light dark">
 <meta name="description" content="OpenWrt 棱镜路由独立面板：直连与代理分账的设备、应用、出口与健康状态。">
@@ -60,6 +60,28 @@
 </header>
 
 <p id="aria-live" class="visually-hidden" role="status" aria-live="polite"></p>
+
+<!-- 离线 / 弱网提示：navigator.onLine=false 或请求失败时显示，恢复后自动消失并刷新一次 -->
+<div id="net-bar" class="netbar" role="status" aria-live="polite" hidden>
+  <span class="netbar__icon" aria-hidden="true">
+    <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+      <path d="M2 2l20 20"></path>
+      <path d="M8.5 16.5a5 5 0 0 1 7 0"></path>
+      <path d="M5 12.9a9.5 9.5 0 0 1 3.3-2.3"></path>
+      <path d="M15.7 10.6A9.5 9.5 0 0 1 19 12.9"></path>
+      <path d="M2 8.8a14.6 14.6 0 0 1 5.7-3.4"></path>
+      <path d="M16.3 5.4A14.6 14.6 0 0 1 22 8.8"></path>
+    </svg>
+  </span>
+  <p id="net-text" class="netbar__text"></p>
+  <button id="net-retry" type="button" class="btn btn--small netbar__retry" aria-label="重新请求面板数据">重试</button>
+</div>
+
+<!-- 下拉刷新指示器（仅窄屏显示，纯装饰） -->
+<div id="pull-hint" class="pullhint" aria-hidden="true">
+  <span class="pullhint__spinner"></span>
+  <span id="pull-hint-text" class="pullhint__text">下拉刷新</span>
+</div>
 
 <div id="error-bar" class="errorbar" role="alert" hidden>
   <span class="errorbar__icon" aria-hidden="true">!</span>
@@ -273,6 +295,46 @@
   <p>独立面板 · 端口 8099 · 数据源 Clash <code>/connections</code> 与 <code>nf_conntrack</code></p>
   <p class="footer__note">纯静态页面，无外部资源；后端异常时保留上一次数据。</p>
 </footer>
+
+<!-- 移动端底部导航：≤760px 由 CSS 显示；锚点复用已有标题 id，不新增区块 id -->
+<nav class="tabbar" aria-label="面板分区导航">
+  <a class="tabbar__link is-active" href="#cards-title" data-tab="overview" aria-current="page">
+    <svg class="tabbar__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+      <rect x="3.5" y="3.5" width="7" height="7" rx="2"></rect>
+      <rect x="13.5" y="3.5" width="7" height="7" rx="2"></rect>
+      <rect x="3.5" y="13.5" width="7" height="7" rx="2"></rect>
+      <rect x="13.5" y="13.5" width="7" height="7" rx="2"></rect>
+    </svg>
+    <span class="tabbar__text">概览</span>
+  </a>
+  <a class="tabbar__link" href="#devices-title" data-tab="devices">
+    <svg class="tabbar__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+      <rect x="2.5" y="4" width="19" height="12.5" rx="2.2"></rect>
+      <path d="M8 20.5h8"></path>
+      <path d="M12 16.5v4"></path>
+    </svg>
+    <span class="tabbar__text">设备</span>
+  </a>
+  <a class="tabbar__link" href="#apps-title" data-tab="apps">
+    <svg class="tabbar__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+      <path d="M12 3l9 4.8-9 4.8-9-4.8L12 3z"></path>
+      <path d="M3 12.4l9 4.8 9-4.8"></path>
+      <path d="M3 17l9 4.8 9-4.8"></path>
+    </svg>
+    <span class="tabbar__text">应用</span>
+  </a>
+  <a class="tabbar__link" href="#settings-title" data-tab="settings">
+    <svg class="tabbar__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
+      <path d="M3.5 7.5h4.6"></path>
+      <path d="M15.9 7.5h4.6"></path>
+      <circle cx="12" cy="7.5" r="2.4"></circle>
+      <path d="M3.5 16.5h4.6"></path>
+      <path d="M15.9 16.5h4.6"></path>
+      <circle cx="12" cy="16.5" r="2.4"></circle>
+    </svg>
+    <span class="tabbar__text">设置</span>
+  </a>
+</nav>
 
 <script src="app.js"></script>
 </body>
