@@ -1365,10 +1365,11 @@ main:focus { outline: none; }
     table-layout: auto;
     font-size: 14px;
   }
-  .dtable caption { display: block; }
+  .dtable > caption { display: block; }
 
-  /* 表头保留在 DOM 与无障碍树里（scope=col 不变），只做视觉隐藏 */
-  .dtable thead {
+  /* 表头保留在 DOM 与无障碍树里（scope=col 不变），只做视觉隐藏；
+     用直接子选择器，避免把设备明细里的 .mini-table 表头一起隐藏 */
+  .dtable > thead {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -1483,13 +1484,13 @@ main:focus { outline: none; }
   }
   .detail__grid { gap: 6px 14px; margin-bottom: 10px; font-size: 12px; }
   .quota { min-width: 0; }
-  .mini-table { table-layout: fixed; font-size: 12px; }
+  .mini-table { table-layout: fixed; font-size: 11px; }
   .mini-table th, .mini-table td {
-    padding: 6px 4px;
+    padding: 6px 3px;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .mini-table th.num, .mini-table td.num { width: 56px; }
+  .mini-table th.num, .mini-table td.num { width: 62px; }
   .mini-table .badge { max-width: 100%; }
   .detail__host { max-width: none; }
 
