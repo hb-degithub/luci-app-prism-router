@@ -921,7 +921,56 @@ var CSS = [
 	'@media (max-width:359px){.tsm-exits{grid-template-columns:1fr 1fr}.tsm-exit{padding:8px}.tsm-exit-name{font-size:12px}.tsm-aps{grid-template-columns:1fr}.tsm-tl-h{margin-bottom:4px}.tsm-conn{height:16px}.tsm-dnode-name{font-size:11px}}',
 	'@media (max-width:320px){.tsm-topo .tsm-exits{grid-template-columns:1fr}.tsm-topo .tsm-exit{padding:7px 8px}.tsm-topo .tsm-exit-name,.tsm-topo .tsm-ap-name,.tsm-topo .tsm-router-name,.tsm-topo .tsm-inet-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-topo .tsm-conn{height:14px}.tsm-topo .tsm-tl-h{margin-bottom:4px}.tsm-topo .tsm-ap{padding:8px}.tsm-topo .tsm-router-card{gap:8px;padding:10px}.tsm-topo .tsm-router-ico{width:38px;height:38px}.tsm-topo .tsm-router-ico svg{width:24px;height:24px}.tsm-topo .tsm-xname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-trow{grid-template-columns:repeat(2,minmax(0,1fr))}.tsm-dnode-ring{width:40px;height:40px}.tsm-dnode-ico,.tsm-dnode-ico svg{width:20px;height:20px}.tsm-otopo{padding:10px 8px 8px}.tsm-dsearch{padding:0 8px;gap:4px;margin-left:0;margin-right:0}}',
 	/* 深色主题：只改背景/分隔线/次级文字，橙/绿/蓝强调色保持不变；不用纯黑 */
-	'@media (prefers-color-scheme: dark){#ts-mobile{--tsm-card-bg:#1c2026;--tsm-line:rgba(255,255,255,.1);--tsm-line-strong:rgba(255,255,255,.18);--tsm-wire:rgba(255,255,255,.34);--tsm-text:#e7eaee;--tsm-sub:#a4abb5;--tsm-soft:rgba(255,255,255,.06);--tsm-dots-bg:linear-gradient(to top,rgba(20,23,27,.99) 55%,rgba(20,23,27,.86));background:#14171b;color:#e7eaee}#ts-mobile .tsm-tabs,#ts-mobile .tsm-dtabs{background:#1c2026}#ts-mobile .tsm-dot-i{background:rgba(255,255,255,.22)}#ts-mobile .tsm-dot-i.on{background:#e7eaee}#ts-mobile .tsm-nhero{background:linear-gradient(180deg,rgba(255,111,0,.14) 0%,rgba(255,111,0,.05) 60%,rgba(20,23,27,0) 100%)}#ts-mobile .tsm-tab.on{color:#e7eaee}#ts-mobile .tsm-health{background:rgba(255,255,255,.05)}}'
+	'@media (prefers-color-scheme: dark){#ts-mobile{--tsm-card-bg:#1c2026;--tsm-line:rgba(255,255,255,.1);--tsm-line-strong:rgba(255,255,255,.18);--tsm-wire:rgba(255,255,255,.34);--tsm-text:#e7eaee;--tsm-sub:#a4abb5;--tsm-soft:rgba(255,255,255,.06);--tsm-dots-bg:linear-gradient(to top,rgba(20,23,27,.99) 55%,rgba(20,23,27,.86));background:#14171b;color:#e7eaee}#ts-mobile .tsm-tabs,#ts-mobile .tsm-dtabs{background:#1c2026}#ts-mobile .tsm-dot-i{background:rgba(255,255,255,.22)}#ts-mobile .tsm-dot-i.on{background:#e7eaee}#ts-mobile .tsm-nhero{background:linear-gradient(180deg,rgba(255,111,0,.14) 0%,rgba(255,111,0,.05) 60%,rgba(20,23,27,0) 100%)}#ts-mobile .tsm-tab.on{color:#e7eaee}#ts-mobile .tsm-health{background:rgba(255,255,255,.05)}}',
+
+	/* ================================================================
+	 * 第 4 步：下拉刷新 / 骨架屏 / 切屏过渡 / 安全区 / 迷你趋势 / Top3
+	 * 全部走颜色变量，深色主题自动跟随。
+	 * ================================================================ */
+	/* ---- 安全区：刘海与底部横条不遮挡内容（viewport-fit=cover 由 injectPwaHead 保证）---- */
+	'#ts-mobile{padding-top:env(safe-area-inset-top,0px);padding-bottom:calc(72px + env(safe-area-inset-bottom,0px))}',
+	'.tsm-tabs{top:env(safe-area-inset-top,0px)}',
+	'.tsm-dots{padding-bottom:calc(8px + env(safe-area-inset-bottom,0px))}',
+	/* ---- 下拉刷新指示器：绝对定位在 .tsm-pages 顶部，默认藏在 sticky tab 后面 ---- */
+	'.tsm-pages{position:relative}',
+	'.tsm-pull{position:absolute;top:0;left:0;right:0;z-index:5;display:flex;align-items:center;justify-content:center;gap:6px;height:56px;pointer-events:none;opacity:0;transform:translateY(-100%);transition:transform .18s ease-out,opacity .18s ease-out;background:var(--tsm-card-bg);color:var(--tsm-sub);font-size:12px;border-bottom:1px solid var(--tsm-line)}',
+	'.tsm-pull-ico{flex:none;display:block;transform-origin:50% 50%}',
+	'.tsm-pull.busy .tsm-pull-ico{animation:tsm-spin .9s linear infinite}',
+	'@keyframes tsm-spin{to{transform:rotate(360deg)}}',
+	/* ---- 骨架屏：灰条 + shimmer 横扫；减少动态偏好时彻底关掉 ---- */
+	'.tsm-skel{position:relative;overflow:hidden;background:rgba(127,127,127,.16);border-radius:10px;min-width:0}',
+	'.tsm-skel::after{content:"";position:absolute;top:0;bottom:0;left:0;right:0;background:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,.45) 50%,rgba(255,255,255,0) 100%);transform:translateX(-100%);animation:tsm-shimmer 1.2s ease-in-out infinite}',
+	'@keyframes tsm-shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}',
+	'.tsm-skel-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:0 0 12px;min-width:0}',
+	'.tsm-skel-num{height:54px}',
+	'.tsm-skel-list{margin:8px 0 0;min-width:0}',
+	'.tsm-skel-row{height:44px;margin:0 0 8px}',
+	'.tsm-skel-stack{display:block;min-width:0;margin:0 0 6px}',
+	'.tsm-skel-card{height:84px;margin:0 0 8px}',
+	/* ---- 切屏过渡：淡入 + 8px 横向位移，150ms；同一时间仍只有 .on 那屏可见 ---- */
+	'.tsm-page.on.is-enter-next{animation:tsm-enter-next .15s ease-out both}',
+	'.tsm-page.on.is-enter-prev{animation:tsm-enter-prev .15s ease-out both}',
+	'@keyframes tsm-enter-next{from{opacity:0;transform:translateX(8px)}to{opacity:1;transform:translateX(0)}}',
+	'@keyframes tsm-enter-prev{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}',
+	/* ---- 迷你趋势：120×32，下行蓝 / 上行橙，与其它屏配色一致 ---- */
+	'.tsm-sparkwrap{display:flex;align-items:center;gap:8px;margin:8px 0 0;min-width:0}',
+	'.tsm-spark{display:block;flex:none;width:120px;height:32px}',
+	'.tsm-spark-cap{font-size:11px;line-height:1.4;color:var(--tsm-sub);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+	/* ---- 概览 Top3：设备行可点（≥40px），应用行只展示不可点 ---- */
+	'.tsm-top3{width:100%;display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:14px 0 0;min-width:0}',
+	'.tsm-topcard{min-width:0;padding:10px 12px;border-radius:14px;background:var(--tsm-card-bg);border:1px solid var(--tsm-line)}',
+	'.tsm-topcard-t{font-size:12px;line-height:1.4;color:var(--tsm-sub);margin:0 0 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+	'.tsm-toprow{display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;min-width:0;min-height:40px;padding:0;margin:0;border:none;background:none;font:inherit;font-size:12.5px;line-height:1.35;color:var(--tsm-text);text-align:left}',
+	'.tsm-toprow.is-link{cursor:pointer}',
+	'.tsm-toprow.is-link:active{opacity:.72}',
+	'.tsm-topname{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+	'.tsm-topval{flex:none;font-size:11.5px;color:var(--tsm-sub);font-variant-numeric:tabular-nums;white-space:nowrap}',
+	'.tsm-toprow-empty{display:flex;align-items:center;min-height:40px;font-size:12px;color:var(--tsm-sub)}',
+	'@media (max-width:359px){.tsm-top3{grid-template-columns:1fr}.tsm-spark-cap{display:none}}',
+	/* ---- 减少动态偏好：新增的动画 / 过渡一律关闭 ---- */
+	'@media (prefers-reduced-motion: reduce){.tsm-skel::after{animation:none;background:none}}',
+	'@media (prefers-reduced-motion: reduce){.tsm-page.on.is-enter-next,.tsm-page.on.is-enter-prev{animation:none}}',
+	'@media (prefers-reduced-motion: reduce){.tsm-pull,.tsm-pull-ico{transition:none}.tsm-pull.busy .tsm-pull-ico{animation:none}}'
 ].join('\n');
 
 // ---------------------------------------------------------------- 设备屏 / 节点屏（第 2 步）
@@ -1783,6 +1832,97 @@ function deviceNodeTitle(dev) {
 		_('下行') + ' ' + rx + ' · ' + _('上行') + ' ' + tx;
 }
 
+// ---------------------------------------------------------------- 交互增强（下拉刷新 / 骨架 / 趋势 / Top3）
+
+var PULL_TRIGGER = 64;        /* 下拉超过 64px 松手才真正刷新 */
+var PULL_ARM = 8;             /* 超过 8px 才认为是在下拉（过滤手指抖动） */
+var PULL_RANGE = 56;          /* 指示器最多露出 56px（与 CSS 高度一致） */
+var PULL_PAGES = [ 0, 1, 3 ]; /* 只有概览 / 设备 / 拓扑三屏支持下拉刷新 */
+var ENTER_MS = 150;           /* 切屏入场动画 150ms，结束后移除 class */
+var SPARK_MAX = 12;           /* 迷你趋势保留最近 12 次采样 */
+var SPARK_W = 120;
+var SPARK_H = 32;
+
+/* 页面滚动位置：优先 scrollingElement，退化到 documentElement / body；取不到当 0（顶部）。 */
+function scrollTopOf() {
+	var el = null;
+	var top = 0;
+
+	try {
+		el = document.scrollingElement || document.documentElement || document.body;
+	}
+	catch (e) { el = null; }
+
+	if (el != null && typeof el.scrollTop == 'number') top = el.scrollTop;
+	else if (typeof window !== 'undefined' && typeof window.scrollY == 'number') top = window.scrollY;
+
+	return num(top);
+}
+
+/* 单指触摸点；多指 / 空列表一律 null（多指手势不当下拉）。 */
+function touchAt(ev, key) {
+	var list = (ev != null) ? ev[key] : null;
+
+	if (list == null || list.length != 1) return null;
+
+	return list[0];
+}
+
+function round1(value) {
+	return Math.round(num(value) * 10) / 10;
+}
+
+/* 骨架块：每块是 .tsm-skel + 变体类，纯装饰（aria-hidden），不带任何假数据。 */
+function skeletonBlocks(count, variant) {
+	var out = [];
+	var n = num(count);
+	var i;
+
+	for (i = 0; i < n; i++)
+		out.push(E('div', {
+			'class': 'tsm-skel' + (variant ? ' ' + variant : ''),
+			'aria-hidden': 'true'
+		}, ''));
+
+	return out;
+}
+
+function sparkMaxOf(samples) {
+	var list = Array.isArray(samples) ? samples : [];
+	var max = 0;
+	var i;
+
+	for (i = 0; i < list.length; i++)
+		max = Math.max(max, num(list[i] != null ? list[i].rx : 0), num(list[i] != null ? list[i].tx : 0));
+
+	return max;
+}
+
+/*
+ * 迷你趋势的点串：无采样返回空串（由占位横线兜底）；单点时居中。
+ * x 均匀分布在 0..SPARK_W，y 按两条序列的共同最大值归一化，留 2px 上下边距。
+ */
+function sparkPoints(samples, field) {
+	var list = Array.isArray(samples) ? samples : [];
+	var n = list.length;
+	var max = sparkMaxOf(list);
+	var out = [];
+	var i, x, y;
+
+	if (!n) return '';
+
+	for (i = 0; i < n; i++) {
+		x = (n <= 1) ? (SPARK_W / 2) : (i * SPARK_W / (n - 1));
+		y = (max <= 0)
+			? (SPARK_H - 2)
+			: (SPARK_H - 2 - (num(list[i][field]) / max) * (SPARK_H - 4));
+
+		out.push(round1(x) + ',' + round1(y));
+	}
+
+	return out.join(' ');
+}
+
 // ---------------------------------------------------------------- 视图
 
 return view.extend({
@@ -1849,6 +1989,15 @@ return view.extend({
 
 		/* 拓扑下钻展开状态：exit:<出口名> / ap:<node_id>，刷新时保留 */
 		this.topoOpenExits = {};
+
+		/* 下拉刷新 / 切屏过渡 / 迷你趋势 / 概览 Top3 的本地状态（内存，不写存储） */
+		this.enterTimer = null;
+		this.enterPageRef = null;
+		this.pullDist = 0;
+		this.pullBusy = false;
+		this.ovSkelOn = false;
+		this.sparkSamples = [];
+		this.top3Sig = null;
 
 		root = E('div', { 'id': 'ts-mobile', 'class': 'tsm-app' }, [
 			E('style', {}, CSS),
@@ -1966,8 +2115,11 @@ return view.extend({
 			this.renderInstallPage()
 		];
 
-		this.pagesHost = E('div', { 'class': 'tsm-pages' }, this.pages);
+		/* 下拉指示器是 .tsm-pages 的第一个子节点（绝对定位，不参与 5 屏的分页） */
+		this.pullNode = this.renderPullIndicator();
+		this.pagesHost = E('div', { 'class': 'tsm-pages' }, [ this.pullNode ].concat(this.pages));
 		this.bindSwipe(this.pagesHost);
+		this.bindPullRefresh(this.pagesHost);
 
 		return this.pagesHost;
 	},
@@ -1976,6 +2128,7 @@ return view.extend({
 	setPage: function(index) {
 		var count = this.pages.length;
 		var target = num(index);
+		var from = this.pageIndex;
 
 		if (!count) return;
 
@@ -1992,6 +2145,9 @@ return view.extend({
 			this.toggleClass(this.tabs[i], 'on', on);
 			this.toggleClass(this.dots[i], 'on', on);
 		}
+
+		/* 入场过渡：只加 class 与一次性定时器，仍然是「不发 RPC」的纯本地切屏 */
+		if (from >= 0) this.enterPage(target, (target >= from) ? 'next' : 'prev');
 
 		/* 先显示占位/已有数据；数据到了由 ensureNodeData 内部 sync，绝不阻塞切屏。 */
 		if (target === 2 || target === 3) this.ensureNodeData();
@@ -2079,6 +2235,243 @@ return view.extend({
 
 			self.setPage(self.pageIndex + (dx < 0 ? 1 : -1));
 		}, { passive: true });
+	},
+
+	// ------------------------------------------------------------ 下拉刷新 / 切屏过渡
+
+	/* 指示器：旋转箭头 SVG + 一行文案；挂在 .tsm-pages 顶部，默认藏在 tab 后面。 */
+	renderPullIndicator: function() {
+		var icon = svgEl('svg', {
+			'class': 'tsm-pull-ico', viewBox: '0 0 24 24', width: '20', height: '20',
+			'aria-hidden': 'true', focusable: 'false'
+		});
+
+		icon.appendChild(svgEl('path', {
+			d: 'M12 4v11', fill: 'none', stroke: '#ff6f00',
+			'stroke-width': '2.4', 'stroke-linecap': 'round'
+		}));
+		icon.appendChild(svgEl('path', {
+			d: 'M6.5 10.5 12 16l5.5-5.5', fill: 'none', stroke: '#ff6f00',
+			'stroke-width': '2.4', 'stroke-linecap': 'round', 'stroke-linejoin': 'round'
+		}));
+
+		this.pullIcon = icon;
+		this.pullText = E('span', { 'class': 'tsm-pull-t' }, _('下拉刷新'));
+
+		return E('div', {
+			'class': 'tsm-pull',
+			'aria-hidden': 'true',
+			/* 默认隐藏写在行内：桌面端没有 touch，永远不会被显示 */
+			style: 'opacity:0;transform:translateY(-100%)'
+		}, [ icon, this.pullText ]);
+	},
+
+	/* 只有概览 / 设备 / 拓扑三屏支持下拉刷新（节点 / 安装屏不拦滚动） */
+	pullAllowed: function() {
+		return PULL_PAGES.indexOf(num(this.pageIndex)) >= 0;
+	},
+
+	/*
+	 * 下拉手势：touchstart 记起点 → touchmove 只在「顶部 + 竖直下拉」时介入，
+	 * 并用 passive:false 的 preventDefault 关掉橡皮筋；水平位移更大时立刻让位给
+	 * bindSwipe 的左右切屏。松手超过 64px 调 this.refresh(true)。
+	 *
+	 * 滚动容器说明：整页由文档滚动（#ts-mobile 没有自己的 overflow），
+	 * 所以「顶部」按 scrollTopOf() 判断；setPage 切屏时本来就 window.scrollTo(0,0)。
+	 */
+	bindPullRefresh: function(host) {
+		var self = this;
+		var active = false;
+		var pulling = false;
+		var horizontal = false;
+		var startX = 0;
+		var startY = 0;
+
+		if (host == null || typeof host.addEventListener != 'function') return;
+
+		host.addEventListener('touchstart', function(ev) {
+			var touch = touchAt(ev, 'touches');
+
+			active = false;
+			pulling = false;
+			horizontal = false;
+			self.pullDist = 0;
+
+			if (touch == null) return;
+			if (self.pullBusy === true) return;
+			if (!self.pullAllowed()) return;
+			if (scrollTopOf() > 0) return;   /* 不在顶部：交给页面正常滚动 */
+
+			active = true;
+			startX = num(touch.clientX);
+			startY = num(touch.clientY);
+		}, { passive: true });
+
+		host.addEventListener('touchmove', function(ev) {
+			var touch, dx, dy;
+
+			if (!active) return;
+
+			touch = touchAt(ev, 'touches');
+
+			if (touch == null) return;
+
+			dx = num(touch.clientX) - startX;
+			dy = num(touch.clientY) - startY;
+
+			/* 水平位移更大 → 这是左右切屏，让位，且不拦默认行为 */
+			if (!pulling && Math.abs(dx) > PULL_ARM && Math.abs(dx) > Math.abs(dy)) {
+				horizontal = true;
+				active = false;
+				self.resetPull();
+
+				return;
+			}
+
+			if (horizontal) return;
+			if (!pulling) {
+				if (dy <= PULL_ARM) return;
+				if (scrollTopOf() > 0) { active = false; return; }
+
+				pulling = true;
+			}
+
+			/* 顶部下拉：阻止页面滚动 / 橡皮筋 */
+			if (ev != null && typeof ev.preventDefault == 'function' && ev.cancelable !== false)
+				ev.preventDefault();
+
+			self.pullDist = dy;
+			self.pullDistance(dy);
+		}, { passive: false });
+
+		host.addEventListener('touchend', function() {
+			var dist = num(self.pullDist);
+
+			if (!active) {
+				if (!pulling) self.resetPull();
+
+				return;
+			}
+
+			active = false;
+
+			if (!pulling) {
+				self.resetPull();
+
+				return;
+			}
+
+			pulling = false;
+
+			if (dist > PULL_TRIGGER) self.startPullRefresh();
+			else self.resetPull();
+		}, { passive: true });
+
+		host.addEventListener('touchcancel', function() {
+			active = false;
+			pulling = false;
+			self.resetPull();
+		}, { passive: true });
+	},
+
+	/* 跟手：指示器从 tab 后面滑出，箭头随下拉角度旋转，文案在 64px 处切换。 */
+	pullDistance: function(dist) {
+		var d = Math.max(0, num(dist));
+		var shown = Math.min(d, PULL_RANGE);
+
+		if (this.pullNode != null) {
+			this.pullNode.style.transform = 'translateY(' + (shown - PULL_RANGE) + 'px)';
+			this.pullNode.style.opacity = (d > 0) ? (Math.min(1, d / 32)).toFixed(2) : '0';
+		}
+
+		if (this.pullIcon != null)
+			this.pullIcon.style.transform = 'rotate(' + Math.min(360, Math.round(d * 3)) + 'deg)';
+
+		if (this.pullText != null)
+			this.pullText.textContent = (d > PULL_TRIGGER) ? _('松手刷新') : _('下拉刷新');
+	},
+
+	/* 松手触发刷新：先切「刷新中…」+ 旋转动画，刷新结束后回弹归零。 */
+	startPullRefresh: function() {
+		var self = this;
+
+		this.pullBusy = true;
+
+		if (this.pullText != null) this.pullText.textContent = _('刷新中…');
+
+		this.toggleClass(this.pullNode, 'busy', true);
+
+		if (this.pullNode != null) {
+			this.pullNode.style.transform = 'translateY(0)';
+			this.pullNode.style.opacity = '1';
+		}
+
+		var done = null;
+
+		try { done = this.refresh(true); }
+		catch (e) { done = null; }
+
+		if (done != null && typeof done.then == 'function') {
+			done.then(function() { self.resetPull(); }, function() { self.resetPull(); });
+
+			return;
+		}
+
+		this.resetPull();
+	},
+
+	/* 归零（回弹由 CSS transition 完成；减少动态偏好时没有过渡） */
+	resetPull: function() {
+		this.pullBusy = false;
+		this.pullDist = 0;
+
+		this.toggleClass(this.pullNode, 'busy', false);
+
+		if (this.pullNode != null) {
+			this.pullNode.style.transform = 'translateY(-100%)';
+			this.pullNode.style.opacity = '0';
+		}
+
+		if (this.pullIcon != null) this.pullIcon.style.transform = 'rotate(0deg)';
+
+		if (this.pullText != null) this.pullText.textContent = _('下拉刷新');
+	},
+
+	/* 入场动画 class 只挂 150ms；reduced-motion 时对应 CSS 直接 animation:none。 */
+	enterPage: function(index, dir) {
+		var self = this;
+		var page = this.pages[index];
+		var prevClass = (dir === 'prev') ? 'is-enter-prev' : 'is-enter-next';
+
+		if (page == null) return;
+
+		/* 连续快速切屏：先把上一屏的入场类清掉，保证同一时间只有一个页面在动画 */
+		if (this.enterPageRef != null && this.enterPageRef !== page)
+			this.clearEnter(this.enterPageRef);
+
+		this.enterPageRef = page;
+
+		this.toggleClass(page, 'is-enter', true);
+		this.toggleClass(page, prevClass, true);
+
+		if (this.enterTimer != null && typeof window.clearTimeout == 'function')
+			window.clearTimeout(this.enterTimer);
+
+		this.enterTimer = (typeof window.setTimeout == 'function') ? window.setTimeout(function() {
+			self.enterTimer = null;
+
+			if (self.enterPageRef === page) self.enterPageRef = null;
+
+			self.clearEnter(page);
+		}, ENTER_MS) : null;
+	},
+
+	clearEnter: function(page) {
+		if (page == null) return;
+
+		this.toggleClass(page, 'is-enter', false);
+		this.toggleClass(page, 'is-enter-next', false);
+		this.toggleClass(page, 'is-enter-prev', false);
 	},
 
 	// ------------------------------------------------------------ 设备屏
@@ -2370,6 +2763,13 @@ return view.extend({
 
 		this.topoSig = 'empty';
 		dom.content(this.topoHost, [
+			/* 2 层卡片骨架：数据到达后 syncTopoPage 会整块替换掉 */
+			E('div', { 'class': 'tsm-tstack tsm-skel-stack' }, [
+				E('div', { 'class': 'tsm-skel tsm-skel-card', 'aria-hidden': 'true' }, ''),
+				E('div', { 'class': 'tsm-conn', 'aria-hidden': 'true' },
+					E('span', { 'class': 'tsm-conn-d' }, '')),
+				E('div', { 'class': 'tsm-skel tsm-skel-card', 'aria-hidden': 'true' }, '')
+			]),
 			E('p', { 'class': 'tsm-empty' }, _('暂无数据')),
 			E('p', { 'class': 'tsm-nnote' }, _('等待后端 prism-router.get_state 返回拓扑数据。'))
 		]);
@@ -2873,6 +3273,7 @@ return view.extend({
 		this.exitName = E('div', { 'class': 'tsm-nodename' }, _('直连'));
 		this.exitSub = E('div', { 'class': 'tsm-nodesub' }, _('出口节点'));
 		this.devPill = E('div', { 'class': 'tsm-pill' }, '—');
+		this.ovSkelHost = E('div', { 'class': 'tsm-skel-grid', 'aria-hidden': 'true' }, '');
 		this.ovTopoHost = E('div', {
 			'class': 'tsm-otopo',
 			role: 'group',
@@ -2887,6 +3288,8 @@ return view.extend({
 		}, '+');
 
 		return E('div', { 'class': 'tsm-page' }, [
+			/* 首屏还没数据时的骨架占位（6 个数字块），数据到了整块清空 */
+			this.ovSkelHost,
 			E('div', { 'class': 'tsm-rates' }, [
 				E('div', { 'class': 'tsm-rate' }, [
 					E('div', { 'class': 'tsm-rate-h' }, [ arrowSvg(true, '#00b96b'), this.txNum ]),
@@ -2898,6 +3301,12 @@ return view.extend({
 					E('div', { 'class': 'tsm-rate-cap' }, _('下载Mbps'))
 				])
 			]),
+			/* 速率数字下方的迷你趋势（120×32 SVG，不用 canvas） */
+			E('div', { 'class': 'tsm-sparkwrap' }, [
+				this.renderSparkline(),
+				E('span', { 'class': 'tsm-spark-cap', title: _('最近 12 次采样的下行（蓝）/ 上行（橙）速率') },
+					_('近 12 次采样'))
+			]),
 			E('div', { 'class': 'tsm-node' }, [
 				globeSvg(),
 				E('div', { 'class': 'tsm-spring' }, ''),
@@ -2905,10 +3314,72 @@ return view.extend({
 				this.exitName,
 				this.exitSub
 			]),
-			E('div', { 'class': 'tsm-foot' }, [ this.plusBtn, this.devPill ]),
+			/* 「N 台终端」胶囊下方：流量 Top 设备 + 应用 Top 3 两个小卡片 */
+			E('div', { 'class': 'tsm-foot' }, [ this.plusBtn, this.devPill, this.renderTop3() ]),
 			/* 「N 台终端」胶囊之后、「累计口径」说明之前：设备拓扑区块 */
 			this.ovTopoHost,
 			this.renderMore()
+		]);
+	},
+
+	/*
+	 * 迷你趋势：120×32 的 SVG，两条 polyline（下行蓝 / 上行橙）+ 一条占位横线。
+	 * 只在 syncSparkline 里改 points / display 属性，不重建节点、不用 canvas。
+	 */
+	renderSparkline: function() {
+		var svg = svgEl('svg', {
+			'class': 'tsm-spark',
+			viewBox: '0 0 ' + SPARK_W + ' ' + SPARK_H,
+			width: '' + SPARK_W,
+			height: '' + SPARK_H,
+			role: 'img',
+			'aria-label': _('最近 12 次采样的上下行速率趋势'),
+			focusable: 'false'
+		});
+
+		this.sparkPh = svgEl('line', {
+			'class': 'tsm-spark-ph',
+			x1: '0', y1: '' + (SPARK_H / 2),
+			x2: '' + SPARK_W, y2: '' + (SPARK_H / 2),
+			stroke: '#8a8f98', 'stroke-width': '1', 'stroke-dasharray': '3 3'
+		});
+		this.sparkDown = svgEl('polyline', {
+			'class': 'tsm-spark-down', fill: 'none', stroke: COLOR_PROXY,
+			'stroke-width': '1.6', 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+			points: ''
+		});
+		this.sparkUp = svgEl('polyline', {
+			'class': 'tsm-spark-up', fill: 'none', stroke: '#ff6f00',
+			'stroke-width': '1.6', 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+			points: ''
+		});
+
+		svg.appendChild(this.sparkPh);
+		svg.appendChild(this.sparkDown);
+		svg.appendChild(this.sparkUp);
+
+		this.sparkSvg = svg;
+
+		return svg;
+	},
+
+	/*
+	 * 概览 Top3：左侧「流量 Top 设备」（可点 → 设备屏并展开该设备），
+	 * 右侧「应用 Top 3」。手机版没有独立应用屏，所以应用行只展示、不加点击。
+	 */
+	renderTop3: function() {
+		this.topDevBox = E('div', { 'class': 'tsm-toplist' }, '');
+		this.topAppBox = E('div', { 'class': 'tsm-toplist' }, '');
+
+		return E('div', { 'class': 'tsm-top3' }, [
+			E('div', { 'class': 'tsm-topcard' }, [
+				E('div', { 'class': 'tsm-topcard-t' }, _('流量 Top 设备')),
+				this.topDevBox
+			]),
+			E('div', { 'class': 'tsm-topcard' }, [
+				E('div', { 'class': 'tsm-topcard-t' }, _('应用 Top 3')),
+				this.topAppBox
+			])
 		]);
 	},
 
@@ -3373,12 +3844,151 @@ return view.extend({
 		node.style.display = truncated ? 'block' : 'none';
 	},
 
-	/* 概览屏：上传/下载速率、出口节点、在线终端数、设备拓扑 */
+	/* 概览屏：上传/下载速率、迷你趋势、出口节点、在线终端数、Top3、设备拓扑 */
 	syncOverview: function(totals, nodes, health, devices) {
+		var apps = (this.state != null && Array.isArray(this.state.apps)) ? this.state.apps : [];
+
 		this.syncRateBig(totals);
+		this.syncSparkline(totals);
 		this.syncExitNode(nodes, health);
 		this.syncDevicePill(devices);
 		this.syncOverviewTopo(devices);
+		this.syncTop3(devices, apps);
+		this.syncOverviewSkeleton(false);
+	},
+
+	/* 每次 sync 追加一次采样（cap 12），只改 polyline 的 points，不重建 SVG。 */
+	syncSparkline: function(totals) {
+		var t = totals || {};
+
+		if (!Array.isArray(this.sparkSamples)) this.sparkSamples = [];
+
+		this.sparkSamples.push({ rx: num(t.rx_rate), tx: num(t.tx_rate) });
+
+		while (this.sparkSamples.length > SPARK_MAX) this.sparkSamples.shift();
+
+		if (this.sparkDown != null)
+			this.sparkDown.setAttribute('points', sparkPoints(this.sparkSamples, 'rx'));
+
+		if (this.sparkUp != null)
+			this.sparkUp.setAttribute('points', sparkPoints(this.sparkSamples, 'tx'));
+
+		/* 有采样就收起占位横线；没数据时保留，避免空白框 */
+		if (this.sparkPh != null)
+			this.sparkPh.style.display = this.sparkSamples.length ? 'none' : '';
+	},
+
+	/* 首屏 state 未到达时铺 6 个数字块骨架；数据到达后整块清空（节点数归 0）。 */
+	syncOverviewSkeleton: function(show) {
+		var on = (show === true);
+
+		if (this.ovSkelHost == null || on === this.ovSkelOn) return;
+
+		this.ovSkelOn = on;
+		dom.content(this.ovSkelHost, on ? skeletonBlocks(6, 'tsm-skel-num') : []);
+	},
+
+	/*
+	 * Top3 写回：设备按合计流量（deviceTotal）取前 3，应用按 rx+tx 取前 3。
+	 * 只在数据 / 名称变化时重建（sig 去重），15s 轮询不会每轮重排。
+	 */
+	syncTop3: function(devices, apps) {
+		var self = this;
+		var devList = Array.isArray(devices) ? devices : [];
+		var appList = Array.isArray(apps) ? apps : [];
+		var entries = [];
+		var sig, rows;
+		var i;
+
+		for (i = 0; i < devList.length; i++)
+			if (devList[i] != null) entries.push({ dev: devList[i], index: i });
+
+		entries.sort(function(a, b) { return deviceTotal(b.dev) - deviceTotal(a.dev); });
+		entries = entries.slice(0, 3);
+
+		appList = appList.slice().sort(function(a, b) {
+			return (num(b != null ? b.rx : 0) + num(b != null ? b.tx : 0)) -
+				(num(a != null ? a.rx : 0) + num(a != null ? a.tx : 0));
+		}).slice(0, 3);
+
+		sig = 'd:' + sigOf(entries, function(item) {
+			return deviceKey(item.dev, item.index) + ':' + deviceTotal(item.dev);
+		}) + '|a:' + sigOf(appList, function(app) {
+			return '' + ((app != null && app.host != null) ? app.host : '') + ':' +
+				num(app != null ? app.rx : 0) + ':' + num(app != null ? app.tx : 0);
+		});
+
+		if (sig === this.top3Sig) return;
+
+		this.top3Sig = sig;
+
+		if (this.topDevBox != null) {
+			rows = entries.map(function(item) {
+				return E('button', {
+					type: 'button',
+					'class': 'tsm-toprow is-link',
+					title: deviceName(item.dev) + ' · ' + _('点击查看设备'),
+					click: function() { self.openTopDevice(item.dev, item.index); }
+				}, [
+					E('span', { 'class': 'tsm-topname' }, deviceName(item.dev)),
+					E('span', { 'class': 'tsm-topval' }, fmtBytes(deviceTotal(item.dev)))
+				]);
+			});
+
+			if (!rows.length)
+				rows.push(E('div', { 'class': 'tsm-toprow-empty' }, _('暂无数据')));
+
+			dom.content(this.topDevBox, rows);
+		}
+
+		if (this.topAppBox != null) {
+			rows = appList.map(function(app) {
+				var host = (app != null && app.host != null) ? ('' + app.host) : '';
+
+				return E('div', { 'class': 'tsm-toprow', title: host }, [
+					E('span', { 'class': 'tsm-topname' }, appLabel(host)),
+					E('span', { 'class': 'tsm-topval' },
+						fmtBytes(num(app != null ? app.rx : 0) + num(app != null ? app.tx : 0)))
+				]);
+			});
+
+			if (!rows.length)
+				rows.push(E('div', { 'class': 'tsm-toprow-empty' }, _('暂无数据')));
+
+			dom.content(this.topAppBox, rows);
+		}
+	},
+
+	/*
+	 * Top 设备 → 设备屏：切到该设备所属分类、清掉搜索/链路筛选并展开它的应用明细。
+	 * 全部是本地状态，不发任何 RPC。
+	 * 展开键沿用 deviceKey()（有 MAC/IP 时稳定；两者都没有的设备按数组下标，
+	 * 与设备屏里的行下标可能不同，这种设备点了只切屏、不一定展开——属于已知边界）。
+	 */
+	openTopDevice: function(dev, index) {
+		var now = deviceNow();
+		var key = deviceKey(dev, index);
+		var tab = classifyDevice(dev, now);
+		var list = (Array.isArray(this.lastDevices) && this.lastDevices.length)
+			? this.lastDevices
+			: ((this.state != null && Array.isArray(this.state.devices)) ? this.state.devices : []);
+
+		this.devNow = now;
+		this.expanded[key] = true;
+
+		this.devQuery = '';
+		this.devLink = '';
+
+		if (tab === 'main' || tab === 'guest' || tab === 'offline') this.devTab = tab;
+		if (this.devSearchInput != null) this.devSearchInput.value = '';
+
+		this.devSig = null;
+
+		this.setPage(1);
+		this.syncDevSearch();
+		this.syncFilterPanel();
+		this.syncDevTabs();
+		this.syncDevicePage(list);
 	},
 
 	syncRateBig: function(totals) {
@@ -3571,6 +4181,8 @@ return view.extend({
 		if (this.devicesCount != null) this.devicesCount.textContent = '(' + list.length + ')';
 
 		var sig = [
+			/* 骨架 → 真实数据必须换 sig，否则同一分钟内会一直停在骨架上 */
+			(this.state == null) ? 'skel' : 'data',
 			'' + this.devTab,
 			'' + this.devSort,
 			'' + this.devLink,
@@ -3587,6 +4199,14 @@ return view.extend({
 		if (sig === this.devSig) return;
 
 		this.devSig = sig;
+
+		/* 首屏 state 还没到：5 行骨架占位，数据到达后整块替换（不发请求） */
+		if (this.state == null) {
+			dom.content(this.devicesBox,
+				E('div', { 'class': 'tsm-skel-list' }, skeletonBlocks(5, 'tsm-skel-row')));
+
+			return;
+		}
 
 		if (list.length == 0) {
 			/* 搜索无结果 vs 该分类本来就没有设备，文案必须分开，避免误以为设备丢了。 */
@@ -3990,6 +4610,9 @@ return view.extend({
 
 		this.setUpdated(0);
 
+		/* 首屏没数据：概览铺 6 个数字块骨架，数据到了由 syncOverview 清掉 */
+		this.syncOverviewSkeleton(true);
+
 		if (this.txNum != null) this.txNum.textContent = '—';
 		if (this.rxNum != null) this.rxNum.textContent = '—';
 		if (this.exitName != null) this.exitName.textContent = '—';
@@ -4189,6 +4812,9 @@ return view.extend({
 			n.parentNode.removeChild(n);
 		});
 
+		/* 安全区：复用（改写）主题已有的 viewport，绝不新增第二个 */
+		this.ensureViewportCover();
+
 		document.title = _('棱镜路由');
 
 		var items = [
@@ -4202,6 +4828,47 @@ return view.extend({
 		];
 
 		items.forEach(function(el) { document.head.appendChild(el); });
+	},
+
+	/*
+	 * 安全区（刘海 / 底部横条）的前提是 viewport 带 viewport-fit=cover。
+	 * 主题通常已经注入了一个 viewport：这里只改写它的 content，绝不再加第二个
+	 * （浏览器只认第一个 viewport，多写一个等于没生效）。
+	 */
+	ensureViewportCover: function() {
+		var list = [];
+		var meta = null;
+		var content = '';
+		var next;
+
+		try { list = document.querySelectorAll('meta[name="viewport"]') || []; }
+		catch (e) { list = []; }
+
+		if (list.length) meta = list[0];
+
+		if (meta == null) {
+			meta = E('meta', {
+				name: 'viewport',
+				content: 'width=device-width, initial-scale=1, viewport-fit=cover'
+			});
+			document.head.appendChild(meta);
+
+			return meta;
+		}
+
+		try { content = '' + (meta.getAttribute('content') || ''); }
+		catch (e) { content = ''; }
+
+		if (content.indexOf('viewport-fit=cover') >= 0) return meta;
+
+		next = content.length
+			? (content.replace(/^\s+|\s+$/g, '') + ',viewport-fit=cover')
+			: 'width=device-width, initial-scale=1, viewport-fit=cover';
+
+		try { meta.setAttribute('content', next); }
+		catch (e) { }
+
+		return meta;
 	},
 
 	handleSaveApply: null,

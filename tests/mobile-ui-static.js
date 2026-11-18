@@ -322,6 +322,7 @@ function makeEnvironment() {
 	const rejections = {};
 	const notifications = [];
 	const timers = { started: [], cleared: [], active: new Map() };
+	const timeouts = { scheduled: [], cleared: [] };
 	const windowEvents = [];
 	const scrolls = [];
 
@@ -447,8 +448,16 @@ function makeEnvironment() {
 				timers.cleared.push(id);
 				timers.active.delete(id);
 			},
-			setTimeout: function () { return nextTimerId(); },
-			clearTimeout: function () {},
+			setTimeout: function (fn, ms) {
+				const id = nextTimerId();
+
+				timeouts.scheduled.push({ id: id, fn: fn, ms: ms });
+
+				return id;
+			},
+			clearTimeout: function (id) {
+				timeouts.cleared.push(id);
+			},
 			scrollTo: function (x, y) {
 				scrolls.push({ x: x, y: y });
 			},
@@ -482,6 +491,7 @@ function makeEnvironment() {
 	env.__rejections = rejections;
 	env.__notifications = notifications;
 	env.__timers = timers;
+	env.__timeouts = timeouts;
 	env.__windowEvents = windowEvents;
 	env.__scrolls = scrolls;
 	env.__body = body;
@@ -3371,6 +3381,466 @@ async function testTouchTargets() {
 
 
 
+// ---------------------------------------------------------------- 17. 下拉刷新
+
+/* 触摸事件桩：带 touches / changedTouches / preventDefault，够 bindSwipe + bindPullRefresh 用。 */
+function touchEvent(points) {
+	const list = points.map(function (p) { return { clientX: p.x, clientY: p.y }; });
+	const ev = {
+		touches: list,
+		changedTouches: list,
+		cancelable: true,
+		defaultPrevented: false,
+		preventDefault: function () { ev.defaultPrevented = true; }
+	};
+
+	return ev;
+}
+
+function fireTouch(node, type, points) {
+	const ev = touchEvent(points);
+
+	(node.listeners[type] || []).forEach(function (fn) { fn(ev); });
+
+	return ev;
+}
+
+/* 执行 window.setTimeout 登记的回调（切屏入场类的移除靠它）。 */
+function runTimeouts(env) {
+	const list = env.__timeouts.scheduled.slice();
+
+	env.__timeouts.scheduled.length = 0;
+	list.forEach(function (item) {
+		if (typeof item.fn === 'function') item.fn();
+	});
+}
+
+async function testPullRefresh() {
+	console.log('\n[17] 下拉刷新：顶部 >64px 触发 refresh(true)，水平/非顶部让位');
+
+	const booted = await boot();
+	const ctx = booted.ctx;
+	const host = findByClass(ctx.root, 'tsm-pages');
+	const calls = [];
+
+	ctx.refresh = function (manual) { calls.push(manual); return Promise.resolve(); };
+
+	check('下拉指示器挂在 .tsm-pages 顶部且默认隐藏',
+		ctx.pullNode != null && host.children[0] === ctx.pullNode &&
+		ctx.pullNode.style.opacity === '0',
+		'first=' + repr(host.children[0] === ctx.pullNode) +
+		' style=' + repr(ctx.pullNode && ctx.pullNode.style));
+	check('指示器带旋转箭头 SVG + 「下拉刷新」文案',
+		ctx.pullIcon != null && ctx.pullIcon.tag === 'svg' && textOf(ctx.pullText) === '下拉刷新',
+		'icon=' + repr(ctx.pullIcon && ctx.pullIcon.tag) + ' text=' + repr(textOf(ctx.pullText)));
+	check('指示器不参与 5 屏（.tsm-page 仍是 5 个）',
+		findAll(ctx.root, function (n) { return hasClass(n, 'tsm-page'); }).length === 5 &&
+		!hasClass(ctx.pullNode, 'tsm-page'),
+		'pages=' + findAll(ctx.root, function (n) { return hasClass(n, 'tsm-page'); }).length);
+
+	/* 顶部下拉 100px → 松手刷新一次 */
+	fireTouch(host, 'touchstart', [ { x: 40, y: 100 } ]);
+	const move = fireTouch(host, 'touchmove', [ { x: 40, y: 200 } ]);
+
+	same('下拉超过 64px 文案变「松手刷新」', textOf(ctx.pullText), '松手刷新');
+	check('顶部下拉时 preventDefault 阻止页面滚动', move.defaultPrevented === true);
+	check('指示器跟手可见且随位移旋转',
+		Number(ctx.pullNode.style.opacity) > 0 &&
+		/rotate\(\d+deg\)/.test('' + ctx.pullIcon.style.transform),
+		'opacity=' + repr(ctx.pullNode.style.opacity) +
+		' transform=' + repr(ctx.pullIcon.style.transform));
+
+	fireTouch(host, 'touchend', [ { x: 40, y: 200 } ]);
+
+	sameList('>64px 松手触发一次 refresh(true)', calls, [ true ]);
+	same('刷新过程中文案是「刷新中…」', textOf(ctx.pullText), '刷新中…');
+	check('刷新过程中指示器停在可见位',
+		ctx.pullNode.style.transform === 'translateY(0)' &&
+		hasClass(ctx.pullNode, 'busy'),
+		'style=' + repr(ctx.pullNode.style) + ' class=' + repr(ctx.pullNode.attrs['class']));
+
+	await flush();
+
+	same('刷新完成后指示器回弹归零（opacity 0）', ctx.pullNode.style.opacity, '0');
+	same('刷新完成后指示器移出视口', ctx.pullNode.style.transform, 'translateY(-100%)');
+	same('刷新完成后文案复位', textOf(ctx.pullText), '下拉刷新');
+	check('刷新完成后旋转动画 class 移除', !hasClass(ctx.pullNode, 'busy'),
+		'class=' + repr(ctx.pullNode.attrs['class']));
+
+	/* 下拉 50px（<64）不触发 */
+	calls.length = 0;
+	fireTouch(host, 'touchstart', [ { x: 40, y: 100 } ]);
+	fireTouch(host, 'touchmove', [ { x: 40, y: 150 } ]);
+	same('下拉 50px 时仍是「下拉刷新」', textOf(ctx.pullText), '下拉刷新');
+	fireTouch(host, 'touchend', [ { x: 40, y: 150 } ]);
+	sameList('<64px 松手不触发刷新', calls, []);
+	same('未触发刷新也会回弹', ctx.pullNode.style.opacity, '0');
+
+	/* 水平滑动：让位给左右切屏，不触发下拉 */
+	calls.length = 0;
+	const pageBefore = ctx.pageIndex;
+	fireTouch(host, 'touchstart', [ { x: 200, y: 200 } ]);
+	const hMove = fireTouch(host, 'touchmove', [ { x: 40, y: 210 } ]);
+	fireTouch(host, 'touchend', [ { x: 40, y: 210 } ]);
+
+	sameList('水平滑动不触发下拉刷新', calls, []);
+	check('水平滑动不拦默认滚动', hMove.defaultPrevented === false);
+	same('水平滑动交给左右切屏（已切到下一屏）', ctx.pageIndex, pageBefore + 1);
+	same('水平滑动后指示器仍是隐藏态', ctx.pullNode.style.opacity, '0');
+
+	/* 非顶部：不介入，交给页面正常滚动 */
+	ctx.setPage(0);
+	calls.length = 0;
+	booted.env.document.body.scrollTop = 120;
+
+	fireTouch(host, 'touchstart', [ { x: 40, y: 100 } ]);
+	const sMove = fireTouch(host, 'touchmove', [ { x: 40, y: 220 } ]);
+	fireTouch(host, 'touchend', [ { x: 40, y: 220 } ]);
+
+	sameList('非顶部下拉不触发刷新', calls, []);
+	check('非顶部下拉不拦默认滚动', sMove.defaultPrevented === false);
+	same('非顶部下拉不显示指示器', ctx.pullNode.style.opacity, '0');
+
+	booted.env.document.body.scrollTop = 0;
+
+	/* 只有概览 / 设备 / 拓扑三屏：节点屏不介入 */
+	ctx.setPage(2);
+	await ctx.ensureNodeData();
+	calls.length = 0;
+	booted.env.document.body.scrollTop = 0;
+
+	fireTouch(host, 'touchstart', [ { x: 40, y: 100 } ]);
+	const nMove = fireTouch(host, 'touchmove', [ { x: 40, y: 220 } ]);
+	fireTouch(host, 'touchend', [ { x: 40, y: 220 } ]);
+
+	sameList('节点屏下拉不触发刷新', calls, []);
+	check('节点屏下拉不拦默认滚动', nMove.defaultPrevented === false);
+
+	/* 设备屏 / 拓扑屏同样支持下拉刷新 */
+	for (const pullPage of [ 1, 3 ]) {
+		ctx.setPage(pullPage);
+		calls.length = 0;
+
+		fireTouch(host, 'touchstart', [ { x: 40, y: 100 } ]);
+		fireTouch(host, 'touchmove', [ { x: 40, y: 200 } ]);
+		fireTouch(host, 'touchend', [ { x: 40, y: 200 } ]);
+
+		sameList('第 ' + (pullPage + 1) + ' 屏下拉也触发 refresh(true)', calls, [ true ]);
+
+		await flush();
+	}
+
+	/* 桌面端：没有 touch 就不会进这套逻辑 → 指示器默认 opacity:0（静态样式断言） */
+	check('CSS 里指示器默认透明 + 移出视口（桌面端不显示）',
+		/\.tsm-pull\{[^}]*opacity:0[^}]*translateY\(-100%\)/.test(SOURCE),
+		'rule=' + repr((SOURCE.match(/\.tsm-pull\{[^}]*\}/) || [])[0]));
+	check('touchmove 用 passive:false 才能 preventDefault',
+		/'touchmove'[\s\S]{0,4000}?passive: false/.test(SOURCE),
+		'match=' + repr(/'touchmove'[\s\S]{0,4000}?passive: false/.test(SOURCE)));
+}
+
+// ---------------------------------------------------------------- 18. 骨架屏
+
+async function testSkeletonScreens() {
+	console.log('\n[18] 骨架屏：state=null 时 6/5/2 个 .tsm-skel，数据到达后清空');
+
+	const booted = await boot({ rejectState: new Error('state boom') });
+	const ctx = booted.ctx;
+
+	function skelCount(node) {
+		return findAll(node, function (n) { return hasClass(n, 'tsm-skel'); }).length;
+	}
+
+	same('state=null：概览 6 个数字块骨架', skelCount(ctx.pages[0]), 6);
+	same('state=null：设备列表 5 行骨架', skelCount(ctx.devicesBox), 5);
+	same('state=null：拓扑 2 层卡片骨架', skelCount(ctx.topoHost), 2);
+	same('骨架不新增 .tsm-page',
+		findAll(ctx.root, function (n) { return hasClass(n, 'tsm-page'); }).length, 5);
+	check('骨架块都带 aria-hidden（纯装饰）',
+		findAll(ctx.pages[0], function (n) { return hasClass(n, 'tsm-skel'); })
+			.every(function (n) { return n.attrs['aria-hidden'] === 'true'; }),
+		'blocks=' + repr(findAll(ctx.pages[0], function (n) { return hasClass(n, 'tsm-skel'); })
+			.map(function (n) { return n.attrs; }).slice(0, 2)));
+
+	/* 数据到达：骨架被真实内容替换（节点数量归 0） */
+	delete booted.env.__rejections.get_state;
+	booted.env.__responses.get_state = baseState({
+		totals: { rx_rate: 1000000, tx_rate: 500000, direct_rx: 10, direct_tx: 5 }
+	});
+
+	await ctx.refresh(false);
+	await flush();
+
+	same('数据到达：概览骨架清空', skelCount(ctx.pages[0]), 0);
+	same('数据到达：设备骨架清空', skelCount(ctx.devicesBox), 0);
+	same('数据到达：拓扑骨架清空', skelCount(ctx.topoHost), 0);
+	check('数据到达：概览换成真实数字',
+		textOf(ctx.txNum) === '4.0' && textOf(ctx.rxNum) === '8.0',
+		'tx=' + repr(textOf(ctx.txNum)) + ' rx=' + repr(textOf(ctx.rxNum)));
+
+	check('骨架屏有 shimmer 动画',
+		/@keyframes tsm-shimmer/.test(SOURCE) &&
+		/\.tsm-skel::after\{[^}]*animation:tsm-shimmer/.test(SOURCE),
+		'keyframes=' + repr(SOURCE.match(/@keyframes tsm-shimmer[^}]*\}/)));
+	check('reduced-motion 关闭骨架动画',
+		/@media \(prefers-reduced-motion: reduce\)\{\.tsm-skel::after\{animation:none/.test(SOURCE),
+		'rule=' + repr(SOURCE.match(/@media \(prefers-reduced-motion: reduce\)\{\.tsm-skel[^}]*\}[^}]*\}/)));
+}
+
+// ---------------------------------------------------------------- 19. 切屏过渡
+
+async function testPageTransition() {
+	console.log('\n[19] 切屏过渡：入场 class / 方向相反 / 150ms 后移除 / reduced-motion 禁用');
+
+	const booted = await boot();
+	const ctx = booted.ctx;
+
+	function enterNodes() {
+		return findAll(ctx.pagesHost, function (n) {
+			return hasClass(n, 'is-enter') || hasClass(n, 'is-enter-next') || hasClass(n, 'is-enter-prev');
+		});
+	}
+
+	same('首屏渲染不带入场动画', enterNodes().length, 0);
+
+	ctx.setPage(2);
+
+	check('setPage(2)：目标页带 .is-enter', hasClass(ctx.pages[2], 'is-enter'),
+		'class=' + repr(ctx.pages[2].attrs['class']));
+	check('向后切屏用 .is-enter-next（从右进）', hasClass(ctx.pages[2], 'is-enter-next'),
+		'class=' + repr(ctx.pages[2].attrs['class']));
+	same('同一时间只有一屏有入场类', enterNodes().length, 1);
+	same('同一时间只有一屏可见（.on）',
+		ctx.pages.filter(function (page) { return hasClass(page, 'on'); }).length, 1);
+	check('入场 class 由 150ms 定时器移除', ctx.enterTimer != null &&
+		booted.env.__timeouts.scheduled.some(function (item) { return item.ms === 150; }),
+		'timers=' + repr(booted.env.__timeouts.scheduled.map(function (t) { return t.ms; })));
+
+	runTimeouts(booted.env);
+
+	same('150ms 后入场类全部移除', enterNodes().length, 0);
+	same('150ms 后页面仍停在第 3 屏', ctx.pageIndex, 2);
+
+	ctx.setPage(0);
+
+	check('向前切屏用 .is-enter-prev（从左进）',
+		hasClass(ctx.pages[0], 'is-enter-prev') && !hasClass(ctx.pages[0], 'is-enter-next'),
+		'class=' + repr(ctx.pages[0].attrs['class']));
+	same('回落时旧页的入场类已清掉', enterNodes().length, 1);
+
+	runTimeouts(booted.env);
+
+	check('CSS 定义淡入 + 8px 位移与 150ms',
+		/@keyframes tsm-enter-next\{from\{opacity:0;transform:translateX\(8px\)\}/.test(SOURCE) &&
+		/@keyframes tsm-enter-prev\{from\{opacity:0;transform:translateX\(-8px\)\}/.test(SOURCE) &&
+		/\.tsm-page\.on\.is-enter-next\{animation:tsm-enter-next \.15s/.test(SOURCE),
+		'enter=' + repr(SOURCE.match(/@keyframes tsm-enter-[a-z]+\{[^}]*\}[^}]*\}/g)));
+	check('reduced-motion 禁用入场动画',
+		/@media \(prefers-reduced-motion: reduce\)\{\.tsm-page\.on\.is-enter-next,\.tsm-page\.on\.is-enter-prev\{animation:none\}\}/.test(SOURCE),
+		'rule=' + repr(SOURCE.match(/@media \(prefers-reduced-motion: reduce\)\{\.tsm-page[^}]*\}[^}]*\}/)));
+}
+
+// ---------------------------------------------------------------- 20. 安全区
+
+async function testSafeArea() {
+	console.log('\n[20] 安全区：env(safe-area-inset-*) + viewport-fit=cover（不重复 viewport）');
+
+	check('CSS 含 env(safe-area-inset-top)', SOURCE.indexOf('env(safe-area-inset-top') >= 0,
+		'match=' + repr((SOURCE.match(/[^']*safe-area-inset-top[^']*/g) || []).slice(0, 1)));
+	check('CSS 含 env(safe-area-inset-bottom)', SOURCE.indexOf('env(safe-area-inset-bottom') >= 0,
+		'match=' + repr((SOURCE.match(/[^']*safe-area-inset-bottom[^']*/g) || []).slice(0, 1)));
+	check('#ts-mobile 顶部/底部留出安全区',
+		/#ts-mobile\{padding-top:env\(safe-area-inset-top,0px\);padding-bottom:calc\(72px \+ env\(safe-area-inset-bottom,0px\)\)\}/.test(SOURCE),
+		'rule=' + repr(SOURCE.match(/#ts-mobile\{padding-top:env[^}]*\}/)));
+	check('底部圆点栏用 safe-area-inset-bottom',
+		/\.tsm-dots\{[^}]*env\(safe-area-inset-bottom/.test(SOURCE),
+		'rule=' + repr(SOURCE.match(/\.tsm-dots\{[^}]*\}/g)));
+	check('sticky tab 也避开刘海',
+		/\.tsm-tabs\{top:env\(safe-area-inset-top/.test(SOURCE),
+		'rule=' + repr(SOURCE.match(/\.tsm-tabs\{top:env[^}]*\}/)));
+
+	const booted = await boot();
+	const metas = findAll(booted.env.__head, function (n) {
+		return n != null && n.tag === 'meta' && n.attrs != null && n.attrs.name === 'viewport';
+	});
+
+	same('head 里只有一个 viewport meta', metas.length, 1);
+	check('viewport 含 viewport-fit=cover',
+		metas.length === 1 && ('' + metas[0].attrs.content).indexOf('viewport-fit=cover') >= 0,
+		'content=' + repr(metas[0] && metas[0].attrs.content));
+}
+
+// ---------------------------------------------------------------- 21. 迷你趋势
+
+function pairCount(points) {
+	const text = (points == null) ? '' : ('' + points);
+
+	return text.length ? text.split(' ').length : 0;
+}
+
+async function testSparkline() {
+	console.log('\n[21] 迷你趋势：120×32 SVG、2 条 polyline、12 次采样、空态占位');
+
+	/* 没有数据：占位横线，折线为空 */
+	const emptyBoot = await boot({ skipLoad: true });
+	const emptyCtx = emptyBoot.ctx;
+
+	check('无数据时占位横线可见',
+		emptyCtx.sparkPh != null && emptyCtx.sparkPh.tag === 'line' &&
+		emptyCtx.sparkPh.style.display !== 'none',
+		'ph=' + repr(emptyCtx.sparkPh && emptyCtx.sparkPh.style));
+	same('无数据时下行折线 points 为空', emptyCtx.sparkDown.attrs.points, '');
+	same('无数据时上行折线 points 为空', emptyCtx.sparkUp.attrs.points, '');
+
+	const booted = await boot({ state: baseState({ totals: { rx_rate: 2000000, tx_rate: 1000000 } }) });
+	const ctx = booted.ctx;
+	const svgs = findAll(ctx.pages[0], function (n) {
+		return n.tag === 'svg' && hasClass(n, 'tsm-spark');
+	});
+
+	same('概览只有 1 个 sparkline SVG', svgs.length, 1);
+	same('sparkline viewBox = 0 0 120 32', svgs[0].attrs.viewBox, '0 0 120 32');
+	same('sparkline 宽 120', svgs[0].attrs.width, '120');
+	same('sparkline 高 32', svgs[0].attrs.height, '32');
+	check('sparkline 在速率数字下方（.tsm-rates 之后）',
+		ctx.pages[0].children.indexOf(findByClass(ctx.pages[0], 'tsm-sparkwrap')) ===
+			ctx.pages[0].children.indexOf(findByClass(ctx.pages[0], 'tsm-rates')) + 1,
+		'order=' + repr(ctx.pages[0].children.map(function (n) {
+			return (n && n.attrs && n.attrs['class']) || n;
+		})));
+
+	const polylines = findAll(svgs[0], function (n) { return n.tag === 'polyline'; });
+
+	same('两条折线（下行 + 上行）', polylines.length, 2);
+	same('下行折线是蓝色', polylines[0].attrs.stroke, '#2b7de9');
+	same('上行折线是橙色', polylines[1].attrs.stroke, '#ff6f00');
+	same('首屏 1 次采样 → 1 个点', pairCount(polylines[0].attrs.points), 1);
+
+	/* 再 sync 11 次 = 12 次采样 */
+	for (let i = 0; i < 11; i++)
+		ctx.syncAll(baseState({ totals: { rx_rate: 2000000 + i, tx_rate: 1000000 + i } }));
+
+	same('12 次 sync 后下行折线 12 个点', pairCount(ctx.sparkDown.attrs.points), 12);
+	same('12 次 sync 后上行折线 12 个点', pairCount(ctx.sparkUp.attrs.points), 12);
+	same('内存采样数 = 12', ctx.sparkSamples.length, 12);
+	same('有数据后占位横线隐藏', ctx.sparkPh.style.display, 'none');
+
+	/* 继续追加：cap 12，最早的被丢弃 */
+	for (let i = 0; i < 3; i++)
+		ctx.syncAll(baseState({ totals: { rx_rate: 3000 + i, tx_rate: 1000 } }));
+
+	same('超过 12 次仍只保留 12 个点', pairCount(ctx.sparkDown.attrs.points), 12);
+	same('数组长度 cap 在 12', ctx.sparkSamples.length, 12);
+	same('保留的是最近一次采样',
+		ctx.sparkSamples[ctx.sparkSamples.length - 1].rx, 3002);
+	check('折线仍是 SVG 元素（不用 canvas）',
+		ctx.sparkDown.tag === 'polyline' &&
+		findAll(ctx.pages[0], function (n) { return n.tag === 'canvas'; }).length === 0);
+}
+
+// ---------------------------------------------------------------- 22. Top3 卡片
+
+async function testOverviewTop3() {
+	console.log('\n[22] 概览 Top3：设备/应用各 3 项排序正确，点设备切屏并展开');
+
+	const devices = [
+		{ mac: 'T1', hostname: '甲', link: 'wifi', last_seen: NOW - 60, direct_rx: 100, direct_tx: 0 },
+		{ mac: 'T2', hostname: '乙', link: 'wifi', last_seen: NOW - 60, direct_rx: 5000, direct_tx: 0 },
+		{ mac: 'T3', hostname: '丙', link: 'wifi', last_seen: NOW - 60, proxy_rx: 300, proxy_tx: 200 },
+		{ mac: 'T4', hostname: '丁', link: 'wired', last_seen: NOW - 60, direct_rx: 40, direct_tx: 0 },
+		{ mac: 'T5', hostname: '戊', link: 'wifi', last_seen: NOW - 60, direct_rx: 900, direct_tx: 100 }
+	];
+	const apps = [
+		{ host: 'a.example', rx: 10, tx: 0 },
+		{ host: 'b.example', rx: 3000, tx: 0 },
+		{ host: 'c.example', rx: 500, tx: 500 },
+		{ host: 'd.example', rx: 1, tx: 0 },
+		{ host: 'e.example', rx: 2000, tx: 0 }
+	];
+
+	const booted = await boot({ state: baseState({ devices: devices, apps: apps }) });
+	const ctx = booted.ctx;
+
+	const cards = findAll(ctx.pages[0], function (n) { return hasClass(n, 'tsm-topcard'); });
+
+	same('概览有 2 张 Top3 卡片', cards.length, 2);
+	sameList('两卡标题是「流量 Top 设备」「应用 Top 3」',
+		cards.map(function (card) { return textOf(findByClass(card, 'tsm-topcard-t')); }),
+		[ '流量 Top 设备', '应用 Top 3' ]);
+
+	const inFoot = findByClass(ctx.pages[0], 'tsm-foot');
+
+	check('Top3 卡片在「N 台终端」胶囊下方（同一个 .tsm-foot 里）',
+		inFoot != null && findByClass(inFoot, 'tsm-top3') != null &&
+		inFoot.children.indexOf(ctx.devPill) === 1,
+		'foot=' + repr(inFoot && inFoot.children.map(function (n) {
+			return (n && n.attrs && n.attrs['class']) || n;
+		})));
+
+	const devRows = findAll(ctx.topDevBox, function (n) { return hasClass(n, 'tsm-toprow'); });
+	const appRows = findAll(ctx.topAppBox, function (n) { return hasClass(n, 'tsm-toprow'); });
+
+	same('流量 Top 设备卡片 3 项', devRows.length, 3);
+	sameList('设备按合计流量降序',
+		devRows.map(function (row) { return textOf(findByClass(row, 'tsm-topname')); }),
+		[ '乙', '戊', '丙' ]);
+	sameList('设备流量显示为格式化字节',
+		devRows.map(function (row) { return textOf(findByClass(row, 'tsm-topval')); }),
+		[ '5 KiB', '1000 B', '500 B' ]);
+
+	same('应用 Top 3 卡片 3 项', appRows.length, 3);
+	sameList('应用按流量降序',
+		appRows.map(function (row) { return textOf(findByClass(row, 'tsm-topname')); }),
+		[ 'b.example', 'e.example', 'c.example' ]);
+	sameList('应用流量显示为格式化字节',
+		appRows.map(function (row) { return textOf(findByClass(row, 'tsm-topval')); }),
+		[ '3 KiB', '2 KiB', '1000 B' ]);
+
+	check('设备 Top 行是可点按钮（≥40px + 有 click）',
+		devRows.every(function (row) {
+			return row.tag === 'button' && typeof row.attrs.click === 'function';
+		}),
+		'rows=' + repr(devRows.map(function (row) { return row.tag; })));
+	check('应用 Top 行不可点（手机版没有应用屏）',
+		appRows.every(function (row) {
+			return (row.listeners == null) || (row.listeners.click == null);
+		}),
+		'listeners=' + repr(appRows.map(function (row) { return Object.keys(row.listeners || {}); })));
+
+	/* 点设备：切到设备屏 + 展开该设备 */
+	const pageBefore = ctx.pageIndex;
+
+	devRows[0].attrs.click();
+
+	same('点设备 Top 行切到设备屏', ctx.pageIndex, 1);
+	check('切屏方向也是正常入场（页变了）', ctx.pageIndex !== pageBefore);
+
+	const shownRows = findAll(ctx.devicesBox, function (n) { return hasClass(n, 'tsm-drow'); });
+
+	same('设备屏渲染出 5 台设备', shownRows.length, 5);
+	check('点中的设备行已展开（.on + aria-expanded）',
+		shownRows[0].attrs['aria-expanded'] === 'true' && hasClass(shownRows[0], 'on'),
+		'aria=' + repr(shownRows[0].attrs['aria-expanded']) +
+		' class=' + repr(shownRows[0].attrs['class']));
+	check('展开区可见（display 不是 none）',
+		shownRows[0].parentNode.children[1].style.display !== 'none',
+		'item=' + repr(shownRows[0].parentNode.children.map(function (n) { return n.style; })));
+	same('目标设备分类是主网络', ctx.devTab, 'main');
+	same('点 Top 设备不会发 RPC（只有懒加载的 0 次）',
+		countCalls(booted.env, 'get_state'), 1);
+
+	/* 空数据：两卡各给占位，不伪造条目 */
+	const emptyBoot = await boot({ state: baseState() });
+	const emptyCtx = emptyBoot.ctx;
+
+	same('无设备时设备卡给占位',
+		findAll(emptyCtx.topDevBox, function (n) { return hasClass(n, 'tsm-toprow-empty'); }).length, 1);
+	same('无应用时应用卡给占位',
+		findAll(emptyCtx.topAppBox, function (n) { return hasClass(n, 'tsm-toprow-empty'); }).length, 1);
+	same('占位不产生可点行',
+		findAll(emptyCtx.topDevBox, function (n) { return n.listeners && n.listeners.click; }).length, 0);
+}
+
 // ---------------------------------------------------------------- main
 
 (async function main() {
@@ -3400,6 +3870,12 @@ async function testTouchTargets() {
 		await testLazyNodeData();
 		await testTopoDrilldown();
 		await testDeviceSearch();
+		await testPullRefresh();
+		await testSkeletonScreens();
+		await testPageTransition();
+		await testSafeArea();
+		await testSparkline();
+		await testOverviewTop3();
 	}
 	catch (err) {
 		console.error('\n测试自身异常：', err && err.stack ? err.stack : err);
