@@ -109,7 +109,7 @@ fun OverviewScreen(
         ) {
             item { StatusHeader(ui, onRefresh) }
             item { RateCards(s) }
-            item { KpiRow(s) }
+            item { KpiRow(s, ui.history) }
             item { TrendCard(ui) }
             item { SparklineCard(ui) }
             item { AlertsCard(ui, onOpenDevices) }
@@ -199,10 +199,17 @@ private fun RateCard(label: String, rate: Long, color: Color, modifier: Modifier
 }
 
 @Composable
-private fun KpiRow(s: PanelState?) {
+private fun KpiRow(s: PanelState?, history: List<DailyUsage>) {
     val t = s?.totals
+    /* totals 是进程累计，不能标成「今日」：优先用历史里今天的汇总，没有历史才退回累计并改标签。 */
+    val todayKey = java.time.LocalDate.now().toString()
+    val today = history.lastOrNull()?.takeIf { it.day == todayKey }
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-        Kpi("今日", fmtBytes(t?.total ?: 0), Modifier.weight(1f))
+        Kpi(
+            if (today != null) "今日" else "本次累计",
+            fmtBytes(today?.total ?: (t?.total ?: 0)),
+            Modifier.weight(1f)
+        )
         Kpi("本月", fmtBytes(t?.monthTotal ?: 0), Modifier.weight(1f))
         Kpi("在线", "${s?.onlineCount ?: 0} 台", Modifier.weight(1f))
         Kpi("连接", "${s?.health?.clashConnections ?: 0}", Modifier.weight(1f))
