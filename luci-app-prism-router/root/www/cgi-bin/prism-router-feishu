@@ -1,7 +1,7 @@
 #!/usr/bin/ucode
 // prism-router-feishu —— 飞书自建应用「扫码绑定群」授权 CGI（默认关闭的应用机器人模式）
 //
-// 安装为 /www/cgi-bin/prism-router-feishu（755）。契约见 docs/SPEC.md「飞书应用机器人」。
+// 安装为 /www/cgi-bin/prism-router-feishu（755）。接口与安全边界见下方注释及配置段说明。
 //
 // 为什么需要它：群自定义机器人 webhook 只能发到「它所在的那一个群」，用户无法在页面上
 // 选择目标群；自建应用（app_id/app_secret）可以先用「用户身份」列出机器人所在的群，
@@ -29,6 +29,7 @@
 //   * 响应只输出 {error} / 固定形状 JSON；错误文本先脱敏（去掉 secret / Bearer / 长 hex）
 //     并截断，不返回堆栈、不返回上游原始响应体。
 //   * 上游 JSON 只解析不执行；HTTP 200 不代表成功，必须看 body 的 code / access_token。
+//   * 回跳地址按当前请求的 scheme（HTTPS=on / SERVER_PORT=443 判 HTTPS）与 Host 生成。
 //   * 只用固定 URL 前缀 open.feishu.cn；环境变量 PRISM_ROUTER_FEISHU_BASE 仅供隔离容器
 //     门禁把 base 指向 127.0.0.1 上的 mock（非 loopback 一律忽略，防止凭证被改道）。
 //
@@ -286,6 +287,21 @@ function feishu_base() {
 	return PROD_BASE;
 }
 
+/* 回调地址的 scheme：uhttpd 在 TLS 监听上会给 CGI 设 HTTPS=on；纯 HTTP 时没有。
+   （X-Forwarded-Proto 不会被 uhttpd 转发，所以不依赖它。）
+   配置注释里两种写法都给了：CGI 按当前请求 scheme 生成，和开放平台填的保持一致即可。 */
+function request_scheme() {
+	const https = lc(trim(text(getenv('HTTPS'), '')));
+
+	if (https == 'on' || https == '1' || https == 'yes' || https == 'true')
+		return 'https';
+
+	if (trim(text(getenv('SERVER_PORT'), '')) == '443')
+		return 'https';
+
+	return 'http';
+}
+
 /* 回调地址：必须与开放平台「重定向 URL」完全一致。
    Host 来自请求头（客户端可控），只接受 IP/域名[:端口] 形状，否则回落到 127.0.0.1。 */
 function redirect_uri() {
@@ -295,7 +311,7 @@ function redirect_uri() {
 	    && match(host, /^\[[0-9A-Fa-f:]+\](:[0-9]{1,5})?$/) == null)
 		host = '127.0.0.1';
 
-	return `http://${host}/cgi-bin/prism-router-feishu?action=callback`;
+	return `${request_scheme()}://${host}/cgi-bin/prism-router-feishu?action=callback`;
 }
 
 // ───────────────────────────── 脱敏 ─────────────────────────────

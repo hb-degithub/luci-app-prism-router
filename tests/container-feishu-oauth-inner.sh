@@ -221,10 +221,10 @@ SF=$(grep -c "FAIL" /tmp/fs-selftest.log)
 # ───────────────────────── CGI 调用助手 ─────────────────────────
 CGI_RAW=/tmp/cgi.raw; CGI_H=/tmp/cgi.h; CGI_B=/tmp/cgi.b
 : > "$CGI_H"; : > "$CGI_B"
-cgi(){ # $1=QUERY_STRING [$2=METHOD] [$3=HTTP_HOST]
+cgi(){ # $1=QUERY_STRING [$2=METHOD] [$3=HTTP_HOST] [$4=HTTPS]
   : > "$CGI_RAW"; : > "$CGI_H"; : > "$CGI_B"
   env PATH="/tmp/shim:$PATH" REQUEST_METHOD="${2:-GET}" HTTP_HOST="${3:-router.lan:8080}" \
-      QUERY_STRING="$1" PRISM_ROUTER_FEISHU_BASE="$MOCK_BASE" \
+      HTTPS="${4:-}" QUERY_STRING="$1" PRISM_ROUTER_FEISHU_BASE="$MOCK_BASE" \
       ucode "$CGI" > "$CGI_RAW" 2>/tmp/cgi.err
   CGI_RC=$?
   tr -d '\r' < "$CGI_RAW" > /tmp/cgi.clean
@@ -302,6 +302,21 @@ esac
 case "$URL" in
   *"state=$STATE") ok "url 的 state 与返回一致" ;;
   *) bad "url 的 state 不一致：$URL" ;;
+esac
+# HTTPS 页面（uhttpd 给 CGI 设 HTTPS=on）下，回跳地址要用 https，否则飞书会报 redirect_uri 不匹配
+cgi "action=start" GET "router.lan" "on"
+HURL=$(jget url)
+case "$HURL" in
+  *"redirect_uri=https%3A%2F%2Frouter.lan%2Fcgi-bin%2Fprism-router-feishu%3Faction%3Dcallback"*)
+    ok "HTTPS 请求下 redirect_uri 用 https（HTTPS=on）" ;;
+  *) bad "HTTPS 请求下 redirect_uri 不对：$HURL" ;;
+esac
+cgi "action=start" GET "router.lan" ""
+LURL=$(jget url)
+case "$LURL" in
+  *"redirect_uri=http%3A%2F%2Frouter.lan%2Fcgi-bin%2Fprism-router-feishu%3Faction%3Dcallback"*)
+    ok "HTTP 请求下 redirect_uri 仍用 http" ;;
+  *) bad "HTTP 请求下 redirect_uri 不对：$LURL" ;;
 esac
 hasnt "$SECRET" "$CGI_B" "start 响应不含 app_secret"
 hasnt "$SECRET" "$URL" "url 里不含 app_secret"
