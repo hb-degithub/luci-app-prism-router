@@ -97,6 +97,15 @@ uci commit prism-router
 `opkg remove luci-app-traffic-stats traffic-stats` 清理旧包；`/etc/config/traffic-stats`
 与 `/etc/traffic-stats/` 不会被自动删除，需要手动清理。
 
+## Android 原生客户端
+
+`android/` 是一个 Kotlin + Jetpack Compose 原生应用（无 WebView），只读展示面板数据：
+概览速率与折线、设备、应用、设置（服务器地址/令牌/刷新间隔）。
+
+构建与安装见 [android/README.md](android/README.md)；本机已用免安装工具链构建出
+`android/artifacts/prism-router-android-1.0.0-debug.apk`（包名 `io.prism.router`，
+minSdk 26，targetSdk 35，debug 签名，仅内测用）。
+
 ## 独立面板服务（脱离 LuCI）
 
 `prism-router` 会安装一个**独立**的 uhttpd 实例（procd 管理，不占用 LuCI 的 web 端口，
