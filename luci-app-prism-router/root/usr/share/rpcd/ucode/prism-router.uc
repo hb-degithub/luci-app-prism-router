@@ -127,7 +127,7 @@ const UCI_FIELDS = {
 	/* 数据/日志保留策略（retention.uc 消费） */
 	retention: [ 'enabled', 'daily_days', 'nodes_days', 'stations_days',
 	             'log_days', 'log_max_kb', 'spool_max_kb', 'dry_run' ],
-	feishu:   [ 'enabled', 'webhook', 'secret', 'daily_time', 'report_chat_enabled',
+	feishu:   [ 'enabled', 'mode', 'webhook', 'secret', 'daily_time', 'report_chat_enabled',
 	             'app_id', 'app_secret', 'chat_id', 'card_wrapper',
 	             /* 内容 / 时间 / 条件可配（feishu.uc 1.1.0） */
 	             'report_items', 'report_mode', 'report_time', 'report_weekday',

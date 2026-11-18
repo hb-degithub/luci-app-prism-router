@@ -25,6 +25,23 @@
  *               metrics_enabled / metrics_token 目前没有界面入口，本页也不改它们，
  *               避免保存时把用户手写的 metrics 配置清掉（后端只写传入的键）。
  *
+ * 飞书发送方式（本页新增，顶部单选）：
+ *   feishu.mode = webhook —— 群自定义机器人，原有 webhook / secret 输入保持不变；
+ *   feishu.mode = app     —— 自建应用机器人，填 App ID / App Secret 后「生成绑定二维码」：
+ *       1. GET /cgi-bin/prism-router-feishu?action=start → {state, url}
+ *          （CGI 只读 GET、凭证从 UCI 取：页面上的 App ID/Secret 与已保存值不一致时，
+ *            先只把这两个键 set_config 保存一次；Secret 绝不进 URL / 二维码 / 日志）
+ *       2. 用 uqr 把 url 画成 SVG 二维码（DOM 节点拼装，无外部图片、无 HTML 字符串赋值）
+ *       3. 每 2 秒 GET ?action=status&state=<state>
+ *          → {status:'pending'} / {status:'ready', chats:[{chat_id,name}]} / {status:'error', error}
+ *          失效 state 走 HTTP 404（立即停表），其余网络错误连续 3 次才放弃
+ *       4. ready 后选群 → set_config('feishu', {mode:'app', chat_id}) 落盘 → 显示已绑定 + 解除绑定
+ *   超时 5 分钟停表；切标签页、切回 webhook、离开页面都会清定时器；错误文案统一脱敏
+ *   （App Secret / token / Bearer 打码 + 截断）。
+ *
+ *   后端契约若还没上线（无 /cgi-bin/prism-router-feishu），这里只会显示可读错误，不影响
+ *   页面其它功能；set_config 白名单还没有 mode 时该键被后端静默跳过，chat_id 仍会写入。
+ *
  * 兼容与降级（页面绝不因为老后端/缺字段报错）：
  *   - 选项不存在 → 显示内置默认值，并在 label 旁标注「默认」；
  *   - 空值 → 默认不写（保持「未配置」语义）；但该 option 原本存在时写空串，用于把旧阈值关掉；
@@ -135,6 +152,8 @@ var DEFAULTS = {
 	},
 	feishu: {
 		enabled: '0',
+		/* 渠道模式：webhook = 群自定义机器人；app = 自建应用机器人（扫码绑定群） */
+		mode: 'webhook',
 		webhook: '',
 		secret: '',
 		app_id: '',
@@ -366,6 +385,145 @@ function isMissingMethodError(err) {
 	return /not\s*found|no\s+such|unknown\s+method|invalid\s+method|method.*missing|-32601|404/i.test(message);
 }
 
+/* ------------------------------------------------- 飞书应用机器人 · 扫码绑定
+ *
+ * 后端契约（由 prism-router-feishu CGI 提供，前端只按这个形状消费）：
+ *   GET  /cgi-bin/prism-router-feishu?action=start      （凭证从 UCI 读，前端不传）
+ *        -> { state, url }                       ; url 是飞书授权链接，渲染成二维码
+ *   GET  /cgi-bin/prism-router-feishu?action=status&state=<state>
+ *        -> { status: 'pending' }
+ *        -> { status: 'ready', chats: [ {chat_id, name} ] }
+ *        -> { status: 'error', error: '<文案>' }
+ *
+ * 两条硬规则：App Secret 只留在 /etc/config 与输入框里（不进 URL、不进二维码，
+ * 也不出现在任何请求体）；state 只放在查询串里且一次性使用；轮询用相对路径，天然同源。
+ */
+var FEISHU_CGI = '/cgi-bin/prism-router-feishu';
+var FEISHU_MODE_WEBHOOK = 'webhook';
+var FEISHU_MODE_APP = 'app';
+var FEISHU_POLL_MS = 2000;                    /* 每 2 秒查一次绑定状态 */
+var FEISHU_BIND_TIMEOUT_MS = 5 * 60 * 1000;   /* 二维码 5 分钟有效 */
+var FEISHU_POLL_FAIL_MAX = 3;                 /* 连续三次网络失败才放弃 */
+var FEISHU_REQUEST_TIMEOUT_MS = 15000;
+var FEISHU_ERROR_MAX = 200;                   /* 错误文案截断，避免糊一屏 */
+var SVG_NS = 'http://www.w3.org/2000/svg';
+
+function escapeRegExp(text) {
+	return ('' + text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/* chat_id 展示脱敏：保留前缀和后 4 位，中间打点（oc_ab12…9f3c）。 */
+function maskChatId(value) {
+	var s = str(value);
+
+	if (s.length === 0) return '';
+	if (s.length <= 8) return s.substr(0, 3) + '…';
+
+	return s.substr(0, 6) + '…' + s.substr(s.length - 4);
+}
+
+/* 错误脱敏：调用方传进来的密钥原文、常见 token 形态、Bearer 头一律打码，再截断。
+ * 后端的原始报文可能把 app_secret / token 原样回显，这里不能直接 textContent 上去。 */
+function redactFeishuError(message, secrets) {
+	var text = (message != null && message.message != null) ? ('' + message.message) : str(message);
+	var list = Array.isArray(secrets) ? secrets : [];
+	var i;
+
+	text = text.replace(/\s+/g, ' ').trim();
+
+	for (i = 0; i < list.length; i++) {
+		var secret = str(list[i]);
+
+		if (secret.length < 4) continue;
+
+		text = text.replace(new RegExp(escapeRegExp(secret), 'g'), '***');
+	}
+
+	text = text.replace(/(Bearer\s+)[A-Za-z0-9._\-]+/gi, '$1***');
+	/* Bearer 先打码，再按 key=value 打码；顺序反了会把 Bearer 这半截吃掉、token 留在后面。 */
+	text = text.replace(
+		/((?:app[_-]?secret|tenant[_-]?access[_-]?token|app[_-]?access[_-]?token|access[_-]?token|authorization|secret|token|passw[a-z]*)\s*["']?\s*[:=]\s*)["']?[^\s"',;}]+/gi,
+		'$1***');
+	/* 长的疑似密钥串（>=32 位字母数字混合）也打码，避免未知字段泄露 */
+	text = text.replace(/\b(?=[A-Za-z0-9_-]{32,}\b)(?=[^\s]*[A-Za-z])(?=[^\s]*[0-9])[A-Za-z0-9_-]{32,}\b/g, '***');
+
+	if (text.length > FEISHU_ERROR_MAX)
+		text = text.substr(0, FEISHU_ERROR_MAX) + '…';
+
+	return text;
+}
+
+/* uqr 返回的是 SVG 字符串：用 DOMParser 解析后 importNode，绝不把字符串当 HTML 赋值。
+ * 只接受根节点是 <svg> 的文档；script / foreignObject 一律剥掉。 */
+function importQrSvg(svgText) {
+	var text = str(svgText);
+
+	if (text === '') return null;
+
+	var doc = null;
+
+	try {
+		if (typeof DOMParser == 'function')
+			doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+	}
+	catch (e) {
+		doc = null;
+	}
+
+	var root = (doc != null) ? doc.documentElement : null;
+
+	if (root == null || ('' + root.nodeName).toLowerCase() !== 'svg') return null;
+
+	var node = null;
+
+	try {
+		node = document.importNode(root, true);
+	}
+	catch (e) {
+		return null;
+	}
+
+	if (node == null) return null;
+
+	try {
+		var bad = node.querySelectorAll('script,foreignObject');
+
+		for (var i = 0; i < bad.length; i++) {
+			if (bad[i].parentNode != null) bad[i].parentNode.removeChild(bad[i]);
+		}
+	}
+	catch (e) { }
+
+	return node;
+}
+
+/* uqr 的 SVG 通常自带 viewBox；只给 width/height 时按像素补一个，CSS 拉满时才能等比缩放。 */
+function normalizeQrSvg(host) {
+	if (host == null || typeof host.querySelector != 'function') return;
+
+	var svg = null;
+
+	try { svg = host.querySelector('svg'); }
+	catch (e) { svg = null; }
+
+	if (svg == null || typeof svg.getAttribute != 'function') return;
+
+	try {
+		if (!svg.getAttribute('viewBox')) {
+			var w = parseFloat(svg.getAttribute('width'));
+			var h = parseFloat(svg.getAttribute('height'));
+
+			if (isFinite(w) && isFinite(h) && w > 0 && h > 0)
+				svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+		}
+
+		svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+		/* 390px 手机上固定像素会溢出：宽 100%、高自动，容器负责最大宽度。 */
+		svg.setAttribute('style', 'display:block;width:100%;height:auto');
+	}
+	catch (e) { }
+}
+
 /*
  * 设置页是写页面：menu.d 已给它 depends.acl=luci-app-prism-router-admin。
  * 这里再检查一次 L.env.acls，作为「老版本 dispatcher 仍放行」或手工打开 URL
@@ -421,6 +579,11 @@ return view.extend({
 		this.uciOk = true;
 		this.status = null;
 		this.loadError = null;
+		/* 生命周期监听（beforeunload / visibilitychange）每次页面装载只绑一次：
+		 * render() 可能被 LuCI 调多次，重复绑定会让旧闭包一直留在 window 上。 */
+		this.feishuLifecycleBound = false;
+		this.feishuUnloadFn = null;
+		this.feishuVisibilityFn = null;
 
 		var tasks = [
 			uci.load('prism-router').catch(function(err) {
@@ -440,6 +603,9 @@ return view.extend({
 	},
 
 	render: function() {
+		/* 重渲染前先把上一份视图的轮询停掉，避免旧实例在后台继续打 CGI。 */
+		this.clearFeishuPollTimer();
+
 		this.inputs = {};
 		this.rows = {};
 		this.radioInputs = {};
@@ -451,6 +617,27 @@ return view.extend({
 		this.retentionOutput = null;
 		this.dryRunStatus = null;
 		this.reportTimeDirty = false;
+
+		/* 飞书应用机器人 · 扫码绑定的运行时状态（只在内存里，不落 UCI） */
+		this.feishuQrHost = null;
+		this.feishuScanStatus = null;
+		this.feishuScanBlock = null;
+		this.feishuChatBox = null;
+		this.feishuBoundNode = null;
+		this.feishuBoundText = null;
+		this.feishuBindBtn = null;
+		this.feishuSaveBindBtn = null;
+		this.feishuUnbindBtn = null;
+		this.feishuChatRadios = [];
+		this.feishuChats = [];
+		this.feishuState = '';
+		this.feishuPollTimer = null;
+		this.feishuPollDeadline = 0;
+		this.feishuPollFailures = 0;
+		this.feishuPolling = false;
+		this.feishuPaused = false;
+		this.feishuStartSeq = 0;
+		this.feishuBoundChat = null;
 
 		var root = E('div', {}, [
 			E('h2', {}, _('棱镜路由 · 设置')),
@@ -780,6 +967,10 @@ return view.extend({
 	renderFeishuSection: function() {
 		var self = this;
 
+		/* 写操作统一闸门：读不到 UCI 或没有 admin ACL 时，所有会落盘的按钮都禁用。
+		 * （下面的扫码绑定按钮也用它，保持与「测试发送 / 列出机器人所在的群」一致。） */
+		var writeDisabled = ((!canManage()) || this.uciOk !== true) ? true : null;
+
 		var channelFields = [
 			[ 'feishu', 'enabled', _('启用飞书报表'), _('开启后按下面的「时间」推送日报/周报；测试发送不受这里影响。'), 'bool', null ],
 			[ 'feishu', 'webhook', _('Webhook 地址'), _('群自定义机器人的地址，https://open.feishu.cn/open-apis/bot/v2/hook/…'), 'text', { wide: true } ],
@@ -790,8 +981,11 @@ return view.extend({
 			[ 'feishu', 'report_chat_enabled', _('群聊报表'), _('关掉后只推送给私聊/其它通道（按后端实现）。'), 'bool', null ]
 		];
 
-		var fields = channelFields.map(function(def) {
-			return self.field(def[0], def[1], def[2], def[3], def[4], def[5]);
+		/* 发送方式在最上面：webhook（自定义机器人）/ app（应用机器人 · 扫码绑定） */
+		var fields = [ this.feishuModeField() ];
+
+		channelFields.forEach(function(def) {
+			fields.push(self.field(def[0], def[1], def[2], def[3], def[4], def[5]));
 		});
 
 		/* ---- 内容（report_items）---- */
@@ -861,10 +1055,11 @@ return view.extend({
 			_('只抑制告警、不影响报表；格式 HH:MM-HH:MM，可逗号分隔多段，支持跨零点。示例：23:00-07:00,12:00-13:00；留空 = 关闭。'),
 			'text', { wide: true, placeholder: '23:00-07:00' }));
 
+		/* ---- 应用机器人 · 扫码绑定（只有「应用机器人」模式显示）---- */
+		fields.push(this.feishuScanField(writeDisabled));
+
 		this.testNode = E('span', { style: 'font-size:12px;opacity:.85' }, '');
 		this.chatNode = E('div', { style: 'font-size:12px;margin-top:8px' }, '');
-
-		var writeDisabled = ((!canManage()) || this.uciOk !== true) ? true : null;
 
 		var section = E('div', { 'class': 'cbi-section', style: 'margin-bottom:18px' }, [
 			E('h3', {}, _('飞书报表')),
@@ -888,7 +1083,112 @@ return view.extend({
 		/* report_weekday 只在 weekly / both 时显示（radio 的 change 也会再调一次） */
 		this.updateConditionalFields();
 
+		/* beforeunload / visibilitychange 只绑一次，切标签或离开页面时清掉轮询定时器 */
+		this.bindFeishuLifecycle();
+
 		return section;
+	},
+
+	/* 发送方式切换：webhook（自定义机器人，保持原样）/ app（自建应用机器人，扫码绑定）。 */
+	feishuModeField: function() {
+		var choices = [ [ FEISHU_MODE_WEBHOOK, _('自定义机器人（webhook）') ],
+		                [ FEISHU_MODE_APP, _('应用机器人（扫码绑定）') ] ];
+
+		/* mode 未设置时后端沿用旧行为：app_id/app_secret/chat_id 齐全走应用。
+		   这里把 app 放到首位，让界面选中项与真实发送路线一致，避免误导。 */
+		if (rawValue('feishu', 'mode') == null &&
+		    rawValue('feishu', 'app_id') && rawValue('feishu', 'app_secret') &&
+		    rawValue('feishu', 'chat_id'))
+			choices = [ choices[1], choices[0] ];
+
+		var row = this.radioField('feishu', 'mode', _('发送方式'),
+			_('自定义机器人 = 复制群里的 webhook；应用机器人 = 自建应用 + 扫码把机器人拉进群，用 chat_id 发消息（不需要 webhook）。'),
+			choices);
+
+		row.setAttribute('id', 'ts-feishu-mode-row');
+
+		return row;
+	},
+
+	/* 扫码绑定区块：二维码 + 轮询状态 + 群列表 + 已绑定提示。
+	 * 只在 mode=app 时显示（syncFeishuMode 负责）；全部单列布局，390px 不横向溢出。 */
+	feishuScanField: function(writeDisabled) {
+		var self = this;
+
+		this.feishuQrHost = E('div', {
+			'id': 'ts-feishu-qr',
+			'data-qr': '',
+			'style': 'display:none;width:180px;max-width:100%;box-sizing:border-box;' +
+				'padding:8px;border-radius:8px;background:#fff;border:1px solid rgba(127,127,127,.28);' +
+				'flex-direction:column;align-items:center;justify-content:center;overflow:hidden'
+		}, '');
+
+		this.feishuScanStatus = E('div', {
+			'id': 'ts-feishu-scan-status',
+			'style': 'font-size:12px;line-height:1.55;max-width:100%;word-break:break-word;overflow-wrap:anywhere'
+		}, '');
+
+		this.feishuChatBox = E('div', {
+			'id': 'ts-feishu-chats',
+			'style': 'display:none;max-width:100%;min-width:0'
+		}, '');
+
+		this.feishuBoundText = E('span', { style: 'font-size:12px;line-height:1.6;word-break:break-word' }, '');
+
+		this.feishuUnbindBtn = E('button', {
+			'id': 'ts-feishu-btn-unbind',
+			'class': 'cbi-button cbi-button-reset',
+			'click': ui.createHandlerFn(this, this.unbindFeishu),
+			'disabled': writeDisabled
+		}, _('解除绑定'));
+
+		this.feishuBoundNode = E('div', {
+			'id': 'ts-feishu-bound',
+			'style': 'display:none;max-width:100%;align-items:center;gap:10px;flex-wrap:wrap;' +
+				'padding:8px 10px;border-radius:6px;background:rgba(76,175,80,.12)'
+		}, [
+			this.feishuBoundText,
+			this.feishuUnbindBtn
+		]);
+
+		this.feishuBindBtn = E('button', {
+			'id': 'ts-feishu-btn-bind',
+			'class': 'cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(this, this.startFeishuBind),
+			'disabled': writeDisabled
+		}, _('生成绑定二维码'));
+
+		this.feishuSaveBindBtn = E('button', {
+			'id': 'ts-feishu-btn-savebind',
+			'class': 'cbi-button cbi-button-apply',
+			'click': ui.createHandlerFn(this, this.saveFeishuBinding),
+			'disabled': writeDisabled
+		}, _('保存绑定'));
+
+		this.feishuScanBlock = E('div', {
+			'id': 'ts-feishu-scan-block',
+			'style': 'display:none;margin:0;max-width:100%;min-width:0'
+		}, [
+			this.subhead(_('飞书应用机器人 · 扫码绑定'), false),
+			E('div', {
+				'style': 'display:grid;grid-template-columns:minmax(0,1fr);gap:10px;' +
+					'max-width:100%;min-width:0;box-sizing:border-box'
+			}, [
+				E('div', { 'class': 'cbi-value-description', style: 'margin:0;max-width:100%' },
+					_('用手机飞书扫描下面的二维码，把自建应用机器人拉进要接收报表的群；授权完成后本页会列出群供你选择。')),
+				E('div', { 'class': 'cbi-value-description', style: 'margin:0;max-width:100%' },
+					_('App ID / App Secret 只保存在本机配置里（扫码接口从本机读取，不进 URL、不进二维码），二维码 5 分钟内有效。')),
+				E('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap;max-width:100%' }, [
+					this.feishuBindBtn
+				]),
+				this.feishuQrHost,
+				this.feishuScanStatus,
+				this.feishuChatBox,
+				this.feishuBoundNode
+			])
+		]);
+
+		return this.feishuScanBlock;
 	},
 
 	/* 内容多选：七个区块；全不勾 → 保存 none（空串会回落到默认内容，语义不同） */
@@ -1133,12 +1433,14 @@ return view.extend({
 	updateConditionalFields: function() {
 		var row = this.rows['feishu.report_weekday'];
 
-		if (row == null)
-			return;
+		if (row != null) {
+			var mode = this.radioValue('feishu', 'report_mode', 'daily');
 
-		var mode = this.radioValue('feishu', 'report_mode', 'daily');
+			row.style.display = (mode === 'daily') ? 'none' : '';
+		}
 
-		row.style.display = (mode === 'daily') ? 'none' : '';
+		/* 发送方式：切到 app 才显示扫码绑定区块；切回 webhook 顺手停表 */
+		this.syncFeishuMode();
 	},
 
 	collect: function() {
@@ -1166,6 +1468,9 @@ return view.extend({
 		this.setOptional(settings, 'settings', 'quota_total_gb', this.inputValue('settings', 'quota_total_gb'));
 
 		feishu.enabled = this.inputChecked('feishu', 'enabled') ? '1' : '0';
+		/* 发送方式：webhook = 群自定义机器人，app = 自建应用机器人（扫码绑定群）。
+		   后端 UCI_FIELDS 白名单里暂时没有 mode 时会静默忽略这个键，不影响其它字段落盘。 */
+		feishu.mode = this.radioValue('feishu', 'mode', FEISHU_MODE_WEBHOOK);
 		feishu.webhook = this.inputValue('feishu', 'webhook');
 		feishu.secret = this.inputValue('feishu', 'secret');
 		feishu.app_id = this.inputValue('feishu', 'app_id');
@@ -1308,6 +1613,13 @@ return view.extend({
 
 		if (feishu.webhook.length > 0 && !/^https?:\/\/[^\s]+$/.test(feishu.webhook))
 			return _('飞书 webhook 必须是 http(s) 地址');
+
+		if (feishu.mode !== FEISHU_MODE_WEBHOOK && feishu.mode !== FEISHU_MODE_APP)
+			return _('飞书发送方式只能是 webhook（自定义机器人）或 app（应用机器人）');
+
+		/* 应用机器人没有 App ID/Secret 连 token 都换不到：保存前就拦住并说清楚，别等到发送时静默失败 */
+		if (feishu.mode === FEISHU_MODE_APP && (str(feishu.app_id) === '' || str(feishu.app_secret) === ''))
+			return _('应用机器人模式需要填写 App ID 和 App Secret：请补全后保存，或把发送方式切回自定义机器人');
 
 		if (feishu.daily_time.length > 0 && normHHMM(feishu.daily_time) == null)
 			return _('旧字段 daily_time 必须是 24 小时制 HH:MM');
@@ -1765,6 +2077,837 @@ return view.extend({
 			clearNode(self.chatNode);
 			self.chatNode.appendChild(E('span', { style: 'color:#c62828' }, _('获取失败：') + e));
 		});
+	},
+
+	// ------------------------------------------------------ 应用机器人 · 扫码绑定
+
+	feishuMode: function() {
+		var mode = this.radioValue('feishu', 'mode', FEISHU_MODE_WEBHOOK);
+
+		return (mode === FEISHU_MODE_APP) ? FEISHU_MODE_APP : FEISHU_MODE_WEBHOOK;
+	},
+
+	/* 读不到 UCI 或没有 admin ACL：所有会落盘的飞书按钮都禁用（与其它写按钮同一闸门）。 */
+	feishuWriteBlocked: function() {
+		return (this.uciOk !== true) || (!canManage());
+	},
+
+	/* 只有「应用机器人」模式才显示扫码区域。 */
+	syncFeishuMode: function() {
+		var app = (this.feishuMode() === FEISHU_MODE_APP);
+
+		if (this.feishuScanBlock != null)
+			this.feishuScanBlock.style.display = app ? '' : 'none';
+
+		if (!app && this.feishuPolling === true) {
+			this.stopFeishuPoll();
+			this.setFeishuScanStatus(_('已切回自定义机器人，绑定轮询已停止。'), 'warn');
+		}
+
+		if (app)
+			this.refreshFeishuBound();
+	},
+
+	/* 页面装载时回显已保存的 chat_id（群名只有扫码后才知道，这里只给打码的 id）。
+	 * 本次会话里刚绑定/解除过就用内存里的结果：uci 缓存要刷新页面才会更新。 */
+	refreshFeishuBound: function() {
+		if (this.feishuBoundNode == null) return;
+
+		if (this.feishuBoundChat != null) {
+			this.showFeishuBound(this.feishuBoundChat.chat_id, this.feishuBoundChat.name);
+
+			return;
+		}
+
+		if (this.uciOk !== true) {
+			this.showFeishuBound('');
+
+			return;
+		}
+
+		var chatId = str(rawValue('feishu', 'chat_id'));
+
+		if (chatId === '') {
+			this.showFeishuBound('');
+
+			return;
+		}
+
+		this.showFeishuBound(chatId, '');
+	},
+
+	showFeishuBound: function(chatId, name) {
+		var id = str(chatId);
+
+		if (this.feishuBoundNode == null || this.feishuBoundText == null) return;
+
+		if (id === '') {
+			this.feishuBoundNode.style.display = 'none';
+			this.feishuBoundText.textContent = '';
+
+			return;
+		}
+
+		var label = str(name);
+		var text = _('已绑定：') + (label.length ? label + ' ' : '') + '（' + maskChatId(id) + '）';
+
+		if (label.length === 0)
+			text += ' ' + _('（群名未知，重新扫码可刷新）');
+
+		this.feishuBoundText.textContent = text;
+		this.feishuBoundNode.style.display = 'flex';
+	},
+
+	setFeishuScanStatus: function(message, kind) {
+		if (this.feishuScanStatus == null) return;
+
+		this.feishuScanStatus.textContent = (message == null) ? '' : ('' + message);
+		this.feishuScanStatus.style.color = (kind === 'error') ? '#c62828'
+			: ((kind === 'ok') ? '#2e7d32'
+			: ((kind === 'warn') ? '#ef6c00' : ''));
+	},
+
+	setFeishuButton: function(btn, label, busy) {
+		if (btn == null) return;
+
+		if (label != null)
+			btn.textContent = label;
+
+		btn.disabled = (busy === true) || this.feishuWriteBlocked();
+	},
+
+	syncFeishuChatIdInput: function(chatId) {
+		var node = this.inputs['feishu.chat_id'];
+
+		if (node != null)
+			node.value = str(chatId);
+	},
+
+	/* 用于错误脱敏的当前密钥（App Secret / webhook 签名 secret），只在本页内存里。 */
+	feishuSecretValues: function() {
+		var out = [];
+		var secret = this.inputValue('feishu', 'app_secret');
+		var sign = this.inputValue('feishu', 'secret');
+
+		if (secret.length >= 4) out.push(secret);
+		if (sign.length >= 4) out.push(sign);
+
+		return out;
+	},
+
+	feishuErrorText: function(err) {
+		var text = redactFeishuError(err, this.feishuSecretValues());
+
+		if (/expire|invalid[\s_-]?state|state[\s_-]?not[\s_-]?found|过期|失效/i.test(text)) {
+			text = _('二维码 / state 已过期或无效，请点「重新生成二维码」') + '（' + text + '）';
+		}
+		else if (/no valid options/i.test(text)) {
+			text = _('后端 set_config 白名单还不认识 mode / chat_id，请更新 prism-router 后端后重试') +
+				'（' + text + '）';
+		}
+
+		return text;
+	},
+
+	clearFeishuPollTimer: function() {
+		var win = (typeof window !== 'undefined') ? window : null;
+
+		if (this.feishuPollTimer != null && win != null && typeof win.clearTimeout === 'function')
+			win.clearTimeout(this.feishuPollTimer);
+
+		this.feishuPollTimer = null;
+	},
+
+	/* 彻底停表：清定时器 + 丢掉 state（用户切模式 / 离开页面 / 超时后才调）。 */
+	stopFeishuPoll: function() {
+		this.clearFeishuPollTimer();
+		this.feishuPolling = false;
+		this.feishuPaused = false;
+		this.feishuState = '';
+		this.feishuPollDeadline = 0;
+		this.feishuPollFailures = 0;
+	},
+
+	/* LuCI 换掉视图后（离开设置页）root 不再挂在 body 上，轮询必须自停。 */
+	feishuViewDetached: function() {
+		var doc = (typeof document !== 'undefined') ? document : null;
+		var body = (doc != null) ? doc.body : null;
+
+		if (this.root == null) return false;
+		if (body == null || typeof body.contains !== 'function') return false;
+
+		return (body.contains(this.root) !== true);
+	},
+
+	bindFeishuLifecycle: function() {
+		var self = this;
+		var win = (typeof window !== 'undefined') ? window : null;
+		var doc = (typeof document !== 'undefined') ? document : null;
+
+		if (this.feishuLifecycleBound === true) return;
+
+		this.feishuLifecycleBound = true;
+
+		this.feishuUnloadFn = function() { self.clearFeishuPollTimer(); };
+
+		if (win != null && typeof win.addEventListener === 'function')
+			win.addEventListener('beforeunload', this.feishuUnloadFn);
+
+		this.feishuVisibilityFn = function() { self.onFeishuVisibility(); };
+
+		if (doc != null && typeof doc.addEventListener === 'function')
+			doc.addEventListener('visibilitychange', this.feishuVisibilityFn);
+	},
+
+	/* 切标签页：先停表（省电省请求），回到本页且在 5 分钟内则继续轮询。 */
+	onFeishuVisibility: function() {
+		var doc = (typeof document !== 'undefined') ? document : null;
+
+		if (doc == null) return;
+
+		if (doc.hidden === true) {
+			if (this.feishuPolling === true) {
+				this.clearFeishuPollTimer();
+				this.feishuPolling = false;
+				this.feishuPaused = true;
+				this.setFeishuScanStatus(_('已切到其它标签页，轮询暂停；回到本页会自动继续。'), 'warn');
+			}
+
+			return;
+		}
+
+		if (this.feishuPaused !== true) return;
+
+		this.feishuPaused = false;
+
+		if (this.feishuState === '') {
+			this.setFeishuScanStatus(_('绑定已结束，请点「重新生成二维码」重新发起。'), 'warn');
+
+			return;
+		}
+
+		if (Date.now() >= this.feishuPollDeadline) {
+			this.stopFeishuPoll();
+			this.setFeishuScanStatus(_('绑定超时（5 分钟未完成扫码）：请点「重新生成二维码」重试。'), 'warn');
+
+			return;
+		}
+
+		this.setFeishuScanStatus(_('等待手机扫码…') + ' ' + _('（已继续轮询）'), '');
+		this.feishuPolling = true;
+		this.scheduleFeishuPoll();
+	},
+
+	/* 同源相对路径 + fetch；请求里不带任何凭证（CGI 从 UCI 读）。非 2xx 与「不是 JSON」都变成可读错误。 */
+	feishuRequest: function(path, init) {
+		var opts = { credentials: 'same-origin', cache: 'no-store' };
+		var key;
+
+		for (key in init) {
+			if (init.hasOwnProperty(key)) opts[key] = init[key];
+		}
+
+		var win = (typeof window !== 'undefined') ? window : null;
+		var controller = null;
+		var timer = null;
+
+		try {
+			if (typeof AbortController == 'function') {
+				controller = new AbortController();
+				opts.signal = controller.signal;
+			}
+		}
+		catch (e) {
+			controller = null;
+		}
+
+		if (controller != null && win != null && typeof win.setTimeout === 'function') {
+			timer = win.setTimeout(function() {
+				try { controller.abort(); }
+				catch (e) { }
+			}, FEISHU_REQUEST_TIMEOUT_MS);
+		}
+
+		var release = function() {
+			if (timer != null && win != null && typeof win.clearTimeout === 'function')
+				win.clearTimeout(timer);
+
+			timer = null;
+		};
+
+		var pending;
+
+		try {
+			pending = fetch(path, opts);
+		}
+		catch (e) {
+			release();
+
+			return Promise.reject(e);
+		}
+
+		return pending.then(function(resp) {
+			release();
+
+			if (resp == null)
+				throw new Error(_('后端没有响应'));
+
+			var status = (resp.status != null) ? (0 + resp.status) : 0;
+			var httpOk = (resp.ok === false) ? false : (status < 400);
+
+			if (typeof resp.text != 'function')
+				throw new Error(_('后端响应没有可读取的内容'));
+
+			return resp.text().then(function(text) {
+				var data = null;
+
+				try { data = (text == null || text === '') ? null : JSON.parse(text); }
+				catch (e) { data = null; }
+
+				if (!httpOk) {
+					var detail = (data != null && data.error != null) ? ('' + data.error)
+						: ((data != null && data.msg != null) ? ('' + data.msg)
+						: ((status === 404 || status === 410)
+							? _('接口不存在（请确认后端已安装 /cgi-bin/prism-router-feishu）')
+							: (_('HTTP ') + status)));
+
+					/* 带上 HTTP 状态码：轮询层据此区分「state 过期」和「网络抖动」 */
+					var httpErr = new Error(detail);
+
+					httpErr.status = status;
+					throw httpErr;
+				}
+
+				if (data == null)
+					throw new Error(_('返回内容不是 JSON'));
+
+				return data;
+			});
+		}).catch(function(err) {
+			release();
+			throw err;
+		});
+	},
+
+	/* 「生成绑定二维码」/「重新生成二维码」 */
+	startFeishuBind: function() {
+		var self = this;
+
+		if (this.uciOk !== true) {
+			this.setFeishuScanStatus(_('读不到 UCI 配置，已拒绝生成绑定二维码：请检查 ACL 或 rpcd 后刷新页面。'), 'error');
+
+			return Promise.resolve();
+		}
+
+		if (!canManage()) {
+			this.setFeishuScanStatus(_('当前账号没有管理 ACL（luci-app-prism-router-admin），不能绑定群。'), 'error');
+
+			return Promise.resolve();
+		}
+
+		if (typeof fetch != 'function') {
+			this.setFeishuScanStatus(_('当前浏览器不支持 fetch，无法生成绑定二维码；请换新版浏览器或用手机 App。'), 'error');
+
+			return Promise.resolve();
+		}
+
+		var appId = this.inputValue('feishu', 'app_id');
+		var appSecret = this.inputValue('feishu', 'app_secret');
+
+		if (appId === '' || appSecret === '') {
+			this.setFeishuScanStatus(_('请先填写 App ID 和 App Secret 再生成绑定二维码（在上面的输入框里）。'), 'error');
+
+			var focusNode = this.inputs['feishu.' + ((appId === '') ? 'app_id' : 'app_secret')];
+
+			if (focusNode != null && typeof focusNode.focus == 'function')
+				focusNode.focus();
+
+			return Promise.resolve();
+		}
+
+		/* App ID 格式与 CGI 的校验保持一致（^[A-Za-z0-9._-]{1,128}$），
+		 * 本地先拦一次，省掉一次往返和一句看不懂的后端报错。 */
+		if (!/^[A-Za-z0-9._-]{1,128}$/.test(appId)) {
+			this.setFeishuScanStatus(_('App ID 格式不对：应为 cli_ 开头的应用 ID（只允许字母/数字/._-）。'), 'error');
+
+			return Promise.resolve();
+		}
+
+		this.stopFeishuPoll();
+		this.clearFeishuChats();
+		this.renderFeishuQr('');
+		this.setFeishuButton(this.feishuBindBtn, _('生成绑定二维码'), true);
+
+		/*
+		 * CGI 是只读 GET，凭证从 UCI 读：页面上刚改过 App ID/Secret 但还没保存时，
+		 * 先只把这两个键写进去（不带 mode，避免还没绑群就把发送路线切走）。
+		 */
+		var savedId = str(rawValue('feishu', 'app_id'));
+		var savedSecret = str(rawValue('feishu', 'app_secret'));
+
+		if (savedId !== appId || savedSecret !== appSecret) {
+			this.setFeishuScanStatus(_('正在保存 App ID / App Secret（扫码接口只读取已保存的配置）…'), '');
+
+			return callSetConfig('feishu', JSON.stringify({ app_id: appId, app_secret: appSecret }))
+				.then(function(res) {
+					if (res == null || res.ok !== true) {
+						throw new Error((res != null && res.error != null)
+							? ('' + res.error)
+							: _('后端没有返回 ok'));
+					}
+
+					self.rememberOptions('feishu', { app_id: appId, app_secret: appSecret });
+
+					return self.requestFeishuStart();
+				})
+				.catch(function(err) {
+					self.setFeishuButton(self.feishuBindBtn, _('生成绑定二维码'), false);
+					self.setFeishuScanStatus(_('生成前需要先保存 App ID / App Secret：') +
+						self.feishuErrorText(err), 'error');
+				});
+		}
+
+		return this.requestFeishuStart();
+	},
+
+	/* 真正调 CGI 的 start：GET + 同源相对路径，不带任何凭证（CGI 从 UCI 读）。 */
+	requestFeishuStart: function() {
+		var self = this;
+		var seq = (this.feishuStartSeq || 0) + 1;
+
+		this.feishuStartSeq = seq;
+		this.setFeishuScanStatus(_('正在申请绑定二维码…'), '');
+
+		return this.feishuRequest(FEISHU_CGI + '?action=start', { method: 'GET' }).then(function(data) {
+			/* 期间又点了一次「重新生成」：这份响应已经过期，别覆盖新的 state/二维码 */
+			if (self.feishuStartSeq !== seq) return;
+
+			var state = (data != null && data.state != null) ? ('' + data.state) : '';
+			var url = (data != null && data.url != null) ? ('' + data.url) : '';
+
+			self.setFeishuButton(self.feishuBindBtn, _('重新生成二维码'), false);
+
+			if (state === '' || url === '') {
+				self.setFeishuScanStatus(_('后端没有返回绑定信息（缺少 state 或 url）：请确认 prism-router 后端已更新。'), 'error');
+
+				return;
+			}
+
+			if (!/^https?:\/\/[^\s]+$/i.test(url)) {
+				self.setFeishuScanStatus(_('后端返回的二维码地址不是 http(s) 链接，已拒绝渲染。'), 'error');
+
+				return;
+			}
+
+			self.feishuState = state;
+			self.feishuPollDeadline = Date.now() + FEISHU_BIND_TIMEOUT_MS;
+			self.feishuPollFailures = 0;
+			self.renderFeishuQr(url);
+			self.setFeishuScanStatus(_('等待手机扫码…') + ' ' + _('（5 分钟内有效）'), '');
+			self.scheduleFeishuPoll();
+		}).catch(function(err) {
+			if (self.feishuStartSeq !== seq) return;
+
+			self.setFeishuButton(self.feishuBindBtn, _('重新生成二维码'), false);
+			self.setFeishuScanStatus(_('生成绑定二维码失败：') + self.feishuErrorText(err), 'error');
+		});
+	},
+
+	/* 每 2 秒查一次；上一次请求回来才排下一次，慢后端不会把定时器叠成并发。 */
+	scheduleFeishuPoll: function() {
+		var self = this;
+		var win = (typeof window !== 'undefined') ? window : null;
+
+		if (win == null || typeof win.setTimeout != 'function') return;
+
+		this.clearFeishuPollTimer();
+		this.feishuPolling = true;
+
+		this.feishuPollTimer = win.setTimeout(function() {
+			self.feishuPollTick();
+		}, FEISHU_POLL_MS);
+	},
+
+	feishuPollTick: function() {
+		var self = this;
+
+		this.feishuPollTimer = null;
+
+		if (this.feishuPolling !== true || this.feishuState === '')
+			return;
+
+		if (this.feishuViewDetached()) {
+			this.stopFeishuPoll();
+
+			return;
+		}
+
+		if (Date.now() >= this.feishuPollDeadline) {
+			this.stopFeishuPoll();
+			this.renderFeishuQr('');
+			this.setFeishuScanStatus(_('绑定超时（5 分钟未完成扫码）：请点「重新生成二维码」重试，并确认手机与路由器在同一网络。'), 'warn');
+
+			return;
+		}
+
+		var query = FEISHU_CGI + '?action=status&state=' + encodeURIComponent(this.feishuState);
+
+		this.feishuRequest(query, { method: 'GET' }).then(function(data) {
+			if (self.feishuPolling !== true) return;
+
+			self.feishuPollFailures = 0;
+			self.applyFeishuStatus(data);
+		}).catch(function(err) {
+			if (self.feishuPolling !== true) return;
+
+			/* 404/410 = 后端的 state 已过期或不存在（CGI 对失效 state 返回 404）：
+			 * 这是终态，立刻停表让用户重新生成，别当成网络故障重试三次。 */
+			if (err != null && (err.status === 404 || err.status === 410)) {
+				self.stopFeishuPoll();
+				self.renderFeishuQr('');
+				self.setFeishuScanStatus(_('二维码 / state 已过期或无效：请点「重新生成二维码」重试。') +
+					'（' + redactFeishuError(err, self.feishuSecretValues()) + '）', 'error');
+
+				return;
+			}
+
+			self.feishuPollFailures = (self.feishuPollFailures || 0) + 1;
+
+			if (self.feishuPollFailures >= FEISHU_POLL_FAIL_MAX || Date.now() >= self.feishuPollDeadline) {
+				self.stopFeishuPoll();
+				self.setFeishuScanStatus(_('查询绑定状态失败：') + self.feishuErrorText(err), 'error');
+
+				return;
+			}
+
+			self.setFeishuScanStatus(_('网络异常，正在重试（') + self.feishuPollFailures + '/' +
+				FEISHU_POLL_FAIL_MAX + _('）…'), 'warn');
+			self.scheduleFeishuPoll();
+		});
+	},
+
+	applyFeishuStatus: function(data) {
+		var status = (data != null && data.status != null) ? ('' + data.status) : '';
+
+		if (this.feishuPolling !== true) return;
+
+		if (status === 'pending') {
+			this.setFeishuScanStatus(_('等待手机扫码…') + ' ' + _('（5 分钟内有效）'), '');
+			this.scheduleFeishuPoll();
+
+			return;
+		}
+
+		if (status === 'ready') {
+			/* state 一次性：拿到群列表就停表，避免继续打后端 */
+			this.clearFeishuPollTimer();
+			this.feishuPolling = false;
+			this.feishuState = '';
+			this.feishuPollFailures = 0;
+			this.renderFeishuQr('');
+
+			var chats = (data != null && Array.isArray(data.chats)) ? data.chats : [];
+
+			this.renderFeishuChats(chats);
+
+			return;
+		}
+
+		if (status === 'error') {
+			var detail = (data != null && data.error != null) ? ('' + data.error)
+				: ((data != null && data.msg != null) ? ('' + data.msg) : _('后端没有给出原因'));
+
+			this.stopFeishuPoll();
+			this.renderFeishuQr('');
+			this.setFeishuScanStatus(_('授权失败：') + this.feishuErrorText(detail), 'error');
+
+			return;
+		}
+
+		/* 未知状态：当错误处理，绝不无限轮询 */
+		this.stopFeishuPoll();
+		this.setFeishuScanStatus(_('后端返回了无法识别的状态：') +
+			redactFeishuError(status || _('（空）'), this.feishuSecretValues()), 'error');
+	},
+
+	/* 群列表：单列单选（390px 不横向溢出），默认选中第一个，点「保存绑定」才落盘。 */
+	renderFeishuChats: function(chats) {
+		var self = this;
+		var box = this.feishuChatBox;
+
+		if (box == null) return;
+
+		this.feishuChatRadios = [];
+		this.feishuChats = [];
+		clearNode(box);
+
+		var list = Array.isArray(chats) ? chats : [];
+		var usable = [];
+
+		for (var i = 0; i < list.length; i++) {
+			var item = list[i];
+
+			if (item == null) continue;
+
+			var chatId = str(item.chat_id);
+
+			if (chatId === '') continue;
+
+			usable.push({ chat_id: chatId, name: str(item.name) });
+		}
+
+		if (usable.length === 0) {
+			box.style.display = '';
+			box.appendChild(E('div', {
+				style: 'font-size:12px;line-height:1.6;color:#c62828;max-width:100%;word-break:break-word'
+			}, _('授权成功，但机器人还没有加入任何群：请先在飞书里把应用机器人拉进目标群，再点「重新生成二维码」。')));
+			this.setFeishuScanStatus(_('群列表为空，无法绑定'), 'warn');
+
+			return;
+		}
+
+		this.feishuChats = usable;
+		this.setFeishuScanStatus(_('扫码成功：选择要接收报表的群，然后点「保存绑定」。'), 'ok');
+
+		var rows = usable.map(function(chat, index) {
+			var radio = E('input', {
+				'id': 'ts-feishu-chat-' + index,
+				'name': 'ts-feishu-chat',
+				'type': 'radio',
+				'class': 'cbi-input-radio',
+				'value': chat.chat_id
+			});
+
+			radio.checked = (index === 0);
+			self.feishuChatRadios.push({ input: radio, chat: chat });
+
+			return E('label', {
+				'for': 'ts-feishu-chat-' + index,
+				'style': 'display:flex;gap:8px;align-items:flex-start;min-width:0;max-width:100%;' +
+					'box-sizing:border-box;padding:7px 8px;border-radius:6px;cursor:pointer;' +
+					'background:rgba(127,127,127,.08)'
+			}, [
+				radio,
+				E('span', { style: 'flex:1 1 auto;min-width:0;max-width:100%;word-break:break-word;line-height:1.45' }, [
+					E('span', { style: 'display:block' }, chat.name.length ? chat.name : _('（未命名群）')),
+					E('code', { style: 'font-size:11px;opacity:.7;word-break:break-all' }, maskChatId(chat.chat_id))
+				])
+			]);
+		});
+
+		box.style.display = '';
+		box.appendChild(E('div', { style: 'font-size:12px;opacity:.85;margin-bottom:6px' },
+			_('机器人所在的群（单选）：')));
+		box.appendChild(E('div', {
+			style: 'display:grid;grid-template-columns:minmax(0,1fr);gap:6px;max-width:100%;min-width:0'
+		}, rows));
+		box.appendChild(E('div', {
+			style: 'margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;max-width:100%'
+		}, [
+			this.feishuSaveBindBtn,
+			E('span', { style: 'font-size:12px;opacity:.75' },
+				_('保存后写入 feishu.chat_id，并切到应用机器人模式'))
+		]));
+	},
+
+	clearFeishuChats: function() {
+		this.feishuChatRadios = [];
+		this.feishuChats = [];
+
+		if (this.feishuChatBox == null) return;
+
+		clearNode(this.feishuChatBox);
+		this.feishuChatBox.style.display = 'none';
+	},
+
+	selectedFeishuChat: function() {
+		for (var i = 0; i < this.feishuChatRadios.length; i++) {
+			if (this.feishuChatRadios[i].input.checked === true)
+				return this.feishuChatRadios[i].chat;
+		}
+
+		return null;
+	},
+
+	/* 「保存绑定」：只写 mode + chat_id 两个键，不动其它飞书配置。 */
+	saveFeishuBinding: function() {
+		var self = this;
+
+		if (this.uciOk !== true) {
+			this.setFeishuScanStatus(_('读不到 UCI 配置，已拒绝保存绑定：不会用页面默认值覆盖现有配置。'), 'error');
+
+			return Promise.resolve();
+		}
+
+		if (!canManage()) {
+			this.setFeishuScanStatus(_('当前账号没有管理 ACL（luci-app-prism-router-admin），不能保存绑定。'), 'error');
+
+			return Promise.resolve();
+		}
+
+		var chat = this.selectedFeishuChat();
+
+		if (chat == null) {
+			this.setFeishuScanStatus(_('请先选择要绑定的群（没有群可选项时请重新生成二维码）。'), 'error');
+
+			return Promise.resolve();
+		}
+
+		this.setFeishuButton(this.feishuSaveBindBtn, _('保存中…'), true);
+		this.setFeishuScanStatus(_('正在保存绑定…'), '');
+
+		var payload = { mode: FEISHU_MODE_APP, chat_id: chat.chat_id };
+
+		return callSetConfig('feishu', JSON.stringify(payload)).then(function(res) {
+			if (res == null || res.ok !== true) {
+				throw new Error((res != null && res.error != null) ? ('' + res.error) : _('后端没有返回 ok'));
+			}
+
+			self.rememberOptions('feishu', payload);
+			self.syncFeishuChatIdInput(chat.chat_id);
+			self.feishuBoundChat = { chat_id: chat.chat_id, name: chat.name };
+			self.showFeishuBound(chat.chat_id, chat.name);
+			self.clearFeishuChats();
+			self.setFeishuButton(self.feishuSaveBindBtn, _('保存绑定'), false);
+			self.setFeishuScanStatus(_('已保存绑定：') +
+				(chat.name.length ? chat.name : maskChatId(chat.chat_id)), 'ok');
+
+			ui.addNotification(null, E('p', {}, _('已绑定飞书群：') +
+				(chat.name.length ? chat.name : maskChatId(chat.chat_id))), 'info');
+		}).catch(function(err) {
+			self.setFeishuButton(self.feishuSaveBindBtn, _('保存绑定'), false);
+			self.setFeishuScanStatus(_('保存绑定失败：') + self.feishuErrorText(err), 'error');
+		});
+	},
+
+	/* 「解除绑定」：清空 feishu.chat_id（不删群、不动 App ID/Secret）。 */
+	unbindFeishu: function() {
+		var self = this;
+
+		if (this.uciOk !== true) {
+			this.setFeishuScanStatus(_('读不到 UCI 配置，已拒绝解除绑定。'), 'error');
+
+			return Promise.resolve();
+		}
+
+		if (!canManage()) {
+			this.setFeishuScanStatus(_('当前账号没有管理 ACL（luci-app-prism-router-admin），不能解除绑定。'), 'error');
+
+			return Promise.resolve();
+		}
+
+		this.setFeishuButton(this.feishuUnbindBtn, _('解除中…'), true);
+
+		return callSetConfig('feishu', JSON.stringify({ chat_id: '' })).then(function(res) {
+			if (res == null || res.ok !== true) {
+				throw new Error((res != null && res.error != null) ? ('' + res.error) : _('后端没有返回 ok'));
+			}
+
+			/* 空串也记成「已知」：下一次整页保存要把空值写回去，而不是跳过 */
+			self.rememberOptions('feishu', { chat_id: '' });
+			self.syncFeishuChatIdInput('');
+			self.feishuBoundChat = null;
+			self.showFeishuBound('');
+			self.setFeishuButton(self.feishuUnbindBtn, _('解除绑定'), false);
+			self.setFeishuScanStatus(_('已解除绑定（feishu.chat_id 已清空），重新扫码可以再绑。'), 'ok');
+		}).catch(function(err) {
+			self.setFeishuButton(self.feishuUnbindBtn, _('解除绑定'), false);
+			self.setFeishuScanStatus(_('解除绑定失败：') + self.feishuErrorText(err), 'error');
+		});
+	},
+
+	/* 二维码：交给 LuCI 自带的 uqr（不重复实现编码），只把解析出来的 SVG 节点插进 host。 */
+	renderFeishuQr: function(text) {
+		var self = this;
+		var host = this.feishuQrHost;
+		var url = str(text);
+
+		if (host == null) return;
+
+		clearNode(host);
+		host.style.display = 'none';
+		host.setAttribute('data-qr', '');
+
+		if (url === '') return;
+
+		var done = false;
+
+		var fallback = function(reason) {
+			if (done) return;
+
+			done = true;
+			clearNode(host);
+			host.setAttribute('data-qr', 'fail');
+			host.appendChild(E('div', {
+				style: 'font-size:11.5px;line-height:1.5;padding:6px;color:#555;word-break:break-word'
+			}, _('二维码组件不可用（') + str(reason || _('未知原因')) + _('）。可在电脑上打开下面的链接完成授权：')));
+			host.appendChild(E('div', {
+				style: 'font-size:11px;line-height:1.4;padding:0 6px 6px;word-break:break-all;opacity:.8'
+			}, url));
+			host.style.display = 'flex';
+		};
+
+		var apply = function(mod) {
+			if (done) return false;
+
+			var api = mod;
+
+			if (api != null && typeof api.renderSVG != 'function' &&
+				api['default'] != null && typeof api['default'].renderSVG == 'function')
+				api = api['default'];
+
+			if (api == null || typeof api.renderSVG != 'function') return false;
+
+			var svg = null;
+
+			try {
+				svg = api.renderSVG(url, { pixelSize: 6, whiteColor: '#fff', blackColor: '#000' });
+			}
+			catch (e) {
+				return false;
+			}
+
+			var node = importQrSvg(svg);
+
+			if (node == null) return false;
+
+			/* 期间用户又点了一次「重新生成」：host 里已经是新的，旧结果直接丢 */
+			if (self.feishuQrHost !== host) return false;
+
+			done = true;
+			clearNode(host);
+			host.appendChild(node);
+			normalizeQrSvg(host);
+			host.setAttribute('data-qr', 'ok');
+			host.style.display = 'flex';
+
+			return true;
+		};
+
+		var mod = null;
+
+		try {
+			mod = (typeof L != 'undefined' && L != null && typeof L.require == 'function')
+				? L.require('uqr')
+				: null;
+		}
+		catch (e) {
+			mod = null;
+		}
+
+		if (apply(mod)) return;
+
+		if (mod != null && typeof mod.then == 'function') {
+			mod.then(function(m) {
+				if (!apply(m)) fallback(_('uqr 模块加载失败'));
+			}).catch(function() {
+				fallback(_('uqr 模块加载失败'));
+			});
+
+			return;
+		}
+
+		fallback(_('uqr 模块不可用'));
 	},
 
 	/* 「导出每日汇总 CSV」：what=daily，单位字节，最多最近 200 天（后端决定）。 */

@@ -38,6 +38,7 @@
 //
 // 常用参数：--base DIR（默认 /tmp/prism-router）、--state FILE、--history FILE、
 //           --webhook URL、--secret SECRET（后两个仅用于测试，不写 UCI）、
+//           --chat CHAT_ID（覆盖 prism-router.feishu.chat_id，仅本次运行）、
 //           --force（忽略 feishu.enabled=0）、
 //           --items LIST（临时覆盖 report_items，如 overview,top_apps）、
 //           --at "YYYY-MM-DD HH:MM" / --epoch N（注入「现在」，用于判定与测试）、
@@ -46,8 +47,16 @@
 //
 // 配置（UCI，section prism-router.feishu；全部可缺省，缺省即老行为）：
 //   prism-router.feishu.enabled             0/1，默认 1（未设置时按启用处理）
+//   prism-router.feishu.mode                webhook | app（默认 webhook）
+//                                             webhook = 群自定义机器人 webhook（老路线）
+//                                             app     = 自建应用 + 机器人（tenant_access_token）
+//                                           该选项**缺省**时沿用旧行为：app_id/app_secret/chat_id
+//                                           三件套齐全走应用，否则走 webhook（升级用户无感）。
 //   prism-router.feishu.webhook             群机器人 webhook，空则静默跳过
 //   prism-router.feishu.secret              签名密钥，空则静默跳过
+//   prism-router.feishu.app_id              自建应用 App ID（cli_xxx），仅 mode=app 使用
+//   prism-router.feishu.app_secret          自建应用 App Secret，仅存于 /etc/config（建议 chmod 600）
+//   prism-router.feishu.chat_id             目标群 chat_id（oc_xxx）；可由「扫码绑定」得到
 //   prism-router.feishu.daily_time          旧字段；report_time 未设时的兜底时间
 //   prism-router.feishu.alert_enabled       告警总开关，默认 1
 //   prism-router.feishu.alert_new_device    新设备上线告警，默认 1
@@ -83,6 +92,11 @@
 //   * 可重试错误按 1 -> 5 -> 15 分钟退避，最多 3 次重试，队列在 /tmp（重启即丢，日报每天都有）。
 //   * 告警同规则+同目标 30 分钟只发一次，状态在 /tmp/prism-router/alert-state.json。
 //   * 日志在 /tmp/prism-router/feishu.log；不记录完整 webhook（防止泄露到日志）。
+//   * 应用机器人路线：tenant_access_token 缓存在 BASE/feishu-tenant.json（0600，过期前 60 秒
+//     刷新，按 app_id 区分）；发送失败只重试一次，仍失败且配了 webhook 则回退 webhook
+//     （日志写明原因）—— 不排重试风暴，也不让一次 API 抖动把日报丢掉。
+//   * app_secret / Bearer token 只进 0600 临时文件（curl -K 配置 + data-binary @file），
+//     绝不进 argv、不进日志、不进 stdout。
 
 const fs = require("fs");
 
@@ -856,6 +870,8 @@ default_cfg = function() {
     return {
         enabled: true,
         webhook: "", app_id: "", app_secret: "", chat_id: "",
+        // 发送路线：mode 为空 = 未配置（沿用旧的三件套自动判定）
+        mode: "", mode_explicit: false, use_app: false, fallback_webhook: false,
         card_wrapper: "card", secret: "", daily_time: "08:30",
         alert_enabled: true, alert_new_device: true,
         device_limit: 0, cooldown: ALERT_COOLDOWN,
@@ -888,6 +904,22 @@ load_cfg = function(opts) {
     c.alert_enabled = bool_opt(uci_get("prism-router.feishu.alert_enabled"), true);
     c.alert_new_device = bool_opt(uci_get("prism-router.feishu.alert_new_device"), true);
     c.device_limit = parse_size(uci_get("prism-router.feishu.device_daily_limit"));
+
+    /* ── 发送路线 ──
+       mode 选项存在时以它为准（webhook/app 二选一）；
+       mode 缺省时（老配置）完全沿用旧行为：三件套齐全走应用，否则走 webhook。
+       应用路线失败后是否回退 webhook：要求 webhook 本身可用（合法 URL + 有签名密钥）。 */
+    c.mode_explicit = uci_present("prism-router.feishu.mode");
+    let mraw = lc(trim(uci_get("prism-router.feishu.mode")));
+    c.mode = (mraw == "app" || mraw == "webhook") ? mraw : "";
+    let app_creds = length(c.app_id) && length(c.app_secret);
+    let app_triple = app_creds && length(c.chat_id);
+    if (!length(c.mode))
+        c.use_app = app_triple;
+    else
+        c.use_app = (c.mode == "app") ? app_creds : false;
+    c.fallback_webhook = webhook_ok(c.webhook) && length(c.secret) > 0;
+
     if (!length(c.daily_time))
         c.daily_time = "08:30";
     if (!length(c.card_wrapper))
@@ -936,6 +968,8 @@ load_cfg = function(opts) {
             c.webhook = trim(opts.webhook);
         if (opts.secret != null)
             c.secret = trim(opts.secret);
+        if (opts.chat != null)
+            c.chat_id = trim(opts.chat);
         if (opts.device_limit != null)
             c.device_limit = parse_size(opts.device_limit);
         if (opts.items != null) {
@@ -998,9 +1032,13 @@ webhook_ok = function(u) {
 
 // 空 webhook/secret -> 静默跳过（只记日志，不报错、不重试）
 send_allowed = function(cfg, ignore_enabled) {
-    /* 自建应用路线：只要三件套齐全就放行，不要求 webhook/secret */
-    let app_mode = length(cfg.app_id) && length(cfg.app_secret) && length(cfg.chat_id);
-    if (app_mode) {
+    /* 应用路线（mode=app，或老配置三件套齐全）：只要求 app_id/app_secret 齐；
+       chat_id 缺失 / 凭据错误交给 deliver 反馈，并且会尝试回退 webhook。 */
+    if (cfg.use_app) {
+        if (!length(cfg.app_id) || !length(cfg.app_secret)) {
+            log("ERROR", "mode=app 但 prism-router.feishu.app_id/app_secret 未配置，无法发送");
+            return false;
+        }
         if (!ignore_enabled && !cfg.enabled && !cfg.force) {
             log("INFO", "prism-router.feishu.enabled=0，跳过发送（可用 --force 强制）");
             return false;
@@ -1716,6 +1754,12 @@ code_help = function(code) {
     if (code == 230020) return "触发频率限制";
     if (code == 230025) return "消息体超长";
     if (code == 230099) return "卡片内容非法（子码见响应）";
+    /* 应用机器人（im/v1/messages）常见错误 */
+    if (code == 230001 || code == 230002) return "机器人不在该群，或群里没有发言权限（先把机器人拉进群）";
+    if (code == 230013) return "机器人没有发消息权限（开放平台检查 im:message:send_as_bot）";
+    if (code == 230027) return "缺少 im:message:send_as_bot 权限（改权限后要发布版本）";
+    if (code == 99991663) return "tenant_access_token 无效或已过期（重试会自动刷新）";
+    if (code == 10014) return "app_id / app_secret 不正确（开放平台核对后重填）";
     if (code == -5) return "tenant_access_token 获取失败（检查 app_id/app_secret）";
     if (code == -6) return "未配置 app_id/app_secret";
     if (code == -7) return "未配置 chat_id（先运行 chats 列群）";
@@ -1811,13 +1855,41 @@ parse_result = function(r) {
 };
 
 /* ============================================================
- * 自建应用路线（app_id / app_secret / chat_id）
- *   机器人用二维码加进群，发消息走 tenant_access_token
- *   - token: POST /open-apis/auth/v3/tenant_access_token/internal（缓存到 BASE/tmp）
- *   - 发送: POST /open-apis/im/v1/messages?receive_id_type=chat_id
- *   - 群列表: GET /open-apis/im/v1/chats
+ * 发送路线：webhook（默认） / app（自建应用机器人，mode=app）
+ *   webhook  POST <webhook>（签名可选，见 hmac_sign）
+ *   app      token: POST /open-apis/auth/v3/tenant_access_token/internal
+ *                  缓存到 BASE/feishu-tenant.json（0600，过期前 60 秒刷新）
+ *            发送: POST /open-apis/im/v1/messages?receive_id_type=chat_id
+ *            群列表: GET /open-apis/im/v1/chats?page_size=50&user_id_type=open_id
+ *   失败处理：应用路线单次 + 一次重试；仍失败且 webhook 可用 -> 回退 webhook 并记原因。
  * ============================================================ */
-app_http = function(method, url, bearer, body) {
+
+/* 测试钩子：把 open.feishu.cn 换成 loopback mock（仅隔离容器门禁用）。
+   非 loopback 一律忽略 —— 否则一个环境变量就能把 app_secret 改道到别的主机。 */
+api_base = function() {
+    let raw = trim(sprintf("%s", getenv("PRISM_ROUTER_FEISHU_BASE") ?? ""));
+    if (length(raw) && match(raw, /^http:\/\/(127\.0\.0\.1|\[::1\]|localhost)(:[0-9]{1,5})?$/))
+        return raw;
+    return "https://open.feishu.cn";
+};
+
+api_loopback = function() {
+    return match(api_base(), /^http:\/\//) != null;
+};
+
+/* curl 的 proto 限制：生产只允许 https；只有 loopback mock 才放宽到 http。 */
+api_proto = function() {
+    return api_loopback() ? "=http,https" : "=https";
+};
+
+/* Bearer token 只允许 unreserved 字符：避免拼进 curl 配置时破坏语法，也挡住脏 token。 */
+token_ok = function(tok) {
+    /* 注意：ucode 的 ERE 不支持 {8,2048}（上限 255），所以长度单独判。 */
+    return length(tok) >= 8 && length(tok) <= 2048
+        && match(tok, /^[A-Za-z0-9._~+\/=-]+$/) != null;
+};
+
+app_http = function(method, path, bearer, body) {
     let dir = BASE + "/tmp";
     if (!ensure_dir(dir))
         return { http: 0, curl: -1, body: "", err: "无法创建临时目录 " + dir };
@@ -1828,16 +1900,19 @@ app_http = function(method, url, bearer, body) {
     let rf = sprintf("%s/aresp-%s.json", dir, tag);
     let cf = sprintf("%s/acurl-%s.conf", dir, tag);
 
+    if (length(bearer) && !token_ok(bearer))
+        return { http: 0, curl: -2, body: "", err: "access_token 格式非法" };
+
     // Bearer token / app_secret 请求体都只进 0600 配置文件，绝不进 argv。
     let lines = [
-        sprintf("url = \"%s\"", url),
+        sprintf("url = \"%s%s\"", api_base(), path),
         sprintf("request = \"%s\"", method),
         "silent",
         "show-error",
         "connect-timeout = 8",
         "max-time = 25",
         "max-filesize = 65536",
-        "proto = \"=https\"",
+        sprintf("proto = \"%s\"", api_proto()),
         "proto-redir = \"=https\"",
         "max-redirs = 0",
         sprintf("output = \"%s\"", rf),
@@ -1869,47 +1944,54 @@ app_http = function(method, url, bearer, body) {
     try { fs.unlink(cf); } catch (e) { }
     if (length(resp) > 65536)
         resp = "";
-    return { http: http, curl: r.code, body: resp, err: length(resp) ? "" : "curl exit " + r.code };
+    return { http: http, curl: r.code, body: resp,
+             err: (r.code != 0) ? "curl exit " + r.code : "" };
 };
 
+/* tenant_access_token 缓存：BASE/feishu-tenant.json（0600，原子写）。
+   过期前 60 秒就刷新；按 app_id 区分（换应用 != 换 token）。force=true 时忽略缓存。 */
 app_token = function(cfg, force) {
-    let cp = BASE + "/tmp/feishu-token.json";
+    let cp = BASE + "/feishu-tenant.json";
     let now = time();
     if (!force) {
         let c = read_json(cp);
         if (c != null && type(c) == "object" && c.app_id == cfg.app_id &&
-            intv(c.expire) > now + 120 && length(c.token))
+            intv(c.expire) > now + 60 && length(c.token) && token_ok(c.token))
             return c.token;
     }
+    /* 旧版本把 token 缓存在 BASE/tmp/feishu-token.json；不再复用，顺手清掉。 */
+    try { fs.unlink(BASE + "/tmp/feishu-token.json"); } catch (e) { }
+
     let body = sprintf('%J', { app_id: cfg.app_id, app_secret: cfg.app_secret });
-    let r = app_http("POST", "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", "", body);
+    let r = app_http("POST", "/open-apis/auth/v3/tenant_access_token/internal", "", body);
     let j = null;
     try { if (length(r.body)) j = json(r.body); } catch (e) { j = null; }
     let tok = (j != null && type(j) == "object" && j.tenant_access_token != null) ? j.tenant_access_token : "";
     let exp = (j != null && type(j) == "object" && j.expire != null) ? intv(j.expire) : 7200;
-    if (!length(tok)) {
+    if (!length(tok) || !token_ok(tok)) {
         let code = -1, msg = "";
         if (j != null && type(j) == "object") {
             code = intv(j.code ?? -1);
             msg = sprintf("%s", j.msg ?? "");
         }
         /* 不记录响应体原文：里面可能有诊断信息，也可能被上游塞入凭证。 */
-        log("ERROR", sprintf("tenant_access_token 获取失败 http=%d code=%d msg=%s",
-            r.http, code, cut(msg, 160)));
+        log("ERROR", sprintf("tenant_access_token 获取失败 http=%d code=%d msg=%s%s",
+            r.http, code, cut(msg, 160), length(r.err) ? "（" + r.err + "）" : ""));
         return "";
     }
     write_atomic_private(cp, sprintf('%J', { app_id: cfg.app_id, token: tok, expire: now + exp }));
     return tok;
 };
 
-deliver_app = function(cfg, req) {
+/* opts.force_token：应用发送失败重试时强制换 token（token 被吊销/缓存脏的常见场景）。 */
+deliver_app = function(cfg, req, force_token) {
     if (!length(cfg.app_id) || !length(cfg.app_secret))
-        return { ok: false, retryable: false, code: -6, http: 0, msg: "未配置 app_id/app_secret", bytes: 0 };
+        return { ok: false, retryable: false, code: -6, http: 0, msg: "未配置 app_id/app_secret", bytes: 0, route: "app" };
     if (!length(cfg.chat_id))
-        return { ok: false, retryable: false, code: -7, http: 0, msg: "未配置 chat_id（先跑 feishu.uc chats 列群）", bytes: 0 };
-    let tok = app_token(cfg);
+        return { ok: false, retryable: false, code: -7, http: 0, msg: "未配置 chat_id（先跑 feishu.uc chats 列群）", bytes: 0, route: "app" };
+    let tok = app_token(cfg, force_token ? true : false);
     if (!length(tok))
-        return { ok: false, retryable: true, code: -5, http: 0, msg: "tenant_access_token 获取失败", bytes: 0 };
+        return { ok: false, retryable: true, code: -5, http: 0, msg: "tenant_access_token 获取失败", bytes: 0, route: "app" };
     let content;
     if (req.msg_type == "interactive")
         content = (cfg.card_wrapper == "bare") ? req.card : { type: "card", data: req.card };
@@ -1922,11 +2004,64 @@ deliver_app = function(cfg, req) {
     });
     let bytes = length(body);
     if (bytes >= LIMIT)
-        return { ok: false, retryable: false, code: -4, http: 0, msg: sprintf("请求体 %d 字节超过 %d 上限", bytes, LIMIT), bytes: bytes };
+        return { ok: false, retryable: false, code: -4, http: 0, msg: sprintf("请求体 %d 字节超过 %d 上限", bytes, LIMIT), bytes: bytes, route: "app" };
     let res = parse_result(app_http("POST",
-        "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", tok, body));
+        "/open-apis/im/v1/messages?receive_id_type=chat_id", tok, body));
     res.bytes = bytes;
+    res.route = "app";
     return res;
+};
+
+deliver_webhook = function(cfg, req) {
+    let ts = sprintf("%d", time());
+    let sign = length(cfg.secret) ? hmac_sign(ts, cfg.secret) : "";
+    if (length(cfg.secret) && !length(sign))
+        return { ok: false, retryable: false, code: -3, http: 0, msg: "签名计算失败（openssl 不可用？）", bytes: 0, route: "webhook" };
+    let body = signed_body(cfg, req, ts, sign);
+    let bytes = length(body);
+    if (bytes >= LIMIT)
+        return { ok: false, retryable: false, code: -4, http: 0, msg: sprintf("请求体 %d 字节超过 %d 上限", bytes, LIMIT), bytes: bytes, route: "webhook" };
+    let res = parse_result(http_post(cfg.webhook, body));
+    res.bytes = bytes;
+    res.route = "webhook";
+    return res;
+};
+
+/* 统一出口：按 cfg.use_app 分路线；应用失败只重试一次，然后（若配了 webhook）回退。 */
+deliver = function(cfg, req) {
+    if (!cfg.use_app)
+        return deliver_webhook(cfg, req);
+
+    let first = deliver_app(cfg, req, false);
+    if (first.ok)
+        return first;
+
+    let last = first;
+    if (first.retryable) {
+        log("WARN", sprintf("应用机器人发送失败（http=%s code=%s %s），重试一次",
+            first.http, first.code, cut(first.msg, 160)));
+        last = deliver_app(cfg, req, true);
+        if (last.ok) {
+            log("INFO", "应用机器人重试成功");
+            return last;
+        }
+    }
+
+    if (cfg.fallback_webhook) {
+        log("WARN", sprintf("应用机器人发送失败（http=%s code=%s %s）→ 回退 webhook",
+            last.http, last.code, cut(last.msg, 160)));
+        let res = deliver_webhook(cfg, req);
+        res.reason = "app_failed";
+        res.app_code = last.code;
+        if (res.ok)
+            log("INFO", "已通过 webhook 回退发送成功");
+        else
+            log("ERROR", sprintf("webhook 回退也失败：http=%s code=%s %s",
+                res.http, res.code, cut(res.msg, 160)));
+        return res;
+    }
+
+    return last;
 };
 
 cmd_chats = function(opts) {
@@ -1940,7 +2075,7 @@ cmd_chats = function(opts) {
         print("tenant_access_token 获取失败：检查 app_id/app_secret 与出网\n");
         return 2;
     }
-    let r = app_http("GET", "https://open.feishu.cn/open-apis/im/v1/chats?page_size=50", tok, "");
+    let r = app_http("GET", "/open-apis/im/v1/chats?page_size=50&user_id_type=open_id", tok, "");
     let j = null;
     try { j = json(r.body); } catch (e) { j = null; }
     if (j == null || type(j) != "object" || intv(j.code) != 0) {
@@ -1955,23 +2090,6 @@ cmd_chats = function(opts) {
     for (let it in items)
         printf("%s\t%s\n", it.chat_id, it.name);
     return 0;
-};
-
-deliver = function(cfg, req) {
-    /* 配了自建应用三件套就走 API，否则回落到群机器人 webhook */
-    if (length(cfg.app_id) && length(cfg.app_secret) && length(cfg.chat_id))
-        return deliver_app(cfg, req);
-    let ts = sprintf("%d", time());
-    let sign = length(cfg.secret) ? hmac_sign(ts, cfg.secret) : "";
-    if (length(cfg.secret) && !length(sign))
-        return { ok: false, retryable: false, code: -3, http: 0, msg: "签名计算失败（openssl 不可用？）", bytes: 0 };
-    let body = signed_body(cfg, req, ts, sign);
-    let bytes = length(body);
-    if (bytes >= LIMIT)
-        return { ok: false, retryable: false, code: -4, http: 0, msg: sprintf("请求体 %d 字节超过 %d 上限", bytes, LIMIT), bytes: bytes };
-    let res = parse_result(http_post(cfg.webhook, body));
-    res.bytes = bytes;
-    return res;
 };
 
 // ───────────────────────────── 重试队列 ─────────────────────────────
@@ -3041,6 +3159,19 @@ cmd_status = function(opts) {
     print(sprintf("  enabled   : %s\n", cfg.enabled ? "1" : "0"));
     print(sprintf("  webhook   : %s\n", length(cfg.webhook) ? ("已配置（" + host + "）") : "未配置"));
     print(sprintf("  secret    : %s\n", length(cfg.secret) ? "已配置" : "未配置"));
+    print(sprintf("  route     : %s%s\n",
+        cfg.use_app ? "app（自建应用机器人）" : "webhook（群自定义机器人）",
+        cfg.mode_explicit ? "" : "（mode 未配置：按旧规则自动判定）"));
+    print(sprintf("  app       : app_id %s / app_secret %s / chat_id %s\n",
+        length(cfg.app_id) ? "已配置" : "未配置",
+        length(cfg.app_secret) ? "已配置" : "未配置",
+        length(cfg.chat_id) ? cfg.chat_id : "未配置"));
+    print(sprintf("  fallback  : %s（应用路线失败时是否回退 webhook）\n",
+        cfg.fallback_webhook ? "可用" : "不可用（webhook/secret 未配齐）"));
+    let tenc = read_json(BASE + "/feishu-tenant.json");
+    if (cfg.use_app)
+        print(sprintf("  tenant    : %s\n",
+            (tenc != null && length(tenc.token)) ? "已缓存（feishu-tenant.json）" : "未缓存（下次发送时获取）"));
     print(sprintf("  daily_time: %s（旧字段）\n", cfg.daily_time));
     print(sprintf("  items     : %s%s\n",
         length(cfg.items) ? join(",", cfg.items) : "（未启用任何区块，不会发送）",
@@ -3344,6 +3475,26 @@ cmd_selftest = function() {
     try { back = json(mini); } catch (e) { }
     eq(back != null && jstr(back) == mini ? 1 : 0, 1, "紧凑 JSON 可被重新解析且内容一致");
 
+    print("== 10. 发送路线（webhook / app）判定 ==\n");
+    let wh = "https://open.feishu.cn/open-apis/bot/v2/hook/00000000-0000-0000-0000-000000000000";
+    let cw = default_cfg();
+    cw.webhook = wh; cw.secret = "s";
+    eq(send_allowed(cw, true) ? 1 : 0, 1, "webhook 齐全 -> 允许发送");
+    let cnone = default_cfg();
+    eq(send_allowed(cnone, true) ? 1 : 0, 0, "webhook 未配置 -> 跳过（不报错）");
+    let capp = default_cfg();
+    capp.use_app = true; capp.app_id = "cli_x"; capp.app_secret = "sec"; capp.chat_id = "oc_x";
+    eq(send_allowed(capp, true) ? 1 : 0, 1, "app 路线不要求 webhook/secret");
+    capp.enabled = false;
+    eq(send_allowed(capp, false) ? 1 : 0, 0, "app 路线同样遵守 enabled=0");
+    eq(send_allowed(capp, true) ? 1 : 0, 1, "ignore_enabled（test 子命令）无视 enabled=0");
+    let cbad = default_cfg();
+    cbad.use_app = true;
+    eq(send_allowed(cbad, true) ? 1 : 0, 0, "mode=app 但缺 app_id/app_secret -> 跳过");
+    eq(token_ok("t-abcdef123456") ? 1 : 0, 1, "token 字符集校验：正常 token 通过");
+    eq(token_ok("bad\"token\\here") ? 1 : 0, 0, "token 字符集校验：引号/反斜杠被拒");
+    eq(length(api_base()) > 0 ? 1 : 0, 1, "api_base() 返回可用的 base URL");
+
     print(sprintf("\n自检结果：%s（%d 项失败 / 共 %d 项）\n", fails ? "FAIL" : "PASS", fails, total));
     return fails ? 1 : 0;
 };
@@ -3372,6 +3523,7 @@ usage = function() {
     print("  ucode feishu.uc check [FILE]                     校验卡片文件结构/体积\n");
     print("  ucode feishu.uc retry [--now]                    处理重试队列\n");
     print("  ucode feishu.uc status                           查看配置与队列\n");
+    print("  ucode feishu.uc chats                            列出应用机器人所在的群（chat_id + 群名）\n");
     print("  ucode feishu.uc sign <timestamp> <secret>        打印签名（调试）\n\n");
     print("内容：--items overview,proxy_direct,wifi_wired,system,top_devices,top_apps,nodes\n");
     print("时间：--at \"YYYY-MM-DD HH:MM\" / --epoch N（注入「现在」）、--window N（分钟容错）、\n");
@@ -3380,7 +3532,9 @@ usage = function() {
     print("      --quiet 23:00-07:00、--device-limit 40G\n");
     print("其它：--base DIR（默认 /tmp/prism-router）、--state FILE、--history FILE、\n");
     print("      --daily-dir DIR（默认 /etc/prism-router/daily）、--limit BYTES、\n");
-    print("      --webhook URL、--secret SECRET（测试用，不写 UCI）、--force\n");
+    print("      --webhook URL、--secret SECRET（测试用，不写 UCI）、--chat CHAT_ID、--force\n");
+    print("发送路线：prism-router.feishu.mode=webhook|app（默认 webhook；app 需 app_id/app_secret，\n");
+    print("          chat_id 可用「扫码绑定」或 chats 子命令获得）\n");
     return 0;
 };
 
@@ -3401,6 +3555,7 @@ parse_args = function(argv) {
         device_limit: null,
         webhook: null,
         secret: null,
+        chat: null,
         text: "",
         path: "",
         sign_ts: "",
@@ -3482,6 +3637,8 @@ parse_args = function(argv) {
             o.webhook = argv[++i];
         } else if (a == "--secret" && i + 1 < length(argv)) {
             o.secret = argv[++i];
+        } else if (a == "--chat" && i + 1 < length(argv)) {
+            o.chat = argv[++i];
         } else if (a == "--text" && i + 1 < length(argv)) {
             o.text = argv[++i];
         } else if (a == "--help" || a == "-h") {

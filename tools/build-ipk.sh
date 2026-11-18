@@ -70,6 +70,7 @@ pack() { # $1=dir $2=basename（不带扩展名）
     "$d/data/www/cgi-bin/prism-router-ingest" \
     "$d/data/www/cgi-bin/prism-router-stations" \
     "$d/data/www/cgi-bin/prism-router-metrics" \
+    "$d/data/www/cgi-bin/prism-router-feishu" \
     "$d/data/etc/init.d/prism-router-panel" \
     "$d/data/www/prism-router-panel/cgi-bin/panel-api" 2>/dev/null || true
   # control 归档：目录 755，control/conffiles 644，维护脚本 755（opkg 会直接 exec）
@@ -151,10 +152,11 @@ install -m 644 "$ROOT/luci-app-prism-router/root/usr/share/rpcd/acl.d/luci-app-p
 install -m 644 "$ROOT/luci-app-prism-router/root/usr/share/luci/menu.d/luci-app-prism-router.json" \
   "$D/data/usr/share/luci/menu.d/luci-app-prism-router.json"
 
-# CGI（接收子节点 / AP 上报、Prometheus 指标）
+# CGI（接收子节点 / AP 上报、Prometheus 指标、飞书扫码绑定）
 install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-ingest"   "$D/data/www/cgi-bin/prism-router-ingest"
 install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-stations" "$D/data/www/cgi-bin/prism-router-stations"
 install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-metrics"  "$D/data/www/cgi-bin/prism-router-metrics"
+install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-feishu"   "$D/data/www/cgi-bin/prism-router-feishu"
 
 # 独立面板（默认关闭；同一插件内的可选视图）
 install -m 755 "$ROOT/luci-app-prism-router/root/www/prism-router-panel/cgi-bin/panel-api" \

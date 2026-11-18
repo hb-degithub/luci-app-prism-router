@@ -1,6 +1,6 @@
 #!/bin/bash
 # 一次跑完全部门禁：先构建一次 dist，再串行跑所有 wrapper（wrapper 都用 SKIP_BUILD=1）。
-# 包含发布、原有回归、核心统计、认证安全与独立面板共 13 套。
+# 包含发布、原有回归、核心统计、认证安全、独立面板与飞书应用机器人共 14 套。
 #
 # 为什么需要它：每个 container-validate*.sh 过去都会先 build 一次，多个门禁并行时
 # 会互相 rm -rf / 重写 dist，出现“A 门禁装到 B 门禁刚写一半的包”。这里只 build 一次，
@@ -9,7 +9,7 @@
 # 全部隔离容器都使用 --network none；本脚本不会连接真机或外网。
 #
 # 用法：
-#   tools/test-release.sh                 # build 一次 + 串行跑全部 13 个门禁
+#   tools/test-release.sh                 # build 一次 + 串行跑全部 14 个门禁
 #   tools/test-release.sh --only features # 只跑名字匹配 features 的门禁（调试用）
 #   tools/test-release.sh --list          # 列出门禁
 set -euo pipefail
@@ -46,6 +46,7 @@ GATES=(
   container-validate-core-fixes.sh
   container-validate-security-fixes.sh
   container-validate-standalone-panel.sh
+  container-validate-feishu-oauth.sh
 )
 
 if [ "$LIST" = 1 ]; then

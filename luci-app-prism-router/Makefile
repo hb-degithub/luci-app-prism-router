@@ -7,7 +7,7 @@
 #   /etc/init.d/prism-router-panel             <- root/etc/init.d/prism-router-panel（默认关闭）
 #   /etc/config/prism-router                   <- root/etc/config/prism-router（conffile）
 #   /usr/share/prism-router/*.uc               <- root/usr/share/prism-router/
-#   /www/cgi-bin/prism-router-{ingest,stations,metrics}
+#   /www/cgi-bin/prism-router-{ingest,stations,metrics,feishu}
 #   /www/prism-router-panel/                   <- 独立面板静态页与 API
 #   /www/luci-static/resources/view/prism-router/*.js   <- htdocs/
 #   /www/luci-static/resources/prism-router/*           <- htdocs/（manifest、图标、类别表）
@@ -66,6 +66,7 @@ define Package/luci-app-prism-router/install
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-ingest $(1)/www/cgi-bin/prism-router-ingest
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-stations $(1)/www/cgi-bin/prism-router-stations
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-metrics $(1)/www/cgi-bin/prism-router-metrics
+	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-feishu $(1)/www/cgi-bin/prism-router-feishu
 
 	$(INSTALL_DIR) $(1)/www/prism-router-panel/cgi-bin
 	$(INSTALL_DATA) ./root/www/prism-router-panel/index.html $(1)/www/prism-router-panel/index.html

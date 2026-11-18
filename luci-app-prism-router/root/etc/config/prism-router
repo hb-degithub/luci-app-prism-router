@@ -146,9 +146,34 @@ config panel 'panel'
 config feishu 'feishu'
 	# 总开关：设 0 可临时静音（未配置 webhook/app 时无论如何都不会发送）
 	option enabled '1'
+	# ── 发送路线（默认关闭应用机器人，不影响已有的 webhook 自定义机器人）──────
+	# webhook = 群自定义机器人（默认）：纯出站 HTTPS，不需要回调、不需要审核。
+	# app     = 自建应用机器人：支持在设置页「扫码绑定群」选择目标群，发消息走
+	#           tenant_access_token；app_id/app_secret 必须填。
+	# 该选项**缺省**时沿用旧行为：app_id/app_secret/chat_id 三件套齐全走 app，
+	# 否则走 webhook —— 已配好应用的老用户（conffile 被改过，opkg 升级时保留）
+	# 因此不会断推；新装/重置后是本行默认值 webhook。
+	option mode 'webhook'
+	# 群自定义机器人 webhook；mode=webhook 时必填（secret 也必填）
 	option webhook ''
+	# ── app 模式：飞书开放平台「企业自建应用」准备步骤 ──────────────────
+	# 1) 开放平台 → 创建企业自建应用，记下 App ID（cli_ 开头）与 App Secret；
+	# 2) 「添加应用能力」→ 开启「机器人」；
+	# 3) 「安全设置」→ 重定向 URL 必须原样填写（回调 CGI 在这个地址上）：
+	#      http://<路由器LAN>/cgi-bin/prism-router-feishu?action=callback
+	# 4) 「权限管理」→ 开通 im:message:send_as_bot（给群发消息）与 im:chat:readonly
+	#    （读机器人所在群列表；只想用 im:chat 也可以）。改完权限要「创建版本并发布」，
+	#    等审核通过后新权限才生效；
+	# 5) 回设置页点「扫码绑定群」完成一次授权 → 选择要绑定的群 → chat_id 自动写入；
+	# 6) 最后把上面的 mode 改成 'app' 并保存。
+	# 注意：机器人必须先被加入目标群，否则发消息会返回权限/可见性错误；错误会原样
+	#       写进 /tmp/prism-router/feishu.log（app_secret 已脱敏）。
 	option app_id ''
+	# App Secret：只存在本文件（opkg conffile；默认打包 0644，建议 chmod 600
+	# /etc/config/prism-router）。不会写进日志、不会出现在 curl 命令行里。
+	# 怀疑泄露时在开放平台重置，再把新值写到这里。
 	option app_secret ''
+	# 目标群 chat_id（oc_ 开头）。可用「扫码绑定群」获得，或 `ucode feishu.uc chats`
 	option chat_id ''
 	option card_wrapper 'card'
 	option secret ''

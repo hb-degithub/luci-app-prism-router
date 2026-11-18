@@ -107,7 +107,7 @@ is_exec_name() {
     ./usr/bin/prism-routerd|./etc/init.d/prism-routerd|\
     ./usr/share/prism-router/feishu-test.sh|\
     ./www/cgi-bin/prism-router-ingest|./www/cgi-bin/prism-router-stations|\
-    ./www/cgi-bin/prism-router-metrics|\
+    ./www/cgi-bin/prism-router-metrics|./www/cgi-bin/prism-router-feishu|\
     ./etc/init.d/prism-router-panel|./www/prism-router-panel/cgi-bin/panel-api) return 0 ;;
   esac
   return 1
@@ -168,6 +168,7 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
              p == "./www/cgi-bin/prism-router-ingest" ||
              p == "./www/cgi-bin/prism-router-stations" ||
              p == "./www/cgi-bin/prism-router-metrics" ||
+             p == "./www/cgi-bin/prism-router-feishu" ||
              p == "./etc/init.d/prism-router-panel" ||
              p == "./www/prism-router-panel/cgi-bin/panel-api"
     }
@@ -233,6 +234,7 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
     "./www/cgi-bin/prism-router-ingest:luci-app-prism-router/root/www/cgi-bin/prism-router-ingest" \
     "./www/cgi-bin/prism-router-stations:luci-app-prism-router/root/www/cgi-bin/prism-router-stations" \
     "./www/cgi-bin/prism-router-metrics:luci-app-prism-router/root/www/cgi-bin/prism-router-metrics" \
+    "./www/cgi-bin/prism-router-feishu:luci-app-prism-router/root/www/cgi-bin/prism-router-feishu" \
     "./www/prism-router-panel/index.html:luci-app-prism-router/root/www/prism-router-panel/index.html" \
     "./www/prism-router-panel/cgi-bin/panel-api:luci-app-prism-router/root/www/prism-router-panel/cgi-bin/panel-api" \
     "./usr/share/rpcd/ucode/prism-router.uc:luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc"; do

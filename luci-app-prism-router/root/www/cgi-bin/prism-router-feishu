@@ -1,0 +1,964 @@
+#!/usr/bin/ucode
+// prism-router-feishu —— 飞书自建应用「扫码绑定群」授权 CGI（默认关闭的应用机器人模式）
+//
+// 安装为 /www/cgi-bin/prism-router-feishu（755）。契约见 docs/SPEC.md「飞书应用机器人」。
+//
+// 为什么需要它：群自定义机器人 webhook 只能发到「它所在的那一个群」，用户无法在页面上
+// 选择目标群；自建应用（app_id/app_secret）可以先用「用户身份」列出机器人所在的群，
+// 再把选中的 chat_id 写进 UCI。为了拿到 user_access_token，需要一次飞书 OAuth 回跳。
+//
+// ───────────────────────── 接口（只读 GET）─────────────────────────
+//   ?action=start
+//       返回 {"state":"<32 hex>","url":"https://open.feishu.cn/open-apis/authen/v1/index?..."}
+//       app_id / app_secret 未配置 -> 400 {"error":"..."}
+//   ?action=callback&code=<code>&state=<state>     ← 飞书回跳地址（浏览器打开）
+//       成功 -> 200 text/html（「授权成功，请回到棱镜路由设置页选择要绑定的群」）
+//       失败 -> 4xx/5xx {"error":"..."}，并把该 state 标记为 error
+//   ?action=status&state=<state>
+//       返回 {"status":"pending|ready|error","chats":[{"chat_id","name"}],"error":"..."}
+//       state 不存在 / 过期 -> 404 {"error":"..."}
+//
+// ───────────────────────── 安全边界（别按直觉改）─────────────────────────
+//   * 只读 GET：除 /tmp/prism-router/feishu-oauth/ 下的授权状态文件外不写任何东西，
+//     也**不**修改 /etc/config（选群由前端写 UCI，本 CGI 不碰配置）。
+//   * 状态文件：目录 0700、文件 0600、临时文件 + rename 原子落盘，文件名只接受
+//     ^[0-9a-f]{32}$（拒绝任何路径穿越）。10 分钟过期，最多同时 8 个（超了删最旧）。
+//   * 只把 user_access_token 用在本进程内存里，**绝不落盘**：state 文件里只有群列表。
+//   * 网络只走 `curl -sS -K <0600 配置文件>`：url / Authorization / 请求体全部在 0600
+//     临时文件里，argv 只有文件路径 —— app_secret、access_token 不会出现在 ps 里。
+//   * 响应只输出 {error} / 固定形状 JSON；错误文本先脱敏（去掉 secret / Bearer / 长 hex）
+//     并截断，不返回堆栈、不返回上游原始响应体。
+//   * 上游 JSON 只解析不执行；HTTP 200 不代表成功，必须看 body 的 code / access_token。
+//   * 只用固定 URL 前缀 open.feishu.cn；环境变量 PRISM_ROUTER_FEISHU_BASE 仅供隔离容器
+//     门禁把 base 指向 127.0.0.1 上的 mock（非 loopback 一律忽略，防止凭证被改道）。
+//
+// 手工调试（不需要 web 服务器）：
+//   env REQUEST_METHOD=GET QUERY_STRING="action=start" \
+//       ucode /www/cgi-bin/prism-router-feishu
+'use strict';
+
+import { readfile, open, lsdir, stat, lstat, mkdir, chmod, rename, unlink, popen } from 'fs';
+import { cursor } from 'uci';
+
+const VERSION       = '1.0.0';
+const PROD_BASE     = 'https://open.feishu.cn';
+const TMP_ROOT      = '/tmp/prism-router';
+const STATE_DIR     = `${TMP_ROOT}/feishu-oauth`;
+const CURL_TMP      = `${TMP_ROOT}/.feishu-oauth`;
+const STATE_TTL     = 600;        /* state 10 分钟过期 */
+const MAX_STATES    = 8;          /* 最多同时 8 个待授权 state */
+const MAX_CHATS     = 50;         /* 与飞书 chats page_size=50 对齐 */
+const NAME_MAX      = 64;         /* 群名按字节截断（不切断 UTF-8 码点） */
+const CURL_TIMEOUT  = 10;         /* 秒：--max-time 10 */
+const CURL_CONNECT  = 5;
+const MAX_RESP      = 65536;      /* 上游响应体上限，超了当失败 */
+const STATE_RE      = /^[0-9a-f]{32}$/;
+
+let seq = 0;
+
+// ───────────────────────────── 小工具 ─────────────────────────────
+
+function text(value, fallback) {
+	return (value == null) ? fallback : `${value}`;
+}
+
+function is_array(value) {
+	return type(value) == 'array';
+}
+
+function is_object(value) {
+	return type(value) == 'object';
+}
+
+function json_parse(raw) {
+	if (type(raw) != 'string' || length(raw) == 0)
+		return null;
+
+	try {
+		return json(raw);
+	}
+	catch (e) {
+		return null;
+	}
+}
+
+/* 按字节截断且不切断 UTF-8 码点（ucode 的 length/substr 都是字节语义）。 */
+function cut_text(value, maxb) {
+	let s = text(value, '');
+
+	if (length(s) <= maxb)
+		return s;
+
+	let n = maxb;
+
+	while (n > 0 && (ord(substr(s, n, 1)) & 0xc0) == 0x80)
+		n--;
+
+	return substr(s, 0, n);
+}
+
+function read_text(path) {
+	try {
+		return text(readfile(path), '');
+	}
+	catch (e) {
+		return '';
+	}
+}
+
+/* 0700/0755 目录：不跟随符号链接，必须是 root 真目录。 */
+function ensure_dir(path, mode) {
+	let st = null;
+
+	try {
+		st = lstat(path);
+	}
+	catch (e) {
+		st = null;
+	}
+
+	if (st != null) {
+		if (st.type != 'directory' || st.uid != 0 || st.gid != 0)
+			return false;
+
+		try {
+			chmod(path, mode);
+		}
+		catch (e) {
+			return false;
+		}
+
+		return true;
+	}
+
+	try {
+		mkdir(path, mode);
+	}
+	catch (e) {
+		return false;
+	}
+
+	try {
+		st = lstat(path);
+	}
+	catch (e) {
+		return false;
+	}
+
+	return st != null && st.type == 'directory' && st.uid == 0 && st.gid == 0;
+}
+
+/* /tmp 必须是 root 的 sticky 真目录；否则一个状态文件都不写。 */
+function safe_tmp_root() {
+	let st = null;
+
+	try {
+		st = lstat('/tmp');
+	}
+	catch (e) {
+		return false;
+	}
+
+	return st != null && st.type == 'directory' && st.uid == 0
+		&& st.perm != null && st.perm.sticky == true;
+}
+
+function ensure_state_dir() {
+	if (!safe_tmp_root())
+		return false;
+
+	return ensure_dir(TMP_ROOT, 0o755) && ensure_dir(STATE_DIR, 0o700);
+}
+
+// ───────────────────────────── 配置 / 环境 ─────────────────────────────
+
+function uci_value(option) {
+	let c = null;
+
+	try {
+		c = cursor();
+	}
+	catch (e) {
+		return '';
+	}
+
+	if (c == null)
+		return '';
+
+	let v = null;
+
+	try {
+		v = c.get('prism-router', 'feishu', option);
+	}
+	catch (e) {
+		v = null;
+	}
+
+	return (v == null) ? '' : trim(`${v}`);
+}
+
+function request_method() {
+	return trim(text(getenv('REQUEST_METHOD'), 'GET'));
+}
+
+function hexval(c) {
+	return index('0123456789abcdef', lc(c));
+}
+
+function url_decode(s) {
+	let out = '';
+
+	for (let i = 0; i < length(s); i++) {
+		const c = substr(s, i, 1);
+
+		if (c == '+') {
+			out += ' ';
+			continue;
+		}
+
+		if (c == '%' && i + 2 < length(s)) {
+			const hi = hexval(substr(s, i + 1, 1));
+			const lo = hexval(substr(s, i + 2, 1));
+
+			if (hi >= 0 && lo >= 0) {
+				out += chr(hi * 16 + lo);
+				i += 2;
+				continue;
+			}
+		}
+
+		out += c;
+	}
+
+	return out;
+}
+
+function query_params() {
+	const out = {};
+	const qs = trim(text(getenv('QUERY_STRING'), ''));
+
+	if (length(qs) == 0)
+		return out;
+
+	for (let pair in split(qs, '&')) {
+		if (length(pair) == 0)
+			continue;
+
+		const eq = index(pair, '=');
+
+		if (eq < 0) {
+			out[url_decode(pair)] = '';
+			continue;
+		}
+
+		out[url_decode(substr(pair, 0, eq))] = url_decode(substr(pair, eq + 1));
+	}
+
+	return out;
+}
+
+/* 只有 RFC 3986 unreserved 字符原样保留，其余按字节 %XX。 */
+function url_encode(s) {
+	const src = text(s, '');
+	const KEEP = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+	let out = '';
+
+	for (let i = 0; i < length(src); i++) {
+		const c = substr(src, i, 1);
+
+		out += (index(KEEP, c) >= 0) ? c : sprintf('%%%02X', ord(c));
+	}
+
+	return out;
+}
+
+/* 测试钩子：仅接受 loopback 上的 http base（隔离容器门禁用），其余一律回落到生产域名。 */
+function is_loopback_base(raw) {
+	return match(raw, /^http:\/\/(127\.0\.0\.1|\[::1\]|localhost)(:[0-9]{1,5})?$/) != null;
+}
+
+function feishu_base() {
+	const raw = trim(text(getenv('PRISM_ROUTER_FEISHU_BASE'), ''));
+
+	if (length(raw) > 0 && is_loopback_base(raw))
+		return raw;
+
+	return PROD_BASE;
+}
+
+/* 回调地址：必须与开放平台「重定向 URL」完全一致。
+   Host 来自请求头（客户端可控），只接受 IP/域名[:端口] 形状，否则回落到 127.0.0.1。 */
+function redirect_uri() {
+	let host = trim(text(getenv('HTTP_HOST'), ''));
+
+	if (match(host, /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$/) == null
+	    && match(host, /^\[[0-9A-Fa-f:]+\](:[0-9]{1,5})?$/) == null)
+		host = '127.0.0.1';
+
+	return `http://${host}/cgi-bin/prism-router-feishu?action=callback`;
+}
+
+// ───────────────────────────── 脱敏 ─────────────────────────────
+
+/* 错误里可能出现：app_secret、Bearer token、超长 hex（签名/追踪 ID）、换行。
+   一次性抹掉，再截断到 160 字节 —— 响应体里绝不允许出现凭证。 */
+function sanitize(message, secret) {
+	let s = text(message, '');
+
+	if (length(secret) > 0)
+		s = replace(s, secret, '***');
+
+	s = replace(s, /Bearer[ \t]+[A-Za-z0-9._~+\/=-]+/g, 'Bearer ***');
+	s = replace(s, /[A-Za-z0-9._~+\/=-]{40,}/g, '***');
+	s = replace(s, /[\r\n\t]+/g, ' ');
+	s = trim(s);
+
+	return length(s) > 0 ? cut_text(s, 160) : '未知错误';
+}
+
+/* 上游失败的简要描述：只取 msg + code，不返回原始 body。 */
+function upstream_reason(j, fallback) {
+	if (is_object(j)) {
+		const code = (j.code != null) ? `${j.code}` : '';
+		const msg = trim(text(j.msg ?? j.message, ''));
+
+		if (length(msg) > 0)
+			return length(code) > 0 ? `code=${code} ${msg}` : msg;
+	}
+
+	return fallback;
+}
+
+// ───────────────────────────── 授权状态文件 ─────────────────────────────
+
+function state_path(state) {
+	return `${STATE_DIR}/${state}.json`;
+}
+
+function read_record(state) {
+	if (match(state, STATE_RE) == null)
+		return null;
+
+	const raw = read_text(state_path(state));
+
+	if (length(raw) == 0)
+		return null;
+
+	const rec = json_parse(raw);
+
+	return is_object(rec) ? rec : null;
+}
+
+/* 临时文件 -> rename：读者永远看不到半截 JSON。目录 0700 + 文件 0600。 */
+function write_record(state, record) {
+	if (match(state, STATE_RE) == null)
+		return false;
+
+	const path = state_path(state);
+	const tmp = `${path}.tmp.${time()}.${seq++}`;
+	let fd = null;
+
+	try {
+		fd = open(tmp, 'w', 0o600);
+	}
+	catch (e) {
+		fd = null;
+	}
+
+	if (fd == null)
+		return false;
+
+	try {
+		fd.write(sprintf('%J\n', record));
+		fd.close();
+	}
+	catch (e) {
+		try { fd.close(); } catch (x) { }
+		try { unlink(tmp); } catch (x) { }
+		return false;
+	}
+
+	if (!rename(tmp, path)) {
+		try { unlink(tmp); } catch (e) { }
+		return false;
+	}
+
+	try { chmod(path, 0o600); } catch (e) { }
+
+	return true;
+}
+
+function remove_record(state) {
+	try {
+		unlink(state_path(state));
+	}
+	catch (e) {
+		/* 删不掉就算了，过期后 prun 会再删一次 */
+	}
+}
+
+function record_expired(record) {
+	const ts = int(record.ts ?? 0);
+
+	return ts <= 0 || (time() - ts) > STATE_TTL;
+}
+
+/* 清理 /tmp/prism-router/feishu-oauth：
+   - 已过期（或 ts 非法）的直接删；
+   - 其它按 ts 从旧到新排，超过 MAX_STATES-1 的删掉（给新 state 留一个位置）。 */
+function prune_states() {
+	let names = null;
+
+	try {
+		names = lsdir(STATE_DIR);
+	}
+	catch (e) {
+		names = null;
+	}
+
+	if (!is_array(names))
+		return;
+
+	let live = [];
+
+	for (let name in names) {
+		if (match(name, /^[0-9a-f]{32}\.json$/) == null) {
+			/* 遗留的 .tmp.* 碎片：超过 1 小时的删掉 */
+			if (match(name, /\.tmp\.[0-9]+\.[0-9]+$/) != null) {
+				const st = stat(`${STATE_DIR}/${name}`);
+
+				if (st != null && (time() - st.mtime) > 3600) {
+					try { unlink(`${STATE_DIR}/${name}`); } catch (e) { }
+				}
+			}
+
+			continue;
+		}
+
+		const id = substr(name, 0, 32);
+		const rec = read_record(id);
+
+		if (rec == null || record_expired(rec)) {
+			remove_record(id);
+			continue;
+		}
+
+		push(live, { id: id, ts: int(rec.ts ?? 0) });
+	}
+
+	live = sort(live, (a, b) => a.ts - b.ts);
+
+	while (length(live) >= MAX_STATES) {
+		const old = shift(live);
+		remove_record(old.id);
+	}
+}
+
+/* 32 hex：优先 /dev/urandom；读不到时退化为「时间 + 请求信息」派生的 32 hex
+   （只在 /dev/urandom 不可用的异常系统上发生，仍保证文件名不可预测性有限但唯一）。 */
+function new_state() {
+	let bin = '';
+	let fd = null;
+
+	try {
+		fd = open('/dev/urandom', 'r');
+	}
+	catch (e) {
+		fd = null;
+	}
+
+	if (fd != null) {
+		try {
+			bin = text(fd.read(16), '');
+		}
+		catch (e) {
+			bin = '';
+		}
+
+		try { fd.close(); } catch (e) { }
+	}
+
+	if (length(bin) >= 16) {
+		let hex = '';
+
+		for (let i = 0; i < 16; i++)
+			hex += sprintf('%02x', ord(substr(bin, i, 1)));
+
+		if (match(hex, STATE_RE) != null)
+			return hex;
+	}
+
+	const seed = sprintf('%d|%d|%s|%s', time(), seq++, text(getenv('REMOTE_ADDR'), ''),
+		text(getenv('HTTP_HOST'), ''));
+	let out = '';
+
+	for (let i = 0; i < 4; i++) {
+		let x = i * 2166136261;
+
+		for (let j = 0; j < length(seed); j++)
+			x = (x * 131 + ord(substr(seed, j, 1))) % 4294967296;
+
+		out += sprintf('%08x', int(x) & 0xffffffff);
+	}
+
+	return out;
+}
+
+// ───────────────────────────── 飞书 API（curl）─────────────────────────────
+
+function shell_quote(s) {
+	return `'${replace(text(s, ''), "'", "'\\''")}'`;
+}
+
+/* 一次 API 调用。参数全部落在 0600 的 curl 配置文件里：
+     url / request / Authorization / data-binary 都不进 argv。 */
+function api_call(method, path, bearer, body_obj) {
+	if (!ensure_dir(TMP_ROOT, 0o755) || !ensure_dir(CURL_TMP, 0o700))
+		return { http: 0, curl: -1, body: '', error: '无法创建临时目录' };
+
+	const tag = sprintf('%d-%d', time(), seq++);
+	const bf = `${CURL_TMP}/body-${tag}`;
+	const rf = `${CURL_TMP}/resp-${tag}`;
+	const cf = `${CURL_TMP}/curl-${tag}`;
+	const loop = is_loopback_base(feishu_base());
+
+	const lines = [
+		`url = "${feishu_base()}${path}"`,
+		`request = "${method}"`,
+		'silent',
+		'show-error',
+		`connect-timeout = ${CURL_CONNECT}`,
+		`max-time = ${CURL_TIMEOUT}`,
+		'max-filesize = 65536',
+		loop ? 'proto = "=http,https"' : 'proto = "=https"',
+		'proto-redir = "=https"',
+		'max-redirs = 0',
+		`output = "${rf}"`,
+		'write-out = "%{http_code}"'
+	];
+
+	if (length(bearer) > 0) {
+		/* 防御性校验：token 只允许 unreserved 字符，避免拼进 curl 配置时破坏语法。
+		   （ucode 的 ERE 不支持 {8,2048}，长度单独判断。） */
+		if (length(bearer) < 8 || length(bearer) > 2048
+		    || match(bearer, /^[A-Za-z0-9._~+\/=-]+$/) == null)
+			return { http: 0, curl: -2, body: '', error: 'access_token 格式非法' };
+
+		push(lines, `header = "Authorization: Bearer ${bearer}"`);
+	}
+
+	if (body_obj != null)
+		push(lines, 'header = "Content-Type: application/json"');
+
+	const write_file = function(p, content) {
+		let fd = null;
+
+		try {
+			fd = open(p, 'w', 0o600);
+		}
+		catch (e) {
+			return false;
+		}
+
+		if (fd == null)
+			return false;
+
+		try {
+			fd.write(content);
+			fd.close();
+		}
+		catch (e) {
+			try { fd.close(); } catch (x) { }
+			return false;
+		}
+
+		return true;
+	};
+
+	let ok = write_file(rf, '');
+
+	if (ok && body_obj != null) {
+		/* 请求体（含 client_secret）只写文件，绝不进 argv。 */
+		ok = write_file(bf, sprintf('%J', body_obj));
+
+		if (ok)
+			push(lines, `data-binary = "@${bf}"`);
+	}
+
+	if (ok)
+		ok = write_file(cf, join('\n', lines) + '\n');
+
+	if (!ok) {
+		try { unlink(bf); } catch (e) { }
+		try { unlink(rf); } catch (e) { }
+		try { unlink(cf); } catch (e) { }
+		return { http: 0, curl: -1, body: '', error: '写临时文件失败' };
+	}
+
+	let out = '';
+	let rc = -1;
+	let p = null;
+
+	try {
+		p = popen(`curl -sS -K ${shell_quote(cf)} 2>/dev/null`, 'r');
+	}
+	catch (e) {
+		p = null;
+	}
+
+	if (p == null) {
+		try { unlink(bf); } catch (e) { }
+		try { unlink(rf); } catch (e) { }
+		try { unlink(cf); } catch (e) { }
+		return { http: 0, curl: -1, body: '', error: 'curl 不可用' };
+	}
+
+	let buf = '';
+
+	try {
+		while (length(buf = p.read(4096)))
+			out += buf;
+	}
+	catch (e) {
+		/* 读失败也要收掉子进程 */
+	}
+
+	rc = p.close();
+
+	const http = int(trim(out)) || 0;
+	let body = '';
+
+	try {
+		body = text(readfile(rf), '');
+	}
+	catch (e) {
+		body = '';
+	}
+
+	try { unlink(bf); } catch (e) { }
+	try { unlink(rf); } catch (e) { }
+	try { unlink(cf); } catch (e) { }
+
+	if (length(body) > MAX_RESP)
+		body = '';
+
+	return { http: http, curl: rc, body: body, error: (rc != 0) ? `curl exit ${rc}` : '' };
+}
+
+/* 群名/群 ID 归一化：chat_id 必须是安全字符集；name 按 64 字节截断，空名回落到 chat_id。 */
+function normalize_chats(items) {
+	const out = [];
+
+	if (!is_array(items))
+		return out;
+
+	for (let item in items) {
+		if (length(out) >= MAX_CHATS)
+			break;
+
+		if (!is_object(item))
+			continue;
+
+		const id = trim(text(item.chat_id ?? item.chatId, ''));
+
+		if (match(id, /^[A-Za-z0-9_-]{1,128}$/) == null)
+			continue;
+
+		let name = trim(text(item.name, ''));
+
+		if (length(name) == 0)
+			name = id;
+
+		push(out, { chat_id: id, name: cut_text(name, NAME_MAX) });
+	}
+
+	return out;
+}
+
+function pick_token(j) {
+	if (!is_object(j))
+		return '';
+
+	const data = is_object(j.data) ? j.data : {};
+	const cands = [ data.access_token, data.user_access_token, j.access_token, j.user_access_token ];
+
+	for (let v in cands) {
+		if (type(v) == 'string' && length(trim(v)) > 0)
+			return trim(v);
+	}
+
+	return '';
+}
+
+/* 群列表：容忍 data.items / data.chats / 顶层 items 三种形状；null = 结构不认识。 */
+function pick_chats(j) {
+	if (!is_object(j))
+		return null;
+
+	const data = is_object(j.data) ? j.data : {};
+
+	if (is_array(data.items))
+		return data.items;
+
+	if (is_array(data.chats))
+		return data.chats;
+
+	if (is_array(j.items))
+		return j.items;
+
+	if (int(j.code ?? -1) == 0)
+		return [];
+
+	return null;
+}
+
+// ───────────────────────────── 响应 ─────────────────────────────
+
+const REASONS = {
+	'200': 'OK',
+	'400': 'Bad Request',
+	'404': 'Not Found',
+	'405': 'Method Not Allowed',
+	'500': 'Internal Server Error',
+	'502': 'Bad Gateway'
+};
+
+function respond(status, contentType, payload) {
+	if (status != 200)
+		print(sprintf('Status: %d %s\r\n', status, REASONS[status] ?? 'Error'));
+
+	print(`Content-Type: ${contentType}\r\n`);
+	print('Cache-Control: no-store\r\n');
+	print('X-Content-Type-Options: nosniff\r\n');
+	print('Referrer-Policy: no-referrer\r\n');
+	print('\r\n');
+	print(payload);
+}
+
+function json_out(status, obj) {
+	respond(status, 'application/json; charset=utf-8', sprintf('%J\n', obj));
+}
+
+function json_error(status, message) {
+	json_out(status, { error: message });
+}
+
+const HTML_OK = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>授权成功</title>
+</head>
+<body style="font-family:system-ui,-apple-system,sans-serif;margin:2rem;line-height:1.6">
+<h1 style="font-size:1.25rem">授权成功</h1>
+<p>授权成功，请回到棱镜路由设置页选择要绑定的群。</p>
+</body>
+</html>
+`;
+
+// ───────────────────────────── 动作 ─────────────────────────────
+
+function action_start() {
+	const app_id = uci_value('app_id');
+	const app_secret = uci_value('app_secret');
+	/* mode 只影响 400 的提示文案：webhook 模式下也允许先扫码绑定群（常见顺序是先选群、
+	   再切 mode），真正的路线选择在 feishu.uc 的 load_cfg 里。本 CGI 绝不改配置。 */
+	const mode = lc(uci_value('mode'));
+
+	if (length(app_id) == 0 || length(app_secret) == 0)
+		return json_error(400, (mode == 'app')
+			? '还没填飞书 App ID / App Secret：请先填写并保存，再扫码绑定群'
+			: '扫码绑定群需要自建应用：请先填写 App ID / App Secret，并把模式切换为「应用机器人」');
+
+	if (match(app_id, /^[A-Za-z0-9._-]{1,128}$/) == null)
+		return json_error(400, 'App ID 格式非法（应为 cli_ 开头的应用 ID）');
+
+	if (!ensure_state_dir())
+		return json_error(500, '无法创建授权状态目录（检查 /tmp/prism-router 权限）');
+
+	prune_states();
+
+	const state = new_state();
+
+	if (match(state, STATE_RE) == null || !write_record(state, {
+		ts: time(), status: 'pending', redirect: redirect_uri()
+	}))
+		return json_error(500, '写入授权状态失败');
+
+	const url = sprintf('%s/open-apis/authen/v1/index?app_id=%s&redirect_uri=%s&state=%s',
+		feishu_base(), url_encode(app_id), url_encode(redirect_uri()), state);
+
+	return json_out(200, { state: state, url: url });
+}
+
+function action_status(query) {
+	const state = trim(text(query.state, ''));
+
+	if (match(state, STATE_RE) == null)
+		return json_error(404, '授权状态不存在或已过期，请重新扫码');
+
+	const rec = read_record(state);
+
+	if (rec == null)
+		return json_error(404, '授权状态不存在或已过期，请重新扫码');
+
+	if (record_expired(rec)) {
+		remove_record(state);
+		return json_error(404, '授权已过期（10 分钟内有效），请重新扫码');
+	}
+
+	const out = { status: text(rec.status, 'pending'), chats: [], error: '' };
+
+	if (rec.status == 'ready' && is_array(rec.chats))
+		out.chats = rec.chats;
+
+	if (rec.status == 'error')
+		out.error = sanitize(text(rec.error, '授权失败'), uci_value('app_secret'));
+
+	return json_out(200, out);
+}
+
+function action_callback(query) {
+	const state = trim(text(query.state, ''));
+	const code = trim(text(query.code, ''));
+
+	if (match(state, STATE_RE) == null)
+		return json_error(404, '授权状态不存在或已过期，请重新扫码');
+
+	const rec = read_record(state);
+
+	if (rec == null)
+		return json_error(404, '授权状态不存在或已过期，请重新扫码');
+
+	if (record_expired(rec)) {
+		remove_record(state);
+		return json_error(404, '授权已过期（10 分钟内有效），请重新扫码');
+	}
+
+	/* 浏览器刷新回调页会带来同一个（已被消费的）code：直接回放成功页，不重复换 token。 */
+	if (rec.status == 'ready')
+		return respond(200, 'text/html; charset=utf-8', HTML_OK);
+
+	if (length(code) == 0)
+		return json_error(400, '缺少 code 参数（请从棱镜路由设置页重新发起扫码）');
+
+	/* 上游 code 是短随机串；超长的一律当坏请求（不把任意大 body 转发给飞书）。 */
+	if (length(code) > 4096)
+		return json_error(400, 'code 参数过长');
+
+	const app_id = uci_value('app_id');
+	const app_secret = uci_value('app_secret');
+
+	if (length(app_id) == 0 || length(app_secret) == 0) {
+		write_record(state, { ts: rec.ts, status: 'error', error: '未配置 App ID / App Secret' });
+		return json_error(400, '未配置 App ID / App Secret：请先在设置页填写并保存');
+	}
+
+	const redirect = length(text(rec.redirect, '')) > 0 ? text(rec.redirect, '') : redirect_uri();
+
+	/* code -> user_access_token（OIDC v1）。app_secret 在 0600 请求体文件里，不在 argv。 */
+	const token_res = api_call('POST', '/open-apis/authen/v1/oidc/access_token', '', {
+		grant_type: 'authorization_code',
+		code: code,
+		redirect_uri: redirect,
+		client_id: app_id,
+		client_secret: app_secret
+	});
+
+	if (token_res.http != 200) {
+		const reason = sanitize(length(token_res.error) > 0
+			? token_res.error
+			: `换取用户授权失败（HTTP ${token_res.http}）`, app_secret);
+
+		write_record(state, { ts: rec.ts, status: 'error', error: reason });
+		return json_error(502, reason);
+	}
+
+	const token_json = json_parse(token_res.body);
+	const token = pick_token(token_json);
+
+	if (length(token) == 0) {
+		const reason = sanitize(upstream_reason(token_json, '换取用户授权失败（响应缺少 access_token）'),
+			app_secret);
+
+		write_record(state, { ts: rec.ts, status: 'error', error: reason });
+		return json_error(502, reason);
+	}
+
+	/* user_access_token -> 机器人所在的群（仅用一次，不落盘）。 */
+	const chats_res = api_call('GET',
+		'/open-apis/im/v1/chats?page_size=50&user_id_type=open_id', token, null);
+
+	if (chats_res.http != 200) {
+		const reason = sanitize(length(chats_res.error) > 0
+			? chats_res.error
+			: `获取群列表失败（HTTP ${chats_res.http}）`, app_secret);
+
+		write_record(state, { ts: rec.ts, status: 'error', error: reason });
+		return json_error(502, reason);
+	}
+
+	const chats_json = json_parse(chats_res.body);
+	const items = pick_chats(chats_json);
+
+	if (items == null) {
+		const reason = sanitize(upstream_reason(chats_json, '群列表响应格式不认识'), app_secret);
+
+		write_record(state, { ts: rec.ts, status: 'error', error: reason });
+		return json_error(502, reason);
+	}
+
+	if (!write_record(state, {
+		ts: rec.ts, status: 'ready', chats: normalize_chats(items), updated: time()
+	}))
+		return json_error(500, '写入授权结果失败');
+
+	return respond(200, 'text/html; charset=utf-8', HTML_OK);
+}
+
+// ───────────────────────────── 主流程 ─────────────────────────────
+
+function run_action() {
+	if (request_method() != 'GET') {
+		json_error(405, '只支持 GET');
+		return 0;
+	}
+
+	const query = query_params();
+	const action = lc(trim(text(query.action, '')));
+
+	if (action == 'start')
+		action_start();
+	else if (action == 'callback')
+		action_callback(query);
+	else if (action == 'status')
+		action_status(query);
+	else
+		json_error(400, '未知 action（可用：start / callback / status）');
+
+	return 0;
+}
+
+let rc = 0;
+
+try {
+	rc = run_action();
+}
+catch (e) {
+	/* 任何未预料的异常都收敛成固定 JSON：不带路径、不带堆栈、不带凭证。 */
+	try {
+		json_error(500, '内部错误（详见路由器日志）');
+	}
+	catch (x) { }
+
+	try {
+		system([ 'logger', '-t', 'prism-router-feishu', '-p', 'daemon.err',
+			cut_text(sprintf('授权 CGI 异常：%s', e), 200) ]);
+	}
+	catch (x) { }
+
+	rc = 1;
+}
+
+exit(rc);
