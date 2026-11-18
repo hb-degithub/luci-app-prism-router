@@ -1073,7 +1073,7 @@ async function testDevicesMetaPermissions() {
 
 	delete env.L.env;
 	env.L.env = { prismRouterCanManage: true };
-	check('LuCI 精简为只读后编辑入口始终隐藏', tests.isAdmin() === false);
+	check('无 ACL 列表时用只读 RPC 的 can_manage 能力', tests.isAdmin() === true);
 	env.L.env.prismRouterCanManage = false;
 	check('RPC 明确非管理员时隐藏写入口', tests.isAdmin() === false);
 
@@ -1122,17 +1122,14 @@ async function testMenu() {
 
 		check('menu.d JSON 可解析', menu != null && typeof menu === 'object');
 
-		const readOnlyViews = [ 'overview', 'devices', 'apps', 'nodes', 'mobile', 'diagnostics' ];
-		const paths = readOnlyViews.map(function (name) {
+		const pluginViews = [ 'overview', 'devices', 'apps', 'nodes', 'settings', 'mobile', 'diagnostics', 'panel' ];
+		const paths = pluginViews.map(function (name) {
 			return menu['admin/services/prism-router/' + name];
 		});
 
-		check('menu.d 只保留只读视图',
+		check('menu.d 含插件全部页面（概览/设备/应用/节点/设置/手机版/诊断/面板）',
 			paths.every(function (item) { return item && item.action && item.action.type === 'view'; }),
 			JSON.stringify(paths.map(function (x) { return x && x.action && x.action.path; })));
-		check('menu.d 不再暴露设置与内嵌详细面板',
-			menu['admin/services/prism-router/settings'] == null &&
-			menu['admin/services/prism-router/panel'] == null);
 
 		const root = menu['admin/services/prism-router'];
 		const rootAcl = root && root.depends && root.depends.acl;
@@ -1141,8 +1138,13 @@ async function testMenu() {
 			Array.isArray(rootAcl) && rootAcl.length === 1 && rootAcl[0] === 'luci-app-prism-router',
 			JSON.stringify(rootAcl));
 
-		check('设置页已从 LuCI 菜单移除（写配置走独立控制台）',
-			menu['admin/services/prism-router/settings'] == null);
+		const settings = menu['admin/services/prism-router/settings'];
+		const settingsAcl = settings && settings.depends && settings.depends.acl;
+
+		check('设置页子路由 depends.acl=luci-app-prism-router-admin',
+			Array.isArray(settingsAcl) && settingsAcl.length === 1 &&
+			settingsAcl[0] === 'luci-app-prism-router-admin',
+			JSON.stringify(settingsAcl));
 
 		/*
 		 * LuCI 的 JS View 基类（luci.js 的 LuCI.view）没有 depends 成员，

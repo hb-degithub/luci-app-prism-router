@@ -302,9 +302,8 @@ function isAdmin() {
 	if (acls != null)
 		return acls.indexOf(ADMIN_ACL) >= 0;
 
-	/* LuCI 已精简为只读：管理组不再下发，编辑入口一律隐藏。
-	   完整控制台的写操作走独立服务，不经过 LuCI ACL。 */
-	return false;
+	/* 标准 LuCI 不一定注入 acls；status.can_manage 只返回布尔能力，不泄密。 */
+	return typeof L != 'undefined' && L.env != null && L.env.prismRouterCanManage === true;
 }
 
 /*

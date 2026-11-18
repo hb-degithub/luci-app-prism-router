@@ -1,8 +1,7 @@
 #!/bin/bash
 # 不依赖 OpenWrt SDK 手搓 .ipk（纯脚本包，无编译产物）
 #
-# 产物（默认只有 2 个 modern 包 + SHA256SUMS）：
-#   dist/prism-router_1.0.0-1_all.ipk
+# 产物（单个插件包 + SHA256SUMS）：
 #   dist/luci-app-prism-router_1.0.0-1_all.ipk
 #   dist/SHA256SUMS
 #
@@ -11,7 +10,7 @@
 # `--legacy` 才会额外产出 *.legacy.ipk，并打印“不可发布”警告。
 #
 # 用法：
-#   tools/build-ipk.sh                 # 重建 dist/，2 个 modern 包 + SHA256SUMS
+#   tools/build-ipk.sh                 # 重建 dist/，1 个插件包 + SHA256SUMS
 #   tools/build-ipk.sh --legacy        # 额外产 ar 包（仅排查极旧版本，不要发布）
 #   tools/build-ipk.sh --out DIR       # 输出到指定目录（供测试用临时目录）
 #   tools/build-ipk.sh --help
@@ -106,58 +105,81 @@ ctl() { # $1=dir  $2=pkgname  $3=section  $4=depends  $5=desc
 }
 hook() { printf '%s\n' "$@" > "$W/_h"; chmod 644 "$W/_h"; }
 
-# ================= prism-router =================
-D="$W/ts"; mkdir -p "$D/data/usr/bin" "$D/data/usr/share/prism-router" \
+# ================= luci-app-prism-router（单包插件）=================
+# 一个 ipk 同时包含：守护进程、init、配置、rpcd 插件、ACL、菜单、LuCI 页面、
+# CGI 与独立面板（默认关闭）。不再拆成 daemon 包 + LuCI 包。
+D="$W/app"
+mkdir -p "$D/data/usr/bin" "$D/data/usr/share/prism-router" \
+  "$D/data/usr/share/rpcd/ucode" "$D/data/usr/share/rpcd/acl.d" \
+  "$D/data/usr/share/luci/menu.d" \
   "$D/data/etc/init.d" "$D/data/etc/config" "$D/data/etc/prism-router/daily" \
-  "$D/data/www/cgi-bin" "$D/data/www/prism-router-panel/cgi-bin" "$D/control"
-chmod 755 "$D" "$D/control" "$D/data" "$D/data/usr" "$D/data/usr/bin" \
-  "$D/data/usr/share" "$D/data/usr/share/prism-router" \
+  "$D/data/www/cgi-bin" "$D/data/www/prism-router-panel/cgi-bin" \
+  "$D/data/www/luci-static/resources/view/prism-router" \
+  "$D/data/www/luci-static/resources/prism-router" "$D/control"
+chmod 755 "$D" "$D/control" "$D/data" \
+  "$D/data/usr" "$D/data/usr/bin" "$D/data/usr/share" "$D/data/usr/share/prism-router" \
+  "$D/data/usr/share/rpcd" "$D/data/usr/share/rpcd/ucode" "$D/data/usr/share/rpcd/acl.d" \
+  "$D/data/usr/share/luci" "$D/data/usr/share/luci/menu.d" \
   "$D/data/etc" "$D/data/etc/init.d" "$D/data/etc/config" \
   "$D/data/etc/prism-router" "$D/data/etc/prism-router/daily" \
   "$D/data/www" "$D/data/www/cgi-bin" \
-  "$D/data/www/prism-router-panel" "$D/data/www/prism-router-panel/cgi-bin"
-install -m 755 "$ROOT/prism-router/files/prism-routerd.uc"  "$D/data/usr/bin/prism-routerd"
-install -m 644 "$ROOT/prism-router/files/feishu.uc"          "$D/data/usr/share/prism-router/feishu.uc"
-install -m 755 "$ROOT/prism-router/files/feishu-test.sh"     "$D/data/usr/share/prism-router/feishu-test.sh"
-# 数据 / 日志保留与清理（用户 cron 调用；只动白名单目录，见 docs/SPEC.md §9）
-install -m 644 "$ROOT/prism-router/files/retention.uc"       "$D/data/usr/share/prism-router/retention.uc"
-# 子节点推送脚本（cron 调用；不进 PATH，避免和守护进程抢名字）
-install -m 644 "$ROOT/prism-router/files/push.uc"            "$D/data/usr/share/prism-router/push.uc"
-# 母节点接收端：CGI，必须可执行（uhttpd -c /cgi-bin 直接 exec）
-install -m 755 "$ROOT/prism-router/files/ingest.uc"          "$D/data/www/cgi-bin/prism-router-ingest"
-# 哑桥 AP 侧：无线站点元数据上报（cron 调用；只报信号/速率，绝不报字节）
-install -m 644 "$ROOT/prism-router/files/stations.uc"        "$D/data/usr/share/prism-router/stations.uc"
-# 安全模块新增的节点/站点认证共享库：存在就打包，不存在不影响；不能因手打包漏掉。
-if [ -f "$ROOT/prism-router/files/prism-router-node-auth.uc" ]; then
-  install -m 644 "$ROOT/prism-router/files/prism-router-node-auth.uc" \
-    "$D/data/usr/share/prism-router/prism-router-node-auth.uc"
-  echo "  + prism-router: 含 prism-router-node-auth.uc"
-fi
-# 母节点接收端：AP 站点元数据 CGI（必须可执行；不写 jsonl 历史）
-install -m 755 "$ROOT/prism-router/files/ingest-stations.uc" "$D/data/www/cgi-bin/prism-router-stations"
-# Prometheus 指标导出 CGI（只读；token 认证；未启用/未配 token 一律 403）
-install -m 755 "$ROOT/prism-router/files/prism-router-metrics.uc" "$D/data/www/cgi-bin/prism-router-metrics"
-install -m 755 "$ROOT/prism-router/files/prism-routerd.init" "$D/data/etc/init.d/prism-routerd"
-install -m 644 "$ROOT/prism-router/files/prism-router.config" "$D/data/etc/config/prism-router"
-# 独立面板服务：procd 管理的独立 uhttpd 实例（init）+ 只读 ucode CGI。
-# 静态页面由前端任务放在 prism-router/files/panel/，存在才装（空目录不失败）。
-install -m 755 "$ROOT/prism-router/files/prism-router-panel.init" "$D/data/etc/init.d/prism-router-panel"
-if [ -f "$ROOT/prism-router/files/panel-api.uc" ]; then
-  install -m 755 "$ROOT/prism-router/files/panel-api.uc" \
-    "$D/data/www/prism-router-panel/cgi-bin/panel-api"
-fi
-if [ -d "$ROOT/prism-router/files/panel" ]; then
-  for f in "$ROOT"/prism-router/files/panel/*; do
-    [ -f "$f" ] || continue
-    install -m 644 "$f" "$D/data/www/prism-router-panel/$(basename "$f")"
-  done
-fi
-# openssl-util 是飞书 HMAC-SHA256 与子母节点签名的真实运行时依赖，必须声明；
-# uhttpd 是独立面板服务（prism-router-panel.init）的运行时依赖。
-ctl "$D" prism-router net "ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util, uhttpd" \
-  "Traffic statistics daemon: per-device/per-app usage with proxy-vs-direct split (OpenClash API + conntrack)."
+  "$D/data/www/prism-router-panel" "$D/data/www/prism-router-panel/cgi-bin" \
+  "$D/data/www/luci-static" "$D/data/www/luci-static/resources" \
+  "$D/data/www/luci-static/resources/view" "$D/data/www/luci-static/resources/view/prism-router" \
+  "$D/data/www/luci-static/resources/prism-router"
+
+# 守护进程 / init / 配置
+install -m 755 "$ROOT/luci-app-prism-router/root/usr/bin/prism-routerd"        "$D/data/usr/bin/prism-routerd"
+install -m 755 "$ROOT/luci-app-prism-router/root/etc/init.d/prism-routerd"     "$D/data/etc/init.d/prism-routerd"
+install -m 755 "$ROOT/luci-app-prism-router/root/etc/init.d/prism-router-panel" "$D/data/etc/init.d/prism-router-panel"
+install -m 644 "$ROOT/luci-app-prism-router/root/etc/config/prism-router"      "$D/data/etc/config/prism-router"
+
+# 运行时脚本（cron / push / retention / 飞书）
+for f in "$ROOT"/luci-app-prism-router/root/usr/share/prism-router/*.uc; do
+  [ -f "$f" ] || continue
+  install -m 644 "$f" "$D/data/usr/share/prism-router/$(basename "$f")"
+done
+[ -f "$ROOT/luci-app-prism-router/root/usr/share/prism-router/feishu-test.sh" ] && \
+  install -m 755 "$ROOT/luci-app-prism-router/root/usr/share/prism-router/feishu-test.sh" \
+    "$D/data/usr/share/prism-router/feishu-test.sh"
+
+# rpcd 插件 / ACL / 菜单
+install -m 644 "$ROOT/luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc" \
+  "$D/data/usr/share/rpcd/ucode/prism-router.uc"
+install -m 644 "$ROOT/luci-app-prism-router/root/usr/share/rpcd/acl.d/luci-app-prism-router.json" \
+  "$D/data/usr/share/rpcd/acl.d/luci-app-prism-router.json"
+install -m 644 "$ROOT/luci-app-prism-router/root/usr/share/luci/menu.d/luci-app-prism-router.json" \
+  "$D/data/usr/share/luci/menu.d/luci-app-prism-router.json"
+
+# CGI（接收子节点 / AP 上报、Prometheus 指标）
+install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-ingest"   "$D/data/www/cgi-bin/prism-router-ingest"
+install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-stations" "$D/data/www/cgi-bin/prism-router-stations"
+install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-metrics"  "$D/data/www/cgi-bin/prism-router-metrics"
+
+# 独立面板（默认关闭；同一插件内的可选视图）
+install -m 755 "$ROOT/luci-app-prism-router/root/www/prism-router-panel/cgi-bin/panel-api" \
+  "$D/data/www/prism-router-panel/cgi-bin/panel-api"
+for f in "$ROOT"/luci-app-prism-router/root/www/prism-router-panel/*.html \
+         "$ROOT"/luci-app-prism-router/root/www/prism-router-panel/*.css \
+         "$ROOT"/luci-app-prism-router/root/www/prism-router-panel/*.js; do
+  [ -f "$f" ] || continue
+  install -m 644 "$f" "$D/data/www/prism-router-panel/$(basename "$f")"
+done
+
+# LuCI 页面与 PWA 资源
+for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/view/prism-router/*.js; do
+  [ -f "$f" ] || continue
+  install -m 644 "$f" "$D/data/www/luci-static/resources/view/prism-router/$(basename "$f")"
+done
+for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/prism-router/*; do
+  [ -f "$f" ] || continue
+  install -m 644 "$f" "$D/data/www/luci-static/resources/prism-router/$(basename "$f")"
+done
+
+ctl "$D" luci-app-prism-router luci \
+  "luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util, uhttpd" \
+  "PRISM Router single-package plugin: usage accounting daemon, LuCI pages, diagnostics and optional standalone panel."
 printf '/etc/config/prism-router\n' > "$D/control/conffiles"; chmod 644 "$D/control/conffiles"
-# 独立面板默认关闭：postinst 只跟随 panel.enabled 决定是否开机自启，绝不强制启动。
 hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
   'if [ -f /etc/config/traffic-stats ]; then cp -p /etc/config/traffic-stats /etc/config/prism-router 2>/dev/null; if ! uci -q get prism-router.panel.enabled >/dev/null 2>&1; then uci -q set prism-router.panel=panel; uci -q set prism-router.panel.enabled='"'"'0'"'"'; uci -q set prism-router.panel.port='"'"'8099'"'"'; uci -q set prism-router.panel.bind='"'"''"'"'; uci -q set prism-router.panel.token='"'"''"'"'; uci -q commit prism-router; fi; fi' \
   'if [ -d /etc/traffic-stats ]; then mkdir -p /etc/prism-router; cp -a /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null || cp -r /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null; fi' \
@@ -165,6 +187,8 @@ hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
   '/etc/init.d/prism-routerd enable >/dev/null 2>&1' \
   '/etc/init.d/prism-routerd restart >/dev/null 2>&1' \
   'if [ "$(uci -q get prism-router.panel.enabled)" = "1" ]; then /etc/init.d/prism-router-panel enable >/dev/null 2>&1; else /etc/init.d/prism-router-panel disable >/dev/null 2>&1; fi' \
+  'rm -f /tmp/luci-indexcache* 2>/dev/null' \
+  '/etc/init.d/rpcd reload >/dev/null 2>&1' \
   'exit 0'
 install -m 755 "$W/_h" "$D/control/postinst"
 hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
@@ -174,40 +198,6 @@ hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
   '/etc/init.d/prism-routerd disable >/dev/null 2>&1' \
   'exit 0'
 install -m 755 "$W/_h" "$D/control/prerm"
-pack "$D" "prism-router_${VER}-${REL}_all"
-
-# ================= luci-app-prism-router =================
-D="$W/luci"; mkdir -p "$D/data/www/luci-static/resources/view/prism-router" \
-  "$D/data/www/luci-static/resources/prism-router" \
-  "$D/data/usr/share/luci/menu.d" "$D/data/usr/share/rpcd/acl.d" "$D/data/usr/share/rpcd/ucode" "$D/control"
-chmod 755 "$D" "$D/control" "$D/data" "$D/data/www" \
-  "$D/data/www/luci-static" "$D/data/www/luci-static/resources" \
-  "$D/data/www/luci-static/resources/view" "$D/data/www/luci-static/resources/view/prism-router" \
-  "$D/data/www/luci-static/resources/prism-router" \
-  "$D/data/usr" "$D/data/usr/share" "$D/data/usr/share/luci" "$D/data/usr/share/luci/menu.d" \
-  "$D/data/usr/share/rpcd" "$D/data/usr/share/rpcd/acl.d" "$D/data/usr/share/rpcd/ucode"
-for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/view/prism-router/*.js; do
-  [ -f "$f" ] || continue
-  install -m 644 "$f" "$D/data/www/luci-static/resources/view/prism-router/$(basename "$f")"
-done
-# PWA 资源（manifest + 主屏图标 + 应用类别表）
-for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/prism-router/*; do
-  [ -f "$f" ] || continue
-  install -m 644 "$f" "$D/data/www/luci-static/resources/prism-router/$(basename "$f")"
-done
-# root/ 整树安装，与 luci.mk 的行为一致：未来新增的 menu/acl/rpcd ucode 插件
-# （例如安全 agent 的 prism-router-node-auth.uc）放进来就自动进包，不会漏。
-# 源文件常被 0600/0700 的 umask 创建，这里按“可执行→755、其余→644”归一。
-while IFS= read -r f; do
-  rel="${f#"$ROOT/luci-app-prism-router/root/"}"
-  if [ -x "$f" ]; then m=755; else m=644; fi
-  install -D -m "$m" "$f" "$D/data/$rel"
-done < <(find "$ROOT/luci-app-prism-router/root" -type f | LC_ALL=C sort)
-# 内置 SVG 不需要 luci-lib-chartjs；curl / openssl-util 是飞书 RPC 的真实依赖。
-ctl "$D" luci-app-prism-router luci "luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, curl, openssl-util, prism-router" \
-  "LuCI pages for traffic statistics (overview / devices / apps / settings). Conffile: /etc/config/prism-router (owned by prism-router)."
-hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' 'rm -f /tmp/luci-indexcache* 2>/dev/null' '/etc/init.d/rpcd reload >/dev/null 2>&1' 'exit 0'
-install -m 755 "$W/_h" "$D/control/postinst"
 pack "$D" "luci-app-prism-router_${VER}-${REL}_all"
 
 # ================= 发布校验和 =================

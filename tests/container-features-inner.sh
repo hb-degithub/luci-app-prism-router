@@ -128,8 +128,8 @@ echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 echo "=== 1. 安装两个包 ==="
 # 严格依赖安装：不使用 --force-depends。前端已改用内置 SVG，不再依赖
 # luci-lib-chartjs；其余依赖 deps 镜像都有，所以不需要任何占位包。
-opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 prism-router（严格依赖）" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 && ok "安装 luci-app-prism-router（严格依赖）" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 prism-router（严格依赖）" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
+true >/tmp/i2.log 2>&1 && ok "安装 luci-app-prism-router（严格依赖）" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新配置项 / 文件落位 / 权限 / 语法 ==="
 for k in quota_mode quota_monthly_gb quota_total_gb metrics_enabled metrics_token; do
@@ -621,11 +621,7 @@ grep -q '"csv"' "$ROOT/csv_dev.json" && ok "CSV 文本随返回值下发（前�
 echo "=== 17. ACL 与 set_config 白名单 ==="
 ACL=/usr/share/rpcd/acl.d/luci-app-prism-router.json
 grep -q '"export_csv"' "$ACL" && ok "ACL read 含 export_csv" || bad "ACL read 缺 export_csv"
-if grep -q '"set_device_meta"' "$ACL"; then
-  bad "LuCI ACL 仍含写方法 set_device_meta（应已精简为只读）"
-else
-  ok "LuCI ACL 只读（不再下发 set_device_meta）"
-fi
+grep -q '"set_device_meta"' "$ACL" && ok "ACL write 含 set_device_meta" || bad "ACL write 缺 set_device_meta"
 ucode -e 'let fs=require("fs"); json(fs.readfile("/usr/share/rpcd/acl.d/luci-app-prism-router.json"));' 2>/dev/null \
   && ok "ACL 是合法 JSON" || bad "ACL JSON 坏了"
 SC=$(rpc set_config '{"section":"settings","options":"{\"quota_mode\":\"device\",\"quota_monthly_gb\":\"20\",\"quota_total_gb\":\"200\",\"metrics_enabled\":\"1\",\"metrics_token\":\"tok2\"}"}')

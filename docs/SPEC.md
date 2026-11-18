@@ -935,10 +935,11 @@ config panel 'panel'
 
 
 
-## LuCI 只读化
+## 单包插件形态
 
-- 菜单：`overview / devices / apps / nodes / mobile / diagnostics`（不含 settings 与内嵌 panel）。
-- ACL：只保留 `luci-app-prism-router` 只读组；管理组 `luci-app-prism-router-admin` 已移除，
-  写方法（set_config / set_device_meta / restart / test_feishu / feishu_chats）不再暴露给 LuCI。
-- 设备页编辑入口：`isAdmin()` 仅按 ACL 判断（管理组不存在即隐藏）。
-- 独立控制台：`http://<LAN>:8099/`，由 `prism-router-panel` 提供，只读 API 见「独立面板服务」。
+- 唯一包 `luci-app-prism-router` 同时安装守护进程、rpcd 插件、ACL、菜单、LuCI 页面、
+  CGI 与独立面板；不再拆分为 daemon 包 + LuCI 包。
+- 菜单含完整页面：overview / devices / apps / nodes / settings / mobile / diagnostics / panel。
+- ACL 两组：只读组 + 管理组（`luci-app-prism-router-admin`，含 UCI 与写方法）。
+- 独立面板（`prism-router-panel`，默认关闭）：同一插件自带的可选视图，端口 8099，
+  API 只读白名单 + token；与 LuCI 共用同一份 `/etc/config/prism-router`。

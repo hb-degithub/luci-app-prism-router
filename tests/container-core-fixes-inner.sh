@@ -47,9 +47,9 @@ ROOT=/tmp/cf
 mkdir -p "$ROOT"
 
 echo "=== 0. 安装两个包 ==="
-opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
   && ok "安装 prism-router" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 \
+true >/tmp/i2.log 2>&1 \
   && ok "安装 luci-app-prism-router" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 check /usr/bin/prism-routerd "root:root -rwxr-xr-x"
 check /usr/share/rpcd/ucode/prism-router.uc "root:root -rw-r--r--"

@@ -35,10 +35,8 @@ echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 # 前端已统一使用内置 SVG，无需 luci-lib-chartjs；严格按声明依赖安装。
 echo "=== 1. 严格依赖安装（无 --force-depends）==="
-opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/rel-i1.log 2>&1 \
-  && ok "prism-router 安装成功" || { bad "prism-router 安装失败"; tail -8 /tmp/rel-i1.log; }
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/rel-i2.log 2>&1 \
-  && ok "luci-app-prism-router 安装成功" || { bad "luci-app 安装失败"; tail -8 /tmp/rel-i2.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/rel-i1.log 2>&1 \
+  && ok "单包插件安装成功（daemon + LuCI + CGI 同包）" || { bad "单包安装失败"; tail -8 /tmp/rel-i1.log; }
 
 echo "=== 2. 系统目录权限未被改动 ==="
 [ "$B_ETC" = "$(perm /etc)" ] && ok "/etc 未变" || bad "/etc 被改动"
@@ -87,7 +85,6 @@ check_opkg_files() { # $1=包名
     esac
   done < "/tmp/files-$pkg.txt"
 }
-check_opkg_files prism-router
 check_opkg_files luci-app-prism-router
 
 for f in /usr/bin/prism-routerd /usr/share/prism-router/*.uc /usr/share/rpcd/ucode/*.uc \
@@ -113,24 +110,29 @@ while IFS='|' read -r dst src; do
   [ -n "$dst" ] || continue
   same_file "$dst" "/src/repo/$src"
 done <<'PAYLOAD'
-/usr/bin/prism-routerd|prism-router/files/prism-routerd.uc
-/etc/init.d/prism-routerd|prism-router/files/prism-routerd.init
-/etc/config/prism-router|prism-router/files/prism-router.config
-/usr/share/prism-router/feishu.uc|prism-router/files/feishu.uc
-/usr/share/prism-router/feishu-test.sh|prism-router/files/feishu-test.sh
-/usr/share/prism-router/retention.uc|prism-router/files/retention.uc
-/usr/share/prism-router/push.uc|prism-router/files/push.uc
-/usr/share/prism-router/stations.uc|prism-router/files/stations.uc
-/www/cgi-bin/prism-router-ingest|prism-router/files/ingest.uc
-/www/cgi-bin/prism-router-stations|prism-router/files/ingest-stations.uc
-/www/cgi-bin/prism-router-metrics|prism-router/files/prism-router-metrics.uc
+/usr/bin/prism-routerd|luci-app-prism-router/root/usr/bin/prism-routerd
+/etc/init.d/prism-routerd|luci-app-prism-router/root/etc/init.d/prism-routerd
+/etc/init.d/prism-router-panel|luci-app-prism-router/root/etc/init.d/prism-router-panel
+/etc/config/prism-router|luci-app-prism-router/root/etc/config/prism-router
+/usr/share/prism-router/feishu.uc|luci-app-prism-router/root/usr/share/prism-router/feishu.uc
+/usr/share/prism-router/feishu-test.sh|luci-app-prism-router/root/usr/share/prism-router/feishu-test.sh
+/usr/share/prism-router/retention.uc|luci-app-prism-router/root/usr/share/prism-router/retention.uc
+/usr/share/prism-router/push.uc|luci-app-prism-router/root/usr/share/prism-router/push.uc
+/usr/share/prism-router/stations.uc|luci-app-prism-router/root/usr/share/prism-router/stations.uc
+/www/cgi-bin/prism-router-ingest|luci-app-prism-router/root/www/cgi-bin/prism-router-ingest
+/www/cgi-bin/prism-router-stations|luci-app-prism-router/root/www/cgi-bin/prism-router-stations
+/www/cgi-bin/prism-router-metrics|luci-app-prism-router/root/www/cgi-bin/prism-router-metrics
+/www/prism-router-panel/index.html|luci-app-prism-router/root/www/prism-router-panel/index.html
+/www/prism-router-panel/app.js|luci-app-prism-router/root/www/prism-router-panel/app.js
+/www/prism-router-panel/style.css|luci-app-prism-router/root/www/prism-router-panel/style.css
+/www/prism-router-panel/cgi-bin/panel-api|luci-app-prism-router/root/www/prism-router-panel/cgi-bin/panel-api
 /usr/share/rpcd/ucode/prism-router.uc|luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc
 /usr/share/rpcd/acl.d/luci-app-prism-router.json|luci-app-prism-router/root/usr/share/rpcd/acl.d/luci-app-prism-router.json
 /usr/share/luci/menu.d/luci-app-prism-router.json|luci-app-prism-router/root/usr/share/luci/menu.d/luci-app-prism-router.json
 PAYLOAD
-if [ -f /src/repo/prism-router/files/prism-router-node-auth.uc ]; then
+if [ -f /src/repo/luci-app-prism-router/root/usr/share/prism-router/prism-router-node-auth.uc ]; then
   same_file /usr/share/prism-router/prism-router-node-auth.uc \
-    /src/repo/prism-router/files/prism-router-node-auth.uc
+    /src/repo/luci-app-prism-router/root/usr/share/prism-router/prism-router-node-auth.uc
 fi
 
 for f in /src/repo/luci-app-prism-router/htdocs/luci-static/resources/view/prism-router/*.js; do
@@ -151,19 +153,19 @@ for f in /src/repo/luci-app-prism-router/root/usr/share/rpcd/ucode/*.uc; do
 done
 
 echo "=== 5. conffile / 同版本重装（升级覆盖）==="
-grep -qx '/etc/config/prism-router' /usr/lib/opkg/info/prism-router.conffiles 2>/dev/null \
+grep -qx '/etc/config/prism-router' /usr/lib/opkg/info/luci-app-prism-router.conffiles 2>/dev/null \
   && ok "conffiles 声明 /etc/config/prism-router" || bad "conffiles 未声明 /etc/config/prism-router"
 
 printf "\n\toption gate_marker '1'\n" >> /etc/config/prism-router
 rm -f /usr/share/rpcd/ucode/prism-router.uc
 opkg install --force-reinstall /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/re-luci.log 2>&1 \
-  && ok "luci-app 同版本强制重装成功" || { bad "luci-app 重装失败"; tail -8 /tmp/re-luci.log; }
+  && ok "同版本强制重装成功（恢复 rpcd 插件）" || { bad "强制重装失败"; tail -8 /tmp/re-luci.log; }
 same_file /usr/share/rpcd/ucode/prism-router.uc \
   /src/repo/luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc
 
 rm -f /usr/bin/prism-routerd
-opkg install --force-reinstall /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/re-daemon.log 2>&1 \
-  && ok "prism-router 同版本强制重装成功" || { bad "prism-router 重装失败"; tail -8 /tmp/re-daemon.log; }
+opkg install --force-reinstall /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/re-daemon.log 2>&1 \
+  && ok "同版本强制重装成功（恢复 daemon）" || { bad "强制重装失败"; tail -8 /tmp/re-daemon.log; }
 [ -f /usr/bin/prism-routerd ] && ok "重装恢复 /usr/bin/prism-routerd" || bad "重装未恢复 /usr/bin/prism-routerd"
 if grep -q "gate_marker" /etc/config/prism-router; then
   ok "重装保留用户修改的 conffile"
@@ -174,11 +176,8 @@ fi
 
 echo "=== 6. 卸载完整清单 ==="
 opkg files luci-app-prism-router 2>/dev/null | tail -n +2 > /tmp/rm-luci-files.txt
-opkg files prism-router 2>/dev/null | tail -n +2 > /tmp/rm-daemon-files.txt
 opkg remove luci-app-prism-router >/tmp/rm-luci.log 2>&1 \
   && ok "卸载 luci-app-prism-router 成功" || { bad "卸载 luci-app 失败"; tail -8 /tmp/rm-luci.log; }
-opkg remove prism-router >/tmp/rm-daemon.log 2>&1 \
-  && ok "卸载 prism-router 成功" || { bad "卸载 prism-router 失败"; tail -8 /tmp/rm-daemon.log; }
 
 leftover=0
 while IFS= read -r f; do
@@ -186,11 +185,6 @@ while IFS= read -r f; do
   [ "$f" = "/etc/config/prism-router" ] && continue
   if [ -e "$f" ]; then bad "卸载残留 $f"; leftover=$((leftover+1)); fi
 done < /tmp/rm-luci-files.txt
-while IFS= read -r f; do
-  [ -n "$f" ] || continue
-  [ "$f" = "/etc/config/prism-router" ] && continue
-  if [ -e "$f" ]; then bad "卸载残留 $f"; leftover=$((leftover+1)); fi
-done < /tmp/rm-daemon-files.txt
 [ "$leftover" = 0 ] && ok "卸载清单内文件全部移除（conffile 按规则保留）"
 [ -f /etc/config/prism-router ] && grep -q "gate_marker" /etc/config/prism-router \
   && ok "conffile 在卸载后保留（用户修改）" || bad "conffile 未按预期保留"
@@ -199,7 +193,6 @@ for f in /usr/bin/prism-routerd /etc/init.d/prism-routerd /www/cgi-bin/prism-rou
   [ -e "$f" ] && bad "卸载后仍存在 $f" || ok "已移除 $f"
 done
 if opkg list-installed 2>/dev/null | grep -q '^luci-app-prism-router '; then bad "luci-app 卸载后 opkg 仍认为已安装"; else ok "luci-app 已从 opkg 数据库移除"; fi
-if opkg list-installed 2>/dev/null | grep -q '^prism-router '; then bad "prism-router 卸载后 opkg 仍认为已安装"; else ok "prism-router 已从 opkg 数据库移除"; fi
 
 echo "=== 7. legacy（ar 容器）负例：必须被拒绝 ==="
 for p in /src/legacy/*.legacy.ipk; do

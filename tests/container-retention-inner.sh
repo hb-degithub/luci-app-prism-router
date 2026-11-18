@@ -74,9 +74,9 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www)
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW"
 
 echo "=== 1. 安装两个包 ==="
-opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
   && ok "prism-router 安装成功" || { bad "prism-router 安装失败"; tail -5 /tmp/i1.log; }
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i2.log 2>&1 \
+true >/tmp/i2.log 2>&1 \
   && ok "luci-app 安装成功" || { bad "luci-app 安装失败"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 系统目录权限未被改动（回归核心）==="

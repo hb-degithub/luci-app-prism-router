@@ -43,6 +43,19 @@
 			"path": "prism-router/nodes"
 		}
 	},
+	"admin/services/prism-router/settings": {
+		"title": "设置",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "prism-router/settings"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-prism-router-admin"
+			]
+		}
+	},
 	"admin/services/prism-router/mobile": {
 		"title": "手机版",
 		"order": 50,
@@ -57,6 +70,14 @@
 		"action": {
 			"type": "view",
 			"path": "prism-router/diagnostics"
+		}
+	},
+	"admin/services/prism-router/panel": {
+		"title": "详细面板",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "prism-router/panel"
 		}
 	}
 }

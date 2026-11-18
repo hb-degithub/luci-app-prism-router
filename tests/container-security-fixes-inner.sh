@@ -85,7 +85,7 @@ uci commit prism-router 2>/dev/null
 }
 
 echo "=== 0. 安装包 ==="
-opkg install /src/dist/prism-router_1.0.0-1_all.ipk >/tmp/i.log 2>&1 && ok "安装 prism-router" || { bad "安装失败"; tail -8 /tmp/i.log; }
+opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i.log 2>&1 && ok "安装 prism-router" || { bad "安装失败"; tail -8 /tmp/i.log; }
 for f in /usr/share/prism-router/push.uc /usr/share/prism-router/stations.uc \
          /usr/share/prism-router/feishu.uc /www/cgi-bin/prism-router-ingest \
          /www/cgi-bin/prism-router-stations; do
