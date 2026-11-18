@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.Devices
+import androidx.compose.material.icons.rounded.Hub
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material3.Icon
@@ -52,6 +53,12 @@ fun App(vm: MainViewModel) {
                 NavigationBarItem(
                     selected = tab == 3,
                     onClick = { tab = 3 },
+                    icon = { Icon(Icons.Rounded.Hub, contentDescription = "节点") },
+                    label = { Text("节点") }
+                )
+                NavigationBarItem(
+                    selected = tab == 4,
+                    onClick = { tab = 4 },
                     icon = { Icon(Icons.Rounded.Settings, contentDescription = "设置") },
                     label = { Text("设置") }
                 )
@@ -60,9 +67,10 @@ fun App(vm: MainViewModel) {
     ) { inner ->
         Box(Modifier.padding(inner)) {
             when (tab) {
-                0 -> OverviewScreen(ui) { vm.refresh() }
+                0 -> OverviewScreen(ui, onRefresh = { vm.refresh() }, onOpenDevices = { tab = 1 })
                 1 -> DevicesScreen(ui)
                 2 -> AppsScreen(ui)
+                3 -> NodesScreen(ui)
                 else -> SettingsScreen(
                     ui = ui,
                     onSave = { base, token, interval -> vm.saveSettings(base, token, interval) },
