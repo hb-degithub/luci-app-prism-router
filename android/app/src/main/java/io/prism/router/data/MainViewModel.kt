@@ -7,6 +7,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -102,6 +103,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 val state = client.fetchState(base, token)
+                /* 请求期间用户改了服务器/令牌：丢弃这次旧结果。 */
+                if (ui.baseUrl != base || ui.token != token) return@launch
                 val rxHist = (ui.rxHistory + state.totals.rxRate).takeLast(24)
                 val txHist = (ui.txHistory + state.totals.txRate).takeLast(24)
                 ui = ui.copy(
@@ -117,7 +120,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 /* 成功即覆盖缓存（同时视为清理了上次的离线态）。 */
                 saveCache(state)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
+                if (ui.baseUrl != base || ui.token != token) return@launch
                 val message = e.message ?: "未知错误"
                 val cached = loadCache()
                 val current = ui.state
@@ -151,7 +157,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun refreshHistory(force: Boolean) {
         val now = System.currentTimeMillis()
-        val due = force || ui.historyAt == 0L || now - ui.historyAt > HISTORY_REFRESH_MS
+        /* 正常 5 分钟一次；上一次失败则 1 分钟后重试（不打扰主数据）。 */
+        val refreshMs = if (ui.historyError != null) 60_000L else HISTORY_REFRESH_MS
+        val due = force || ui.historyAt == 0L || now - ui.historyAt > refreshMs
         if (!due) return
         if (historyJob?.isActive == true) return
 
@@ -160,12 +168,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         historyJob = viewModelScope.launch {
             try {
                 val days = client.fetchHistory(base, token, HISTORY_DAYS)
+                if (ui.baseUrl != base || ui.token != token) return@launch
                 ui = ui.copy(
                     history = days,
                     historyAt = System.currentTimeMillis(),
                     historyError = null
                 )
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
+                if (ui.baseUrl != base || ui.token != token) return@launch
                 /* 历史失败不影响主数据：保留上一次成功的曲线，只记下原因。 */
                 ui = ui.copy(
                     historyAt = System.currentTimeMillis(),
