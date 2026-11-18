@@ -222,3 +222,21 @@ node tests/mobile-ui-static.js          # 手机版 App 界面（分页/分类/�
 | `docs/AP-ROLE.md` | 为什么哑桥 AP 不参与字节统计 |
 | `docs/CALIBRATION.md` | 真机标定手册（offload 与精度取舍） |
 | `docs/research-*.md` | 六份调研（采集点、归因路线、飞书接口、打包、业界实践、L2 计数） |
+
+
+## 飞书机器人（两种方式）
+
+- **自定义机器人（默认）**：群里添加机器人，把 webhook 与签名 secret 填进设置页。
+- **应用机器人 · 扫码绑定**：适合多群/换群，不需要复制 webhook。
+
+扫码绑定的准备（飞书开放平台，一次性）：
+
+1. 创建企业自建应用，记下 App ID / App Secret；
+2. 添加应用能力「机器人」；
+3. 安全设置 → 重定向 URL：`https://<路由器LAN>/cgi-bin/prism-router-feishu?action=callback`
+   （若未强制 HTTPS 则用 http）；
+4. 权限：`im:message:send_as_bot`、`im:chat:readonly`，然后创建版本并发布；
+5. 设置页「发送方式」选「应用机器人（扫码绑定）」→ 填 App ID/Secret →
+   点「生成绑定二维码」→ 手机飞书扫码授权 → 选择要绑定的群 → 保存。
+
+机器人必须先被加入目标群；错误会写进 `/tmp/prism-router/feishu.log`（已脱敏）。

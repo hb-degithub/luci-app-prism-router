@@ -159,8 +159,9 @@ config feishu 'feishu'
 	# ── app 模式：飞书开放平台「企业自建应用」准备步骤 ──────────────────
 	# 1) 开放平台 → 创建企业自建应用，记下 App ID（cli_ 开头）与 App Secret；
 	# 2) 「添加应用能力」→ 开启「机器人」；
-	# 3) 「安全设置」→ 重定向 URL 必须原样填写（回调 CGI 在这个地址上）：
-	#      http://<路由器LAN>/cgi-bin/prism-router-feishu?action=callback
+	# 3) 「安全设置」→ 重定向 URL 必须原样填写（回调 CGI 在这个地址上；
+	#    uhttpd 默认 redirect_https=1，所以通常用 https；未强制 HTTPS 时用 http）：
+	#      https://<路由器LAN>/cgi-bin/prism-router-feishu?action=callback
 	# 4) 「权限管理」→ 开通 im:message:send_as_bot（给群发消息）与 im:chat:readonly
 	#    （读机器人所在群列表；只想用 im:chat 也可以）。改完权限要「创建版本并发布」，
 	#    等审核通过后新权限才生效；
