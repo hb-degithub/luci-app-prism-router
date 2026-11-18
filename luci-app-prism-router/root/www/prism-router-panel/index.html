@@ -282,7 +282,7 @@
       <header class="panel__head">
         <div class="panel__titles">
           <h2 id="settings-title" class="panel__title">设置</h2>
-          <p class="panel__sub">只读展示；修改配置请使用 uci 命令行（后续版本控制台支持写入）</p>
+          <p class="panel__sub">只读展示；家长控制在设备榜操作，其余修改请使用 uci 命令行</p>
         </div>
         <span class="panel__meta" id="settings-meta">只读</span>
       </header>
@@ -290,6 +290,21 @@
     </section>
   </div>
 </main>
+
+<!-- 家长控制确认框：文案全部由 app.js 以 textContent 填充 -->
+<div id="guard-modal" class="modal" hidden>
+  <div id="guard-backdrop" class="modal__backdrop"></div>
+  <div id="guard-dialog" class="modal__panel" role="dialog" aria-modal="true" aria-labelledby="guard-title" aria-describedby="guard-desc" tabindex="-1">
+    <h2 id="guard-title" class="modal__title">暂停该设备上网</h2>
+    <p id="guard-target" class="modal__target"></p>
+    <p id="guard-desc" class="modal__desc"></p>
+    <p id="guard-error" class="modal__error" role="alert" hidden></p>
+    <div class="modal__actions">
+      <button id="guard-cancel" type="button" class="btn">取消</button>
+      <button id="guard-confirm" type="button" class="btn btn--danger">确认暂停</button>
+    </div>
+  </div>
+</div>
 
 <footer class="footer">
   <p>独立面板 · 端口 8099 · 数据源 Clash <code>/connections</code> 与 <code>nf_conntrack</code></p>

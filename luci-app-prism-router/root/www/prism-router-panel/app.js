@@ -13,6 +13,8 @@
 	 * 常量
 	 * ------------------------------------------------------------------ */
 	var API_BASE = '/cgi-bin/panel-api';
+	/* 家长控制写接口：只接受 POST + JSON，令牌放在请求体，绝不进地址栏。 */
+	var CONTROL_BASE = '/cgi-bin/prism-router-control';
 	var TOKEN_KEY = 'prism-router-panel-token';
 	var AUTO_KEY = 'prism-router-panel-autorefresh';
 
@@ -45,6 +47,26 @@
 	var TAB_LOCK_MS = 700;          /* 点击 tab 后锁定高亮，避免平滑滚动途中来回跳 */
 	var TAB_PROBE_GAP = 20;         /* 区块顶部越过顶栏底边多少像素算「当前区块」 */
 	var NET_REFRESH_MIN = 1500;     /* 网络恢复后的刷新去抖 */
+
+	/* 家长控制（暂停 / 恢复设备上网） */
+	var GUARD_DESC = '暂停后该设备的所有转发流量会被丢弃（nftables），恢复后立即生效；规则重启后自动重放。';
+	var GUARD_OFF_HINT = '默认关闭，因此不显示暂停按钮。启用需要在路由器上设置 panel.write_enabled=1 并配置 panel.token，重启面板服务后生效。';
+	var GUARD_NO_TOKEN_HINT = '家长控制已开启，但面板未设置令牌：请先在 UCI 里设置 prism-router 的 panel.token 并重启面板服务，之后才能暂停设备。';
+	var GUARD_UNAVAILABLE_HINT = '暂时读不到家长控制开关（设置接口不可用），因此不显示暂停按钮。';
+	var GUARD_LOADING_HINT = '正在读取家长控制开关…';
+	var GUARD_TOKEN_PROMPT = '暂停 / 恢复设备上网需要面板访问令牌。令牌只保存在本机浏览器中，不会出现在地址栏里。';
+
+	/* 失败提示一律走白名单文案：不回显服务端原始响应。 */
+	var GUARD_ERR_TEXT = {
+		write_disabled: '家长控制未开启（面板已禁用写操作），暂时不能执行该操作。',
+		forbidden: '令牌无效或没有权限执行该操作。',
+		protected_target: '出于安全考虑，路由器自身与网关设备不能被暂停。',
+		bad_request: '设备地址无效，无法执行该操作。',
+		internal: '路由器执行失败，请稍后重试。',
+		network: '无法连接到面板服务，请检查网络后重试。',
+		timeout: '请求超时：路由器没有在预期时间内响应。',
+		unknown: '操作失败，请稍后重试。'
+	};
 
 	var CONFIDENCE = {
 		exact: { label: '精确', cls: 'pill--ok' },
@@ -81,7 +103,18 @@
 		expanded: {},
 		manual: false,
 		offlineSeen: false,     /* 是否已经因为断网提示过（用于恢复后只刷新一次） */
-		lastRecoverAt: 0
+		lastRecoverAt: 0,
+		tokenPrompt: '',        /* 非 401 原因要求输入令牌时的说明（复用令牌面板） */
+		guard: {
+			paused: {},         /* 归一化 MAC -> handle */
+			listBusy: false,
+			listAt: 0,
+			listError: null,
+			busyMac: '',
+			target: null,       /* 待确认 {mac, name, isPaused} */
+			error: '',          /* 确认框内展示的错误码 */
+			pending: null       /* 缺令牌时暂存的动作，保存令牌后继续确认 */
+		}
 	};
 
 	var dom = {};
@@ -341,6 +374,175 @@
 	/* /what=settings 的只读投影（只含非敏感项，写操作恒为未开放）。 */
 	function fetchSettings() {
 		return requestJson(apiUrl('settings'));
+	}
+
+	/* ------------------------------------------------------------------ *
+	 * 家长控制：能力判定 / 暂停集合 / 写请求
+	 * ------------------------------------------------------------------ */
+	function truthyFlag(v) {
+		if (v === true || v === 1) return true;
+		var s = str(v).trim().toLowerCase();
+		return s === '1' || s === 'true' || s === 'on' || s === 'yes' || s === 'enabled';
+	}
+
+	function guardPanelCfg() {
+		var data = app.settings;
+		var panel = (data && data.panel && typeof data.panel === 'object') ? data.panel : null;
+		var write = (data && data.write && typeof data.write === 'object') ? data.write : null;
+		if (!panel && app.state && app.state.panel && typeof app.state.panel === 'object') {
+			panel = app.state.panel;   /* 兼容：某些版本把面板信息挂在 state 上 */
+		}
+		return { panel: panel || {}, write: write || {} };
+	}
+
+	/* 契约：只有 panel.write_enabled=1 且 panel.token 非空时写接口可用。
+	   只读投影不回传令牌原值，因此用 has_token 判断「已设令牌」。 */
+	function guardStatus() {
+		var cfg = guardPanelCfg();
+		var panel = cfg.panel;
+		var writeEnabled = truthyFlag(panel.write_enabled);
+		/* 兼容：仅当没有 write_enabled 字段时才参考 write.enabled */
+		if (panel.write_enabled === undefined && cfg.write.enabled === true) writeEnabled = true;
+		var hasToken = truthyFlag(panel.has_token) || truthyFlag(panel.token_set) ||
+			(typeof panel.token === 'string' && panel.token.length > 0);
+		var ready = !!(app.settings || (app.state && app.state.panel));
+
+		if (!ready) {
+			return {
+				key: app.settingsError ? 'unavailable' : 'loading',
+				enabled: false, writeEnabled: false, hasToken: false
+			};
+		}
+		if (!writeEnabled) {
+			return { key: 'off', enabled: false, writeEnabled: false, hasToken: hasToken };
+		}
+		if (!hasToken) {
+			return { key: 'notoken', enabled: false, writeEnabled: true, hasToken: false };
+		}
+		return { key: 'on', enabled: true, writeEnabled: true, hasToken: true };
+	}
+
+	function guardEnabled() {
+		return guardStatus().enabled;
+	}
+
+	var MAC_RE = /^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$/;
+
+	/* 归一化 MAC：大小写、'-' 与 ':' 差异都抹平；非法值返回空串（不写入对象键）。 */
+	function normMac(v) {
+		var s = str(v).trim().toLowerCase().replace(/-/g, ':');
+		return MAC_RE.test(s) ? s : '';
+	}
+
+	function isPaused(mac) {
+		var key = normMac(mac);
+		return !!key && Object.prototype.hasOwnProperty.call(app.guard.paused, key);
+	}
+
+	function setPaused(mac, on) {
+		var key = normMac(mac);
+		if (!key) return;
+		if (on) app.guard.paused[key] = true;
+		else delete app.guard.paused[key];
+	}
+
+	function applyPaused(list) {
+		var next = {};
+		if (Array.isArray(list)) {
+			list.forEach(function (item) {
+				var raw = (item && typeof item === 'object') ? item.mac : item;
+				var key = normMac(raw);
+				if (key) next[key] = (item && typeof item === 'object') ? str(item.handle) : '';
+			});
+		}
+		app.guard.paused = next;
+	}
+
+	function pausedCount() {
+		return Object.keys(app.guard.paused).length;
+	}
+
+	function guardErrorText(code) {
+		return GUARD_ERR_TEXT[code] || GUARD_ERR_TEXT.unknown;
+	}
+
+	function controlCode(raw) {
+		var s = str(raw).trim().toLowerCase();
+		if (s === 'write_disabled' || s === 'forbidden' || s === 'protected_target' ||
+			s === 'bad_request' || s === 'internal') {
+			return s;
+		}
+		return 'internal';
+	}
+
+	function controlError(code, status) {
+		return { ctrlError: true, code: code, status: n0(status) };
+	}
+
+	/* 写接口：POST + JSON。令牌只放在 body，永远不出现在 URL。 */
+	function controlPost(payload) {
+		var opts = {
+			method: 'POST',
+			credentials: 'same-origin',
+			cache: 'no-store',
+			referrerPolicy: 'no-referrer',
+			headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+			body: JSON.stringify(payload)
+		};
+		var ctrl = null;
+		var timer = 0;
+
+		if (typeof window.AbortController === 'function') {
+			ctrl = new window.AbortController();
+			opts.signal = ctrl.signal;
+			timer = window.setTimeout(function () {
+				try { ctrl.abort(); } catch (e) { /* 忽略 */ }
+			}, REQUEST_TIMEOUT);
+		}
+
+		return window.fetch(CONTROL_BASE, opts).then(function (res) {
+			return res.text().then(function (text) {
+				var data = null;
+				if (text) {
+					try { data = JSON.parse(text); } catch (e) { data = null; }
+				}
+				if (data && typeof data === 'object' && typeof data.error === 'string') {
+					throw controlError(controlCode(data.error), res.status);
+				}
+				if (res.status === 401 || res.status === 403) throw controlError('forbidden', res.status);
+				if (!res.ok) throw controlError('internal', res.status);
+				if (!data || typeof data !== 'object' || data.ok !== true) {
+					throw controlError('internal', res.status);
+				}
+				return data;
+			});
+		}).then(function (data) {
+			if (timer) window.clearTimeout(timer);
+			return data;
+		}, function (err) {
+			if (timer) window.clearTimeout(timer);
+			if (err && err.ctrlError) throw err;
+			var timeout = err && err.name === 'AbortError';
+			throw controlError(timeout ? 'timeout' : 'network', 0);
+		});
+	}
+
+	/* 每次加载 state 时同步暂停集合：失败静默，绝不阻塞主流程。 */
+	function syncPaused() {
+		if (app.guard.listBusy) return;
+		if (!guardEnabled() || !app.token) return;
+
+		app.guard.listBusy = true;
+		controlPost({ token: app.token, action: 'list' }).then(function (data) {
+			applyPaused(data ? data.paused : null);
+			app.guard.listAt = Date.now();
+			app.guard.listError = null;
+		}, function (err) {
+			app.guard.listError = (err && err.code) ? err.code : 'internal';
+		}).then(function () {
+			app.guard.listBusy = false;
+			paintGuardButtons();
+		});
 	}
 
 	/* ------------------------------------------------------------------ *
@@ -949,6 +1151,16 @@
 			btn.setAttribute('aria-label', (expanded ? '收起 ' : '展开 ') + name + ' 的应用明细');
 			btn.setAttribute('data-name', name);
 			btn.appendChild(el('span', 'caret', '▶'));
+
+			/* 家长控制：仅开关开启且设备有 MAC 时提供暂停 / 恢复入口 */
+			if (guardEnabled() && normMac(dev.mac)) {
+				var guardBtn = el('button', 'btn btn--small guard-btn');
+				guardBtn.type = 'button';
+				setGuardButton(guardBtn, name, str(dev.mac), isPaused(dev.mac));
+				guardBtn.addEventListener('click', onGuardClick);
+				nameWrap.appendChild(guardBtn);
+			}
+
 			nameWrap.appendChild(btn);
 			nameCell.appendChild(nameWrap);
 			row.appendChild(nameCell);
@@ -984,6 +1196,262 @@
 			detailCell.appendChild(buildDeviceDetail(dev));
 			detailRow.appendChild(detailCell);
 			body.appendChild(detailRow);
+		});
+	}
+
+	/* ------------------------------------------------------------------ *
+	 * 家长控制 UI：设备行按钮 / 设置区状态 / 确认框
+	 * 说明：设备行按钮只改自身文案与 aria 状态，不重建表格。
+	 * ------------------------------------------------------------------ */
+	var guardModalLastFocus = null;
+
+	function guardStatusMeta() {
+		var status = guardStatus();
+		if (status.key === 'on') return { text: '已开启', cls: 'guard__status--on' };
+		if (status.key === 'notoken') return { text: '已开启但未设令牌', cls: 'guard__status--warn' };
+		if (status.key === 'off') return { text: '未开启', cls: 'guard__status--off' };
+		if (status.key === 'unavailable') return { text: '状态不可用', cls: 'guard__status--off' };
+		return { text: '正在读取…', cls: 'guard__status--off' };
+	}
+
+	function guardMetaText() {
+		var count = pausedCount();
+		if (!count) return '当前没有设备被暂停 · 每次加载自动同步暂停列表';
+		return '已暂停 ' + count + ' 台设备 · 每次加载自动同步暂停列表';
+	}
+
+	function setGuardButton(btn, name, mac, paused) {
+		if (!btn) return;
+		var displayName = name || '该设备';
+		var busy = !!app.guard.busyMac && normMac(app.guard.busyMac) === normMac(mac);
+		var label = (paused ? '恢复 ' : '暂停 ') + displayName + ' 的上网';
+
+		setText(btn, busy ? '处理中…' : (paused ? '恢复' : '暂停'));
+		btn.disabled = busy;
+		if (busy) btn.setAttribute('aria-busy', 'true');
+		else btn.removeAttribute('aria-busy');
+		btn.setAttribute('aria-pressed', paused ? 'true' : 'false');
+		btn.setAttribute('aria-label', label);
+		btn.setAttribute('data-name', displayName);
+		btn.setAttribute('data-mac', mac);
+		btn.title = label;
+		if (paused) btn.classList.add('is-paused');
+		else btn.classList.remove('is-paused');
+	}
+
+	/* list 回来或动作完成后，只就地刷新按钮，不整页重建。 */
+	function paintGuardButtons() {
+		if (dom.devicesBody) {
+			var btns = dom.devicesBody.querySelectorAll('.guard-btn');
+			for (var i = 0; i < btns.length; i++) {
+				var mac = btns[i].getAttribute('data-mac') || '';
+				setGuardButton(btns[i], btns[i].getAttribute('data-name') || '该设备', mac, isPaused(mac));
+			}
+		}
+		paintGuardMeta();
+	}
+
+	function paintGuardMeta() {
+		if (!dom.settingsBody) return;
+		var meta = dom.settingsBody.querySelector('.guard__meta');
+		if (meta) setText(meta, guardMetaText());
+	}
+
+	function guardSettingsGroup() {
+		var status = guardStatus();
+		var metaState = guardStatusMeta();
+
+		var group = el('div', 'settings__group');
+		group.appendChild(el('h3', 'settings__group-title', '家长控制'));
+
+		var box = el('div', 'guard');
+
+		var head = el('div', 'guard__head');
+		head.appendChild(el('span', 'guard__label', '当前状态'));
+		head.appendChild(el('span', 'guard__status ' + metaState.cls, metaState.text));
+		box.appendChild(head);
+
+		box.appendChild(el('p', 'guard__desc', GUARD_DESC));
+
+		if (status.key === 'on') {
+			box.appendChild(el('p', 'guard__meta', guardMetaText()));
+			box.appendChild(el('p', 'guard__hint',
+				'在设备榜的每台设备右侧点「暂停」即可切断它的转发流量；已暂停的设备显示「恢复」。'));
+		} else {
+			var hint = el('p', 'guard__note');
+			if (status.key === 'notoken') hint.textContent = GUARD_NO_TOKEN_HINT;
+			else if (status.key === 'off') hint.textContent = GUARD_OFF_HINT;
+			else if (status.key === 'unavailable') hint.textContent = GUARD_UNAVAILABLE_HINT;
+			else hint.textContent = GUARD_LOADING_HINT;
+			box.appendChild(hint);
+		}
+
+		group.appendChild(box);
+		return group;
+	}
+
+	/* ---- 确认框 ---- */
+	function paintGuardModal() {
+		var target = app.guard.target;
+		if (!target || !dom.guardModal) return;
+
+		setText(dom.guardTitle, target.isPaused ? '恢复该设备上网' : '暂停该设备上网');
+		if (dom.guardTarget) {
+			clear(dom.guardTarget);
+			dom.guardTarget.appendChild(el('span', 'modal__name', target.name || '该设备'));
+			if (str(target.mac)) dom.guardTarget.appendChild(el('span', 'modal__mac', str(target.mac)));
+		}
+		setText(dom.guardDesc, GUARD_DESC);
+
+		var busy = !!app.guard.busyMac;
+		var hasErr = !!app.guard.error;
+		if (dom.guardError) {
+			dom.guardError.hidden = !hasErr;
+			setText(dom.guardError, hasErr ? guardErrorText(app.guard.error) : '');
+		}
+		if (dom.guardConfirm) {
+			setText(dom.guardConfirm, busy ? '处理中…' : (target.isPaused ? '确认恢复' : '确认暂停'));
+			dom.guardConfirm.disabled = busy;
+			dom.guardConfirm.setAttribute('aria-busy', busy ? 'true' : 'false');
+		}
+		if (dom.guardCancel) dom.guardCancel.disabled = busy;
+	}
+
+	function onGuardModalKey(ev) {
+		if (!dom.guardModal || dom.guardModal.hidden) return;
+
+		if (ev.key === 'Escape' || ev.key === 'Esc') {
+			ev.preventDefault();
+			if (!app.guard.busyMac) closeGuardModal();
+			return;
+		}
+		if (ev.key !== 'Tab') return;
+
+		var items = [];
+		if (dom.guardCancel && !dom.guardCancel.disabled) items.push(dom.guardCancel);
+		if (dom.guardConfirm && !dom.guardConfirm.disabled) items.push(dom.guardConfirm);
+		if (!items.length) return;
+
+		var first = items[0];
+		var last = items[items.length - 1];
+		if (ev.shiftKey && document.activeElement === first) {
+			ev.preventDefault();
+			try { last.focus(); } catch (e) { /* 忽略 */ }
+		} else if (!ev.shiftKey && document.activeElement === last) {
+			ev.preventDefault();
+			try { first.focus(); } catch (e) { /* 忽略 */ }
+		}
+	}
+
+	function openGuardModal(target) {
+		if (!dom.guardModal || !target) return;
+		app.guard.target = target;
+		app.guard.error = '';
+		guardModalLastFocus = document.activeElement;
+
+		paintGuardModal();
+		dom.guardModal.hidden = false;
+		document.body.classList.add('is-modal-open');
+		document.addEventListener('keydown', onGuardModalKey, true);
+		try { dom.guardCancel.focus(); } catch (e) { /* 忽略 */ }
+		announce((target.isPaused ? '恢复 ' : '暂停 ') + (target.name || '该设备') + '上网，请确认。');
+	}
+
+	function closeGuardModal() {
+		if (!dom.guardModal) return;
+		dom.guardModal.hidden = true;
+		document.body.classList.remove('is-modal-open');
+		document.removeEventListener('keydown', onGuardModalKey, true);
+		app.guard.target = null;
+		app.guard.error = '';
+
+		var back = guardModalLastFocus;
+		guardModalLastFocus = null;
+		if (back && back.focus && document.contains(back)) {
+			try { back.focus(); } catch (e) { /* 忽略 */ }
+		}
+	}
+
+	function showTokenPrompt(text, message) {
+		app.tokenPrompt = text;
+		renderNotices();
+		/* 令牌面板在页面顶部：动作发生在设备榜时把用户带过去，避免以为「按了没反应」。 */
+		scrollToNode(dom.authPanel, 'center');
+		try { if (dom.tokenInput) dom.tokenInput.focus(); } catch (e) { /* 忽略 */ }
+		if (message) announce(message);
+	}
+
+	function requestGuardToken() {
+		showTokenPrompt(GUARD_TOKEN_PROMPT, '需要访问令牌，请先输入令牌。');
+	}
+
+	function onGuardClick(ev) {
+		if (ev) {
+			if (ev.preventDefault) ev.preventDefault();
+			if (ev.stopPropagation) ev.stopPropagation();   /* 不要触发展开 / 收起 */
+		}
+		var node = (ev && ev.currentTarget) ? ev.currentTarget : this;
+		var mac = node ? node.getAttribute('data-mac') || '' : '';
+		var name = node ? node.getAttribute('data-name') || '该设备' : '该设备';
+		if (!mac) return;
+
+		var target = { mac: mac, name: name, isPaused: isPaused(mac) };
+		if (!app.token) {
+			app.guard.pending = target;
+			requestGuardToken();
+			return;
+		}
+		openGuardModal(target);
+	}
+
+	function onGuardConfirm() {
+		var target = app.guard.target;
+		if (!target || app.guard.busyMac) return;
+		if (!app.token) {
+			app.guard.pending = { mac: target.mac, name: target.name, isPaused: target.isPaused };
+			closeGuardModal();
+			requestGuardToken();
+			return;
+		}
+		runGuardAction(target);
+	}
+
+	function runGuardAction(target) {
+		var action = target.isPaused ? 'resume' : 'pause';
+
+		app.guard.busyMac = target.mac;
+		app.guard.error = '';
+		paintGuardModal();
+		paintGuardButtons();
+
+		controlPost({ token: app.token, action: action, mac: target.mac }).then(function (data) {
+			app.guard.busyMac = '';
+			if (Array.isArray(data.paused)) applyPaused(data.paused);
+			else setPaused(target.mac, action === 'pause');
+
+			closeGuardModal();
+			paintGuardButtons();
+			renderSettings();
+			announce((action === 'pause' ? '已暂停 ' : '已恢复 ') + (target.name || '该设备') + '的上网。');
+		}, function (err) {
+			app.guard.busyMac = '';
+			var code = (err && err.code) ? err.code : 'internal';
+
+			/* 令牌被拒绝：复用令牌面板，保存后自动回到这次操作。 */
+			if (code === 'forbidden') {
+				app.guard.pending = { mac: target.mac, name: target.name, isPaused: target.isPaused };
+				closeGuardModal();
+				paintGuardButtons();
+				showTokenPrompt('已保存的令牌被拒绝（HTTP 403）：请重新输入面板令牌，保存后会自动继续这次操作。',
+					'令牌被拒绝，请重新输入。');
+				return;
+			}
+
+			app.guard.error = code;
+			paintGuardModal();
+			paintGuardButtons();
+			announce(guardErrorText(code));
+			if (code === 'write_disabled') loadSettings(true);
 		});
 	}
 
@@ -1636,7 +2104,7 @@
 		var panelCfg = (data.panel && typeof data.panel === 'object') ? data.panel : {};
 		var write = (data.write && typeof data.write === 'object') ? data.write : {};
 
-		setMeta(dom.settingsMeta, '只读');
+		setMeta(dom.settingsMeta, guardEnabled() ? '只读 · 家长控制' : '只读');
 
 		if (write.enabled === false) {
 			var writeBox = el('p', 'settings__write');
@@ -1679,6 +2147,8 @@
 			}
 		]));
 
+		body.appendChild(guardSettingsGroup());
+
 		/* 刷新失败但已有旧数据：保留数据，在底部补一条错误与重试。 */
 		if (app.settingsError) body.appendChild(settingsErrorBox());
 	}
@@ -1686,6 +2156,8 @@
 	function loadSettings(force) {
 		if (app.settingsBusy) return;
 		if (!force && app.settings && (Date.now() - app.settingsAt) < SETTINGS_REFRESH) return;
+
+		var prevGuard = guardStatus().key;
 
 		app.settingsBusy = true;
 		app.settingsError = null;
@@ -1714,6 +2186,11 @@
 		}).then(function () {
 			app.settingsBusy = false;
 			renderSettings();
+
+			/* 家长控制开关变了：设备榜要补上 / 去掉暂停按钮，并同步暂停列表。 */
+			var nextGuard = guardStatus().key;
+			if (nextGuard !== prevGuard) renderDevices();
+			if (nextGuard === 'on') syncPaused();
 		});
 	}
 
@@ -1755,9 +2232,11 @@
 		if (dom.errorBar) dom.errorBar.hidden = !err || suppress;
 		setText(dom.errorText, (!err || suppress) ? '' : errText(err));
 
-		dom.authPanel.hidden = !app.authBlocked;
-		if (app.authBlocked) {
-			setText(dom.authDesc, authMessage());
+		/* 401 与「家长控制缺少令牌」共用同一个令牌面板，说明文案区分来源。 */
+		var showAuth = !!app.authBlocked || !!app.tokenPrompt;
+		dom.authPanel.hidden = !showAuth;
+		if (showAuth) {
+			setText(dom.authDesc, app.tokenPrompt || authMessage());
 			if (app.token && !dom.tokenInput.value) dom.tokenInput.value = app.token;
 			if (!app.authFocused) {
 				app.authFocused = true;
@@ -1835,6 +2314,7 @@
 			app.lastErr = null;
 			app.lastOk = Date.now();
 			recordSample(state);
+			syncPaused();   /* 家长控制：静默同步已暂停集合，失败不影响主流程 */
 
 			/* 节点上报状态只是辅助数据：单独请求，失败不影响主流程。 */
 			var needNodes = manual || !app.nodes || (Date.now() - app.nodesAt) > NODES_REFRESH;
@@ -1938,16 +2418,29 @@
 		storeToken(value);
 		app.authBlocked = false;
 		app.lastErr = null;
+		app.tokenPrompt = '';
+
+		/* 保存令牌后回到刚才被令牌挡住的那次暂停 / 恢复操作（仍需用户确认）。 */
+		var pending = app.guard.pending;
+		app.guard.pending = null;
+
 		renderNotices();
 		announce('已保存令牌，正在重试。');
 		load(true);
+		syncPaused();
+		if (pending) openGuardModal(pending);
 	}
 
 	function onTokenClear() {
 		app.token = '';
 		storeToken('');
+		app.tokenPrompt = '';
+		app.guard.pending = null;
+		app.guard.paused = {};
 		setText(dom.authHint, '已清除本机保存的令牌。');
 		if (dom.tokenInput) dom.tokenInput.value = '';
+		renderNotices();
+		paintGuardButtons();
 		load(true);
 	}
 
@@ -1970,7 +2463,18 @@
 		return null;
 	}
 
+	function closestClass(node, cls) {
+		var current = node;
+		while (current && current.nodeType === 1) {
+			if (current.classList && current.classList.contains(cls)) return current;
+			current = current.parentNode;
+		}
+		return null;
+	}
+
 	function onDevicesClick(ev) {
+		/* 暂停 / 恢复按钮有自己的确认流程，不要连带展开设备明细。 */
+		if (ev.target && closestClass(ev.target, 'guard-btn')) return;
 		var row = closestRow(ev.target);
 		if (!row || row.className.indexOf('drow') < 0) return;
 		toggleDeviceRow(row);
@@ -2006,6 +2510,13 @@
 		if (dom.authForm) dom.authForm.addEventListener('submit', onTokenSubmit);
 		if (dom.tokenClear) dom.tokenClear.addEventListener('click', onTokenClear);
 		if (dom.devicesBody) dom.devicesBody.addEventListener('click', onDevicesClick);
+		if (dom.guardCancel) dom.guardCancel.addEventListener('click', closeGuardModal);
+		if (dom.guardConfirm) dom.guardConfirm.addEventListener('click', onGuardConfirm);
+		if (dom.guardBackdrop) {
+			dom.guardBackdrop.addEventListener('click', function () {
+				if (!app.guard.busyMac) closeGuardModal();
+			});
+		}
 		document.addEventListener('visibilitychange', onVisibilityChange);
 	}
 
@@ -2153,6 +2664,12 @@
 		pullState.tracking = true;
 		pullState.startY = ev.touches[0].clientY;
 		pullState.distance = 0;
+
+		/* 指示器从顶栏下沿滑出：这里钉一次顶栏底边位置（窄屏顶栏会换行变高）。 */
+		if (dom.pullHint && dom.topbar) {
+			var barBottom = dom.topbar.getBoundingClientRect().bottom;
+			dom.pullHint.style.setProperty('--pull-top', Math.max(0, Math.round(barBottom)) + 'px');
+		}
 	}
 
 	function onTouchMove(ev) {
@@ -2263,6 +2780,8 @@
 			'aria-live', 'error-bar', 'error-text', 'error-retry',
 			'net-bar', 'net-text', 'net-retry', 'pull-hint', 'pull-hint-text',
 			'auth-panel', 'auth-desc', 'auth-form', 'token-input', 'token-clear', 'auth-hint',
+			'guard-modal', 'guard-backdrop', 'guard-dialog', 'guard-title', 'guard-target',
+			'guard-desc', 'guard-error', 'guard-cancel', 'guard-confirm',
 			'card-rx', 'card-rx-sub', 'card-rx-unit', 'card-tx', 'card-tx-sub', 'card-tx-unit',
 			'card-today', 'card-today-sub', 'card-month', 'card-month-sub',
 			'card-devices', 'card-devices-unit', 'card-devices-sub',

@@ -1206,11 +1206,12 @@ main:focus { outline: none; }
 /* ------------------------------------------------------------------ *
  * 下拉刷新指示器：窄屏专用，默认藏在顶栏上方
  * ------------------------------------------------------------------ */
+/* 从粘性顶栏下沿「滑出来」：z-index 低于顶栏，未拉开时被顶栏遮住 */
 .pullhint {
   position: fixed;
   left: 50%;
-  top: calc(env(safe-area-inset-top, 0px) + 10px);
-  z-index: 12;
+  top: var(--pull-top, 84px);
+  z-index: 9;
   display: none;
   align-items: center;
   gap: 7px;
@@ -1226,7 +1227,7 @@ main:focus { outline: none; }
   white-space: nowrap;
   opacity: 0;
   pointer-events: none;
-  transform: translate(-50%, calc(-58px + var(--pull-y, 0px)));
+  transform: translate(-50%, calc(-100% - 30px + var(--pull-y, 0px)));
   transition: transform .2s ease, opacity .2s ease, color .15s ease, border-color .15s ease;
 }
 .pullhint.is-visible { opacity: 1; }
@@ -1255,6 +1256,8 @@ main:focus { outline: none; }
     padding-top: max(12px, env(safe-area-inset-top, 0px));
     padding-left: max(12px, env(safe-area-inset-left, 0px));
     padding-right: max(12px, env(safe-area-inset-right, 0px));
+    /* 顶栏同时充当下拉指示器的「遮罩」，略提高不透明度 */
+    background: color-mix(in srgb, var(--panel) 96%, transparent);
   }
   .layout {
     padding-left: max(12px, env(safe-area-inset-left, 0px));
@@ -1284,9 +1287,9 @@ main:focus { outline: none; }
              max(6px, env(safe-area-inset-left, 0px));
     border-top: 1px solid var(--line);
     background: var(--panel);
-    background: color-mix(in srgb, var(--panel) 94%, transparent);
-    -webkit-backdrop-filter: blur(12px);
-    backdrop-filter: blur(12px);
+    background: color-mix(in srgb, var(--panel) 97%, transparent);
+    -webkit-backdrop-filter: blur(16px) saturate(1.2);
+    backdrop-filter: blur(16px) saturate(1.2);
     box-shadow: 0 -8px 20px rgba(16, 24, 40, .10);
   }
   .tabbar__link {
@@ -1513,6 +1516,248 @@ main:focus { outline: none; }
 }
 
 /* ------------------------------------------------------------------ *
+ * 560–760：卡片横向铺开（接入 / 上下行 / 累计 / 本月 一行四项），
+ * 避免宽一点的手机上卡片右侧留大片空白。
+ * ------------------------------------------------------------------ */
+@media (min-width: 560px) and (max-width: 760px) {
+  .dtable > tbody > tr.drow {
+    grid-template-columns: minmax(0, .9fr) minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, 1fr);
+    align-items: start;
+  }
+  .dtable > tbody > tr.drow > td.cell-name { grid-column: 1 / -1; }
+  .dtable > tbody > tr.drow > td.cell-link {
+    grid-column: auto;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+  .dtable > tbody > tr.drow > td.cell-speed {
+    grid-column: auto;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .dtable > tbody > tr.drow > td.cell-total,
+  .dtable > tbody > tr.drow > td.cell-month { grid-column: auto; }
+  .dtable > tbody > tr.drow > td.cell-link[data-label]::before,
+  .dtable > tbody > tr.drow > td.cell-speed[data-label]::before { margin-bottom: 2px; }
+}
+
+/* ------------------------------------------------------------------ *
+ * 家长控制：设置区状态 / 设备行按钮 / 确认框
+ * 颜色全部走主题变量，深色模式自动跟随；按钮高度 ≥40px（窄屏 44px）。
+ * ------------------------------------------------------------------ */
+.guard {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+  min-width: 0;
+}
+.guard__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+}
+.guard__label { font-size: 12px; font-weight: 650; color: var(--text-soft); }
+.guard__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 1px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.guard__status::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+.guard__status--on {
+  color: var(--ok);
+  background: var(--ok-soft);
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+}
+.guard__status--warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+}
+.guard__status--off { color: var(--muted); background: var(--panel); }
+
+.guard__desc {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-soft);
+  overflow-wrap: anywhere;
+}
+.guard__meta,
+.guard__hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.guard__meta { font-family: var(--mono); }
+.guard__note {
+  padding: 9px 10px;
+  border: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* 设备行 / 设备卡里的暂停按钮：始终 ≥40px，窄屏 44px */
+.guard-btn {
+  flex: none;
+  min-width: 64px;
+  min-height: 40px;
+  padding: 4px 12px;
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.guard-btn[aria-pressed="true"],
+.guard-btn.is-paused {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  background: var(--warn-soft);
+}
+.guard-btn[aria-pressed="true"]:hover,
+.guard-btn.is-paused:hover { color: var(--warn); border-color: var(--warn); }
+.guard-btn[disabled] { opacity: .6; cursor: progress; }
+
+/* ---- 确认框 ---- */
+body.is-modal-open { overflow: hidden; }
+
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px))
+           max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px));
+}
+.modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(9, 13, 22, .55);
+  -webkit-backdrop-filter: blur(2px);
+  backdrop-filter: blur(2px);
+}
+.modal__panel {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 10px;
+  width: min(94vw, 420px);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+  padding: 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  outline: none;
+}
+.modal__title { font-size: 16px; font-weight: 650; overflow-wrap: anywhere; }
+.modal__target {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  min-width: 0;
+}
+.modal__name { font-weight: 650; overflow-wrap: anywhere; }
+.modal__mac {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.modal__desc { font-size: 13px; line-height: 1.55; color: var(--text-soft); overflow-wrap: anywhere; }
+.modal__error {
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+  border-radius: 8px;
+  background: var(--danger-soft);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.modal__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 4px;
+}
+.modal__actions .btn { min-width: 96px; }
+
+.btn--danger {
+  border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+.btn--danger:hover {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: var(--panel);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .modal__panel { animation: modal-in .16s ease-out; }
+  .guard-btn { transition: color .15s ease, border-color .15s ease, background-color .15s ease; }
+  @keyframes modal-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
+  }
+}
+
+/* 1000–1199：设备表与节点并排，名称列被压窄，暂停按钮换到下一行，避免设备名只剩两三个字 */
+@media (min-width: 1000px) and (max-width: 1199px) {
+  .dtable > tbody > tr.drow > td.cell-name .name-wrap { flex-wrap: wrap; gap: 6px 8px; }
+  .dtable > tbody > tr.drow > td.cell-name .name-wrap__text { flex: 1 1 100%; }
+  .dtable > tbody > tr.drow > td.cell-name .name-wrap .guard-btn { flex: 1 1 auto; min-width: 0; }
+  .dtable > tbody > tr.drow > td.cell-name .name-wrap .row-toggle { margin-left: auto; }
+}
+
+/* 窄屏：设备卡里给暂停按钮单独一行，避免和展开按钮挤在一起 */
+@media (max-width: 760px) {
+  .dtable > tbody > tr.drow > td.cell-name .name-wrap { flex-wrap: wrap; gap: 8px; }
+  .dtable > tbody > tr.drow > td.cell-name .name-wrap__text { flex: 1 1 100%; }
+  .dtable > tbody > tr.drow > td.cell-name .name-wrap .guard-btn {
+    flex: 1 1 auto;
+    min-height: 44px;
+    min-width: 0;
+  }
+  .dtable > tbody > tr.drow > td.cell-name .name-wrap .row-toggle { margin-left: auto; }
+
+  .modal {
+    padding-left: max(12px, env(safe-area-inset-left, 0px));
+    padding-right: max(12px, env(safe-area-inset-right, 0px));
+  }
+  .modal__panel { width: 100%; padding: 16px; }
+  .modal__actions .btn { flex: 1 1 0; min-width: 0; min-height: 44px; }
+}
+
+/* ------------------------------------------------------------------ *
  * 减少动态效果：关闭新增组件的过渡与旋转
  * ------------------------------------------------------------------ */
 @media (prefers-reduced-motion: reduce) {
@@ -1521,6 +1766,8 @@ main:focus { outline: none; }
   .pullhint,
   .dtable > tbody > tr > td::before,
   .card,
+  .guard-btn,
+  .modal__panel,
   .drow { transition: none !important; animation: none !important; }
   .pullhint.is-armed .pullhint__spinner { animation: none !important; }
 }

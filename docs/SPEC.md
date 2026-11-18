@@ -41,6 +41,9 @@
 /etc/init.d/prism-router-panel         # 独立面板服务的 procd init（§11；默认关闭）
 /www/prism-router-panel/               # 独立面板静态根：index.html / app.js / style.css（§11）
 /www/prism-router-panel/cgi-bin/panel-api  # 独立面板只读 JSON CGI（§11；0644→0755，ucode）
+/www/cgi-bin/prism-router-control      # 家长控制写操作 CGI + 本机 root 的 apply 重放（§12；0755，ucode）
+/etc/prism-router/paused.json          # 暂停列表（§12；0600，原子写）
+/etc/prism-router/control.log          # 家长控制审计（§12；0600，最近 200 行）
 /usr/share/rpcd/acl.d/luci-app-prism-router.json
 /usr/share/luci/menu.d/luci-app-prism-router.json
 /htdocs/luci-static/resources/view/prism-router/*.js
@@ -858,6 +861,7 @@ config panel 'panel'
     option port '8099'     # 1–65535；非法/空/越界回退 8099
     option bind ''         # IPv4 字面量；留空 = 取 network.lan.ipaddr；都没有 = 监听所有接口
     option token ''        # 空 = 不做应用层认证（只依赖网络边界）
+    option write_enabled '0'  # 家长控制总开关（§12）；默认 0，且 token 非空才允许写
 ```
 
 - **默认关闭**：`enabled=0` 时 `/etc/init.d/prism-router-panel start` 直接 `return 0`，不监听任何端口；
@@ -934,6 +938,161 @@ config panel 'panel'
 - init 不读 token、CGI 无写文件/日志调用、临时日志里没有 token、系统目录权限不变。
 
 
+
+## 12. 家长控制（按 MAC 暂停/恢复上网）
+
+按单台设备的 MAC 在 nftables 的 **`inet fw4` / `forward` 链**上加一条
+`ether saddr <MAC> counter drop`，临时断开该设备的上网；恢复时按 comment 找到
+`handle` 再删除。**默认关闭**，写操作必须带 `panel.token`。
+
+### 12.1 安装内容
+
+```
+/www/cgi-bin/prism-router-control   0755   ucode CGI：HTTP 写接口 + 本机 root 的 apply 重放
+/etc/prism-router/paused.json       0600   暂停列表（{"v":1,"paused":[...]}，原子写）
+/etc/prism-router/control.log       0600   审计（最近 200 行）
+```
+
+`/etc/init.d/prism-routerd` 在 `procd_close_instance` 之后调用
+`/www/cgi-bin/prism-router-control apply`，把上次运行暂停的设备重新加回规则；
+失败只写一条 syslog（`logger -t prism-routerd`），不影响守护进程启动。
+
+### 12.2 配置（UCI `prism-router`，section `panel`）
+
+```
+config panel 'panel'
+    option write_enabled '0'   # 总开关，默认 0（关闭）
+    option token ''            # 复用独立面板令牌；**为空则写操作一律 403**
+```
+
+- 只有 `write_enabled` **恰好为字符串 `1`** 才认为开启；缺省 / `0` / 其它值都按关闭处理
+  （老配置升级后没有该选项 → 行为与未启用前一致）。
+- `panel.token` 必须非空；请求里的 token 与之逐字节比较（常量时间，长度不同直接失败）。
+
+### 12.3 HTTP 契约：`POST /cgi-bin/prism-router-control`
+
+| 项 | 规则 |
+|---|---|
+| 方法 | **仅 POST**；GET / HEAD / PUT … → `405 {"error":"method_not_allowed"}` |
+| Content-Type | 若提供则必须是 `application/json…`，否则 `400 {"error":"bad_request"}`（不提供不拦，便于手工调试） |
+| body | ≤ **4096 字节**；`Content-Length` 只接受 `^[0-9]+$`；声明超限直接 `400 body_too_large`（不读）；实际超限/声明不符同样 400 |
+| body 形态 | 必须是一个 JSON 对象；解析失败/数组/字符串 → `400 {"error":"invalid_json"}`；空 body → `400 {"error":"empty_body"}` |
+| 请求体 | `{"token":"...","action":"pause"\|"resume"\|"list","mac":"aa:bb:cc:dd:ee:ff"}` |
+| 令牌 | `body.token` 优先；为空时取 `Authorization: Bearer <token>` |
+
+**校验顺序（实现与门禁都按它断言）**：
+方法 → body 长度/Content-Type/JSON 解析 → `write_enabled==1` → token → action 白名单 → mac。
+
+- `write_enabled != 1` → `403 {"error":"write_disabled"}`
+- token 缺失 / 为空 / 不匹配（含 `panel.token` 本身为空）→ `403 {"error":"forbidden"}`
+- `action` 不在 `pause|resume|list` → `400 {"error":"invalid_action"}`
+  （**`apply` 不是 HTTP action**，远程调用拿到的就是 400）
+- `mac` 归一化（去首尾空白、转大写、`-`→`:`、12 位裸 hex 自动补冒号）后必须匹配
+  `^([0-9A-F]{2}:[0-9A-F]{2}){5}$`，否则 `400 {"error":"invalid_mac"}`
+
+### 12.4 保护目标（400 `protected_target`，在调用 nft 之前拒绝）
+
+| 目标 | 判定 |
+|---|---|
+| 全零 | `00:00:00:00:00:00` |
+| 广播 | `FF:FF:FF:FF:FF:FF` |
+| 多播 | 首字节 bit0 = 1（`(int(MAC[0..2],16) & 1) == 1`），例如 `33:33:..` / `01:00:5e:..` |
+| 本机网桥 | MAC 等于 `/sys/class/net/br-lan/address`（读不到就跳过该条） |
+
+> 测试钩子：容器门禁设 `PRISM_ROUTER_BRLAN_ADDR` 指向 fixture 文件；生产环境不要设置。
+
+### 12.5 行为
+
+| action | 成功响应 | 说明 |
+|---|---|---|
+| `pause` | `200 {"ok":true,"already":false,"mac":"AA:..."}` | 加规则后写 `paused.json` |
+| `pause`（已有 comment 规则） | `200 {"ok":true,"already":true,"mac":"AA:..."}` | **不重复加规则**；补写 `paused.json` |
+| `resume` | `200 {"ok":true,"already":false,"mac":"AA:..."}` | 删除所有 comment 匹配的 handle |
+| `resume`（无匹配） | `200 {"ok":true,"already":true,"mac":"AA:..."}` | 不改 nft |
+| `list` | `200 {"ok":true,"paused":[{"mac":"AA:...","handle":42}, …]}` | **每次从内核现查**，不读 `paused.json`；不写审计 |
+
+失败：`500 {"error":"nft_failed"}` / `500 {"error":"persist_failed"}`。
+所有响应固定 `Content-Type: application/json`、`Cache-Control: no-store`、
+`X-Content-Type-Options: nosniff`；**绝不返回 nft 的原始输出**。
+
+### 12.6 nft 命令（固定 argv，经 `fs.popen` + 单引号转义，绝不拼原始请求）
+
+```
+nft add rule inet fw4 forward ether saddr <MAC> counter drop comment "prism-pause-<MAC>"
+nft -a list chain inet fw4 forward
+nft delete rule inet fw4 forward handle <N>
+```
+
+- MAC 只可能含 `0-9A-F:`，handle 只可能是 `^[0-9]+$`，comment 是固定前缀 + 已校验 MAC。
+- 只操作 `inet fw4` 的 `forward` 链；**绝不** `nft flush ruleset`、**绝不**列出/修改别的表
+  （第三方 `inet UA3F` 不会被触碰）。
+- nft stderr 重定向到 `/dev/null`，退出码非 0 一律映射成 500，不把命令输出带回响应。
+
+### 12.7 持久化：`/etc/prism-router/paused.json`
+
+```json
+{ "v": 1, "paused": [ "AA:BB:CC:DD:EE:FF", "02:00:00:00:00:01" ] }
+```
+
+- 0600 root:root；`/etc/prism-router` 已存在时必须是真实目录且 root:root（`lstat` 不跟随符号链接），否则写失败。
+- 原子写：同目录临时文件（`open(..., "wx", 0600)`，目标已存在即失败）+ `chmod` + `rename`。
+- 每次成功的 pause/resume 后重写；`list` 不碰它。
+- 读取时丢弃非法/保护目标 MAC（脏文件不会卡住重放）。
+
+### 12.8 apply 模式（仅本机 root，无 HTTP）
+
+```
+/www/cgi-bin/prism-router-control apply
+```
+
+- 只有 **没有 `REQUEST_METHOD`** 且 `argv[0] == "apply"` 才进入；任何 CGI 请求都带
+  `REQUEST_METHOD`，因此远程无法触发。
+- 要求 `euid == 0`（读 `/proc/self/status` 的 `Uid:` 首字段），否则退出码 1。
+- 不需要 token，**不受 `write_enabled` 影响**：这是恢复既有的管理决定，不是新的写操作；
+  要真正放开某台设备仍需带 token 的 `resume`。
+- 读 `paused.json`，逐条做归一化 + 保护目标校验后 `nft add rule`；已经在 forward 链里的跳过。
+- 幂等；单条失败不影响其余条目；有失败时退出码 1（无失败 0）。审计里 action 记为 `apply`。
+
+### 12.9 审计：`/etc/prism-router/control.log`
+
+```
+YYYY-MM-DD HH:MM:SS action mac result
+```
+
+- `action ∈ {pause, resume, apply}`；`result ∈ {ok, already, failed}`。
+- 0600 root:root；每次写入后只保留最近 **200 行**（读尾部 64 KiB → 追加 → 截断 → 原子写）。
+- **绝不写 token**，也不写请求体原文。
+- 只读的 `list` 不写审计。
+
+### 12.10 安全边界与剩余风险
+
+- 默认关闭；写接口必须 POST + JSON + 4 KiB 上限 + 常量时间 token 比较。
+- `panel.token` 与独立面板共用：改一处两边都变，部署时注意。
+- 明文局域网 HTTP：token 可能被窃听/重放；跨不可信网络请用 TLS / WireGuard / Tailscale。
+- 依赖 `inet fw4` 的 `forward` 链存在（未装 firewall4 / 链被改名 → 写操作 500 `nft_failed`）。
+- 容器门禁用**假 nft** 断言"我们发出了什么 argv"，不证明内核行为；fw4 规则顺序、
+  counter、nft 对 `comment` 的打印格式等需要真机验收。
+
+### 12.11 容器门禁
+
+`tests/container-validate-control.sh`（第 15 套，隔离容器、`--network none`，**123 项**）：
+
+- 装包后 CGI 755 root:root、`ucode -c`、init `sh -n`、config 默认 `write_enabled '0'`；
+- 默认关闭 → 403 `write_disabled`；老配置（缺该选项）同样 403；GET/HEAD/PUT → 405；
+- token 为空 / 缺失 / 错误 → 403 `forbidden`；`body.token` 与 `Bearer` 两条路径都能 pause；
+- pause → nft 收到固定 `add rule … ether saddr <MAC> … drop comment "prism-pause-<MAC>"`；
+  重复 pause → `already=true` 且不再加规则；
+- resume 从 `-a list chain` 输出解析 handle 并 `delete rule … handle N`；无规则 → `already=true`；
+- list 从内核现查、返回 `{mac,handle}`、不写审计；
+- 保护目标（br-lan / 全零 / 广播 / 多播）→ 400 且 **0 次 nft 调用**；
+- 非法 MAC / action / `apply` / JSON / 超大 body / 无 body / 错 Content-Type / 错 Content-Length → 400；
+- nft 失败 → 500 `nft_failed`，响应不回显 nft 输出；
+- `paused.json` 0600 且内容正确；apply 重放、幂等、保护目标跳过、`write_enabled=0` 仍重放；
+- 审计 0600、格式正确、不含 token、205 次操作后截断为 200 行；
+- 所有 nft 调用只落在 `inet fw4 forward`，断言没有 `flush` / `ruleset` / `UA3F`；
+- 卸载后 CGI 与 init 移除、系统目录权限不变。
+
+---
 
 ## 单包插件形态
 

@@ -1,0 +1,894 @@
+#!/usr/bin/ucode
+// SPDX-License-Identifier: Apache-2.0
+//
+// prism-router-control —— 家长控制（按 MAC 暂停/恢复上网）写操作 CGI
+// 安装为 /www/cgi-bin/prism-router-control，契约见 docs/SPEC.md §12。
+//
+// ───────────────────────── 安全边界（必读，别按直觉改）─────────────────────────
+//   * 唯一会**改防火墙**的入口，默认**关闭**：UCI `panel.write_enabled` 必须为 1，
+//     且 `panel.token` 非空；两者任一不满足一律 403（连"为什么"都不细说）：
+//       - write_enabled != 1          → 403 {"error":"write_disabled"}
+//       - token 为空 / 缺失 / 不匹配   → 403 {"error":"forbidden"}
+//     token 复用 `panel.token`，与独立面板同一个值；比对是常量时间的。
+//   * 只接受 POST + application/json（body ≤ 4096 字节）；GET/HEAD/其它 → 405。
+//   * action 白名单只有 pause / resume / list。**`apply` 不是 HTTP action**：
+//     它是本机 root 专用的重放模式（无 REQUEST_METHOD 时才进入），供 init 在
+//     服务启动后把 /etc/prism-router/paused.json 里的暂停规则重新加回内核。
+//     这样"重启后孩子仍然被暂停"，而远程调用方无法触发重放。
+//   * 目标 MAC 先归一化（大写冒号）再按 ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ 校验，
+//     然后拒绝：00:00:00:00:00:00、广播 FF:FF:FF:FF:FF:FF、多播（首字节 bit0=1）、
+//     本机 br-lan 的 MAC（读 /sys/class/net/br-lan/address）。拒绝 → 400
+//     {"error":"protected_target"}，**在调用 nft 之前**就返回。
+//   * nft 只碰 `inet fw4` 的 `forward` 链：add rule / delete rule / list chain。
+//     绝不 flush ruleset、绝不 banner 别的表（例如第三方 `inet UA3F`）。
+//     所有调用都走 fs.popen，命令片段是常量，MAC/handle 均经过白名单校验后
+//     单引号转义，不把请求原文拼进 shell。
+//   * 错误统一 {"error":"..."} + 4xx/5xx，**不返回 nft 的原始输出**；响应头固定
+//     Content-Type: application/json、Cache-Control: no-store、nosniff。
+//   * 审计：每次成功的写操作（pause/resume，含幂等的 already）追加一行到
+//     /etc/prism-router/control.log（0600）：
+//         YYYY-MM-DD HH:MM:SS action mac result
+//     绝不写 token；只保留最近 200 行。列表只读，不写审计。
+//   * 持久化：/etc/prism-router/paused.json（0600，原子写）
+//         {"v":1,"paused":["AA:BB:CC:DD:EE:FF", ...]}
+//     仅用于重启后重放；list 永远从内核现查，不读这个文件。
+//
+// ───────────────────────── HTTP 契约 ─────────────────────────
+//   POST /cgi-bin/prism-router-control
+//   Content-Type: application/json
+//   Authorization: Bearer <panel.token>        （可选；body.token 优先）
+//   body: {"token":"...","action":"pause"|"resume"|"list","mac":"aa:bb:cc:dd:ee:ff"}
+//
+//   200 {"ok":true,"already":false,"mac":"AA:BB:CC:DD:EE:FF"}   pause/resume 成功
+//   200 {"ok":true,"already":true,"mac":"..."}                  幂等（规则已存在/不存在）
+//   200 {"ok":true,"paused":[{"mac":"AA:...","handle":42}, ...]} list
+//   400 {"error":"bad_request"|"invalid_json"|"invalid_action"|"invalid_mac"|
+//               "protected_target"|"body_too_large"|"empty_body"}
+//   403 {"error":"write_disabled"|"forbidden"}
+//   405 {"error":"method_not_allowed"}
+//   500 {"error":"nft_failed"|"persist_failed"|"internal"}
+//
+// 手工调试（不经过 web 服务器，直接喂环境变量；PAT 仅为本机调试）：
+//   printf '%s' '{"token":"t","action":"list"}' | \
+//     env REQUEST_METHOD=POST CONTENT_LENGTH=30 CONTENT_TYPE=application/json \
+//     PATH=/tmp/fakebin:$PATH ucode /www/cgi-bin/prism-router-control
+//
+// 重放暂停规则（本机 root，无 HTTP 语义）：
+//   PATH=/usr/sbin:/usr/bin:/sbin:/bin /www/cgi-bin/prism-router-control apply
+//
+// 依赖：ucode（fs / uci 内建）+ nft（/usr/sbin/nft，经 PATH 解析）+ /etc/config/prism-router。
+'use strict';
+
+import {
+	readfile, popen, open, rename, chmod, chown, mkdir, lstat, unlink, stdin, stderr
+} from 'fs';
+import { cursor } from 'uci';
+
+const UCI_CONFIG  = 'prism-router';
+const MAX_BODY    = 4096;
+
+const STATE_DIR   = '/etc/prism-router';
+const STATE_FILE  = `${STATE_DIR}/paused.json`;
+const AUDIT_FILE  = `${STATE_DIR}/control.log`;
+
+const AUDIT_MAX_LINES = 200;
+const AUDIT_MAX_BYTES = 65536;      /* 只读尾部，防止被外部灌成巨型文件 */
+
+const MODE_600 = 384;               /* 0o600 */
+const MODE_755 = 493;               /* 0o755 */
+
+const COMMENT_PREFIX = 'prism-pause-';
+
+const NFT_FAMILY = 'inet';
+const NFT_TABLE  = 'fw4';
+const NFT_CHAIN  = 'forward';
+
+const ACTION_PAUSE  = 'pause';
+const ACTION_RESUME = 'resume';
+const ACTION_LIST   = 'list';
+
+/* 测试钩子（生产环境不要设置）：容器里没有 /sys/class/net/br-lan，门禁换成 fixture。
+   与 metrics CGI 的 PRISM_ROUTER_STATE_FILE 同一套思路。 */
+function env_or(name, fallback) {
+	const value = getenv(name);
+
+	if (value == null || length(value) == 0)
+		return fallback;
+
+	return value;
+}
+
+const BRLAN_ADDR_FILE = env_or('PRISM_ROUTER_BRLAN_ADDR', '/sys/class/net/br-lan/address');
+
+let _seq = 0;
+
+// ───────────────────────────── 基础工具 ─────────────────────────────
+
+function text(value, fallback) {
+	return (value == null) ? fallback : `${value}`;
+}
+
+function read_first_line(path) {
+	let raw = null;
+
+	try {
+		raw = readfile(path);
+	}
+	catch (e) {
+		return '';
+	}
+
+	if (type(raw) != 'string')
+		return '';
+
+	for (let line in split(raw, '\n')) {
+		line = trim(line);
+
+		if (length(line))
+			return line;
+	}
+
+	return '';
+}
+
+function shq(s) {
+	return `'${replace(`${s}`, "'", "'\\''")}'`;
+}
+
+/* 与 stations.uc / ingest 相同的小工具：popen + 读完 stdout + close 取退出码。 */
+function run(cmd) {
+	let p = null;
+
+	try {
+		p = popen(cmd, 'r');
+	}
+	catch (e) {
+		return { code: -1, out: '' };
+	}
+
+	if (p == null)
+		return { code: -1, out: '' };
+
+	let out = '';
+	let buf = '';
+
+	try {
+		while (length(buf = p.read(4096))) {
+			out += buf;
+
+			if (length(out) > 1048576)      /* nft 输出上限，防御性截断 */
+				break;
+		}
+	}
+	catch (e) {
+		/* 读失败也要把子进程收掉 */
+	}
+
+	return { code: p.close(), out: out };
+}
+
+/* nft 只经这里调用：argv 全部是常量或已白名单校验的值，单引号转义后再进 shell。
+   stderr 丢到 /dev/null —— 不把 nft 原文泄给调用方，也不污染 CGI 错误日志。 */
+function nft_exec(args) {
+	let cmd = 'nft';
+
+	for (let arg in args)
+		cmd += ' ' + shq(arg);
+
+	return run(`${cmd} 2>/dev/null`);
+}
+
+/* 返回 forward 链的完整列表（含 handle）；失败返回 null。 */
+function nft_list() {
+	const r = nft_exec([ '-a', 'list', 'chain', NFT_FAMILY, NFT_TABLE, NFT_CHAIN ]);
+
+	return (r.code == 0) ? r.out : null;
+}
+
+function nft_pause(mac) {
+	return nft_exec([
+		'add', 'rule', NFT_FAMILY, NFT_TABLE, NFT_CHAIN,
+		'ether', 'saddr', mac,
+		'counter', 'drop',
+		'comment', `"${COMMENT_PREFIX}${mac}"`      /* nft 需要引号才是字符串字面量 */
+	]);
+}
+
+function nft_delete(handle) {
+	return nft_exec([
+		'delete', 'rule', NFT_FAMILY, NFT_TABLE, NFT_CHAIN, 'handle', `${handle}`
+	]);
+}
+
+// ───────────────────────────── MAC ─────────────────────────────
+
+/* 归一化：去空白 → 大写 → '-' 当分隔符 → 12 位裸 hex 补冒号。
+   产出必须满足 ^[0-9A-F]{2}(:[0-9A-F]{2}){5}$，否则返回 ''。 */
+function norm_mac(value) {
+	let s = uc(trim(text(value, '')));
+
+	if (length(s) == 0)
+		return '';
+
+	s = replace(s, '-', ':');
+
+	if (match(s, /^[0-9A-F]{12}$/) != null) {
+		let out = '';
+
+		for (let i = 0; i < 12; i += 2) {
+			if (i > 0)
+				out += ':';
+
+			out += substr(s, i, 2);
+		}
+
+		s = out;
+	}
+
+	if (match(s, /^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/) == null)
+		return '';
+
+	return s;
+}
+
+/* 返回拒绝原因（'' = 允许）。顺序固定：全零 → 广播 → 多播 → 本机 br-lan。 */
+function protect_reason(mac) {
+	if (mac == '00:00:00:00:00:00')
+		return 'zero';
+
+	if (mac == 'FF:FF:FF:FF:FF:FF')
+		return 'broadcast';
+
+	if ((int(substr(mac, 0, 2), 16) & 1) == 1)
+		return 'multicast';
+
+	const brlan = norm_mac(read_first_line(BRLAN_ADDR_FILE));
+
+	if (length(brlan) && mac == brlan)
+		return 'bridge';
+
+	return '';
+}
+
+// ───────────────────────────── 审计 / 持久化 ─────────────────────────────
+
+/* /etc/prism-router 必须是真实 root:root 目录（lstat 不跟随符号链接）。 */
+function ensure_state_dir() {
+	let st = null;
+
+	try { st = lstat(STATE_DIR); } catch (e) { st = null; }
+
+	if (st != null)
+		return st.type == 'directory' && st.uid == 0 && st.gid == 0;
+
+	try { mkdir(STATE_DIR, MODE_755); } catch (e) { return false; }
+
+	try { chmod(STATE_DIR, MODE_755); } catch (e) { }
+	try { chown(STATE_DIR, 0, 0); } catch (e) { }
+
+	try { st = lstat(STATE_DIR); } catch (e) { st = null; }
+
+	return st != null && st.type == 'directory' && st.uid == 0 && st.gid == 0;
+}
+
+/* 临时文件 + rename 原子写；open(..., 'wx', 0600) 保证创建瞬间就是 0600，
+   且目标已存在（含预置符号链接）时直接失败，不跟随写入。 */
+function write_atomic(path, content) {
+	if (!ensure_state_dir())
+		return false;
+
+	const tmp = sprintf('%s.tmp.%d.%d.%d', path, int(time()), _seq++, int(time() * 1000) % 1000);
+	const body = `${content}`;
+	let fd = null;
+
+	try {
+		fd = open(tmp, 'wx', MODE_600);
+
+		if (fd == null)
+			return false;
+
+		let off = 0;
+
+		while (off < length(body)) {
+			const n = fd.write(substr(body, off));
+
+			if (n == null || n <= 0)
+				break;
+
+			off += n;
+		}
+
+		fd.close();
+
+		if (off != length(body)) {
+			try { unlink(tmp); } catch (e) { }
+			return false;
+		}
+
+		try { chmod(tmp, MODE_600); } catch (e) { }
+		try { chown(tmp, 0, 0); } catch (e) { }
+
+		if (rename(tmp, path)) {
+			try { chmod(path, MODE_600); } catch (e) { }
+			return true;
+		}
+	}
+	catch (e) {
+		try { if (fd != null) fd.close(); } catch (e2) { }
+	}
+
+	try { unlink(tmp); } catch (e) { }
+
+	return false;
+}
+
+/* 审计只写 MAC/action/result，绝不写 token。最多保留最近 200 行。 */
+function audit(action, mac, result) {
+	if (!ensure_state_dir())
+		return;
+
+	const t = localtime();
+	const line = sprintf('%04d-%02d-%02d %02d:%02d:%02d %s %s %s',
+		int(t.year), int(t.mon) + 1, int(t.mday),
+		int(t.hour), int(t.min), int(t.sec), action, mac, result);
+
+	let raw = '';
+
+	try { raw = readfile(AUDIT_FILE); } catch (e) { raw = ''; }
+
+	if (type(raw) != 'string')
+		raw = '';
+
+	if (length(raw) > AUDIT_MAX_BYTES)
+		raw = substr(raw, length(raw) - AUDIT_MAX_BYTES);
+
+	let lines = [];
+
+	for (let item in split(raw, '\n'))
+		if (length(item))
+			push(lines, item);
+
+	push(lines, line);
+
+	if (length(lines) > AUDIT_MAX_LINES)
+		lines = slice(lines, length(lines) - AUDIT_MAX_LINES);
+
+	write_atomic(AUDIT_FILE, `${join('\n', lines)}\n`);
+}
+
+function list_has(list, value) {
+	for (let item in list)
+		if (item == value)
+			return true;
+
+	return false;
+}
+
+/* 读持久化列表：坏文件/坏条目一律丢弃（绝不因为一个脏 MAC 卡住启动重放）。 */
+function read_paused() {
+	let raw = null;
+
+	try { raw = readfile(STATE_FILE); } catch (e) { return []; }
+
+	if (type(raw) != 'string' || length(trim(raw)) == 0)
+		return [];
+
+	let doc = null;
+
+	try { doc = json(raw); } catch (e) { return []; }
+
+	if (type(doc) != 'object' || type(doc.paused) != 'array')
+		return [];
+
+	let out = [];
+
+	for (let item in doc.paused) {
+		const mac = norm_mac(item);
+
+		if (length(mac) == 0 || length(protect_reason(mac)) > 0)
+			continue;
+
+		if (!list_has(out, mac))
+			push(out, mac);
+	}
+
+	return out;
+}
+
+function save_paused(list) {
+	return write_atomic(STATE_FILE, sprintf('%J\n', { v: 1, paused: sort(list) }));
+}
+
+// ───────────────────────────── forward 链解析 ─────────────────────────────
+
+/* 从 `nft -a list chain ...` 的输出里解析出 prism 自己加的规则：
+   ether saddr AA:BB:... counter ... drop comment "prism-pause-AA:BB:..." # handle 42 */
+function paused_entries(listing) {
+	let out = [];
+
+	if (type(listing) != 'string')
+		return out;
+
+	for (let line in split(listing, '\n')) {
+		if (index(line, COMMENT_PREFIX) < 0)
+			continue;
+
+		const mac_match = match(line,
+			/prism-pause-([0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5})/);
+		const handle_match = match(line, /#[ \t]*handle[ \t]+([0-9]+)/);
+
+		if (mac_match == null || handle_match == null)
+			continue;
+
+		const mac = norm_mac(mac_match[1]);
+
+		if (length(mac) == 0)
+			continue;
+
+		push(out, { mac: mac, handle: int(handle_match[1]) });
+	}
+
+	return out;
+}
+
+function entries_for(entries, mac) {
+	let out = [];
+
+	for (let entry in entries)
+		if (entry.mac == mac)
+			push(out, entry.handle);
+
+	return out;
+}
+
+function drop_mac(list, mac) {
+	let out = [];
+
+	for (let item in list)
+		if (item != mac)
+			push(out, item);
+
+	return out;
+}
+
+// ───────────────────────────── UCI ─────────────────────────────
+
+function uci_get(section, option, fallback) {
+	let c = null;
+
+	try {
+		c = cursor();
+	}
+	catch (e) {
+		return fallback;
+	}
+
+	if (c == null)
+		return fallback;
+
+	const value = c.get(UCI_CONFIG, section, option);
+
+	return (value == null) ? fallback : value;
+}
+
+/* 只有明确写 1 才认为开启；缺省 / 0 / 垃圾值一律视为关闭（默认关闭是硬约束）。 */
+function write_enabled() {
+	return trim(text(uci_get('panel', 'write_enabled', '0'), '0')) == '1';
+}
+
+/* 常量时间比较（长度不同直接失败）。 */
+function same_text(a, b) {
+	if (length(a) != length(b))
+		return false;
+
+	let diff = 0;
+
+	for (let i = 0; i < length(a); i++)
+		diff |= ord(substr(a, i, 1)) ^ ord(substr(b, i, 1));
+
+	return diff == 0;
+}
+
+function bearer_token() {
+	let auth = getenv('HTTP_AUTHORIZATION');
+
+	if (auth == null || length(trim(text(auth, ''))) == 0)
+		auth = getenv('AUTHORIZATION');
+
+	const m = match(trim(text(auth, '')), /^[Bb]earer[ \t]+(.+)$/);
+
+	return (m != null) ? trim(m[1]) : '';
+}
+
+// ───────────────────────────── 请求体 ─────────────────────────────
+
+function read_body(declared, has_declared) {
+	const kind = type(stdin);
+	const limit = MAX_BODY + 1;
+	let raw = '';
+
+	if (kind != 'resource' && kind != 'object')
+		return raw;
+
+	for (let guard = 0; guard < 64 && length(raw) < limit; guard++) {
+		let want = limit - length(raw);
+
+		if (has_declared) {
+			const left = declared - length(raw);
+
+			if (left <= 0)
+				break;
+
+			if (left < want)
+				want = left;
+		}
+
+		let chunk = null;
+
+		try {
+			chunk = stdin.read(want);
+		}
+		catch (e) {
+			break;
+		}
+
+		if (chunk == null || length(chunk) == 0)
+			break;
+
+		raw += chunk;
+	}
+
+	if (has_declared && length(raw) <= declared) {
+		try {
+			const extra = stdin.read(1);
+
+			if (extra != null && length(extra) > 0)
+				raw += extra;
+		}
+		catch (e) {
+			/* EOF 正常 */
+		}
+	}
+
+	return raw;
+}
+
+// ───────────────────────────── 响应 ─────────────────────────────
+
+function reason(status) {
+	if (status == 400)
+		return 'Bad Request';
+
+	if (status == 403)
+		return 'Forbidden';
+
+	if (status == 405)
+		return 'Method Not Allowed';
+
+	return 'Internal Server Error';
+}
+
+function respond(status, payload) {
+	if (status != 200)
+		print(sprintf('Status: %d %s\r\n', status, reason(status)));
+
+	print('Content-Type: application/json\r\n');
+	print('Cache-Control: no-store\r\n');
+	print('X-Content-Type-Options: nosniff\r\n');
+	print('\r\n');
+	print(sprintf('%J\n', payload));
+}
+
+function fail(status, code) {
+	respond(status, { error: code });
+}
+
+// ───────────────────────────── pause / resume / list ─────────────────────────────
+
+function do_list() {
+	const listing = nft_list();
+
+	if (listing == null) {
+		fail(500, 'nft_failed');
+		return 0;
+	}
+
+	const entries = sort(paused_entries(listing), (a, b) => {
+		if (a.mac != b.mac)
+			return (a.mac < b.mac) ? -1 : 1;
+
+		return (a.handle < b.handle) ? -1 : ((a.handle > b.handle) ? 1 : 0);
+	});
+
+	respond(200, { ok: true, paused: entries });
+
+	return 0;
+}
+
+function do_pause(mac) {
+	const listing = nft_list();
+	const entries = paused_entries(listing);
+	const handles = entries_for(entries, mac);
+
+	if (length(handles) > 0) {
+		/* 幂等路径也要保证持久化里有它（规则可能是手工加的） */
+		const known = read_paused();
+
+		if (!list_has(known, mac))
+			push(known, mac);
+
+		if (!save_paused(known)) {
+			audit(ACTION_PAUSE, mac, 'failed');
+			fail(500, 'persist_failed');
+			return 0;
+		}
+
+		audit(ACTION_PAUSE, mac, 'already');
+		respond(200, { ok: true, already: true, mac: mac });
+
+		return 0;
+	}
+
+	const r = nft_pause(mac);
+
+	if (r.code != 0) {
+		audit(ACTION_PAUSE, mac, 'failed');
+		fail(500, 'nft_failed');
+		return 0;
+	}
+
+	const pending = read_paused();
+
+	if (!list_has(pending, mac))
+		push(pending, mac);
+
+	if (!save_paused(pending)) {
+		audit(ACTION_PAUSE, mac, 'failed');
+		fail(500, 'persist_failed');
+		return 0;
+	}
+
+	audit(ACTION_PAUSE, mac, 'ok');
+	respond(200, { ok: true, already: false, mac: mac });
+
+	return 0;
+}
+
+function do_resume(mac) {
+	const listing = nft_list();
+
+	if (listing == null) {
+		fail(500, 'nft_failed');
+		return 0;
+	}
+
+	const handles = entries_for(paused_entries(listing), mac);
+
+	if (length(handles) == 0) {
+		const pending = read_paused();
+
+		if (list_has(pending, mac) && !save_paused(drop_mac(pending, mac))) {
+			audit(ACTION_RESUME, mac, 'failed');
+			fail(500, 'persist_failed');
+			return 0;
+		}
+
+		audit(ACTION_RESUME, mac, 'already');
+		respond(200, { ok: true, already: true, mac: mac });
+
+		return 0;
+	}
+
+	for (let handle in handles) {
+		const r = nft_delete(handle);
+
+		if (r.code != 0) {
+			audit(ACTION_RESUME, mac, 'failed');
+			fail(500, 'nft_failed');
+			return 0;
+		}
+	}
+
+	if (!save_paused(drop_mac(read_paused(), mac))) {
+		audit(ACTION_RESUME, mac, 'failed');
+		fail(500, 'persist_failed');
+		return 0;
+	}
+
+	audit(ACTION_RESUME, mac, 'ok');
+	respond(200, { ok: true, already: false, mac: mac });
+
+	return 0;
+}
+
+// ───────────────────────────── apply（仅本机 root）─────────────────────────────
+
+function root_uid() {
+	let raw = '';
+
+	try { raw = readfile('/proc/self/status'); } catch (e) { return -1; }
+
+	if (type(raw) != 'string')
+		return -1;
+
+	for (let line in split(raw, '\n')) {
+		const m = match(line, /^Uid:[ \t]+([0-9]+)/);
+
+		if (m != null)
+			return int(m[1]);
+	}
+
+	return -1;
+}
+
+/* 重放：只读 paused.json + 内核现态，把缺失的规则按原顺序补回。
+   幂等；保护目标一律跳过；单个失败不影响其余条目。返回退出码。 */
+function cli_apply() {
+	if (root_uid() != 0) {
+		try { stderr.write('prism-router-control: apply must run as root\n'); } catch (e) { }
+		return 1;
+	}
+
+	const want = read_paused();
+
+	if (length(want) == 0)
+		return 0;
+
+	const entries = paused_entries(nft_list());
+	let failed = 0;
+
+	for (let mac in want) {
+		if (length(entries_for(entries, mac)) > 0)
+			continue;
+
+		const r = nft_pause(mac);
+
+		if (r.code != 0) {
+			audit('apply', mac, 'failed');
+			failed++;
+			continue;
+		}
+
+		audit('apply', mac, 'ok');
+	}
+
+	return (failed == 0) ? 0 : 1;
+}
+
+// ───────────────────────────── 主流程 ─────────────────────────────
+
+function main() {
+	const method = trim(text(getenv('REQUEST_METHOD'), ''));
+
+	/* 没有 REQUEST_METHOD = 本机命令行调用；只认 `apply`，别的参数直接拒绝。 */
+	if (length(method) == 0) {
+		const argv = ARGV;
+
+		if (type(argv) == 'array' && length(argv) > 0 && `${argv[0]}` == 'apply')
+			return cli_apply();
+
+		try { stderr.write('usage: prism-router-control apply   (local root only)\n'); } catch (e) { }
+
+		return 2;
+	}
+
+	/* 1. 方法：只有 POST。 */
+	if (method != 'POST') {
+		fail(405, 'method_not_allowed');
+		return 0;
+	}
+
+	/* 2. body 长度（声明 > 4KiB 直接拒，省得读一个巨型请求体）。 */
+	const cl_raw = text(getenv('CONTENT_LENGTH'), '');
+	const has_declared = length(cl_raw) > 0;
+	let declared = 0;
+
+	if (has_declared) {
+		if (match(cl_raw, /^[0-9]+$/) == null) {
+			fail(400, 'bad_request');
+			return 0;
+		}
+
+		let digits = cl_raw;
+
+		while (length(digits) > 1 && substr(digits, 0, 1) == '0')
+			digits = substr(digits, 1);
+
+		const max_text = `${MAX_BODY}`;
+
+		if (length(digits) > length(max_text)
+			|| (length(digits) == length(max_text) && digits > max_text)) {
+			fail(400, 'body_too_large');
+			return 0;
+		}
+
+		declared = int(digits);
+	}
+
+	const ctype = lc(trim(text(getenv('CONTENT_TYPE'), '')));
+
+	/* 带了 Content-Type 就必须是 JSON；没带不拦（便于手工调试）。 */
+	if (length(ctype) > 0 && match(ctype, /^application\/json/) == null) {
+		fail(400, 'bad_request');
+		return 0;
+	}
+
+	const body = read_body(declared, has_declared);
+
+	if (length(body) == 0) {
+		fail(400, 'empty_body');
+		return 0;
+	}
+
+	if (length(body) > MAX_BODY) {
+		fail(400, 'body_too_large');
+		return 0;
+	}
+
+	if (has_declared && length(body) != declared) {
+		fail(400, 'bad_request');
+		return 0;
+	}
+
+	/* 3. JSON 解析（必须先于开关/令牌判定，契约顺序如此）。 */
+	let payload = null;
+
+	try { payload = json(body); } catch (e) { payload = null; }
+
+	if (type(payload) != 'object') {
+		fail(400, 'invalid_json');
+		return 0;
+	}
+
+	/* 4. 总开关：默认关闭。 */
+	if (!write_enabled()) {
+		fail(403, 'write_disabled');
+		return 0;
+	}
+
+	/* 5. 令牌：panel.token 必须非空；body.token 优先，否则 Authorization: Bearer。 */
+	const expected = trim(text(uci_get('panel', 'token', ''), ''));
+
+	if (length(expected) == 0) {
+		fail(403, 'forbidden');
+		return 0;
+	}
+
+	let token = trim(text(payload.token, ''));
+
+	if (length(token) == 0)
+		token = bearer_token();
+
+	if (length(token) == 0 || !same_text(token, expected)) {
+		fail(403, 'forbidden');
+		return 0;
+	}
+
+	/* 6. action 白名单。`apply` 永远不是 HTTP action。 */
+	const action = text(payload.action, '');
+
+	if (action != ACTION_PAUSE && action != ACTION_RESUME && action != ACTION_LIST) {
+		fail(400, 'invalid_action');
+		return 0;
+	}
+
+	if (action == ACTION_LIST)
+		return do_list();
+
+	/* 7. MAC 归一化 + 保护目标。 */
+	const mac = norm_mac(payload.mac);
+
+	if (length(mac) == 0) {
+		fail(400, 'invalid_mac');
+		return 0;
+	}
+
+	if (length(protect_reason(mac)) > 0) {
+		fail(400, 'protected_target');
+		return 0;
+	}
+
+	return (action == ACTION_PAUSE) ? do_pause(mac) : do_resume(mac);
+}
+
+exit(main());

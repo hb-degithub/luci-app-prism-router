@@ -63,6 +63,7 @@ for pair in \
   "/www/cgi-bin/prism-router-stations:root:root -rwxr-xr-x" \
   "/www/cgi-bin/prism-router-metrics:root:root -rwxr-xr-x" \
   "/www/cgi-bin/prism-router-feishu:root:root -rwxr-xr-x" \
+  "/www/cgi-bin/prism-router-control:root:root -rwxr-xr-x" \
   "/usr/share/rpcd/ucode/prism-router.uc:root:root -rw-r--r--"; do
   f="${pair%%:*}"; want="${pair#*:}"
   check "$f" "$want"
@@ -90,7 +91,7 @@ check_opkg_files luci-app-prism-router
 
 for f in /usr/bin/prism-routerd /usr/share/prism-router/*.uc /usr/share/rpcd/ucode/*.uc \
          /www/cgi-bin/prism-router-ingest /www/cgi-bin/prism-router-stations /www/cgi-bin/prism-router-metrics \
-         /www/cgi-bin/prism-router-feishu; do
+         /www/cgi-bin/prism-router-feishu /www/cgi-bin/prism-router-control; do
   [ -f "$f" ] || continue
   # ucode -c 按“raw script”编译；带 export 的共享库必须去掉 export 再编译，
   # 否则会把合法的 module 误判为语法错误。
@@ -125,6 +126,7 @@ done <<'PAYLOAD'
 /www/cgi-bin/prism-router-stations|luci-app-prism-router/root/www/cgi-bin/prism-router-stations
 /www/cgi-bin/prism-router-metrics|luci-app-prism-router/root/www/cgi-bin/prism-router-metrics
 /www/cgi-bin/prism-router-feishu|luci-app-prism-router/root/www/cgi-bin/prism-router-feishu
+/www/cgi-bin/prism-router-control|luci-app-prism-router/root/www/cgi-bin/prism-router-control
 /www/prism-router-panel/index.html|luci-app-prism-router/root/www/prism-router-panel/index.html
 /www/prism-router-panel/app.js|luci-app-prism-router/root/www/prism-router-panel/app.js
 /www/prism-router-panel/style.css|luci-app-prism-router/root/www/prism-router-panel/style.css
@@ -193,7 +195,7 @@ done < /tmp/rm-luci-files.txt
   && ok "conffile 在卸载后保留（用户修改）" || bad "conffile 未按预期保留"
 for f in /usr/bin/prism-routerd /etc/init.d/prism-routerd /www/cgi-bin/prism-router-ingest \
          /www/cgi-bin/prism-router-stations /www/cgi-bin/prism-router-metrics \
-         /www/cgi-bin/prism-router-feishu; do
+         /www/cgi-bin/prism-router-feishu /www/cgi-bin/prism-router-control; do
   [ -e "$f" ] && bad "卸载后仍存在 $f" || ok "已移除 $f"
 done
 if opkg list-installed 2>/dev/null | grep -q '^luci-app-prism-router '; then bad "luci-app 卸载后 opkg 仍认为已安装"; else ok "luci-app 已从 opkg 数据库移除"; fi

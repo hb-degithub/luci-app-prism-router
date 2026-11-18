@@ -29,6 +29,7 @@
 - **哑桥 AP 信号**：只上报无线元数据（不含字节，避免双计）
 - **数据治理**：保留策略（daily/nodes/stations/日志/队列，带 dry-run）、CSV 导出、Prometheus 指标
 - **设备管理**：别名、分组、月配额与剩余量、陌生设备标记与阻断命令生成
+- **家长控制**：按 MAC 在 `inet fw4` 的 `forward` 链上暂停/恢复某台设备上网（默认关闭，必须 `panel.token`；规则持久化、重启重放、审计只留最近 200 行）
 
 ## 安装
 
@@ -123,6 +124,41 @@ uci commit prism-router
 - 面板数据来自 rpcd 的 `prism-router` ubus 对象（由 `luci-app-prism-router` 提供），
   两个包都要装；运行时还需要系统自带的 `uhttpd`（已声明为 `prism-router` 依赖）。
 
+## 家长控制（按 MAC 暂停/恢复上网）
+
+只对单台设备生效：在 nftables 的 `inet fw4` **forward 链**上加一条
+`ether saddr <MAC> counter drop`，恢复时按 comment 找到 handle 删除。
+**默认关闭**，而且必须带令牌；不碰其他表（第三方 `inet UA3F` 完全不受影响），
+也绝不执行 `nft flush ruleset` 之类的破坏性命令。
+
+```sh
+# 1) 打开写开关并设置令牌（与独立面板共用 panel.token）
+uci set prism-router.panel.write_enabled='1'
+uci set prism-router.panel.token="$(hexdump -n 24 -e '24/1 "%02x"' /dev/urandom)"
+uci commit prism-router
+
+# 2) 暂停某台设备（MAC 大小写/分隔符都行，返回里统一成大写冒号）
+curl -sS -X POST http://<路由器LAN>/cgi-bin/prism-router-control \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"<token>","action":"pause","mac":"aa:bb:cc:dd:ee:ff"}'
+# {"ok":true,"already":false,"mac":"AA:BB:CC:DD:EE:FF"}
+
+# 3) 看当前暂停了谁 / 恢复
+curl -sS -X POST ... -d '{"token":"<token>","action":"list"}'
+# {"ok":true,"paused":[{"mac":"AA:BB:CC:DD:EE:FF","handle":42}]}
+curl -sS -X POST ... -d '{"token":"<token>","action":"resume","mac":"AA:BB:CC:DD:EE:FF"}'
+```
+
+- 只接受 **POST + application/json（body ≤ 4 KiB）**，GET/HEAD 一律 405。
+- `action` 只有 `pause` / `resume` / `list`；`token` 放 body 或 `Authorization: Bearer` 均可。
+- 拒绝把 `00:00:00:00:00:00`、广播、多播、以及本机 br-lan 的 MAC 当目标（400 `protected_target`）。
+- 暂停列表落在 `/etc/prism-router/paused.json`（0600）：重启后由
+  `/etc/init.d/prism-routerd` 调 `prism-router-control apply` 自动重放，
+  孩子重启设备/路由器也逃不掉。要真正放开，仍需带 token 的 `resume`（或手动删规则）。
+- 审计在 `/etc/prism-router/control.log`（0600，只留最近 200 行，绝不记录 token）。
+- 这是**仅限局域网**的明文 HTTP 接口，token 可能被窃听/重放；跨网络请用 TLS/WireGuard。
+  没有 `inet fw4`（未装 firewall4）时写操作会返回 500 `nft_failed`。
+
 ## 飞书
 
 两条路线，配了哪条走哪条：
@@ -178,10 +214,10 @@ ucode /usr/share/prism-router/push.uc && echo ok
 
 ## 部署前验证（强制）
 
-十三套容器门禁（全部 `--network none` 隔离运行）。统一入口会只构建一次，所有门禁随后验证同一份只读产物：
+十五套容器门禁（全部 `--network none` 隔离运行）。统一入口会只构建一次，所有门禁随后验证同一份只读产物：
 
 ```sh
-./tools/test-release.sh                 # 全部：发布/原有回归/核心/认证/独立面板
+./tools/test-release.sh                 # 全部：发布/原有回归/核心/认证/独立面板/家长控制
 node tests/ui-frontend-static.js        # LuCI 静态与纯函数检查
 node tests/mobile-ui-static.js          # 手机版 App 界面（分页/分类/节点/轮询）
 
@@ -198,10 +234,12 @@ node tests/mobile-ui-static.js          # 手机版 App 界面（分页/分类/�
 ./tests/container-validate-core-fixes.sh # 跨重启/去重/历史/并发 72
 ./tests/container-validate-security-fixes.sh # 独立凭证/防重放/TLS 87
 ./tests/container-validate-standalone-panel.sh # 独立面板服务 68（真实 procd + uhttpd + CGI）
+./tests/container-validate-feishu-oauth.sh # 飞书应用机器人扫码绑定（OAuth 回调/状态校验）
+./tests/container-validate-control.sh    # 家长控制 123（假 nft / 保护目标 / 审计 / 重放）
 ./tests/container-validate-release.sh    # 发布物/权限/升级/卸载，23.05+24.10 各110
 ```
 
-原有回归合计 **804 项断言**，另含核心、安全、独立面板（68 项）、发布与前端专项；实际通过数以本次运行输出为准。真机部署后再跑 `./tests/smoke.sh`（15 项）与 `LUCI_PASS='<密码>' ./tests/ui/run.sh`（页面渲染）。
+原有回归合计 **804 项断言**，另含家长控制（123 项）、核心、安全、独立面板（68 项）、发布与前端专项；实际通过数以本次运行输出为准。真机部署后再跑 `./tests/smoke.sh`（15 项）与 `LUCI_PASS='<密码>' ./tests/ui/run.sh`（页面渲染）。
 
 ```sh
 ./tests/container-validate.sh        # 28 项：包安装、属主权限、系统目录未被改动、守护进程离线用例
