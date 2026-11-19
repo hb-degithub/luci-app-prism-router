@@ -65,6 +65,7 @@ import io.prism.router.data.fmtBytes
 import io.prism.router.data.fmtClock
 import io.prism.router.data.fmtRate
 import io.prism.router.data.normalizeMac
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -139,6 +140,8 @@ fun DevicesScreen(ui: UiState) {
         scope.launch {
             val loaded = try {
                 withContext(Dispatchers.IO) { controlClient.list(ui.baseUrl, ui.token) }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 null
             }
@@ -180,11 +183,15 @@ fun DevicesScreen(ui: UiState) {
                 controlOk = if (pause) "已暂停该设备上网" else "已恢复该设备上网"
                 val fresh = try {
                     withContext(Dispatchers.IO) { controlClient.list(ui.baseUrl, ui.token) }
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     null
                 }
                 /* 服务端列表是准绳；拿不到就保留本地结果（至少徽章是对的）。 */
                 if (fresh != null) pausedMacs = fresh
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: ControlException) {
                 controlError = e.message ?: "操作失败"
                 if (e.code == "write_disabled" || e.code == "forbidden") controlBlocked = true

@@ -229,7 +229,7 @@ private fun TopologyNote(
             Spacer(Modifier.height(4.dp))
             Text(
                 "出口层取 state.nodes 中流量最大的非 DIRECT 节点；子节点 / AP 来自 ?what=nodes" +
-                    "（上报 0–300 秒视为在线）；设备层只画在线设备的前 $TOPO_DEVICE_LIMIT 台。",
+                    "（上报 0–300 秒视为在线）；设备层只画在线设备（最近 10 分钟有上报或仍有速率）的前 $TOPO_DEVICE_LIMIT 台。",
                 fontSize = 11.sp,
                 color = SubText
             )
@@ -414,7 +414,7 @@ private fun LinkConnector() {
 @Composable
 private fun GroupConnector() {
     val lineColor = MaterialTheme.colorScheme.secondary
-    Canvas(Modifier.fillMaxWidth().height(24.dp)) {
+    Canvas(Modifier.fillMaxWidth().height(30.dp)) {
         val cx = size.width / 2f
         val railX = RAIL_X.toPx()
         val path = Path().apply {
