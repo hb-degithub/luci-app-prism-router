@@ -2432,7 +2432,15 @@ const methods = {
 							push(buckets, slim);
 					}
 
-					push(out, { day: day, buckets: buckets });
+					/* 今日也补 summary：App 的「今日流量」需要当天汇总。history.json
+					   的桶在 daemon 刚重启时可能只有 ts，不能把今日当成 0。 */
+					const today_data = read_json(`${DAILY_DIR}/${day}.json`);
+					push(out, {
+						day: day,
+						buckets: buckets,
+						summary: (today_data != null && type(today_data) == 'object')
+							? history_summary_light(today_data, day) : null
+					});
 					seen[day] = true;
 				}
 			}

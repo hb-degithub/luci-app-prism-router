@@ -29,9 +29,10 @@ import kotlinx.coroutines.withContext
 /**
  * 主界面状态。
  *
- * 字段保持与旧版完全一致（屏幕层零改动）；配置类字段（[baseUrl] / [token] /
- * [intervalSec] / [servers] / [activeIndex]）由 DataStore 经 [MainViewModel] 同步，
- * 运行数据（state / 历史 / 节点 / 应用 / 告警）由仓库轮询写入。
+ * 配置类字段（[baseUrl] / [token] / [intervalSec] / [servers] / [activeIndex]）由
+ * DataStore 经 [MainViewModel] 同步；运行数据（state / 历史 / 节点 / 应用 / AP 客户端 /
+ * 系统信息 / 管理员会话 / 更新）由 ViewModel 写入。管理员令牌不在本类里（只在 ViewModel
+ * 私有字段），这里只有展示所需的登录态与到期时间。
  */
 data class UiState(
     val baseUrl: String = DEFAULT_BASE_URL,
@@ -58,6 +59,40 @@ data class UiState(
     /** 应用多日汇总的最近一次拉取（或尝试）时间，用于 5 分钟节流。 */
     val apps7dAt: Long = 0,
     val apps7dError: String? = null,
+    /** `?what=stations` 的 AP 无线客户端快照；失败时保留上一次成功结果。 */
+    val stations: StationsData = StationsData(),
+    val stationsError: String? = null,
+    /** AP 快照的最近一次拉取（或尝试）时间，用于 5 分钟节流。 */
+    val stationsAt: Long = 0,
+    /** 是否正在拉取 AP 快照（仅在列表为空时显示骨架屏，有数据时不闪烁）。 */
+    val stationsLoading: Boolean = false,
+    /** 系统信息（`/cgi-bin/prism-router-system`，无需登录）。 */
+    val system: SystemInfo? = null,
+    val services: List<ServiceInfo> = emptyList(),
+    val processes: List<ProcessInfo> = emptyList(),
+    val systemError: String? = null,
+    val systemAt: Long = 0,
+    val systemLoading: Boolean = false,
+    /**
+     * 管理员会话的展示字段。
+     *
+     * **令牌不在这里**：它只保存在 ViewModel 的私有字段里，既不进 UiState
+     * （避免 data class 的 toString / Compose 日志意外带出），也不写 DataStore。
+     */
+    val adminUser: String = "",
+    val adminLoggedIn: Boolean = false,
+    /** 令牌到期时间（秒级时间戳）；0 表示后端没给。 */
+    val adminExpiresAt: Long = 0,
+    val adminLoginLoading: Boolean = false,
+    val adminError: String? = null,
+    val adminNotice: String? = null,
+    /** `?action=wifi&token=…` 的射频列表；未登录时为 null。 */
+    val wifi: WifiInfo? = null,
+    val wifiLoading: Boolean = false,
+    /** 重启 / 无线开关等管理写操作是否在进行中（禁用按钮、防重复提交）。 */
+    val adminBusy: Boolean = false,
+    /** 检查更新：App 版本、服务端版本与结论。 */
+    val update: UpdateState = UpdateState(),
     /** 多路由器：地址列表与当前选中项（下标）。空列表时退回默认地址。 */
     val servers: List<ServerProfile> = listOf(DEFAULT_SERVER),
     val activeIndex: Int = 0,
@@ -91,8 +126,8 @@ private data class CachedState(val state: PanelState, val at: Long)
  * - 容器来自 [PrismApplication]，用 `AndroidViewModel` 取 Application 免去 Hilt；
  * - 配置读写是 suspend，但对外接口（[saveSettings]、[addServer] 等）保持同步签名，
  *   内部 `viewModelScope.launch` 落盘；
- * - 轮询 15s（可在设置里改 5–300s），历史 / 节点 / 应用多日汇总 5 分钟节流，
- *   失败 1 分钟后重试；
+ * - 轮询 15s（可在设置里改 5–300s），历史 / 节点 / 应用多日汇总 / AP 客户端 5 分钟节流，
+ *   失败 1 分钟后重试；系统信息进设置页时读一次，同样 5 分钟节流；
  * - 网络失败展示 ≤24h 的离线快照（仍存 SharedPreferences，兼容旧版本数据）；
  * - 主数据失败时发一次 [UiEvent.Snackbar]（同一文案去重，避免每 15s 刷屏）。
  */
@@ -111,6 +146,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val APPS_REFRESH_MS = 5 * 60 * 1000L
         const val APPS_RETRY_MS = 60 * 1000L
 
+        /* AP 无线客户端快照（stations.uc 每分钟上报）：正常 5 分钟一次，失败 1 分钟后重试。 */
+        const val STATIONS_REFRESH_MS = 5 * 60 * 1000L
+        const val STATIONS_RETRY_MS = 60 * 1000L
+
+        /* 系统信息：进设置页自动读一次，之后 5 分钟节流；失败 1 分钟后可重试。 */
+        const val SYSTEM_REFRESH_MS = 5 * 60 * 1000L
+        const val SYSTEM_RETRY_MS = 60 * 1000L
+
         /* 告警阈值与规则见 data/AlertRules.kt（纯函数，便于单测）。 */
     }
 
@@ -119,6 +162,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         (app as? PrismApplication)?.container ?: AppContainer(app)
     private val repository: PanelRepository = container.panelRepository
     private val settingsStore: SettingsStore = container.settingsStore
+
+    /*
+     * AP 快照复用既有只读客户端（只新增了 fetchStations()）；系统 / 管理员接口是
+     * 独立 CGI，各自一个轻量客户端。三者都是无状态阻塞式 client，在 IO 线程调用。
+     */
+    private val panelClient = PanelClient()
+    private val systemClient = SystemClient()
+    private val adminClient = AdminClient()
 
     /**
      * 仅保留离线快照的 SharedPreferences（`stateCache` / `stateCacheAt`）；
@@ -130,6 +181,15 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var historyJob: Job? = null
     private var nodesJob: Job? = null
     private var appsJob: Job? = null
+    private var stationsJob: Job? = null
+    private var systemJob: Job? = null
+    private var wifiJob: Job? = null
+
+    /**
+     * 管理员令牌：**只保存在内存**（不进 UiState / DataStore / 日志），
+     * 进程退出、切换服务器或退出登录即丢弃。
+     */
+    private var adminToken: String? = null
 
     /** 配置是否已从 DataStore 读出；读出前不发起网络请求，避免用默认地址空跑。 */
     private var settingsReady = false
@@ -264,6 +324,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         nodesJob = null
         appsJob?.cancel()
         appsJob = null
+        stationsJob?.cancel()
+        stationsJob = null
+        systemJob?.cancel()
+        systemJob = null
+        wifiJob?.cancel()
+        wifiJob = null
+        /* 取消后不会再有心跳回来清 loading，这里主动收起骨架屏 / 进度条。 */
+        if (ui.stationsLoading || ui.systemLoading || ui.wifiLoading) {
+            ui = ui.copy(stationsLoading = false, systemLoading = false, wifiLoading = false)
+        }
     }
 
     /** 手动刷新：state 立即重取，history / nodes / 应用多日汇总一并强制重取。 */
@@ -279,6 +349,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun refreshNodes() {
         if (!settingsReady) return
         loadNodes(force = true)
+    }
+
+    /** AP 面板手动刷新（网络页「AP」分段的下拉刷新 / 重试按钮）。 */
+    fun refreshStations() {
+        if (!settingsReady) return
+        loadStations(force = true)
     }
 
     /* ───────────────────────── 主数据 ───────────────────────── */
@@ -348,6 +424,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             }
             refreshHistory(forceHistory)
             loadNodes(force = forceHistory)
+            loadStations(force = forceHistory)
             loadAppsHistory(force = forceHistory)
         }
     }
@@ -429,6 +506,382 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
         }
+    }
+
+    /* ───────────────────────── AP 无线客户端（?what=stations） ───────────────────────── */
+
+    /**
+     * 拉取 `?what=stations` 的 AP 无线客户端快照。
+     *
+     * 与 nodes 一样独立节流：正常 5 分钟一次，失败 1 分钟后重试。失败只写
+     * [UiState.stationsError] 并保留上一次成功结果，绝不影响拓扑 / 节点 / 概览数据。
+     * 响应里的 `enabled=false`（母节点关了 AP 上报）是正常状态，由 AP 面板显示引导文案。
+     */
+    private fun loadStations(force: Boolean) {
+        if (!settingsReady) return
+        val now = System.currentTimeMillis()
+        val refreshMs = if (ui.stationsError != null) STATIONS_RETRY_MS else STATIONS_REFRESH_MS
+        val due = force || ui.stationsAt == 0L || now - ui.stationsAt > refreshMs
+        if (!due) return
+        if (stationsJob?.isActive == true) return
+
+        val base = ui.baseUrl
+        val token = ui.token
+        ui = ui.copy(stationsLoading = true)
+        stationsJob = viewModelScope.launch {
+            try {
+                val data = withContext(Dispatchers.IO) { panelClient.fetchStations(base, token) }
+                if (ui.baseUrl != base || ui.token != token) return@launch
+                ui = ui.copy(
+                    stations = data,
+                    stationsAt = System.currentTimeMillis(),
+                    stationsError = null,
+                    stationsLoading = false
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (ui.baseUrl != base || ui.token != token) return@launch
+                ui = ui.copy(
+                    stationsAt = System.currentTimeMillis(),
+                    stationsError = e.message ?: "AP 客户端数据获取失败",
+                    stationsLoading = false
+                )
+            }
+        }
+    }
+
+    /* ───────────────────────── 系统信息（无需登录） ───────────────────────── */
+
+    /** 设置页「系统」卡片的手动刷新。 */
+    fun refreshSystem() {
+        loadSystem(force = true)
+    }
+
+    /**
+     * 读取系统摘要 / 服务状态 / 进程列表（三个独立 GET）。
+     *
+     * 进设置页自动调用一次（5 分钟节流），之后由「刷新」按钮强制重取。
+     * 三项分别容错：某一项失败不影响其它两项展示；全部失败才在 UI 显示错误态。
+     */
+    fun loadSystem(force: Boolean = false) {
+        if (!settingsReady) return
+        val now = System.currentTimeMillis()
+        val refreshMs = if (ui.systemError != null) SYSTEM_RETRY_MS else SYSTEM_REFRESH_MS
+        val due = force || ui.systemAt == 0L || now - ui.systemAt > refreshMs
+        if (!due) return
+        if (systemJob?.isActive == true) return
+
+        val base = ui.baseUrl
+        ui = ui.copy(systemLoading = true)
+        systemJob = viewModelScope.launch {
+            val info = safely { withContext(Dispatchers.IO) { systemClient.fetchSystem(base) } }
+            val services = safely { withContext(Dispatchers.IO) { systemClient.fetchServices(base) } }
+            val processes = safely { withContext(Dispatchers.IO) { systemClient.fetchProcesses(base) } }
+            if (ui.baseUrl != base) return@launch
+
+            val failure = info.exceptionOrNull()
+                ?: services.exceptionOrNull()
+                ?: processes.exceptionOrNull()
+            ui = ui.copy(
+                system = info.getOrNull() ?: ui.system,
+                services = services.getOrNull() ?: ui.services,
+                processes = processes.getOrNull() ?: ui.processes,
+                systemError = failure?.let { systemErrorMessage(it) },
+                systemAt = System.currentTimeMillis(),
+                systemLoading = false
+            )
+        }
+    }
+
+    /* ───────────────────────── 管理员登录 / 管理操作 ───────────────────────── */
+
+    /**
+     * 用 root 密码登录路由器管理接口。
+     *
+     * 成功时把令牌保存在 ViewModel 内存，并立即读取无线状态；失败按后端错误码给出
+     * 中文提示（`bad_credentials` → 密码错误，429 → 尝试过于频繁）。密码本身不落盘。
+     */
+    fun adminLogin(username: String, password: String) {
+        if (ui.adminLoginLoading) return
+        if (!settingsReady) return
+        if (password.isBlank()) {
+            ui = ui.copy(adminError = "请输入管理员密码")
+            return
+        }
+        if (ui.baseUrl.isBlank()) {
+            ui = ui.copy(adminError = "请先在「连接」里填写面板地址")
+            return
+        }
+
+        val base = ui.baseUrl
+        val user = username.trim().ifBlank { "root" }
+        ui = ui.copy(adminLoginLoading = true, adminError = null, adminNotice = null)
+        viewModelScope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { adminClient.login(base, user, password) }
+                if (ui.baseUrl != base) return@launch
+                adminToken = result.token
+                ui = ui.copy(
+                    adminUser = result.user.ifBlank { user },
+                    adminLoggedIn = true,
+                    adminExpiresAt = result.expires,
+                    adminLoginLoading = false,
+                    adminError = null,
+                    adminNotice = "登录成功",
+                    wifi = null,
+                    wifiLoading = false
+                )
+                /* 登录后立刻拉射频列表，用户不必再点一次。 */
+                wifiJob?.cancel()
+                loadWifi()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                adminToken = null
+                if (ui.baseUrl != base) return@launch
+                ui = ui.copy(
+                    adminLoggedIn = false,
+                    adminUser = "",
+                    adminExpiresAt = 0,
+                    adminLoginLoading = false,
+                    adminError = adminErrorMessage(e),
+                    wifi = null
+                )
+            }
+        }
+    }
+
+    /** 退出登录：本地立即清空令牌，服务端删除失败也不打扰用户。 */
+    fun adminLogout() {
+        val base = ui.baseUrl
+        val token = adminToken
+        adminToken = null
+        wifiJob?.cancel()
+        wifiJob = null
+        ui = ui.copy(
+            adminLoggedIn = false,
+            adminUser = "",
+            adminExpiresAt = 0,
+            adminLoginLoading = false,
+            adminError = null,
+            adminNotice = "已退出管理员登录",
+            wifi = null,
+            wifiLoading = false,
+            adminBusy = false
+        )
+        if (token.isNullOrBlank()) return
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { adminClient.logout(base, token) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                /* 服务端令牌会在 30 分钟内自然过期，退出失败不需要提示。 */
+            }
+        }
+    }
+
+    /** 重新读取无线状态（登录后自动调用；失败保留空态 + 错误提示）。 */
+    fun adminReloadWifi() {
+        if (!ui.adminLoggedIn) return
+        wifiJob?.cancel()
+        loadWifi()
+    }
+
+    private fun loadWifi() {
+        if (!ui.adminLoggedIn) return
+        if (wifiJob?.isActive == true) return
+        val token = validAdminToken() ?: return
+        val base = ui.baseUrl
+        ui = ui.copy(wifiLoading = true)
+        wifiJob = viewModelScope.launch {
+            try {
+                val wifi = withContext(Dispatchers.IO) { adminClient.fetchWifi(base, token) }
+                if (ui.baseUrl != base) return@launch
+                ui = ui.copy(wifi = wifi, wifiLoading = false, adminError = null)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (ui.baseUrl != base) return@launch
+                ui = ui.copy(wifiLoading = false, wifi = null, adminError = adminErrorMessage(e))
+                if (e is AdminException && e.code == "unauthorized") clearAdminSession()
+            }
+        }
+    }
+
+    /**
+     * 开关某个射频：`disabled=true` 关闭无线。
+     *
+     * 关闭会断开该频段的客户端（本机若走 Wi-Fi 也会掉线），由 UI 在做之前说明。
+     * 成功后重新读取无线状态，让开关显示与实际一致。
+     */
+    fun adminSetWifiDisabled(radio: String, disabled: Boolean) {
+        if (ui.adminBusy) return
+        val token = validAdminToken() ?: return
+        val base = ui.baseUrl
+        ui = ui.copy(adminBusy = true, adminError = null, adminNotice = null)
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { adminClient.setWifiDisabled(base, token, radio, disabled) }
+                if (ui.baseUrl != base) return@launch
+                ui = ui.copy(
+                    adminBusy = false,
+                    adminNotice = if (disabled) "已关闭 $radio 无线" else "已开启 $radio 无线"
+                )
+                wifiJob?.cancel()
+                loadWifi()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (ui.baseUrl != base) return@launch
+                ui = ui.copy(adminBusy = false, adminError = adminErrorMessage(e))
+                if (e is AdminException && e.code == "unauthorized") clearAdminSession()
+            }
+        }
+    }
+
+    /** 重启路由器：必须带字面量 `REBOOT` 二次确认；后台会在回包后延迟 1 秒重启。 */
+    fun adminReboot(confirm: String) {
+        if (ui.adminBusy) return
+        if (confirm.trim() != "REBOOT") {
+            ui = ui.copy(adminError = "请输入 REBOOT 确认重启")
+            return
+        }
+        val token = validAdminToken() ?: return
+        val base = ui.baseUrl
+        ui = ui.copy(adminBusy = true, adminError = null, adminNotice = null)
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { adminClient.reboot(base, token, "REBOOT") }
+                if (ui.baseUrl != base) return@launch
+                ui = ui.copy(
+                    adminBusy = false,
+                    adminNotice = "重启命令已发送：路由器将在约 1 分钟后重启，期间面板会断开连接。"
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (ui.baseUrl != base) return@launch
+                ui = ui.copy(adminBusy = false, adminError = adminErrorMessage(e))
+                if (e is AdminException && e.code == "unauthorized") clearAdminSession()
+            }
+        }
+    }
+
+    /**
+     * 校验并返回当前令牌：过期时清空会话并提示重新登录。
+     * 令牌只在内存里，任何路径都不会写盘 / 打印。
+     */
+    private fun validAdminToken(): String? {
+        val token = adminToken
+        if (token.isNullOrBlank()) {
+            ui = ui.copy(
+                adminLoggedIn = false,
+                adminUser = "",
+                adminExpiresAt = 0,
+                adminError = "请先登录管理员"
+            )
+            return null
+        }
+        val expires = ui.adminExpiresAt
+        if (expires > 0L && System.currentTimeMillis() / 1000 >= expires) {
+            clearAdminSession()
+            ui = ui.copy(adminError = "登录已过期，请重新登录")
+            return null
+        }
+        return token
+    }
+
+    private fun clearAdminSession() {
+        adminToken = null
+        wifiJob?.cancel()
+        wifiJob = null
+        ui = ui.copy(
+            adminLoggedIn = false,
+            adminUser = "",
+            adminExpiresAt = 0,
+            adminLoginLoading = false,
+            adminNotice = null,
+            wifi = null,
+            wifiLoading = false,
+            adminBusy = false
+        )
+    }
+
+    private fun adminErrorMessage(error: Throwable): String = when (error) {
+        is AdminException -> error.message
+        else -> error.message ?: "管理员操作失败"
+    }
+
+    /* ───────────────────────── 检查更新 ───────────────────────── */
+
+    /**
+     * 比较 App 版本与路由器 `?what=version`。
+     *
+     * 结论只有四种：有新版本 / 已是最新 / 无法比较（版本号非数字）/ 失败。
+     * 不自动下载，只提示用户去获取安装包。App 版本读自 PackageManager
+     * （当前构建未开启 BuildConfig，`VERSION_NAME` 与 `versionName` 同值）。
+     */
+    fun checkUpdate() {
+        if (ui.update.status == UpdateStatus.CHECKING) return
+        if (!settingsReady) return
+        val base = ui.baseUrl
+        val appVersion = appVersionName()
+        ui = ui.copy(update = UpdateState(UpdateStatus.CHECKING, appVersion, ui.update.server))
+        viewModelScope.launch {
+            try {
+                val server = withContext(Dispatchers.IO) { systemClient.fetchVersion(base) }
+                if (ui.baseUrl != base) return@launch
+                val comparison = compareVersions(server.effectiveVersion, appVersion)
+                val status = when {
+                    server.effectiveVersion.isBlank() -> UpdateStatus.UNKNOWN
+                    comparison == null -> UpdateStatus.UNKNOWN
+                    comparison > 0 -> UpdateStatus.UPDATE_AVAILABLE
+                    else -> UpdateStatus.UP_TO_DATE
+                }
+                ui = ui.copy(update = UpdateState(status, appVersion, server))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (ui.baseUrl != base) return@launch
+                ui = ui.copy(
+                    update = UpdateState(
+                        status = UpdateStatus.ERROR,
+                        appVersion = appVersion,
+                        server = ui.update.server,
+                        message = systemErrorMessage(e)
+                    )
+                )
+            }
+        }
+    }
+
+    /** 本机 App 版本号（等价 BuildConfig.VERSION_NAME；构建未开启 buildConfig，改读系统包信息）。 */
+    private fun appVersionName(): String = try {
+        val app = getApplication<Application>()
+        @Suppress("DEPRECATION")
+        app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
+    } catch (e: Exception) {
+        ""
+    }
+
+    /** 系统接口错误 → 可展示文案（SystemException 已带中文）。 */
+    private fun systemErrorMessage(error: Throwable): String = when (error) {
+        is SystemException -> error.message
+        else -> error.message ?: "系统信息获取失败"
+    }
+
+    /**
+     * 与 `runCatching` 等价的协程安全版本：**取消信号必须透传**，
+     * 否则页面关闭时会把 CancellationException 吞成「业务失败」并继续写已废状态。
+     */
+    private suspend fun <T> safely(block: suspend () -> T): Result<T> = try {
+        Result.success(block())
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Result.failure(e)
     }
 
     /* ───────────────────────── 应用多日汇总（近 7 天） ───────────────────────── */
@@ -592,6 +1045,38 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         applyServer(index)
     }
 
+    /**
+     * 清空与「某台路由器」绑定的数据：AP 快照 / 系统信息 / 管理员会话 / 更新结果。
+     *
+     * 切换或保存地址时调用，避免把旧路由器的管理令牌、系统信息、更新结论带到新面板上。
+     * 同时丢弃内存里的管理令牌（令牌只对签发它的那台路由器有效）。
+     */
+    private fun UiState.withoutRouterScopedData(): UiState {
+        adminToken = null
+        return copy(
+            stations = StationsData(),
+            stationsError = null,
+            stationsAt = 0,
+            stationsLoading = false,
+            system = null,
+            services = emptyList(),
+            processes = emptyList(),
+            systemError = null,
+            systemAt = 0,
+            systemLoading = false,
+            update = UpdateState(),
+            adminUser = "",
+            adminLoggedIn = false,
+            adminExpiresAt = 0,
+            adminLoginLoading = false,
+            adminError = null,
+            adminNotice = null,
+            wifi = null,
+            wifiLoading = false,
+            adminBusy = false
+        )
+    }
+
     private fun applyServer(index: Int) {
         if (index !in ui.servers.indices) return
         val server = ui.servers[index]
@@ -620,7 +1105,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             alerts = emptyList(),
             offline = false,
             offlineAt = 0
-        )
+        ).withoutRouterScopedData()
         lastEmittedError = null
         persistServers(ui.servers, index)
         start()
@@ -687,7 +1172,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             nodesList = emptyList(),
             nodesAt = 0,
             nodesError = null
-        )
+        ).withoutRouterScopedData()
         lastEmittedError = null
         persistServers(list, index)
         stop()

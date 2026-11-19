@@ -1,0 +1,526 @@
+#!/usr/bin/ucode
+// prism-router-system —— 棱镜路由「系统信息 / 服务 / 进程 / 版本」只读查询 CGI
+//
+// 定位：给 Android/Web 客户端在没有管理员令牌的情况下展示路由器自身状态。
+// 与 prism-router-admin 的分工：
+//   * 本 CGI：**只读、无需登录**，只读 /proc、/proc/net、opkg control、netstat/pgrep 输出；
+//   * prism-router-admin：登录后返回带 token 的系统/网络/无线信息与少量写操作。
+//
+// 契约（docs/SPEC.md §13）：
+//   GET ?what=system     -> {hostname,model,kernel,uptime,load[3],memory{},rootfs{},version}
+//   GET ?what=services   -> {services:[{name,label,running,pid,info}]}
+//   GET ?what=processes  -> {processes:[{pid,user,cpu,mem,command} × ≤20]}
+//   GET ?what=version    -> {version,build,apk_version,update_check}
+//   缺省 what -> system；未知 what -> 400；非 GET -> 405。
+//
+// 安全边界：
+//   * 不写任何文件、不写日志、不执行任何带请求参数的命令：所有命令行都是本文件里的
+//     固定字面量（pgrep/pidof 的名字、netstat/df/nft 的参数均来自硬编码白名单）。
+//   * 只返回内核与进程元数据；不返回 /etc/shadow、UCI 密钥、token 或任何文件内容。
+//   * 响应统一 Cache-Control: no-store + application/json，避免被中间层缓存。
+//   * 未配置更新源：update_check 恒为 false（客户端据此隐藏"检查更新"入口）。
+
+const PROC = '/proc';
+const HZ = 100;                       // Linux USER_HZ：/proc/<pid>/stat 的 utime/stime 单位
+const MAX_PROCESSES = 20;             // processes 最多返回 20 条
+const CMD_MAX = 80;                   // command 最多 80 字节（按 UTF-8 字符边界截断）
+const DEFAULT_PANEL_PORT = 8099;      // 独立面板默认端口（读取 UCI 失败时使用）
+
+/* ucode 的 fs 是模块而不是全局：不 require 时所有读写都抛 ReferenceError。 */
+const fs = require('fs');
+
+let SENT = false;
+
+function out(code, reason, body) {
+	if (SENT) return;
+	SENT = true;
+	printf('Status: %d %s\r\n', code, reason);
+	printf('Content-Type: application/json; charset=utf-8\r\n');
+	printf('Cache-Control: no-store\r\n');
+	printf('X-Content-Type-Options: nosniff\r\n');
+	printf('Referrer-Policy: no-referrer\r\n\r\n');
+	printf('%J\n', body);
+}
+
+function env(name) { return getenv(name) ?? ''; }
+
+function read_file(path) {
+	try { return fs.readfile(path); } catch (e) { return null; }
+}
+
+function read_trim(path) {
+	let s = read_file(path);
+	return (s == null) ? '' : trim(s);
+}
+
+function exists(path) {
+	try { return fs.stat(path) != null; } catch (e) { return false; }
+}
+
+function first_exe(paths) {
+	for (let p in paths) if (exists(p)) return p;
+	return null;
+}
+
+/* 执行固定命令（调用方只传本文件里的字面量，绝不拼接请求数据），返回 stdout。 */
+function run(cmd) {
+	try {
+		let p = fs.popen(cmd + ' 2>/dev/null');
+		let s = p.read('all');
+		p.close();
+		return s ?? '';
+	} catch (e) { return ''; }
+}
+
+function query(name) {
+	let q = env('QUERY_STRING');
+	if (q == '') return '';
+	for (let pair in split(q, '&')) {
+		let kv = split(pair, '=');
+		if (kv[0] == name) return (length(kv) > 1) ? kv[1] : '';
+	}
+	return '';
+}
+
+/* ---------------- 版本 ---------------- */
+
+/* 版本来源（按优先级）：
+ *   1. /usr/lib/opkg/info/luci-app-prism-router.control 的 Version: 1.0.0-1（opkg 安装后必有）
+ *   2. /etc/prism-router/version（可选，由部署方写入，供 APK/App 直接比对）
+ * build 是完整版本（含 -release），version 是去掉 release 的短版本。 */
+function version_info() {
+	let build = '';
+	let raw = read_file('/usr/lib/opkg/info/luci-app-prism-router.control');
+	if (raw != null) {
+		for (let line in split(raw, '\n')) {
+			let t = trim(line);
+			if (index(t, 'Version:') == 0) { build = trim(substr(t, 8)); break; }
+		}
+	}
+	let alt = read_trim('/etc/prism-router/version');
+	if (build == '') build = alt;
+
+	let version = build;
+	let dash = index(build, '-');
+	if (dash > 0) version = substr(build, 0, dash);
+	if (version == '') version = alt;
+
+	/* apk_version：给 Android 端做版本比对。优先独立部署的 /etc/prism-router/version，
+	 * 没有就退化成短版本。没有更新源，所以 update_check 恒 false。 */
+	let apk = alt != '' ? alt : version;
+	return { version: version, build: build, apk_version: apk, update_check: false };
+}
+
+/* ---------------- system ---------------- */
+
+function proc_uptime() {
+	let f = split(trim(read_trim(PROC + '/uptime')), /\s+/);
+	if (length(f) == 0 || !match(f[0], /^[0-9]+(\.[0-9]+)?$/)) return 0;
+	return int(f[0]);
+}
+
+function load_avg() {
+	let f = split(trim(read_trim(PROC + '/loadavg')), /\s+/);
+	let res = [];
+	for (let i = 0; i < 3; i++) push(res, (i < length(f)) ? +(f[i]) : 0);
+	return res;
+}
+
+function memory_info() {
+	let m = { MemTotal: 0, MemFree: 0, MemAvailable: 0 };
+	let raw = read_file(PROC + '/meminfo') ?? '';
+	for (let line in split(raw, '\n')) {
+		let hit = match(line, /^(MemTotal|MemFree|MemAvailable):\s+([0-9]+)\s*kB/);
+		if (hit) m[hit[1]] = int(hit[2]) * 1024;   /* 字节，与 ubus system info 一致 */
+	}
+	if (m.MemAvailable == 0) m.MemAvailable = m.MemFree;
+	return { total: m.MemTotal, free: m.MemFree, available: m.MemAvailable };
+}
+
+/* rootfs：优先 /overlay（可写层），没有 overlay 时退化为 /。单位字节。 */
+function rootfs_info() {
+	let df = first_exe(['/bin/df', '/usr/bin/df']);
+	let res = { total: 0, used: 0, free: 0 };
+	if (df == null) return res;
+	for (let target in ['/overlay', '/']) {
+		let lines = split(trim(run(df + ' -k ' + target)), '\n');
+		if (length(lines) < 2) continue;
+		let f = split(trim(lines[length(lines) - 1]), /\s+/);
+		if (length(f) < 4 || !match(f[1], /^[0-9]+$/)) continue;
+		res.total = int(f[1]) * 1024;
+		res.used = int(f[2]) * 1024;
+		res.free = int(f[3]) * 1024;
+		break;
+	}
+	return res;
+}
+
+/* model：OpenWrt 的 /tmp/sysinfo/model；容器/非 OpenWrt 环境没有该文件时
+ * 退化为 ubus system board（真机由 procd 提供），仍然失败就给空串。 */
+function device_model() {
+	let m = read_trim('/tmp/sysinfo/model');
+	if (m != '') return m;
+	let p = first_exe(['/bin/ubus', '/usr/bin/ubus']);
+	if (p == null) return '';
+	try {
+		let board = json(trim(run(p + ' call system board')));
+		if (type(board) == 'object' && type(board.model) == 'string') return board.model;
+	} catch (e) { }
+	return '';
+}
+
+function do_system() {
+	let hostname = read_trim(PROC + '/sys/kernel/hostname');
+	let kernel = read_trim(PROC + '/sys/kernel/osrelease');
+	let info = version_info();
+	out(200, 'OK', {
+		hostname: hostname,
+		model: device_model(),
+		kernel: kernel,
+		uptime: proc_uptime(),
+		load: load_avg(),
+		memory: memory_info(),
+		rootfs: rootfs_info(),
+		version: info.version
+	});
+}
+
+/* ---------------- 进程/服务探测（名字全部硬编码） ---------------- */
+
+function pid_list(text) {
+	let pids = [];
+	for (let tok in split(trim(text ?? ''), /\s+/)) {
+		if (!match(tok, /^[0-9]+$/)) continue;
+		let n = int(tok);
+		if (n > 0) push(pids, n);
+	}
+	return pids;
+}
+
+function argv_of(pid) {
+	let raw = read_file(PROC + '/' + pid + '/cmdline');
+	if (raw == null || raw == '') return [];
+	return split(raw, '\0');
+}
+
+function comm_of(pid) {
+	let raw = read_file(PROC + '/' + pid + '/stat');
+	if (raw == null) return '';
+	let rp = rindex(raw, ')');
+	let lp = index(raw, '(');
+	if (rp < 0 || lp < 0 || rp <= lp) return '';
+	return substr(raw, lp + 1, rp - lp - 1);
+}
+
+/* 按 comm 找进程（pidof 名字来自本文件白名单）。 */
+function pids_by_comm(name) {
+	let pidof = first_exe(['/bin/pidof', '/usr/bin/pidof']);
+	let pids = [];
+	if (pidof != null) pids = pid_list(run(pidof + ' ' + name));
+	if (length(pids) == 0) {
+		for (let e in (fs.lsdir(PROC) ?? [])) {
+			if (!match(e, /^[0-9]+$/)) continue;
+			if (comm_of(e) == name) push(pids, int(e));
+		}
+	}
+	return pids;
+}
+
+function argv_has(pid, needles) {
+	let args = argv_of(pid);
+	for (let a in args) {
+		if (a == '') continue;
+		for (let n in needles) if (a == n) return true;
+	}
+	return false;
+}
+
+/* 按 argv 精确匹配找进程（用于解释器脚本：cmdline 为 "ucode /usr/bin/prism-routerd"）。
+ * 先用 pgrep -f（固定模式）拿候选，再逐个回读 /proc/<pid>/cmdline 做精确比对，
+ * 避免 pgrep -f 匹配到只是命令行里含该字符串的 shell。 */
+function pids_by_argv(needles) {
+	let candidates = [];
+	let pgrep = first_exe(['/usr/bin/pgrep', '/bin/pgrep']);
+	if (pgrep != null) {
+		for (let n in needles) {
+			for (let pid in pid_list(run(pgrep + ' -f ' + n))) {
+				if (index(candidates, pid) < 0) push(candidates, pid);
+			}
+		}
+	}
+	if (length(candidates) == 0) {
+		for (let e in (fs.lsdir(PROC) ?? [])) {
+			if (!match(e, /^[0-9]+$/)) continue;
+			if (argv_has(int(e), needles)) push(candidates, int(e));
+		}
+		return candidates;
+	}
+	return filter(candidates, function(pid) { return argv_has(pid, needles); });
+}
+
+/* /etc/init.d/<name> status（procd 服务；不用 systemd）。name 只来自白名单。 */
+function init_status(name) {
+	let script = '/etc/init.d/' + name;
+	if (!exists(script)) return '';
+	return trim(split(trim(run(script + ' status')), '\n')[0] ?? '');
+}
+
+/* 某端口是否在 LISTEN、监听地址与 pid（netstat -ltnp 优先，读不到时退化为 /proc/net/tcp{,6}）。 */
+function listen_info(port) {
+	let res = { listening: false, addr: '', pid: 0 };
+	let netstat = first_exe(['/bin/netstat', '/usr/bin/netstat']);
+	let out = '';
+	if (netstat != null) out = run(netstat + ' -ltnp');
+	if (trim(out) == '' && netstat != null) out = run(netstat + ' -ltn');
+
+	for (let line in split(out, '\n')) {
+		let f = split(trim(line), /\s+/);
+		if (length(f) < 6 || f[5] != 'LISTEN') continue;
+		let addr = f[3];
+		let idx = rindex(addr, ':');
+		if (idx < 0) continue;
+		let lp = substr(addr, idx + 1);
+		if (!match(lp, /^[0-9]+$/) || int(lp) != port) continue;
+		res.listening = true;
+		res.addr = addr;
+		if (length(f) >= 7) {
+			let hit = match(f[6], /^([0-9]+)\//);
+			if (hit) res.pid = int(hit[1]);
+		}
+		return res;
+	}
+	if (netstat != null) return res;   /* netstat 可用就信它 */
+
+	/* 没有 netstat：直接读 /proc/net/tcp{,6}，只认状态 0A（LISTEN）。 */
+	let hexport = sprintf('%04X', port);
+	for (let f in [PROC + '/net/tcp', PROC + '/net/tcp6']) {
+		let raw = read_file(f) ?? '';
+		for (let line in split(raw, '\n')) {
+			let cols = split(trim(line), /\s+/);
+			if (length(cols) < 4 || cols[3] != '0A') continue;
+			let idx = rindex(cols[1], ':');
+			if (idx < 0 || substr(cols[1], idx + 1) != hexport) continue;
+			res.listening = true;
+			res.addr = cols[1];
+			return res;
+		}
+	}
+	return res;
+}
+
+function panel_port() {
+	try {
+		let uci = require('uci');
+		let c = uci.cursor();
+		let p = c.get('prism-router', 'panel', 'port');
+		try { c.close(); } catch (e2) { }
+		if (p != null && match(p, /^[0-9]+$/)) {
+			let n = int(p);
+			if (n >= 1 && n <= 65535) return n;
+		}
+	} catch (e) { }
+	return DEFAULT_PANEL_PORT;
+}
+
+function count_nft_tables(nft) {
+	if (nft == null) return 0;
+	let n = 0;
+	for (let line in split(run(nft + ' list tables'), '\n')) {
+		if (index(trim(line), 'table ') == 0) n++;
+	}
+	return n;
+}
+
+function any_exists(paths) {
+	for (let p in paths) if (exists(p)) return p;
+	return null;
+}
+
+function svc(name, label, running, pid, info) {
+	return { name: name, label: label, running: running, pid: pid, info: info };
+}
+
+function do_services() {
+	let services = [];
+
+	/* 1) 采集守护进程：cmdline 是 "ucode /usr/bin/prism-routerd"，按 argv 精确匹配；
+	 *    再用 /etc/init.d status（procd）补充说明。 */
+	let dpids = pids_by_argv(['/usr/bin/prism-routerd', '/usr/share/prism-router/prism-routerd.uc']);
+	let dstatus = init_status('prism-routerd');
+	push(services, svc('prism-routerd', '采集守护进程',
+		length(dpids) > 0 || dstatus == 'running',
+		length(dpids) > 0 ? dpids[0] : 0,
+		dstatus != '' ? ('init: ' + dstatus) : ''));
+
+	/* 2) 独立面板：procd 管理的 uhttpd 实例，按端口（默认 8099）与 argv 双重判定。 */
+	let pinfo = listen_info(panel_port());
+	let ppids = pids_by_argv(['/www/prism-router-panel']);
+	let ppid = pinfo.pid > 0 ? pinfo.pid : (length(ppids) > 0 ? ppids[0] : 0);
+	let pstatus = init_status('prism-router-panel');
+	let penabled = pinfo.listening || length(ppids) > 0;
+	push(services, svc('prism-router-panel', '独立面板（uhttpd）', penabled, ppid,
+		pinfo.listening ? (pinfo.addr + ' 监听')
+			: (pstatus != '' ? ('init: ' + pstatus) : '未监听')));
+
+	/* 3) 计划任务：OpenWrt 用 busybox crond（不是 systemd timer）。 */
+	let cpids = pids_by_comm('crond');
+	push(services, svc('crontab', '计划任务（crond）', length(cpids) > 0,
+		length(cpids) > 0 ? cpids[0] : 0,
+		exists('/etc/crontabs/root') ? '/etc/crontabs/root' : '无 crontab'));
+
+	/* 4) dnsmasq：LAN 的 DNS/DHCP 服务。 */
+	let mpids = pids_by_comm('dnsmasq');
+	push(services, svc('dnsmasq', 'DNS/DHCP（dnsmasq）', length(mpids) > 0,
+		length(mpids) > 0 ? mpids[0] : 0,
+		length(mpids) > 0 ? 'dnsmasq' : '未运行'));
+
+	/* 5) 防火墙：fw4/nft（一次性 rule 加载，没有常驻进程，running 看 nft 是否已有表）。 */
+	let fw4 = first_exe(['/sbin/fw4', '/usr/sbin/fw4', '/usr/bin/fw4']);
+	let nft = first_exe(['/usr/sbin/nft', '/sbin/nft', '/usr/bin/nft']);
+	let tables = count_nft_tables(nft);
+	let finfo;
+	if (fw4 != null) finfo = 'fw4 · ' + sprintf('%d 张表', tables);
+	else if (nft != null) finfo = 'nft · ' + sprintf('%d 张表', tables);
+	else finfo = 'fw4/nft 未安装';
+	push(services, svc('firewall', '防火墙（fw4/nft）', tables > 0, 0, finfo));
+
+	/* 6) clash：只有装了 Clash/mihomo（或 OpenClash）才出现。 */
+	let clash_bins = ['/usr/bin/clash', '/usr/bin/mihomo', '/usr/bin/clash-meta'];
+	let clash_cfgs = ['/etc/init.d/openclash', '/etc/init.d/clash', '/etc/init.d/mihomo',
+		'/etc/config/openclash', '/etc/config/clash', '/etc/config/mihomo'];
+	let clash_inst = any_exists(clash_bins) ?? any_exists(clash_cfgs);
+	if (clash_inst != null) {
+		let xpids = [];
+		for (let nm in ['clash', 'mihomo', 'clash-meta']) {
+			for (let pid in pids_by_comm(nm)) if (index(xpids, pid) < 0) push(xpids, pid);
+		}
+		push(services, svc('clash', '代理内核（Clash/mihomo）', length(xpids) > 0,
+			length(xpids) > 0 ? xpids[0] : 0,
+			length(xpids) > 0 ? 'mihomo/clash' : '已安装未运行'));
+	}
+
+	/* 7) docker：只有装了 Docker 才出现（dockerd 是常驻进程）。 */
+	let docker_inst = any_exists(['/usr/bin/dockerd', '/usr/sbin/dockerd', '/usr/bin/docker',
+		'/etc/init.d/dockerd', '/etc/init.d/docker']);
+	if (docker_inst != null) {
+		let dp = pids_by_comm('dockerd');
+		push(services, svc('docker', '容器（Docker）', length(dp) > 0,
+			length(dp) > 0 ? dp[0] : 0,
+			length(dp) > 0 ? 'dockerd' : '已安装未运行'));
+	}
+
+	out(200, 'OK', { services: services });
+}
+
+/* ---------------- processes ---------------- */
+
+function user_map() {
+	let map = {};
+	for (let line in split(read_file('/etc/passwd') ?? '', '\n')) {
+		let f = split(line, ':');
+		if (length(f) >= 3 && match(f[2], /^[0-9]+$/)) map[f[2]] = f[0];
+	}
+	return map;
+}
+
+/* /proc/<pid>/stat：comm 可能含空格/括号，取最后一个 ')' 之后再切字段。
+ * comm 之后的字段：0=state(3) … 11=utime(14) 12=stime(15) 13=cutime 14=cstime … 21=rss(24)。 */
+function stat_fields(pid) {
+	let raw = read_file(PROC + '/' + pid + '/stat');
+	if (raw == null) return null;
+	let rp = rindex(raw, ')');
+	if (rp < 0 || rp + 2 >= length(raw)) return null;
+	let f = split(substr(raw, rp + 2), ' ');
+	return (length(f) >= 22) ? f : null;
+}
+
+/* 截断到 max 字节，并回退到完整 UTF-8 字符边界（避免 JSON 里出现半个汉字）。 */
+function trunc_utf8(s, max) {
+	if (length(s) <= max) return s;
+	let t = substr(s, 0, max);
+	let i = length(t) - 1;
+	for (let back = 0; i >= 0 && back < 4; back++) {
+		let b = ord(substr(t, i, 1));
+		if (b < 0x80) return t;                       // ASCII：边界完整
+		if (b >= 0xC0) {                              // 多字节首字节
+			let need = (b >= 0xF0) ? 4 : (b >= 0xE0) ? 3 : 2;
+			if (length(t) - i < need) t = substr(t, 0, i);
+			return t;
+		}
+		i--;                                          // 续字节（0x80–0xBF），继续向前
+	}
+	return t;
+}
+
+function cmdline_text(pid) {
+	let args = argv_of(pid);
+	let clean = [];
+	for (let a in args) if (a != '') push(clean, a);
+	if (length(clean) == 0) return '';
+	/* 参数里可能含换行/制表符（如 sh -c "..."），统一压成空格，避免日志/界面里跳行。 */
+	let s = replace(join(' ', clean), /\n/g, ' ');
+	s = replace(s, /\t/g, ' ');
+	return trim(replace(s, /\r/g, ' '));
+}
+
+function do_processes() {
+	let users = user_map();
+	let list = [];
+
+	for (let e in (fs.lsdir(PROC) ?? [])) {
+		if (!match(e, /^[0-9]+$/)) continue;
+		let pid = int(e);
+		if (pid <= 0) continue;
+
+		let cmd = cmdline_text(pid);
+		if (cmd == '') continue;                      // 内核线程 / 僵尸：cmdline 为空
+
+		let f = stat_fields(pid);
+		if (f == null) continue;
+		if (!match(f[11], /^[0-9]+$/) || !match(f[12], /^[0-9]+$/)) continue;
+
+		let status = read_file(PROC + '/' + pid + '/status') ?? '';
+		let uid_hit = match(status, /Uid:\s+([0-9]+)/);
+		let rss_hit = match(status, /VmRSS:\s+([0-9]+)\s*kB/);
+		if (rss_hit == null) continue;                // 没有 VmRSS 的条目（如内核线程）跳过
+
+		let uid = uid_hit ? uid_hit[1] : '';
+		let cpu_tenth = int((int(f[11]) + int(f[12])) * 10 / HZ);   // 累计 CPU 时间，0.1 秒
+		push(list, {
+			pid: pid,
+			user: (uid != '' && users[uid] != null) ? users[uid] : ('uid:' + (uid != '' ? uid : '?')),
+			cpu: cpu_tenth * 1.0 / 10,                // 秒（保留 1 位小数）
+			mem: int(rss_hit[1]) * 1024,              // 字节
+			command: trunc_utf8(cmd, CMD_MAX)
+		});
+	}
+
+	/* 按常驻内存降序；内存相同按累计 CPU 时间降序；再按 pid 升序保证稳定。 */
+	sort(list, function(a, b) {
+		if (a.mem != b.mem) return b.mem - a.mem;
+		if (a.cpu != b.cpu) return (b.cpu > a.cpu) ? 1 : ((b.cpu < a.cpu) ? -1 : 0);
+		return a.pid - b.pid;
+	});
+	out(200, 'OK', { processes: slice(list, 0, MAX_PROCESSES) });
+}
+
+/* ---------------- 入口 ---------------- */
+
+function do_version() {
+	out(200, 'OK', version_info());
+}
+
+function main() {
+	let method = env('REQUEST_METHOD');
+	if (method != 'GET') { out(405, 'Method Not Allowed', { error: 'method_not_allowed' }); return; }
+
+	let what = query('what');
+	if (what == '') what = 'system';
+	if (what == 'system') { do_system(); return; }
+	if (what == 'services') { do_services(); return; }
+	if (what == 'processes') { do_processes(); return; }
+	if (what == 'version') { do_version(); return; }
+	out(400, 'Bad Request', { error: 'bad_request' });
+}
+
+try { main(); } catch (e) { out(500, 'Internal Server Error', { error: 'internal' }); }

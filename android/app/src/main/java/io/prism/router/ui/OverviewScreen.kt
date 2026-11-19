@@ -560,8 +560,13 @@ private fun SpeedHeroCard(state: PanelState) {
                     .padding(horizontal = PrismSpacing.lg, vertical = PrismSpacing.md)
             ) {
                 HeroMetric(
-                    label = "本次累计",
-                    value = fmtBytes(totals.total),
+                    label = "本次下载",
+                    value = fmtBytes(totals.rx),
+                    modifier = Modifier.weight(1f)
+                )
+                HeroMetric(
+                    label = "本次上传",
+                    value = fmtBytes(totals.tx),
                     modifier = Modifier.weight(1f)
                 )
                 HeroMetric(

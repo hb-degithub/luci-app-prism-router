@@ -2,6 +2,7 @@ package io.prism.router.data
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.Locale
 
 /* ───────────────────────── 多路由器配置 ───────────────────────── */
 
@@ -201,6 +202,303 @@ data class SubNode(
     }
 }
 
+/* ───────────────────────── AP 无线客户端（?what=stations） ───────────────────────── */
+
+/**
+ * AP 上报快照的陈旧阈值（秒）：stations.uc 每分钟上报一次，300 秒仍未更新即算陈旧。
+ * 与 [SUB_NODE_ONLINE_SEC] 同值，但语义是「无线站点快照」而不是「节点流量快照」。
+ */
+const val STATION_STALE_SEC = 300L
+
+/** 无线信号档位：绿（好）/ 黄（一般）/ 红（弱）/ 灰（未上报 dBm）。 */
+enum class SignalLevel { GOOD, FAIR, WEAK, UNKNOWN }
+
+/**
+ * 信号 dBm → 档位。阈值取消费级路由器 App 的常见分档：
+ * `>= -60` 绿、`(-75, -60)` 黄、`<= -75` 红；`null`（后端没给 / 超出 -120..0）为灰。
+ */
+fun signalLevelOf(signal: Int?): SignalLevel = when {
+    signal == null -> SignalLevel.UNKNOWN
+    signal >= -60 -> SignalLevel.GOOD
+    signal > -75 -> SignalLevel.FAIR
+    else -> SignalLevel.WEAK
+}
+
+/** 秒数 → 简短中文跨度（45 秒 / 3 分钟 / 2 小时 5 分 / 1 天）；负数返回「—」。 */
+fun fmtSpan(sec: Long): String = when {
+    sec < 0L -> "—"
+    sec < 60L -> "$sec 秒"
+    sec < 3600L -> "${sec / 60} 分钟"
+    sec < 86400L -> "${sec / 3600} 小时 ${(sec % 3600) / 60} 分"
+    else -> "${sec / 86400} 天"
+}
+
+/** 上报年龄 → 「12 秒前 / N 分钟前 / 未上报」；负数（无可信时间戳）显示「未上报」。 */
+fun fmtStationAge(ageSec: Long): String = when {
+    ageSec < 0L -> "未上报"
+    ageSec < 60L -> "${ageSec} 秒前"
+    else -> fmtSpan(ageSec) + "前"
+}
+
+/**
+ * `?what=stations` 里的一个 AP 节点汇总。
+ *
+ * [count] 是服务端统计的站点数（可能大于本次实际返回的条数：服务端按报文预算
+ * 裁剪列表），[ageSec] 为该节点最后一次上报的年龄（`<0` 表示没有可信时间戳）。
+ */
+data class StationNode(
+    val nodeId: String,
+    val name: String,
+    val ts: Long,
+    val ageSec: Long,
+    val count: Int
+) {
+    val displayName: String
+        get() = name.trim().ifBlank { nodeId.trim().ifBlank { "未命名 AP" } }
+
+    val freshness: NodeFreshness
+        get() = when {
+            ageSec < 0L -> NodeFreshness.UNKNOWN
+            ageSec <= STATION_STALE_SEC -> NodeFreshness.ONLINE
+            else -> NodeFreshness.STALE
+        }
+
+    /** 超过 [STATION_STALE_SEC] 未上报：UI 显示橙色「数据陈旧」。 */
+    val stale: Boolean get() = freshness == NodeFreshness.STALE
+
+    /** 状态短文案：在线 / 数据陈旧 / 未上报。 */
+    fun freshnessText(): String = when (freshness) {
+        NodeFreshness.ONLINE -> "在线"
+        NodeFreshness.STALE -> "数据陈旧"
+        NodeFreshness.UNKNOWN -> "未上报"
+    }
+
+    /** 上报年龄文案（「12 秒前」/「1 天前」/「未上报」）。 */
+    fun ageText(): String = fmtStationAge(ageSec)
+}
+
+/**
+ * 单条无线客户端（AP 侧 stations.uc 上报的元数据，不含任何字节字段）。
+ *
+ * 单位与后端一致：[signal] 为 dBm（后端判定非法时为 `null`，不能用 0 顶替），
+ * [rxRate]/[txRate] 为 kbit/s（iw 的协商速率），[connectedSec] 为连接秒数。
+ */
+data class StationInfo(
+    val mac: String,
+    val nodeId: String,
+    val nodeName: String,
+    val iface: String,
+    val signal: Int?,
+    val rxRate: Int,
+    val txRate: Int,
+    val connectedSec: Long,
+    val ts: Long,
+    val ageSec: Long
+) {
+    /** MAC 统一大写展示（后端存小写）。 */
+    val displayMac: String get() = mac.uppercase(Locale.US)
+
+    /** 所属 AP：优先展示名，缺失时退回 node_id，再退回占位文案。 */
+    val apName: String
+        get() = nodeName.trim().ifBlank { nodeId.trim().ifBlank { "未知 AP" } }
+
+    val signalLevel: SignalLevel get() = signalLevelOf(signal)
+
+    /** 该行快照是否已过保鲜窗口（> [STATION_STALE_SEC] 秒）。 */
+    val stale: Boolean get() = ageSec > STATION_STALE_SEC
+
+    /** 信号文案：`-50 dBm` / `信号未知`。 */
+    fun signalText(): String = signal?.let { "$it dBm" } ?: "信号未知"
+
+    /** 上报年龄文案。 */
+    fun ageText(): String = fmtStationAge(ageSec)
+
+    /** 客户端行的新鲜度文案：陈旧时直接写「数据陈旧」，否则「N 分钟前 / 未上报」。 */
+    fun freshnessText(): String = if (stale) "数据陈旧" else ageText()
+}
+
+/** `?what=stations` 的完整响应；`enabled=false` 表示母节点没开 AP 上报。 */
+data class StationsData(
+    val enabled: Boolean = true,
+    val nodes: List<StationNode> = emptyList(),
+    val stations: List<StationInfo> = emptyList(),
+    /** 服务端统计的站点条数（可能大于 [stations] 的长度）。 */
+    val count: Int = 0
+) {
+    val isEmpty: Boolean get() = nodes.isEmpty() && stations.isEmpty()
+
+    val staleNodeCount: Int get() = nodes.count { it.stale }
+}
+
+/* ───────────────────────── 系统信息（/cgi-bin/prism-router-system） ───────────────────────── */
+
+/** 内存：`total` / `free` / `available` 均为字节；`available` 缺失时退回 `free`。 */
+data class MemoryInfo(
+    val total: Long = 0,
+    val free: Long = 0,
+    val available: Long = 0
+) {
+    /** 可用内存：优先 `available`（含缓存可回收），没有就退回 `free`。 */
+    val usable: Long get() = if (available > 0) available else free
+
+    val used: Long get() = (total - usable).coerceAtLeast(0L)
+
+    val usedPercent: Float
+        get() = if (total > 0) (used.toFloat() / total).coerceIn(0f, 1f) else 0f
+
+    val known: Boolean get() = total > 0
+}
+
+/** 根分区（overlay）：`total` / `used` / `free` 均为字节。 */
+data class RootfsInfo(
+    val total: Long = 0,
+    val used: Long = 0,
+    val free: Long = 0
+) {
+    val usedPercent: Float
+        get() = if (total > 0) (used.toFloat() / total).coerceIn(0f, 1f) else 0f
+
+    val known: Boolean get() = total > 0
+}
+
+/** `?what=system`：设备摘要（主机名 / 型号 / 内核 / 运行时间 / 负载 / 内存 / 根分区）。 */
+data class SystemInfo(
+    val hostname: String = "",
+    val model: String = "",
+    val kernel: String = "",
+    val uptime: Long = 0,
+    val load: List<Double> = emptyList(),
+    val memory: MemoryInfo = MemoryInfo(),
+    val rootfs: RootfsInfo = RootfsInfo(),
+    val version: String = ""
+) {
+    /** 三个负载值（1 / 5 / 15 分钟），缺失时显示「—」。 */
+    val loadText: String
+        get() = if (load.isEmpty()) {
+            "—"
+        } else {
+            load.take(3).joinToString(" / ") { String.format(Locale.US, "%.2f", it) }
+        }
+}
+
+/** `?what=services` 的一项：系统服务运行状态。 */
+data class ServiceInfo(
+    val name: String,
+    val label: String,
+    val running: Boolean,
+    val pid: Int,
+    val info: String
+) {
+    /** 展示名：优先中文 label，缺失时退回服务名。 */
+    val displayName: String
+        get() = label.trim().ifBlank { name.trim().ifBlank { "未知服务" } }
+}
+
+/** `?what=processes` 的一行：PID / 用户 / CPU% / 内存% / 命令行。 */
+data class ProcessInfo(
+    val pid: Int,
+    val user: String,
+    val cpu: Double,
+    val mem: Double,
+    val command: String
+) {
+    val userText: String get() = user.trim().ifBlank { "—" }
+
+    val commandText: String get() = command.trim().ifBlank { "—" }
+
+    val cpuText: String get() = String.format(Locale.US, "%.1f%%", cpu.coerceAtLeast(0.0))
+
+    val memText: String get() = String.format(Locale.US, "%.1f%%", mem.coerceAtLeast(0.0))
+}
+
+/**
+ * `?what=version`：服务端版本。
+ *
+ * [version] 是面板 / 固件版本（检查更新时与 App 的 versionName 比较）；
+ * [apkVersion] 是服务端记录的 Android 包版本，仅在 [version] 缺失时兜底；
+ * [build] 是构建标识，只用于展示。
+ */
+data class ServerVersion(
+    val version: String = "",
+    val build: String = "",
+    val apkVersion: String = ""
+) {
+    /** 参与比较的有效版本：优先 `version`，缺失时退回 `apk_version`。 */
+    val effectiveVersion: String get() = version.trim().ifBlank { apkVersion.trim() }
+
+    val displayVersion: String get() = effectiveVersion.ifBlank { "未知" }
+
+    val known: Boolean get() = effectiveVersion.isNotBlank()
+}
+
+/* ───────────────────────── 无线射频（管理员 ?action=wifi） ───────────────────────── */
+
+/** 一个无线射频：radio 名、SSID、频段 / 信道、客户端数、是否禁用与加密方式。 */
+data class WifiDevice(
+    val radio: String = "",
+    val ssid: String = "",
+    val band: String = "",
+    val channel: String = "",
+    val disabled: Boolean = false,
+    val clients: Int = 0,
+    val encryption: String = ""
+) {
+    /** 展示名：radio 名缺失时退回「无线」。 */
+    val displayRadio: String get() = radio.trim().ifBlank { "无线" }
+}
+
+/** `?action=wifi` 的响应；`supported=false`（或没有射频）表示路由器没有无线网卡。 */
+data class WifiInfo(
+    val supported: Boolean = false,
+    val devices: List<WifiDevice> = emptyList()
+)
+
+/* ───────────────────────── 检查更新 ───────────────────────── */
+
+/** 检查更新的四种确定结果 + 两种过程态。 */
+enum class UpdateStatus { IDLE, CHECKING, UP_TO_DATE, UPDATE_AVAILABLE, UNKNOWN, ERROR }
+
+/** 检查更新的 UI 状态：App 版本、服务端版本与结论。 */
+data class UpdateState(
+    val status: UpdateStatus = UpdateStatus.IDLE,
+    val appVersion: String = "",
+    val server: ServerVersion? = null,
+    val message: String? = null
+)
+
+/**
+ * 提取版本号里的数字段：`"v1.2.3-beta"` → `[1, 2, 3]`、`"1.10"` → `[1, 10]`。
+ * 遇到第一个非数字 / 空段即停止；完全没有数字时返回 `null`（不可比较）。
+ */
+fun versionParts(value: String): List<Int>? {
+    val text = value.trim().removePrefix("v").removePrefix("V")
+    if (text.isEmpty()) return null
+    val out = ArrayList<Int>(4)
+    for (chunk in text.split('.')) {
+        val number = chunk.takeWhile { it.isDigit() }.toIntOrNull() ?: break
+        out.add(number)
+        if (out.size >= 4) break
+    }
+    return out.ifEmpty { null }
+}
+
+/**
+ * 比较两个版本号：`>0` 表示 [a] 比 [b] 新，`<0` 更旧，`0` 相同；
+ * 任一侧无法解析出数字段时返回 `null`（UI 显示「无法比较」而不是猜）。
+ */
+fun compareVersions(a: String, b: String): Int? {
+    val left = versionParts(a) ?: return null
+    val right = versionParts(b) ?: return null
+    val size = maxOf(left.size, right.size)
+    for (i in 0 until size) {
+        val x = left.getOrElse(i) { 0 }
+        val y = right.getOrElse(i) { 0 }
+        if (x != y) return x.compareTo(y)
+    }
+    return 0
+}
+
+/** 面板健康状态（`state.health` 的只读投影）。 */
 data class Health(
     val confidence: String,
     val reasons: List<String>,

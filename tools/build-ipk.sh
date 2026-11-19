@@ -72,8 +72,12 @@ pack() { # $1=dir $2=basename（不带扩展名）
     "$d/data/www/cgi-bin/prism-router-metrics" \
     "$d/data/www/cgi-bin/prism-router-control" \
     "$d/data/www/cgi-bin/prism-router-feishu" \
+    "$d/data/www/cgi-bin/prism-router-system" \
+    "$d/data/www/cgi-bin/prism-router-admin" \
     "$d/data/etc/init.d/prism-router-panel" \
-    "$d/data/www/prism-router-panel/cgi-bin/panel-api" 2>/dev/null || true
+    "$d/data/www/prism-router-panel/cgi-bin/panel-api" \
+    "$d/data/www/prism-router-panel/cgi-bin/prism-router-system" \
+    "$d/data/www/prism-router-panel/cgi-bin/prism-router-admin" 2>/dev/null || true
   # control 归档：目录 755，control/conffiles 644，维护脚本 755（opkg 会直接 exec）
   find "$d/control" -type d -exec chmod 755 {} +
   chmod 644 "$d/control/control"
@@ -159,10 +163,19 @@ install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-statio
 install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-metrics"  "$D/data/www/cgi-bin/prism-router-metrics"
 install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-control"  "$D/data/www/cgi-bin/prism-router-control"
 install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-feishu"   "$D/data/www/cgi-bin/prism-router-feishu"
+# 系统信息（只读、无需登录）与管理员 API（登录 + token）——同样必须是 755。
+install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-system"   "$D/data/www/cgi-bin/prism-router-system"
+install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-admin"    "$D/data/www/cgi-bin/prism-router-admin"
 
 # 独立面板（默认关闭；同一插件内的可选视图）
 install -m 755 "$ROOT/luci-app-prism-router/root/www/prism-router-panel/cgi-bin/panel-api" \
   "$D/data/www/prism-router-panel/cgi-bin/panel-api"
+# 面板服务（8099）也需要系统/管理员接口：同一份 CGI 再装一份到面板 cgi-bin，
+# 这样 App 只填面板地址就能同时用 panel-api 与 system/admin（不必反向代理）。
+install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-system" \
+  "$D/data/www/prism-router-panel/cgi-bin/prism-router-system"
+install -m 755 "$ROOT/luci-app-prism-router/root/www/cgi-bin/prism-router-admin" \
+  "$D/data/www/prism-router-panel/cgi-bin/prism-router-admin"
 for f in "$ROOT"/luci-app-prism-router/root/www/prism-router-panel/*.html \
          "$ROOT"/luci-app-prism-router/root/www/prism-router-panel/*.css \
          "$ROOT"/luci-app-prism-router/root/www/prism-router-panel/*.js; do

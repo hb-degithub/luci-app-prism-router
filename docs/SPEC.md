@@ -42,6 +42,8 @@
 /www/prism-router-panel/               # 独立面板静态根：index.html / app.js / style.css（§11）
 /www/prism-router-panel/cgi-bin/panel-api  # 独立面板只读 JSON CGI（§11；0644→0755，ucode）
 /www/cgi-bin/prism-router-control      # 家长控制写操作 CGI + 本机 root 的 apply 重放（§12；0755，ucode）
+/www/cgi-bin/prism-router-system       # 系统信息/服务/进程/版本只读 CGI（§13；0755，GET-only，无需登录）
+/www/cgi-bin/prism-router-admin        # 管理员登录 + 系统/网络/无线/重启/无线开关（§14；0755，token）
 /etc/prism-router/paused.json          # 暂停列表（§12；0600，原子写）
 /etc/prism-router/control.log          # 家长控制审计（§12；0600，最近 200 行）
 /usr/share/rpcd/acl.d/luci-app-prism-router.json
@@ -847,6 +849,8 @@ CSV 规则（门禁逐条验）：
 /www/prism-router-panel/app.js            0644
 /www/prism-router-panel/style.css         0644
 /www/prism-router-panel/cgi-bin/panel-api 0755   只读 ucode CGI（#!/usr/bin/ucode）
+/www/prism-router-panel/cgi-bin/prism-router-system 0755  §13 只读系统信息 CGI 的副本
+/www/prism-router-panel/cgi-bin/prism-router-admin  0755  §14 管理员 API 的副本（自身仍校验 token）
 ```
 
 `prism-router` 的 `DEPENDS` 因此包含 `uhttpd`（系统自带的 web 服务器，不是 LuCI）。
@@ -910,6 +914,8 @@ config panel 'panel'
 - 默认关闭 + 默认绑定 LAN 地址；`bind` 解析失败时宁可监听所有接口也不拼命令（uhttpd argv 由
   procd 以列表形式传递，不经过 shell）。
 - 文档根只放静态页面；目录里没有可写路径。token 只在 CGI 内从 UCI 读取，不写日志、不进 argv。
+  例外：`cgi-bin/` 下多装了两份 §13/§14 的 CGI 副本，使独立面板端口也能访问系统信息与管理员 API；
+  两者各自做只读/令牌校验（与 LuCI 端口上的行为一致），不读面板的静态文件。
 - 这是**仅限局域网**的明文 HTTP 服务：没有 TLS、没有防重放；不要暴露到 WAN，跨网络请用
   WireGuard/Tailscale。
 - ⚠ OpenWrt 的 uhttpd 只把 `Accept/Authorization/Host/User-Agent` 转成 CGI 环境变量，
@@ -920,7 +926,7 @@ config panel 'panel'
 
 ### 11.6 容器门禁
 
-`tests/container-validate-standalone-panel.sh`（第 13 套，隔离容器、`--network none`，**68 项**）：
+`tests/container-validate-standalone-panel.sh`（第 13 套，隔离容器、`--network none`，**138 项**）：
 
 - 装包后落位/权限（init 755、CGI 755、静态 644）、`sh -n`/`ucode -c`、panel 段默认值；
 - **默认关闭**：`enabled=0` 时 start 退出码 0 且 18099 无监听；
@@ -935,7 +941,12 @@ config panel 'panel'
 - 非法 `port=99999`→回退 8099、非法 bind→监听所有接口、旧端口不再监听；
 - `panel.bind` 留空 → 自动取 `network.lan.ipaddr`；
 - 停掉 rpcd → 500 `{"error":"internal"}` 且响应不含路径/堆栈；
-- init 不读 token、CGI 无写文件/日志调用、临时日志里没有 token、系统目录权限不变。
+- init 不读 token、CGI 无写文件/日志调用、临时日志里没有 token、系统目录权限不变；
+- **系统信息 CGI（§13）**：`system`/`services`/`processes`/`version` 均 200 + 结构断言 +
+  `Content-Type`/`Cache-Control`；服务列表识别出正在监听的面板 uhttpd；POST/PUT→405；
+  `what=bad`→400；缺省 `what`→`system`；
+- **管理员 CGI（§14）**：文件 755、`ucode -c`、`GET ?action=system` 未带 token→401、
+  `POST {"action":"login"}` 缺密码→400。
 
 
 
@@ -1094,10 +1105,248 @@ YYYY-MM-DD HH:MM:SS action mac result
 
 ---
 
+## 13. 系统信息 / 服务 / 进程 / 版本（`prism-router-system`）
+
+一个**只读、无需登录**的 ucode CGI：给客户端展示路由器自身状态，不涉及任何写操作，
+也不读取 UCI 密钥/token。Android/Web 的「关于」「诊断」「服务状态」页可直接轮询。
+
+### 13.1 安装内容
+
+```
+/www/cgi-bin/prism-router-system   0755   ucode CGI（GET-only；由 LuCI 的 uhttpd 以 -x /cgi-bin 执行）
+/www/prism-router-panel/cgi-bin/prism-router-system  0755   同一份文件的副本，供独立面板实例（8099）访问
+```
+
+与其它 CGI 同一个 LuCI web 根，不新开端口、不新增 init/service。独立面板启用后，
+`http://<路由器LAN>:8099/cgi-bin/prism-router-system` 也可用（面板 uhttpd 的 `-x /cgi-bin`
+直接执行面板目录下的同一份副本）；两处行为完全一致（同样 GET-only、同样无认证）。
+
+### 13.2 请求契约
+
+| 请求 | 说明 |
+|---|---|
+| `GET /cgi-bin/prism-router-system?what=system` | 主机/内核/负载/内存/根分区/版本 |
+| `GET …?what=services` | 关键服务运行状态 |
+| `GET …?what=processes` | 进程 Top 20（按常驻内存） |
+| `GET …?what=version` | 插件版本（App 比对用） |
+| 省略 `what` | 等价于 `what=system` |
+| 其它 `what` | `400 {"error":"bad_request"}` |
+| 非 `GET`（含 `HEAD`/`POST`/`PUT`） | `405 {"error":"method_not_allowed"}` |
+
+**`what=system`**
+
+```json
+{
+  "hostname": "OpenWrt",
+  "model": "Xiaomi Router AX6000",
+  "kernel": "5.15.167",
+  "uptime": 123456,
+  "load": [0.12, 0.20, 0.18],
+  "memory": { "total": 1048576000, "free": 314572800, "available": 734003200 },
+  "rootfs": { "total": 1073741824, "used": 268435456, "free": 805306368 },
+  "version": "1.0.0"
+}
+```
+
+- `memory` / `rootfs` 单位**字节**（与 ubus `system info` 一致）；`uptime` 秒。
+- `load` 是 `/proc/loadavg` 的 1/5/15 分钟三值（数字，不是字符串）。
+- `model` 取 `/tmp/sysinfo/model`；没有该文件时退化为 `ubus call system board` 的 `model`，
+  再失败就是空串（容器/非 OpenWrt 环境）。
+- `kernel` 取 `/proc/sys/kernel/osrelease`；`hostname` 取 `/proc/sys/kernel/hostname`。
+- `rootfs` 优先 `df -k /overlay`，没有 overlay 时用 `df -k /`。
+- `version` 是短版本（见 13.2 `what=version` 的 `version`）。
+
+**`what=services`**
+
+```json
+{ "services": [
+  { "name": "prism-routerd",    "label": "采集守护进程",          "running": true,  "pid": 2345, "info": "init: running" },
+  { "name": "prism-router-panel","label": "独立面板（uhttpd）",    "running": false, "pid": 0,    "info": "未监听" },
+  { "name": "crontab",          "label": "计划任务（crond）",       "running": true,  "pid": 987,  "info": "/etc/crontabs/root" },
+  { "name": "dnsmasq",          "label": "DNS/DHCP（dnsmasq）",    "running": true,  "pid": 1024, "info": "dnsmasq" },
+  { "name": "firewall",         "label": "防火墙（fw4/nft）",       "running": true,  "pid": 0,    "info": "fw4 · 4 张表" }
+] }
+```
+
+- 固定顺序：`prism-routerd`、`prism-router-panel`、`crontab`、`dnsmasq`、`firewall`；
+  `clash`（Clash/mihomo/OpenClash）与 `docker` **仅在已安装时**追加在末尾。
+- 判定手段（不用 systemd）：
+  - `prism-routerd`：`pgrep -f` 拿候选后逐个回读 `/proc/<pid>/cmdline` **精确比对**
+    `/usr/bin/prism-routerd`（解释器脚本的 comm 是 `ucode`），再用
+    `/etc/init.d/prism-routerd status`（procd）补充。
+  - `prism-router-panel`：端口从 UCI `prism-router.panel.port` 读取（默认 `8099`），
+    用 `netstat -ltnp` 找 `LISTEN` 行；没有 `netstat` 时读 `/proc/net/tcp{,6}`（state `0A`）；
+    同时按 argv `/www/prism-router-panel` 兜底。
+  - `crontab`：`pidof crond`（OpenWrt 的 busybox crond）。
+  - `dnsmasq`：`pidof dnsmasq`。
+  - `firewall`：`nft list tables` 的表数（fw4 是一次性加载，没有常驻进程，`pid` 恒 0）。
+  - `clash` / `docker`：`pidof clash|mihomo|dockerd`，二进制/init/config 存在才出现。
+- `running` 一定是布尔，`pid` 一定是整数（0 = 没有可报告的 pid），`info` 是给人看的补充说明。
+
+**`what=processes`**
+
+```json
+{ "processes": [
+  { "pid": 1024, "user": "root", "cpu": 12.3, "mem": 18350080, "command": "/usr/sbin/uhttpd -f -h /www ..." }
+] }
+```
+
+- 扫描 `/proc/[0-9]+`，读 `stat`（utime/stime）、`status`（`Uid`/`VmRSS`）、`cmdline`。
+- **内核线程/僵尸剔除**：`cmdline` 为空（或没有 `VmRSS`）的条目不返回。
+- `user` 由 `/etc/passwd` 的 uid→name 映射；查不到时给 `uid:<n>`。
+- `cpu` = `(utime+stime)/HZ` 的**累计 CPU 时间（秒，1 位小数）**，`HZ=100`；
+  单次采样无法得到瞬时占用率，所以这里给累计值。
+- `mem` = `VmRSS × 1024`（字节）。
+- `command` = `cmdline` 的参数用空格连接，`LF/TAB/CR` 压成空格，**最多 80 字节**，
+  截断时回退到完整 UTF-8 字符边界。
+- 排序：`mem` 降序 → `cpu` 降序 → `pid` 升序；最多返回 **20** 条。
+
+**`what=version`**
+
+```json
+{ "version": "1.0.0", "build": "1.0.0-1", "apk_version": "1.0.0", "update_check": false }
+```
+
+- `build`：完整 opkg 版本，来自 `/usr/lib/opkg/info/luci-app-prism-router.control` 的 `Version:`。
+- `version`：`build` 去掉 `-<release>` 的短版本。
+- `apk_version`：优先 `/etc/prism-router/version`（可选文件），没有就用 `version`；
+  供 App 与服务端版本比较。
+- `update_check`：**恒为 `false`**——插件未配置任何更新源，客户端应隐藏「检查更新」入口。
+
+### 13.3 响应头与错误
+
+所有响应（含错误）：
+
+```
+Content-Type: application/json; charset=utf-8
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+```
+
+错误体固定 `{"error": "..."}`：`method_not_allowed`（405）、`bad_request`（400）、
+`internal`（500，异常时兜底，不含堆栈/路径/命令输出）。
+
+### 13.4 安全边界
+
+- **GET-only、无认证**：可被任何能访问 LuCI 的客户端读取，暴露面等于 LuCI 的 uhttpd（默认只监听 LAN）。
+- 不读 `/etc/shadow`、UCI 密钥、token、任何业务数据文件；只输出内核/进程元数据。
+- **命令参数全部固定**：`pidof`/`pgrep` 的名字、`netstat`/`df`/`nft` 的参数都是文件里的字面量，
+  没有任何请求参数进入命令行（`what` 只做字符串白名单比较）。
+- 不写文件、不写日志。
+
+### 13.5 容器门禁
+
+`tests/container-validate-standalone-panel.sh`（第 13 套，隔离容器、`--network none`）新增：
+文件 755 root:root、`ucode -c`、不调用 systemd；`what=system` 200 + 头部 + 字段类型 +
+`memory.total>0`/`rootfs.total>0` + `version=1.0.0`；`what=services` 结构/必需项 +
+「正在监听 18099 的面板」被识别为 running 且 pid>0；`what=processes` ≤20、字段类型、
+`command ≤80`、按内存降序、无内核线程；`what=version` 恰好 4 字段且值正确；
+POST/PUT→405、`what=bad`→400、缺省 `what`→`system`。
+
+### 13.6 已知不足
+
+- `cpu` 是累计 CPU 秒数，不是瞬时百分比（单次请求只采样一次；要瞬时值需两帧采样）。
+- `firewall.running` 表示「nft 里已有表」，不代表 fw4 进程状态（fw4 本就没有常驻进程）。
+- 识别面板端口依赖 UCI + `netstat`/`/proc/net/tcp`；极端定制环境（如把 uhttpd 放进别的
+  netns）可能识别不到，返回 `running:false`。
+- APK 安装的 OpenWrt 25.x 没有 opkg 的 `*.control`，此时 `version`/`build` 为空
+  （`apk_version` 仍可从 `/etc/prism-router/version` 得到）；尚未解析 `/lib/apk/db/installed`。
+- 容器内 `/proc` 的进程数与真机不同，门禁只断言结构、排序与截断，不比对具体进程。
+
+---
+
+## 14. 管理员 API（`prism-router-admin`）
+
+让 Android/Web 客户端在验证**路由器管理密码**后做少量低风险管理操作（查看系统/网络/无线、
+重启、无线开关），而不是拿到 shell。写操作只有两个，且都要求有效 token。
+
+### 14.1 安装内容
+
+```
+/www/cgi-bin/prism-router-admin   0755   ucode CGI（GET/POST；token）
+/www/prism-router-panel/cgi-bin/prism-router-admin  0755   同一份文件的副本（独立面板实例 8099 也可访问）
+```
+
+运行期文件（都在 `/tmp`，重启即失效）：
+
+```
+/tmp/prism-router/admin/<token>.json        0600  管理 token 元数据（30 分钟 TTL）
+/tmp/prism-router/admin-rate/<ip>           0600  登录失败限速（同 IP 每分钟 5 次）
+```
+
+### 14.2 认证流程
+
+```sh
+POST /cgi-bin/prism-router-admin
+Content-Type: application/json
+{"action":"login","username":"root","password":"<密码>"}
+→ 200 {"ok":true,"token":"<32 hex>","user":"root","expires":<unix>}
+```
+
+- 密码只用于与 `/etc/shadow` 的哈希比较：按 `$1$/$5$/$6$` 选 `openssl passwd -1/-5/-6`，
+  用与原哈希相同的 salt，密码经 0600 临时文件传给 `openssl -in`（**不进 argv、不进日志**），
+  比较用常量时间逐字节。
+- 登录失败同 IP 每分钟最多 5 次，超出 → `429 {"error":"rate_limited"}`；
+  用户名默认 `root`，只接受 `^[a-z_][a-z0-9_-]{0,31}$`。
+- token 32 位十六进制；存储文件 0600、目录 0700；过期文件在验证时删除。
+- 后续请求带 token 的方式：`Authorization: Bearer <token>`（推荐）或 body/query 的 `token`。
+
+### 14.3 action 契约
+
+| action | 方法 | 需要 token | 请求 | 成功响应 |
+|---|---|---|---|---|
+| `login` | POST | 否 | `{username?,password}`；密码必填 | `{ok,token,user,expires}` |
+| `logout` | POST | 是 | `{token}` | `{ok:true}`（删除 token 文件） |
+| `system` | GET/POST | 是 | — | `{hostname,model,kernel,version,uptime,load,memory,rootfs}` |
+| `network` | GET/POST | 是 | — | `{interfaces:[{name,up,proto,ipv4[],ipv6[],uptime,mac}]}` |
+| `wifi` | GET/POST | 是 | — | `{supported,devices:[{radio,ssid,band,channel,disabled,clients,encryption}]}` |
+| `reboot` | POST | 是 | `{"confirm":"REBOOT"}` | `{ok:true,rebooting:true}`，1 秒后重启 |
+| `wifi_toggle` | POST | 是 | `{"radio":"radio0","disabled":true}` | `{ok:true}`（`uci set wireless.<radio>.disabled` + `wifi reload`） |
+
+校验顺序：方法 → （POST）body JSON → action 白名单 → login/logout 专用分支 → token。
+
+| 情况 | 响应 |
+|---|---|
+| 非 GET/POST | `405 {"error":"method_not_allowed"}` |
+| 缺少/未知 action、body 不是对象 | `400 {"error":"bad_request"}` |
+| 登录密码为空 | `400 {"error":"bad_request"}` |
+| 密码错误 | `400 {"error":"bad_credentials"}`（并计入限速） |
+| 登录过于频繁 | `429 {"error":"rate_limited"}` |
+| token 缺失/过期/格式错 | `401 {"error":"unauthorized"}` |
+| `reboot` 的 `confirm` 不是字面量 `REBOOT` | `400 {"error":"confirm_required"}` |
+| `radio` 不匹配 `^radio[0-9]+$` | `400 {"error":"bad_request"}` |
+| 无线状态读不到（无无线硬件） | `400 {"error":"wifi_unsupported"}` |
+| 内部异常 | `500 {"error":"internal"}` |
+
+### 14.4 安全边界
+
+- 密码**绝不**进入 argv、日志或响应；临时密码文件用完即删。
+- token 目录 0700、文件 0600；GET 的 `?token=` 会进浏览器历史，客户端应优先用 Bearer。
+- 写操作只有重启与无线开关；没有 UCI 任意写、没有 shell、没有文件读写接口。
+- 所有响应 `Cache-Control: no-store`，错误体不含堆栈/路径/命令输出。
+- 明文局域网 HTTP；跨不可信网络请用 TLS/WireGuard/Tailscale。
+
+### 14.5 实现注意（ucode）
+
+- `fs`/`uci` 都是**模块**，必须 `const fs = require('fs')`；ucode 没有全局 `fs`/`cursor()`。
+- ucode 的函数只能引用**先定义**的函数：`opt_query()`、`shell_quote()` 等 helper 必须写在
+  调用者之前，否则运行期抛 `left-hand side is not a function`（编译期 `ucode -c` 不会发现）。
+
+### 14.6 容器门禁
+
+`tests/container-validate-standalone-panel.sh` 中新增：CGI 0755 root:root、`ucode -c`、
+`GET ?action=system` 未带 token → 401 `unauthorized`、`POST {"action":"login"}` 缺密码 →
+400 `bad_request`。更完整的登录/重启/无线开关流程需要真机（容器没有 `/etc/shadow` 与无线硬件）。
+
+---
+
 ## 单包插件形态
 
 - 唯一包 `luci-app-prism-router` 同时安装守护进程、rpcd 插件、ACL、菜单、LuCI 页面、
   CGI 与独立面板；不再拆分为 daemon 包 + LuCI 包。
+- CGI 共 7 个：`prism-router-{ingest,stations,metrics,feishu,control,system,admin}`，
+  全部 0755；其中 `system` 只读免登录（§13）、`admin` 登录 + token（§14）。
 - 菜单含完整页面：overview / devices / apps / nodes / settings / mobile / diagnostics / panel。
 - ACL 两组：只读组 + 管理组（`luci-app-prism-router-admin`，含 UCI 与写方法）。
 - 独立面板（`prism-router-panel`，默认关闭）：同一插件自带的可选视图，端口 8099，

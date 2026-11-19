@@ -18,6 +18,10 @@
 #  12. bind 默认取 network.lan.ipaddr
 #  13. 后端异常：rpcd 不在 → 500 {"error":"internal"}，响应体不含路径/堆栈
 #  14. 日志：init 不读 token、CGI 不写文件/不记日志、临时日志里没有 token
+#  17. 系统信息 CGI（prism-router-system，GET-only、无需登录）：
+#      system / services / processes / version 200 + 结构 + Content-Type/Cache-Control
+#  18. 管理员 CGI（prism-router-admin）：文件 755、ucode -c、GET 未带 token → 401、
+#      POST login 缺密码 → 400
 #
 # 隔离：--network none，只有 127.0.0.1；不访问外网、不接触任何真机。
 mkdir -p /var/run/ubus /var/lock /tmp
@@ -67,6 +71,35 @@ json_val(){ # $1=表达式；打印原始值，仅用于 ok/bad 消息（不做 
     let fs = require('fs');
     let d = null;
     try { d = json(fs.readfile('/tmp/panel-body.txt')); } catch (e) { d = null; }
+    print((function(d){ return ($1); })(d));" 2>/dev/null
+}
+
+# ── 系统信息 / 管理员 CGI（直接执行 CGI，不依赖 LuCI 的 uhttpd）──
+SYS=/www/cgi-bin/prism-router-system
+ADMIN=/www/cgi-bin/prism-router-admin
+SH=/tmp/sys-headers.txt
+SB=/tmp/sys-body.json
+sysreq(){ # $1=方法 $2=查询串；响应头 -> $SH，响应体 -> $SB
+  rm -f "$SH" "$SB" /tmp/sys-raw.txt
+  env REQUEST_METHOD="$1" QUERY_STRING="$2" ucode "$SYS" 2>/dev/null | tr -d '\r' > /tmp/sys-raw.txt
+  awk -v h="$SH" -v b="$SB" '
+    !done { if ($0 == "") { done=1; next } print > h; next }
+    { print > b }' /tmp/sys-raw.txt
+}
+syscode(){ head -n 1 "$SH" 2>/dev/null | sed 's/^Status: //'; }
+syshdr(){ grep -i "^$1:" "$SH" 2>/dev/null | head -n 1 | sed 's/^[^:]*:[[:space:]]*//'; }
+sysjson(){ # $1=表达式（d = 解析后的 JSON）
+  env F="$SB" ucode -e "
+    let fs = require('fs');
+    let d = null;
+    try { d = json(fs.readfile(getenv('F'))); } catch (e) { d = null; }
+    print((function(d){ return ($1); })(d) ? '1' : '0');" 2>/dev/null
+}
+sysval(){ # $1=表达式；打印原始值（用于长度/计数）
+  env F="$SB" ucode -e "
+    let fs = require('fs');
+    let d = null;
+    try { d = json(fs.readfile(getenv('F'))); } catch (e) { d = null; }
     print((function(d){ return ($1); })(d));" 2>/dev/null
 }
 
@@ -426,7 +459,114 @@ else
 fi
 grep -q 'config panel' /etc/config/prism-router && ok "conffile 已包含 panel 段" || bad "conffile 缺 panel 段"
 
-echo "=== 17. 系统目录权限未被改动 ==="
+echo "=== 17. 系统信息 CGI（prism-router-system）：?what=system，GET-only、无需登录 ==="
+check "$SYS" "root:root -rwxr-xr-x"
+ucode -c "$SYS" >/dev/null 2>&1 && ok "system CGI ucode -c 通过" || bad "system CGI 语法错误"
+if grep -Eq 'systemctl|systemd-run|/run/systemd' "$SYS"; then
+  bad "system CGI 调用了 systemd（应只用 /proc + init.d/pidof）"
+else
+  ok "system CGI 不依赖 systemd"
+fi
+
+sysreq GET "what=system"
+[ "$(syscode)" = "200 OK" ] && ok "what=system 未登录 -> 200" || bad "what=system -> [$(syscode)]"
+case "$(syshdr Content-Type)" in
+  application/json*) ok "system Content-Type=$(syshdr Content-Type)" ;;
+  *) bad "system Content-Type=[$(syshdr Content-Type)]" ;;
+esac
+[ "$(syshdr Cache-Control)" = "no-store" ] && ok "system Cache-Control: no-store" \
+  || bad "system Cache-Control=[$(syshdr Cache-Control)]"
+[ "$(syshdr X-Content-Type-Options)" = "nosniff" ] && ok "system X-Content-Type-Options: nosniff" \
+  || bad "system X-Content-Type-Options=[$(syshdr X-Content-Type-Options)]"
+[ "$(sysjson 'type(d)=="object" && type(d.hostname)=="string" && length(d.hostname)>0')" = "1" ] \
+  && ok "system.hostname 非空字符串" || bad "system.hostname 缺失"
+[ "$(sysjson 'type(d.model)=="string"')" = "1" ] \
+  && ok "system.model 是字符串（容器内可为空；真机读 /tmp/sysinfo/model）" || bad "system.model 类型错误"
+[ "$(sysjson 'type(d.kernel)=="string" && length(d.kernel)>0')" = "1" ] \
+  && ok "system.kernel 非空（/proc/sys/kernel/osrelease）" || bad "system.kernel 缺失"
+[ "$(sysjson 'type(d.uptime)=="int" && d.uptime>=0')" = "1" ] \
+  && ok "system.uptime 非负整数（/proc/uptime）" || bad "system.uptime 异常"
+[ "$(sysjson '(function(a){ if (type(a)!="array" || length(a)!=3) return false; for (let v in a) if (type(v)!="int" && type(v)!="double") return false; return true; })(d.load)')" = "1" ] \
+  && ok "system.load 为 3 个数字（/proc/loadavg）" || bad "system.load 结构异常"
+[ "$(sysjson 'type(d.memory)=="object" && d.memory.total>0 && d.memory.free>=0 && d.memory.available>=0')" = "1" ] \
+  && ok "system.memory{total,free,available} 为字节且 total>0" || bad "system.memory 结构异常"
+[ "$(sysjson 'type(d.rootfs)=="object" && d.rootfs.total>0 && d.rootfs.used>=0 && d.rootfs.free>=0')" = "1" ] \
+  && ok "system.rootfs{total,used,free} 为字节且 total>0" || bad "system.rootfs 结构异常"
+[ "$(sysjson 'd.version=="1.0.0"')" = "1" ] \
+  && ok "system.version=1.0.0（来自 /usr/lib/opkg/info/luci-app-prism-router.control）" \
+  || bad "system.version 不是 1.0.0"
+
+echo "=== 18. 服务 / 进程：?what=services、?what=processes ==="
+sysreq GET "what=services"
+[ "$(syscode)" = "200 OK" ] && ok "what=services -> 200" || bad "what=services -> [$(syscode)]"
+[ "$(sysjson 'type(d.services)=="array" && length(d.services)>=5')" = "1" ] \
+  && ok "services 为数组且至少 5 项" || bad "services 结构异常"
+[ "$(sysjson '(function(a){ for (let s in a) { if (type(s.name)!="string" || length(s.name)==0) return false; if (type(s.label)!="string" || length(s.label)==0) return false; if (type(s.running)!="bool") return false; if (type(s.pid)!="int" || s.pid<0) return false; if (type(s.info)!="string") return false; } return true; })(d.services)')" = "1" ] \
+  && ok "每个 service 的 name/label/running/pid/info 类型正确" || bad "service 字段类型异常"
+[ "$(sysjson '(function(a){ for (let n in ["prism-routerd","prism-router-panel","crontab","dnsmasq","firewall"]) { let hit=false; for (let s in a) if (s.name==n) hit=true; if (!hit) return false; } return true; })(d.services)')" = "1" ] \
+  && ok "包含 prism-routerd/panel/crontab/dnsmasq/firewall 五项" || bad "缺少必需的服务项"
+# 此时面板正监听 18099（§14 设置 panel.port），CGI 应通过 UCI + netstat 识别到运行中的 uhttpd。
+[ "$(sysjson '(function(a){ for (let s in a) if (s.name=="prism-router-panel") return s.running==true && s.pid>0; return false; })(d.services)')" = "1" ] \
+  && ok "prism-router-panel 被识别为运行中（UCI 端口 + netstat）" \
+  || bad "未识别到正在监听 18099 的 prism-router-panel"
+
+sysreq GET "what=processes"
+[ "$(syscode)" = "200 OK" ] && ok "what=processes -> 200" || bad "what=processes -> [$(syscode)]"
+NPROC=$(sysval 'type(d.processes)=="array" ? length(d.processes) : -1')
+[ "$NPROC" -ge 0 ] 2>/dev/null && [ "$NPROC" -le 20 ] && ok "processes 为数组且 ≤20 条（实际 $NPROC）" \
+  || bad "processes 长度异常（$NPROC）"
+if [ "$NPROC" -gt 0 ] 2>/dev/null; then
+  [ "$(sysjson '(function(a){ for (let p in a) { if (type(p.pid)!="int" || p.pid<=0) return false; if (type(p.user)!="string" || length(p.user)==0) return false; if (type(p.cpu)!="int" && type(p.cpu)!="double") return false; if (p.cpu<0) return false; if (type(p.mem)!="int" || p.mem<0) return false; if (type(p.command)!="string" || length(p.command)==0 || length(p.command)>80) return false; } return true; })(d.processes)')" = "1" ] \
+    && ok "每个进程 pid/user/cpu/mem/command 类型正确，command ≤80 字节" || bad "进程字段类型/截断异常"
+  [ "$(sysjson '(function(a){ let prev=null; for (let p in a) { if (prev!=null && p.mem>prev) return false; prev=p.mem; } return true; })(d.processes)')" = "1" ] \
+    && ok "按常驻内存降序" || bad "进程未按内存降序"
+  if [ "$(sysjson 'index(join(",", map(d.processes, p => p.command)), "kthreadd") < 0')" = "1" ]; then
+    ok "内核线程（cmdline 为空）已屏蔽"
+  else
+    bad "进程列表混入内核线程"
+  fi
+else
+  ok "processes 为空数组但结构正确（容器内进程数不足时允许）"
+fi
+
+echo "=== 19. 版本：?what=version（App 比对用） ==="
+sysreq GET "what=version"
+[ "$(syscode)" = "200 OK" ] && ok "what=version -> 200" || bad "what=version -> [$(syscode)]"
+[ "$(sysjson 'type(d)=="object" && length(keys(d))==4')" = "1" ] \
+  && ok "version 响应恰好 4 个字段（version/build/apk_version/update_check）" || bad "version 字段数异常"
+[ "$(sysjson 'd.version=="1.0.0"')" = "1" ] && ok "version=1.0.0" || bad "version=$(sysjson 'd.version')"
+[ "$(sysjson 'd.build=="1.0.0-1"')" = "1" ] && ok "build=1.0.0-1（opkg 完整版本）" || bad "build 异常"
+[ "$(sysjson 'd.apk_version=="1.0.0"')" = "1" ] && ok "apk_version=1.0.0（供 App 比对）" || bad "apk_version 异常"
+[ "$(sysjson 'd.update_check==false')" = "1" ] && ok "update_check=false（未配置更新源）" || bad "update_check 异常"
+
+echo "=== 20. 方法 / 参数错误：非 GET -> 405，未知 what -> 400，缺省 what=system ==="
+sysreq POST "what=system"
+[ "$(syscode)" = "405 Method Not Allowed" ] && ok "POST -> 405" || bad "POST -> [$(syscode)]"
+[ "$(sysjson 'd.error=="method_not_allowed"')" = "1" ] && ok "POST 响应 {error:method_not_allowed}" || bad "POST 错误体异常"
+sysreq PUT "what=version"
+[ "$(syscode)" = "405 Method Not Allowed" ] && ok "PUT -> 405" || bad "PUT -> [$(syscode)]"
+sysreq GET "what=bad"
+[ "$(syscode)" = "400 Bad Request" ] && ok "what=bad -> 400" || bad "what=bad -> [$(syscode)]"
+[ "$(sysjson 'd.error=="bad_request"')" = "1" ] && ok "what=bad 响应 {error:bad_request}" || bad "what=bad 错误体异常"
+sysreq GET ""
+[ "$(syscode)" = "200 OK" ] && [ "$(sysjson 'type(d.hostname)=="string"')" = "1" ] \
+  && ok "缺省 what -> system（200 且含 hostname）" || bad "缺省 what 未回退到 system"
+
+echo "=== 21. 管理员 CGI（prism-router-admin）：安装 / 语法 / 未认证 401 / 登录缺密码 400 ==="
+check "$ADMIN" "root:root -rwxr-xr-x"
+ucode -c "$ADMIN" >/dev/null 2>&1 && ok "admin CGI ucode -c 通过" || bad "admin CGI 语法错误"
+raw=$(env REQUEST_METHOD=GET QUERY_STRING="action=system" ucode "$ADMIN" 2>/dev/null | tr -d '\r')
+[ "$(printf '%s\n' "$raw" | head -n 1)" = "Status: 401 Unauthorized" ] \
+  && ok "GET action=system 未带 token -> 401" || bad "admin GET 未认证 -> [$(printf '%s\n' "$raw" | head -n 1)]"
+printf '%s\n' "$raw" | grep -Eq '"error":[[:space:]]*"unauthorized"' \
+  && ok "401 响应体 {error:unauthorized}" || bad "401 响应体异常"
+raw=$(printf '{"action":"login"}' | env REQUEST_METHOD=POST CONTENT_LENGTH=18 ucode "$ADMIN" 2>/dev/null | tr -d '\r')
+[ "$(printf '%s\n' "$raw" | head -n 1)" = "Status: 400 Bad Request" ] \
+  && ok "POST login 缺密码 -> 400" || bad "admin POST login -> [$(printf '%s\n' "$raw" | head -n 1)]"
+printf '%s\n' "$raw" | grep -Eq '"error":[[:space:]]*"bad_request"' \
+  && ok "400 响应体 {error:bad_request}" || bad "400 响应体异常"
+
+echo "=== 22. 系统目录权限未被改动 ==="
 [ "$B_ETC" = "$(perm /etc)" ] && ok "/etc 未变" || bad "/etc 被改动"
 [ "$B_USR" = "$(perm /usr)" ] && ok "/usr 未变" || bad "/usr 被改动"
 [ "$B_WWW" = "$(perm /www)" ] && ok "/www 未变" || bad "/www 被改动"

@@ -109,6 +109,9 @@ is_exec_name() {
     ./www/cgi-bin/prism-router-ingest|./www/cgi-bin/prism-router-stations|\
     ./www/cgi-bin/prism-router-metrics|./www/cgi-bin/prism-router-feishu|\
     ./www/cgi-bin/prism-router-control|\
+    ./www/cgi-bin/prism-router-system|./www/cgi-bin/prism-router-admin|\
+    ./www/prism-router-panel/cgi-bin/prism-router-system|\
+    ./www/prism-router-panel/cgi-bin/prism-router-admin|\
     ./etc/init.d/prism-router-panel|./www/prism-router-panel/cgi-bin/panel-api) return 0 ;;
   esac
   return 1
@@ -171,6 +174,10 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
              p == "./www/cgi-bin/prism-router-metrics" ||
              p == "./www/cgi-bin/prism-router-feishu" ||
              p == "./www/cgi-bin/prism-router-control" ||
+             p == "./www/cgi-bin/prism-router-system" ||
+             p == "./www/cgi-bin/prism-router-admin" ||
+             p == "./www/prism-router-panel/cgi-bin/prism-router-system" ||
+             p == "./www/prism-router-panel/cgi-bin/prism-router-admin" ||
              p == "./etc/init.d/prism-router-panel" ||
              p == "./www/prism-router-panel/cgi-bin/panel-api"
     }
@@ -238,6 +245,8 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
     "./www/cgi-bin/prism-router-metrics:luci-app-prism-router/root/www/cgi-bin/prism-router-metrics" \
     "./www/cgi-bin/prism-router-feishu:luci-app-prism-router/root/www/cgi-bin/prism-router-feishu" \
     "./www/cgi-bin/prism-router-control:luci-app-prism-router/root/www/cgi-bin/prism-router-control" \
+    "./www/cgi-bin/prism-router-system:luci-app-prism-router/root/www/cgi-bin/prism-router-system" \
+    "./www/cgi-bin/prism-router-admin:luci-app-prism-router/root/www/cgi-bin/prism-router-admin" \
     "./www/prism-router-panel/index.html:luci-app-prism-router/root/www/prism-router-panel/index.html" \
     "./www/prism-router-panel/cgi-bin/panel-api:luci-app-prism-router/root/www/prism-router-panel/cgi-bin/panel-api" \
     "./usr/share/rpcd/ucode/prism-router.uc:luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc"; do

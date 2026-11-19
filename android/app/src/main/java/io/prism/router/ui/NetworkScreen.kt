@@ -56,11 +56,17 @@ import io.prism.router.data.Device
 import io.prism.router.data.NodeFreshness
 import io.prism.router.data.NodeUsage
 import io.prism.router.data.PanelState
+import io.prism.router.data.STATION_STALE_SEC
+import io.prism.router.data.SignalLevel
+import io.prism.router.data.StationInfo
+import io.prism.router.data.StationNode
+import io.prism.router.data.StationsData
 import io.prism.router.data.SubNode
 import io.prism.router.data.UiState
 import io.prism.router.data.fmtBytes
 import io.prism.router.data.fmtClock
 import io.prism.router.data.fmtRateShort
+import io.prism.router.data.fmtUptime
 import io.prism.router.ui.components.EmptyState
 import io.prism.router.ui.components.ErrorState
 import io.prism.router.ui.components.Pill
@@ -89,24 +95,28 @@ private val RAIL_X = 14.dp
 /** 分支卡片相对主干缩进，留出连接线 + 横向短线的空间。 */
 private val CARD_START = 30.dp
 
-/** 网络页的两个子视图：拓扑图与节点列表。 */
+/** 网络页的三个子视图：拓扑图、节点列表与 AP 无线客户端。 */
 private enum class NetworkTab(val label: String) {
     TOPOLOGY("拓扑"),
-    NODES("节点")
+    NODES("节点"),
+    AP("AP")
 }
 
 /**
- * 网络页 = 拓扑 + 节点合并（第 4 个一级页签，只读）。
+ * 网络页 = 拓扑 + 节点 + AP 三合一（第 4 个一级页签，只读）。
  *
  * 顶部大标题 / 副标题由本页的 [PrismScaffold] 提供（滚动收起），下面用 [Segmented]
- * 在「拓扑 / 节点」之间切换，两种视图共用同一个 [PullToRefreshBox]：
+ * 在「拓扑 / 节点 / AP」之间切换，三种视图共用同一个 [PullToRefreshBox]：
  * - 拓扑：互联网 → 出口 → 主路由 → 子节点 / AP → 设备的分层卡片，层间用 Canvas 连线；
- * - 节点：出口节点（rank / 流量 / 占比条）+ 子节点 / AP 列表（新鲜度 / 设备数 / 流量）。
+ * - 节点：出口节点（rank / 流量 / 占比条）+ 子节点 / AP 列表（新鲜度 / 设备数 / 流量）；
+ * - AP：母节点汇总的无线客户端（AP 节点卡 + MAC / 信号 / 协商速率 / 连接时长）。
  *
- * 数据来源：`state`（互联网 / 出口 / 主路由 / 设备）+ `?what=nodes`（子节点 / AP）。
- * 子节点单独失败只影响子节点区块，主数据继续展示；失败时给出重试入口。
+ * 数据来源：`state`（互联网 / 出口 / 主路由 / 设备）+ `?what=nodes`（子节点 / AP）+
+ * `?what=stations`（AP 无线客户端）。三个来源各自失败互不影响；AP 分段失败 / 空
+ * 数据都有独立说明与重试入口。
  *
- * @param onRefresh 完整的「刷新」动作（state + 节点）；未接入时退回 [onRetryNodes]。
+ * @param onRefresh 完整的「刷新」动作（state + 节点 + AP）；未接入时退回 [onRetryNodes]。
+ * @param onRefreshStations 仅重取 AP 快照的动作；为 null 时退回 [onRefresh]（它也会强制重取）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -114,12 +124,14 @@ fun NetworkScreen(
     ui: UiState,
     onRetryNodes: () -> Unit = {},
     modifier: Modifier = Modifier,
-    onRefresh: (() -> Unit)? = null
+    onRefresh: (() -> Unit)? = null,
+    onRefreshStations: (() -> Unit)? = null
 ) {
     var tabIndex by rememberSaveable { mutableIntStateOf(0) }
     val tabs = NetworkTab.entries
     val tab = tabs[tabIndex.coerceIn(0, tabs.lastIndex)]
     val refresh = onRefresh ?: onRetryNodes
+    val refreshStations = onRefreshStations ?: refresh
 
     /* 下拉刷新指示器只由手势触发，避免 15s 自动轮询反复闪动。 */
     var pulling by remember { mutableStateOf(false) }
@@ -186,6 +198,12 @@ fun NetworkScreen(
                             ui = ui,
                             onRetryNodes = onRetryNodes,
                             onRefresh = refresh
+                        )
+
+                        NetworkTab.AP -> ApContent(
+                            ui = ui,
+                            onRefreshStations = refreshStations,
+                            onRetryStations = onRefreshStations ?: refresh
                         )
                     }
                 }
@@ -721,6 +739,302 @@ private fun NodesFooter(ui: UiState) {
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+    }
+}
+
+/* ───────────────────────── AP 视图 ───────────────────────── */
+
+/**
+ * AP 面板：母节点汇总的无线客户端（`?what=stations`）。
+ *
+ * 结构：每个 AP 一张节点卡（名称 / 客户端数 / 上报新鲜度），下面一张客户端列表
+ * （MAC、所属 AP、信号 dBm 带绿 / 黄 / 红、上下行协商速率、连接时长、新鲜度）。
+ * - `age_sec > 300` 的行与节点标橙色「数据陈旧」，但保留最后一次上报内容；
+ * - 空列表分两种：母节点没开 AP 上报（enabled=false）与「已开启但 AP 没推过快照」，
+ *   两种都给出对应的配置说明，不伪造数据；
+ * - 拉取失败显示错误 + 重试（来自 [MainViewModel.refreshStations]）。
+ */
+@Composable
+private fun ApContent(
+    ui: UiState,
+    onRefreshStations: () -> Unit,
+    onRetryStations: () -> Unit
+) {
+    val data = ui.stations
+    val initialLoading = ui.stationsError == null && (ui.stationsLoading || ui.stationsAt == 0L)
+
+    if (data.isEmpty) {
+        when {
+            initialLoading -> Column(
+                Modifier
+                    .fillMaxSize()
+                    .padding(PrismSpacing.lg)
+            ) {
+                SkeletonList(rows = 3)
+            }
+
+            ui.stationsError != null -> ErrorState(
+                msg = redact(ui.stationsError, ui.token),
+                title = "AP 数据加载失败",
+                onRetry = onRetryStations
+            )
+
+            !data.enabled -> EmptyState(
+                title = "AP 上报未启用",
+                desc = "母节点没有开启 AP 无线站点上报（stations_enabled=0）。" +
+                    "在路由器 LuCI「棱镜路由 → 设置」里启用后，AP 侧按 stations.uc 配置上报。",
+                icon = Icons.Rounded.Wifi
+            )
+
+            else -> EmptyState(
+                title = "暂无 AP 客户端",
+                desc = "母节点已启用 AP 上报，但还没有 AP 推送过无线站点快照：" +
+                    "请在 AP 侧安装 stations.uc，配置 mother_url / node_id / token，并加入 crontab 每分钟执行一次。",
+                icon = Icons.Rounded.Wifi
+            )
+        }
+        return
+    }
+
+    /* 客户端按信号降序（弱信号沉底）；所属 AP 保留在后端给定的节点顺序里展示。 */
+    val clients = remember(data) {
+        data.stations.sortedWith(
+            compareByDescending<StationInfo> { it.signal ?: Int.MIN_VALUE }.thenBy { it.mac }
+        )
+    }
+
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(
+            start = PrismSpacing.lg,
+            end = PrismSpacing.lg,
+            top = PrismSpacing.lg,
+            bottom = PrismSpacing.xl
+        ),
+        verticalArrangement = Arrangement.spacedBy(PrismSpacing.lg)
+    ) {
+        if (data.nodes.isNotEmpty()) {
+            itemsIndexed(data.nodes) { _, node -> StationNodeCard(node) }
+        }
+
+        item {
+            SectionCard(
+                title = "无线客户端",
+                subtitle = when {
+                    clients.isNotEmpty() -> "共 ${data.count} 条 · 信号按强弱排序"
+                    else -> "服务端未返回客户端条目"
+                },
+                action = {
+                    TextButton(
+                        onClick = onRetryStations,
+                        modifier = Modifier.heightIn(min = 48.dp)
+                    ) {
+                        Text("刷新", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            ) {
+                if (clients.isEmpty()) {
+                    EmptyState(
+                        title = "暂无客户端",
+                        desc = "AP 快照里没有无线站点：可能当前没有设备关联，或上报内容为空。",
+                        icon = Icons.Rounded.Wifi
+                    )
+                } else {
+                    clients.forEachIndexed { index, station ->
+                        StationRow(station)
+                        if (index != clients.lastIndex) {
+                            HorizontalDivider(
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        item { ApFooter(ui = ui, data = data, onRetry = onRetryStations) }
+    }
+}
+
+/** 一张 AP 节点卡：名称、接入客户端数、上报新鲜度与快照时间。 */
+@Composable
+private fun StationNodeCard(node: StationNode) {
+    val tint = freshnessColor(node.freshness)
+    SectionCard(
+        title = node.displayName,
+        subtitle = node.nodeId.trim().takeIf { it.isNotBlank() }?.let { "节点 $it" } ?: "AP 节点",
+        action = { Pill(text = node.freshnessText(), color = tint) }
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.md)) {
+            MetricColumn("接入客户端", "${node.count} 台", Modifier.weight(1f))
+            MetricColumn("上报", node.ageText(), Modifier.weight(1f))
+            MetricColumn(
+                label = "快照时间",
+                value = if (node.ts > 0L) fmtClock(node.ts * 1000L) else "—",
+                modifier = Modifier.weight(1f)
+            )
+        }
+        if (node.stale) {
+            Spacer(Modifier.height(PrismSpacing.sm))
+            Text(
+                text = "该 AP 上报已超过 ${STATION_STALE_SEC / 60} 分钟，信号与连接时长可能不是当前值。",
+                style = MaterialTheme.typography.labelSmall,
+                color = tint
+            )
+        }
+    }
+}
+
+/**
+ * 单个无线客户端：左侧 MAC / 所属 AP / 协商速率，右侧信号 / 连接时长 / 新鲜度。
+ *
+ * 390dp 宽度下左列 `weight(1f)` + 右列固定内容宽度，MAC 用等宽字体；两列都只允许
+ * 单行省略，不会横向溢出。整行 ≥64dp 且不承载点击，刷新由卡片右上角按钮负责。
+ */
+@Composable
+private fun StationRow(station: StationInfo) {
+    val semantic = LocalPrismSemanticColors.current
+    val signalTint = signalColor(station.signalLevel)
+    val ageTint = if (station.stale) semantic.warning else MaterialTheme.colorScheme.onSurfaceVariant
+    val iface = station.iface.trim()
+    val subtitle = if (iface.isEmpty()) station.apName else "${station.apName} · $iface"
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 64.dp)
+            .padding(vertical = PrismSpacing.sm),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = station.displayMac,
+                style = MaterialTheme.typography.bodyMedium.copy(
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                ),
+                fontWeight = androidx.compose.ui.text.font.FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "↓ ${fmtLinkRate(station.rxRate)} · ↑ ${fmtLinkRate(station.txRate)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Spacer(Modifier.width(PrismSpacing.sm))
+        Column(horizontalAlignment = Alignment.End) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier
+                        .size(8.dp)
+                        .background(signalTint, CircleShape)
+                )
+                Spacer(Modifier.width(PrismSpacing.xs))
+                Text(
+                    text = station.signalText(),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = signalTint,
+                    maxLines = 1
+                )
+            }
+            Text(
+                text = "已连 ${fmtUptime(station.connectedSec)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1
+            )
+            Text(
+                text = station.freshnessText(),
+                style = MaterialTheme.typography.labelSmall,
+                color = ageTint,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+/** AP 面板脚注：失败提示、截断说明与数据来源（只读）。 */
+@Composable
+private fun ApFooter(ui: UiState, data: StationsData, onRetry: () -> Unit) {
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(top = PrismSpacing.xs),
+        verticalArrangement = Arrangement.spacedBy(PrismSpacing.sm)
+    ) {
+        if (ui.stationsError != null) {
+            InlineWarning(
+                message = "AP 刷新失败：${redact(ui.stationsError, ui.token)}",
+                onRetry = onRetry
+            )
+        }
+        if (data.staleNodeCount > 0) {
+            Text(
+                text = "${data.staleNodeCount} 个 AP 上报已超过 ${STATION_STALE_SEC / 60} 分钟，" +
+                    "客户端信号可能不是当前值。",
+                style = MaterialTheme.typography.labelSmall,
+                color = LocalPrismSemanticColors.current.warning
+            )
+        }
+        if (data.count > data.stations.size) {
+            Text(
+                text = "服务端共 ${data.count} 条，按报文预算截断为 ${data.stations.size} 条展示。",
+                style = MaterialTheme.typography.labelSmall,
+                color = LocalPrismSemanticColors.current.warning
+            )
+        }
+        Text(
+            text = "AP 面板来自 ?what=stations：AP 侧 stations.uc 每分钟上报 MAC / 信号 / 协商速率 / " +
+                "连接时长（不报流量）；超过 ${STATION_STALE_SEC / 60} 分钟未更新标为「数据陈旧」。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = if (ui.stationsAt > 0L) {
+                "更新于 ${fmtClock(ui.stationsAt)}"
+            } else {
+                "尚未获取 AP 数据"
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+/** 信号档位 → 语义色（绿 / 黄 / 红 / 灰）。 */
+@Composable
+private fun signalColor(level: SignalLevel): Color {
+    val semantic = LocalPrismSemanticColors.current
+    return when (level) {
+        SignalLevel.GOOD -> semantic.success
+        SignalLevel.FAIR -> semantic.warning
+        SignalLevel.WEAK -> semantic.danger
+        SignalLevel.UNKNOWN -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+}
+
+/**
+ * 协商速率：后端 `rx_rate` / `tx_rate` 单位是 kbit/s（与 iw 的 "866.6 MBit/s" 一致），
+ * 这里换算成 Mbps 展示；0 表示 AP 没给该字段，显示「—」而不是「0 Mbps」。
+ */
+private fun fmtLinkRate(kbps: Int): String {
+    if (kbps <= 0) return "—"
+    val mbps = kbps / 1000.0
+    return if (mbps >= 100.0) {
+        String.format(Locale.US, "%.0f Mbps", mbps)
+    } else {
+        String.format(Locale.US, "%.1f Mbps", mbps)
     }
 }
 

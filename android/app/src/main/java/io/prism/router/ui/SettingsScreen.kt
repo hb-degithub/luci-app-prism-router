@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -66,23 +67,36 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.prism.router.data.MAX_SERVERS
 import io.prism.router.data.MainViewModel
 import io.prism.router.data.PanelClient
+import io.prism.router.data.ProcessInfo
 import io.prism.router.data.ServerProfile
+import io.prism.router.data.ServiceInfo
+import io.prism.router.data.SystemInfo
 import io.prism.router.data.UiState
+import io.prism.router.data.UpdateStatus
+import io.prism.router.data.WifiDevice
+import io.prism.router.data.fmtBytes
+import io.prism.router.data.fmtUptime
+import io.prism.router.ui.components.EmptyState
+import io.prism.router.ui.components.ErrorState
 import io.prism.router.ui.components.Pill
 import io.prism.router.ui.components.PrismIconAction
 import io.prism.router.ui.components.PrismScaffold
 import io.prism.router.ui.components.SectionCard
 import io.prism.router.ui.components.Segmented
+import io.prism.router.ui.components.SkeletonList
 import io.prism.router.ui.theme.LocalPrismSemanticColors
 import io.prism.router.ui.theme.PrismRadius
 import io.prism.router.ui.theme.PrismSize
@@ -93,6 +107,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import java.util.Locale
 
 /* ───────────────────────── 常量 ───────────────────────── */
 
@@ -108,6 +123,13 @@ private const val DIAG_POLL_WARN_MS = 1500L
 /* 记账原因只展示前 3 条，避免长列表把卡片撑长。 */
 private const val DIAG_REASON_LIMIT = 3
 
+/* 进程列表只展示 CPU 占用最高的前 10 条（需求约定的 Top 10）。 */
+private const val PROCESS_TOP_N = 10
+
+/* 内存 / 根分区占用达到该比例后进度条转为橙 / 红。 */
+private const val USAGE_WARN_PERCENT = 0.75f
+private const val USAGE_DANGER_PERCENT = 0.90f
+
 /** 单项诊断结论：绿 / 橙 / 红 / 灰。 */
 private enum class DiagLevel { OK, WARN, FAIL, UNKNOWN }
 
@@ -120,16 +142,20 @@ private data class DiagItem(
 )
 
 /**
- * 设置页（只读展示 + 本机配置）。
+ * 设置页（统计只读 + 本机配置 + 少量管理操作）。
  *
- * 分组顺序与商用路由器 App 一致：连接 → 显示 → 通知 → 刷新 → 诊断 → 关于。
+ * 分组顺序与商用路由器 App 一致：连接 → 管理员 → 系统 → 显示 → 通知 → 刷新 → 诊断 → 关于。
  * - 连接：当前服务器摘要、面板地址 / 令牌编辑、测试连接；「多路由器」内联展开
  *   （增删切换仍调用 ViewModel 的既有方法，不跳子路由）；
+ * - 管理员：root 密码登录换取 30 分钟内存令牌，登录后可重启路由器（输入 REBOOT
+ *   二次确认）或开关无线射频；密码与令牌都不落盘、不进日志；
+ * - 系统：无需登录的只读摘要（主机 / 型号 / 内核 / 运行时间 / 负载 / 内存 / 根分区
+ *   进度条）+ 服务运行状态 + 进程 Top 10（等宽表格），带「刷新」；
  * - 显示 / 通知：主题、动态取色、告警通知开关。UiState 暂无这些字段、导航也未传入，
  *   默认用本地 remember 展示；调用方可通过参数接入真实状态（传 null 即本地模式）；
  * - 刷新：5–300 秒步进 + 输入；
  * - 诊断：原有 9 项只读自检，折叠展示；
- * - 关于：版本、构建信息、只读说明与开源许可。
+ * - 关于：版本、构建信息、服务端版本与「检查更新」、只读说明与开源许可。
  *
  * 底部固定「保存设置」按钮，保存后弹 Snackbar；深色 / 动态色全部走主题令牌。
  *
@@ -195,6 +221,11 @@ fun SettingsScreen(
     /* 外部改了间隔（保存 / 布局恢复）时同步输入框；用户输入不会触发这个 effect。 */
     LaunchedEffect(ui.intervalSec) {
         if (interval.toIntOrNull() != ui.intervalSec) interval = ui.intervalSec.toString()
+    }
+
+    /* 系统信息（无需登录）：进入设置页自动读一次，ViewModel 内部 5 分钟节流。 */
+    LaunchedEffect(Unit) {
+        vm.loadSystem(force = false)
     }
 
     /* 诊断：status 只在点「刷新诊断」时读取一次，失败只影响「版本与服务」一项。 */
@@ -523,6 +554,23 @@ fun SettingsScreen(
                     }
                 }
 
+                /* ───────── 管理员 ───────── */
+                item {
+                    AdminSection(
+                        ui = ui,
+                        vm = vm,
+                        toast = { message -> toast(message) }
+                    )
+                }
+
+                /* ───────── 系统（无需登录） ───────── */
+                item {
+                    SystemSection(
+                        ui = ui,
+                        onRefresh = { vm.refreshSystem() }
+                    )
+                }
+
                 /* ───────── 显示 ───────── */
                 item {
                     SectionCard(title = "显示", subtitle = "主题与动态取色") {
@@ -805,7 +853,8 @@ fun SettingsScreen(
                             "$buildType · Android ${Build.VERSION.RELEASE}（API ${Build.VERSION.SDK_INT}）"
                         )
                         InfoRow("数据来源", "路由器只读面板 /cgi-bin/panel-api")
-                        InfoRow("权限", "只读展示，不修改路由器配置")
+                        InfoRow("权限", "统计只读；管理员操作需登录，且仅限重启 / 无线开关")
+                        UpdateBlock(ui = ui, onCheck = { vm.checkUpdate() })
                         Spacer(Modifier.height(PrismSpacing.xs))
                         HorizontalDivider(
                             color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
@@ -838,7 +887,9 @@ fun SettingsScreen(
                         }
                         Spacer(Modifier.height(PrismSpacing.xs))
                         Text(
-                            text = "本应用只读展示面板数据；面板地址、令牌与刷新间隔仅保存在本机 DataStore，卸载应用会清除本机配置。",
+                            text = "统计功能只读；管理员操作需登录，且仅限重启路由器与无线开关。" +
+                                "面板地址、访问令牌与刷新间隔仅保存在本机 DataStore；" +
+                                "管理员令牌只存在于内存，退出应用或切换服务器即失效。",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -1422,4 +1473,815 @@ private fun redact(message: String, token: String): String {
     /* 太短的令牌替换会误伤普通文字，只有 ≥4 位时才按原文抹掉。 */
     if (secret.length >= 4) out = out.replace(secret, "***")
     return out
+}
+
+/* ───────────────────────── 管理员（登录 + 管理操作） ───────────────────────── */
+
+/**
+ * 管理员分组：root 密码登录 → 临时管理令牌（只在 ViewModel 内存）→ 重启 / 无线开关。
+ *
+ * 安全与交互约定：
+ * - 密码只放在 [remember] 的输入框状态里（不落 DataStore、不参与屏幕状态恢复），
+ *   登录成功后立刻清空；
+ * - 令牌由 ViewModel 私有字段持有，UiState 只暴露「已登录 / 用户名 / 到期时间」；
+ * - 重启必须二次确认并输入字面量 `REBOOT`（与后端 `confirm` 校验一致）；
+ * - 关无线会断开客户端，卡片里提前说明，开关只作用于后端返回的 radio；
+ * - 错误（密码错误 / 429 限速 / 令牌过期）与成功提示都在卡片内就地展示。
+ */
+@Composable
+private fun AdminSection(ui: UiState, vm: MainViewModel, toast: (String) -> Unit) {
+    val semantic = LocalPrismSemanticColors.current
+    var username by rememberSaveable { mutableStateOf("root") }
+    /* 密码不是配置：用 remember（不参与状态恢复），登录成功立即清空。 */
+    var password by remember { mutableStateOf("") }
+    var showPassword by remember { mutableStateOf(false) }
+    var showReboot by remember { mutableStateOf(false) }
+    var rebootText by remember { mutableStateOf("") }
+
+    LaunchedEffect(ui.adminLoggedIn) {
+        if (ui.adminLoggedIn) password = ""
+    }
+
+    val logoutAction: (@Composable () -> Unit)? = if (ui.adminLoggedIn) {
+        {
+            TextButton(
+                onClick = {
+                    vm.adminLogout()
+                    toast("已退出管理员登录")
+                },
+                modifier = Modifier.heightIn(min = 48.dp)
+            ) {
+                Text("退出", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    } else {
+        null
+    }
+
+    SectionCard(
+        title = "管理员",
+        subtitle = if (ui.adminLoggedIn) {
+            "已登录 · 令牌仅保存在内存，30 分钟后过期"
+        } else {
+            "root 密码登录后可执行重启 / 无线开关"
+        },
+        action = logoutAction
+    ) {
+        if (!ui.adminLoggedIn) {
+            OutlinedTextField(
+                value = username,
+                onValueChange = { username = it },
+                label = { Text("用户名") },
+                singleLine = true,
+                enabled = !ui.adminLoginLoading,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(PrismSpacing.sm))
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = { Text("管理员密码") },
+                singleLine = true,
+                enabled = !ui.adminLoginLoading,
+                visualTransformation = if (showPassword) {
+                    VisualTransformation.None
+                } else {
+                    PasswordVisualTransformation()
+                },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                trailingIcon = {
+                    IconButton(onClick = { showPassword = !showPassword }) {
+                        Icon(
+                            imageVector = if (showPassword) {
+                                Icons.Rounded.VisibilityOff
+                            } else {
+                                Icons.Rounded.Visibility
+                            },
+                            contentDescription = if (showPassword) "隐藏密码" else "显示密码"
+                        )
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(PrismSpacing.md))
+            Button(
+                onClick = { vm.adminLogin(username, password) },
+                enabled = !ui.adminLoginLoading && password.isNotBlank(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+            ) {
+                Text(if (ui.adminLoginLoading) "登录中…" else "登录")
+            }
+            AdminFeedback(ui)
+            Spacer(Modifier.height(PrismSpacing.sm))
+            Text(
+                text = "密码只用于向路由器换取 30 分钟有效的管理令牌；令牌只保存在内存，" +
+                    "不写入本机存储，也不会出现在日志里。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Pill("已登录", color = semantic.success)
+                Spacer(Modifier.width(PrismSpacing.sm))
+                Text(
+                    text = ui.adminUser.ifBlank { "root" },
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+            Spacer(Modifier.height(PrismSpacing.xs))
+            Text(
+                text = "令牌到期 ${fmtClockSec(ui.adminExpiresAt)} · ${adminExpiryText(ui.adminExpiresAt)}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(Modifier.height(PrismSpacing.md))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            Spacer(Modifier.height(PrismSpacing.md))
+
+            Text(
+                text = "管理操作",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(Modifier.height(PrismSpacing.sm))
+            OutlinedButton(
+                onClick = {
+                    rebootText = ""
+                    showReboot = true
+                },
+                enabled = !ui.adminBusy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+            ) {
+                Text("重启路由器")
+            }
+            Text(
+                text = "需要输入 REBOOT 二次确认；重启期间路由器管理页与面板都会断开约 1 分钟。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Spacer(Modifier.height(PrismSpacing.md))
+            Text(
+                text = "无线开关",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+            Spacer(Modifier.height(PrismSpacing.xs))
+            WifiBlock(ui = ui, vm = vm)
+            AdminFeedback(ui)
+        }
+    }
+
+    if (showReboot) {
+        AlertDialog(
+            onDismissRequest = { if (!ui.adminBusy) showReboot = false },
+            title = { Text("重启路由器") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.sm)) {
+                    Text(
+                        text = "重启会中断所有网络连接约 1 分钟。请输入 REBOOT 确认：",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    OutlinedTextField(
+                        value = rebootText,
+                        onValueChange = { rebootText = it },
+                        placeholder = { Text("REBOOT") },
+                        singleLine = true,
+                        enabled = !ui.adminBusy,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        vm.adminReboot(rebootText)
+                        rebootText = ""
+                        showReboot = false
+                    },
+                    enabled = rebootText.trim() == "REBOOT" && !ui.adminBusy,
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Text("重启", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showReboot = false },
+                    enabled = !ui.adminBusy,
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Text("取消")
+                }
+            }
+        )
+    }
+}
+
+/** 管理员卡片内的错误 / 成功提示与写操作进度条（就地展示，不弹 Snackbar 打断）。 */
+@Composable
+private fun AdminFeedback(ui: UiState) {
+    val semantic = LocalPrismSemanticColors.current
+    ui.adminError?.let { message ->
+        Spacer(Modifier.height(PrismSpacing.sm))
+        Text(
+            text = message,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.error
+        )
+    }
+    ui.adminNotice?.let { message ->
+        Spacer(Modifier.height(PrismSpacing.sm))
+        Text(
+            text = message,
+            style = MaterialTheme.typography.labelSmall,
+            color = semantic.success
+        )
+    }
+    if (ui.adminBusy) {
+        Spacer(Modifier.height(PrismSpacing.sm))
+        LinearProgressIndicator(Modifier.fillMaxWidth())
+    }
+}
+
+/** 无线射频列表：未登录时整个区块不会渲染；0 个射频时提示「未检测到无线网卡」。 */
+@Composable
+private fun WifiBlock(ui: UiState, vm: MainViewModel) {
+    val semantic = LocalPrismSemanticColors.current
+    val wifi = ui.wifi
+    when {
+        ui.wifiLoading && wifi == null -> Row(verticalAlignment = Alignment.CenterVertically) {
+            LinearProgressIndicator(Modifier.weight(1f))
+            Spacer(Modifier.width(PrismSpacing.md))
+            Text(
+                text = "正在读取无线状态…",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        wifi == null -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.sm)) {
+            Text(
+                text = "还没有读取到无线状态。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedButton(
+                onClick = { vm.adminReloadWifi() },
+                enabled = !ui.adminBusy,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+            ) {
+                Text("读取无线状态")
+            }
+        }
+
+        !wifi.supported -> Text(
+            text = "未检测到无线网卡（wifi.supported=false）。",
+            style = MaterialTheme.typography.bodyMedium,
+            color = semantic.warning
+        )
+
+        wifi.devices.isEmpty() -> Text(
+            text = "路由器上报支持无线，但没有射频条目；稍后点「刷新无线状态」再试。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        else -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
+            wifi.devices.forEach { device ->
+                WifiSwitchRow(
+                    device = device,
+                    busy = ui.adminBusy,
+                    onToggle = { enabled -> vm.adminSetWifiDisabled(device.radio, !enabled) }
+                )
+            }
+            TextButton(
+                onClick = { vm.adminReloadWifi() },
+                enabled = !ui.wifiLoading && !ui.adminBusy,
+                modifier = Modifier.heightIn(min = 48.dp)
+            ) {
+                Text("刷新无线状态", style = MaterialTheme.typography.labelSmall)
+            }
+            Text(
+                text = "关闭射频会断开该频段的无线客户端（本机若走 Wi-Fi 也会掉线）。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+/** 单个射频：radio 名 + SSID / 频段 / 信道 / 客户端数 + 开关（开 = 未禁用）。 */
+@Composable
+private fun WifiSwitchRow(device: WifiDevice, busy: Boolean, onToggle: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 56.dp)
+            .padding(vertical = PrismSpacing.xs),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = device.displayRadio,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = wifiDeviceDetail(device),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Spacer(Modifier.width(PrismSpacing.sm))
+        Switch(
+            checked = !device.disabled,
+            onCheckedChange = onToggle,
+            enabled = !busy
+        )
+    }
+}
+
+/** 射频副文案：SSID / 频段 / 信道 / 客户端数 / 加密方式（空字段直接跳过）。 */
+private fun wifiDeviceDetail(device: WifiDevice): String = listOfNotNull(
+    device.ssid.trim().takeIf { it.isNotBlank() }?.let { "SSID $it" },
+    device.band.trim().takeIf { it.isNotBlank() },
+    device.channel.trim().takeIf { it.isNotBlank() }?.let { "信道 $it" },
+    "${device.clients} 台客户端",
+    device.encryption.trim().takeIf { it.isNotBlank() }
+).joinToString(" · ")
+
+/** 令牌到期文案：绝对时间由调用方展示，这里给相对剩余（过期即提示重新登录）。 */
+private fun adminExpiryText(expiresAt: Long): String {
+    if (expiresAt <= 0L) return "到期时间未知"
+    val remain = expiresAt - System.currentTimeMillis() / 1000
+    return when {
+        remain <= 0L -> "已过期，请重新登录"
+        remain < 60L -> "剩余不到 1 分钟"
+        else -> "剩余 ${remain / 60} 分钟"
+    }
+}
+
+/* ───────────────────────── 系统（无需登录） ───────────────────────── */
+
+/**
+ * 系统分组：设备摘要（主机名 / 型号 / 内核 / 运行时间 / 负载 / 内存 / 根分区）、
+ * 服务状态（绿点运行 / 红点停止 + PID / info）与进程 Top 10（等宽表格）。
+ *
+ * 数据来自 `/cgi-bin/prism-router-system`（只读、无需登录）。三个查询互相独立：
+ * 某一块失败只影响本块，其它块照常展示；全部失败才显示整块错误 + 重试。
+ */
+@Composable
+private fun SystemSection(ui: UiState, onRefresh: () -> Unit) {
+    val semantic = LocalPrismSemanticColors.current
+    val system = ui.system
+    val hasAny = system != null || ui.services.isNotEmpty() || ui.processes.isNotEmpty()
+
+    SectionCard(
+        title = "系统",
+        subtitle = "无需登录 · 只读",
+        action = {
+            TextButton(
+                onClick = onRefresh,
+                enabled = !ui.systemLoading,
+                modifier = Modifier.heightIn(min = 48.dp),
+                contentPadding = PaddingValues(horizontal = PrismSpacing.sm)
+            ) {
+                Text(
+                    text = if (ui.systemLoading) "刷新中…" else "刷新",
+                    style = MaterialTheme.typography.labelSmall
+                )
+            }
+        }
+    ) {
+        when {
+            !hasAny && ui.systemLoading -> SkeletonList(rows = 3, showHeader = false)
+
+            !hasAny && ui.systemError != null -> ErrorState(
+                msg = ui.systemError,
+                title = "系统信息读取失败",
+                onRetry = onRefresh
+            )
+
+            !hasAny -> EmptyState(
+                title = "尚未读取系统信息",
+                desc = "点右上角「刷新」读取主机名、内存、根分区、服务与进程。",
+                icon = Icons.Rounded.Info
+            )
+
+            else -> {
+                if (system != null) {
+                    SystemInfoBlock(system)
+                } else if (ui.systemError != null) {
+                    Text(
+                        text = "设备信息读取失败：${ui.systemError}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+
+                Spacer(Modifier.height(PrismSpacing.md))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                Spacer(Modifier.height(PrismSpacing.md))
+
+                Text(
+                    text = "服务状态",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(Modifier.height(PrismSpacing.xs))
+                if (ui.services.isEmpty()) {
+                    Text(
+                        text = "暂无服务数据",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    Text(
+                        text = "运行中 ${ui.services.count { it.running }} / ${ui.services.size}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(PrismSpacing.xs))
+                    ui.services.forEachIndexed { index, service ->
+                        ServiceStatusRow(service)
+                        if (index != ui.services.lastIndex) {
+                            HorizontalDivider(
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(PrismSpacing.md))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+                Spacer(Modifier.height(PrismSpacing.md))
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "进程 Top $PROCESS_TOP_N",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        text = "按 CPU 排序",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(Modifier.height(PrismSpacing.xs))
+                if (ui.processes.isEmpty()) {
+                    Text(
+                        text = "暂无进程数据",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    ProcessTable(ui.processes)
+                }
+
+                if (ui.systemError != null && system != null) {
+                    Spacer(Modifier.height(PrismSpacing.sm))
+                    Text(
+                        text = "部分数据读取失败：${ui.systemError}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = semantic.warning
+                    )
+                }
+                Spacer(Modifier.height(PrismSpacing.sm))
+                Text(
+                    text = if (ui.systemAt > 0L) {
+                        "读取于 ${fmtClockSec(ui.systemAt / 1000L)} · 来自 /cgi-bin/prism-router-system"
+                    } else {
+                        "来自 /cgi-bin/prism-router-system"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+/** 设备摘要：主机名 / 型号 / 内核 / 运行时间 / 负载 + 内存与根分区进度条。 */
+@Composable
+private fun SystemInfoBlock(info: SystemInfo) {
+    InfoRow("主机名", info.hostname.ifBlank { "—" })
+    InfoRow("型号", info.model.ifBlank { "—" })
+    InfoRow("内核", info.kernel.ifBlank { "—" })
+    if (info.version.isNotBlank()) InfoRow("固件", info.version)
+    InfoRow("运行时间", if (info.uptime > 0L) fmtUptime(info.uptime) else "—")
+    InfoRow("负载", info.loadText)
+    Spacer(Modifier.height(PrismSpacing.xs))
+    if (info.memory.known) {
+        ProgressRow(
+            label = "内存",
+            valueText = "${fmtBytes(info.memory.used)} / ${fmtBytes(info.memory.total)}",
+            percent = info.memory.usedPercent
+        )
+    } else {
+        InfoRow("内存", "未获取到")
+    }
+    if (info.rootfs.known) {
+        ProgressRow(
+            label = "根分区",
+            valueText = "${fmtBytes(info.rootfs.used)} / ${fmtBytes(info.rootfs.total)}",
+            percent = info.rootfs.usedPercent
+        )
+    } else {
+        InfoRow("根分区", "未获取到")
+    }
+}
+
+/** 单条容量进度：标签 + 已用/总量 + 百分比 + 6dp 进度条（≥75% 橙、≥90% 红）。 */
+@Composable
+private fun ProgressRow(label: String, valueText: String, percent: Float) {
+    val color = usageColor(percent)
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = PrismSpacing.xs)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.width(64.dp)
+            )
+            Text(
+                text = valueText,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                text = String.format(Locale.US, "%.0f%%", percent * 100f),
+                style = MaterialTheme.typography.labelSmall,
+                color = color
+            )
+        }
+        Spacer(Modifier.height(PrismSpacing.xs))
+        LinearProgressIndicator(
+            progress = { percent.coerceIn(0f, 1f) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(6.dp)
+                .clip(RoundedCornerShape(PrismRadius.pill)),
+            color = color,
+            trackColor = MaterialTheme.colorScheme.surfaceVariant
+        )
+    }
+}
+
+/** 占用比例 → 语义色。 */
+@Composable
+private fun usageColor(percent: Float): Color {
+    val semantic = LocalPrismSemanticColors.current
+    return when {
+        percent >= USAGE_DANGER_PERCENT -> MaterialTheme.colorScheme.error
+        percent >= USAGE_WARN_PERCENT -> semantic.warning
+        else -> MaterialTheme.colorScheme.primary
+    }
+}
+
+/** 单条服务：状态点（绿运行 / 红停止）+ 名称 + 服务名 / PID / info + 状态文案。 */
+@Composable
+private fun ServiceStatusRow(service: ServiceInfo) {
+    val semantic = LocalPrismSemanticColors.current
+    val tint = if (service.running) semantic.success else MaterialTheme.colorScheme.error
+    val subtitle = listOfNotNull(
+        service.name.trim().takeIf { it.isNotBlank() && !it.equals(service.displayName, ignoreCase = true) },
+        service.pid.takeIf { it > 0 }?.let { "PID $it" },
+        service.info.trim().takeIf { it.isNotBlank() }
+    ).joinToString(" · ")
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .padding(vertical = PrismSpacing.xs),
+        verticalAlignment = Alignment.Top
+    ) {
+        Box(
+            Modifier
+                .padding(top = 6.dp)
+                .size(8.dp)
+                .background(tint, CircleShape)
+        )
+        Spacer(Modifier.width(PrismSpacing.md))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = service.displayName,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (subtitle.isNotEmpty()) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        Spacer(Modifier.width(PrismSpacing.sm))
+        Text(
+            text = if (service.running) "运行中" else "已停止",
+            style = MaterialTheme.typography.labelSmall,
+            color = tint,
+            maxLines = 1
+        )
+    }
+}
+
+/**
+ * 进程 Top 10 表格：PID / 用户 / CPU% / 内存 / 命令，全部等宽字体。
+ *
+ * 列宽固定（40 / 56 / 48 / 48dp），命令列 `weight(1f)` 单行省略 —— 390dp 宽度下
+ * 不横向溢出；行高不设 48dp（只读表格，无触控目标），卡片整体仍可滚动。
+ */
+@Composable
+private fun ProcessTable(processes: List<ProcessInfo>) {
+    val mono = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace)
+    val headerColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val top = remember(processes) { processes.sortedByDescending { it.cpu }.take(PROCESS_TOP_N) }
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = PrismSpacing.xs)
+    ) {
+        ProcessCell("PID", mono, 40.dp, headerColor)
+        ProcessCell("用户", mono, 56.dp, headerColor)
+        ProcessCell("CPU%", mono, 48.dp, headerColor)
+        ProcessCell("内存", mono, 48.dp, headerColor)
+        ProcessCell("命令", mono, null, headerColor)
+    }
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+    top.forEach { process ->
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ProcessCell("${process.pid}", mono, 40.dp)
+            ProcessCell(process.userText, mono, 56.dp)
+            ProcessCell(process.cpuText, mono, 48.dp)
+            ProcessCell(process.memText, mono, 48.dp)
+            ProcessCell(process.commandText, mono, null)
+        }
+    }
+}
+
+/** 进程表格单元格：固定列宽或吃掉剩余宽度，永远单行省略。 */
+@Composable
+private fun RowScope.ProcessCell(text: String, style: TextStyle, width: Dp?, color: Color) {
+    Text(
+        text = text,
+        style = style,
+        color = color,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = if (width != null) Modifier.width(width) else Modifier.weight(1f)
+    )
+}
+
+@Composable
+private fun RowScope.ProcessCell(text: String, style: TextStyle, width: Dp?) {
+    ProcessCell(text, style, width, MaterialTheme.colorScheme.onSurface)
+}
+
+/* ───────────────────────── 检查更新（关于分组内） ───────────────────────── */
+
+/**
+ * 检查更新：显示服务端版本、比较 App 版本与服务端版本。
+ *
+ * - 有新版本：显示「服务端有新版本 X（当前 Y）」，并说明暂不自动下载；
+ * - 无更新：显示「已是最新」；
+ * - 版本号不是数字 / 服务端没给版本：显示「无法比较」，不臆测；
+ * - 请求失败：显示具体原因（404 → 请升级面板）。
+ */
+@Composable
+private fun UpdateBlock(ui: UiState, onCheck: () -> Unit) {
+    val semantic = LocalPrismSemanticColors.current
+    val update = ui.update
+    val server = update.server
+
+    Spacer(Modifier.height(PrismSpacing.md))
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+    Spacer(Modifier.height(PrismSpacing.sm))
+
+    InfoRow(
+        label = "服务端",
+        value = server?.let { info ->
+            buildString {
+                append("v").append(info.displayVersion)
+                if (info.build.isNotBlank()) append(" · 构建 ").append(info.build)
+            }
+        } ?: "未检查"
+    )
+    Spacer(Modifier.height(PrismSpacing.sm))
+    OutlinedButton(
+        onClick = onCheck,
+        enabled = update.status != UpdateStatus.CHECKING,
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+    ) {
+        Text(if (update.status == UpdateStatus.CHECKING) "检查中…" else "检查更新")
+    }
+    Spacer(Modifier.height(PrismSpacing.sm))
+
+    when (update.status) {
+        UpdateStatus.IDLE -> Text(
+            text = "比较本机 App 版本与路由器面板版本；有新版本只提示，不自动下载。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        UpdateStatus.CHECKING -> LinearProgressIndicator(Modifier.fillMaxWidth())
+
+        UpdateStatus.UPDATE_AVAILABLE -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
+            Text(
+                text = "服务端有新版本 ${server?.displayVersion ?: "?"}" +
+                    "（当前 ${update.appVersion.ifBlank { "?" }}）",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.primary
+            )
+            Text(
+                text = "暂不自动下载：请从路由器后台或项目发布页获取新版本安装包。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        UpdateStatus.UP_TO_DATE -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
+            Text(
+                text = "已是最新",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = semantic.success
+            )
+            if (server != null) {
+                Text(
+                    text = "当前 ${update.appVersion.ifBlank { "未知" }} · 服务端 v${server.displayVersion}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        UpdateStatus.UNKNOWN -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
+            Text(
+                text = "无法比较版本号",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = semantic.warning
+            )
+            Text(
+                text = "当前 ${update.appVersion.ifBlank { "未知" }} · " +
+                    "服务端 ${server?.displayVersion ?: "未知"}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        UpdateStatus.ERROR -> Text(
+            text = "检查更新失败：${update.message ?: "未知错误"}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.error
+        )
+    }
 }

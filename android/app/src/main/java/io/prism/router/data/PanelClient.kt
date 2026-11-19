@@ -94,6 +94,36 @@ class PanelClient {
     }
 
     /**
+     * 拉取 AP 无线客户端快照（`?what=stations`）。
+     *
+     * 母节点把各 AP 通过 stations.uc 上报的 MAC / 信号 / 协商速率 / 连接时长汇总成
+     * `{enabled, nodes, stations, count}`。失败时抛 [PanelException]，由调用方降级
+     * （AP 分段显示错误 + 重试，不影响拓扑 / 节点数据）。
+     */
+    fun fetchStations(baseUrl: String, token: String?): StationsData {
+        val body = try {
+            get(baseUrl, "stations", token)
+        } catch (e: PanelException) {
+            /* 老面板的 what 白名单里没有 stations，会回 400 {"error":"bad_request"}；
+               换成可操作的中文提示，别把后端错误码直接甩到界面上。 */
+            val raw = e.message.trim()
+            if (e.code == "badResponse" &&
+                (raw.equals("bad_request", true) || raw.startsWith("HTTP 400"))
+            ) {
+                throw PanelException("面板不支持 AP 客户端查询（?what=stations），请升级面板插件", "unsupported", e)
+            }
+            throw e
+        }
+        return try {
+            parseStations(body)
+        } catch (e: PanelException) {
+            throw e
+        } catch (e: Exception) {
+            throw PanelException("AP 客户端响应无法解析", "badResponse", e)
+        }
+    }
+
+    /**
      * 拉取近 [days] 天（1–31）的应用（域名）汇总：`?what=apps_history&days=n`。
      *
      * 返回按 rx+tx 降序的列表（后端已排序，这里再排一次保证稳定），最多 100 条。
@@ -219,8 +249,10 @@ class PanelClient {
         val o = JSONObject(body)
         val t = o.optJSONObject("totals") ?: JSONObject()
         val totals = Totals(
-            rx = t.optLong("rx"),
-            tx = t.optLong("tx"),
+            /* 后端 totals 只有 direct/proxy（以及 wifi/wired/unknown）分项，没有顶层 rx/tx；
+               直接读 rx/tx 会恒为 0（这就是「本次累计 0 B」的根因）。 */
+            rx = totalsSum(t, "rx", "direct_rx", "proxy_rx"),
+            tx = totalsSum(t, "tx", "direct_tx", "proxy_tx"),
             rxRate = t.optLong("rx_rate"),
             txRate = t.optLong("tx_rate"),
             directRx = t.optLong("direct_rx"),
@@ -467,6 +499,88 @@ class PanelClient {
                 .thenByDescending { it.total }
                 .thenBy { it.displayName }
         )
+    }
+
+    /**
+     * 解析 `?what=stations`：
+     * `{enabled, nodes:[{node_id,name,ts,age_sec,count}],
+     *   stations:[{mac,node_id,node_name,iface,signal,rx_rate,tx_rate,connected_sec,ts,age_sec}],count}`。
+     *
+     * 容错策略与其它解析一致，坏数据不炸整页：
+     * - 数组缺失 / 不是对象 → 空列表；单条缺 MAC（站点行的唯一键）→ 跳过；
+     * - `signal` 缺失或为 `null`（后端判定非法 dBm）→ Kotlin 侧保持 `null`，不伪造成 0；
+     * - `age_sec` 缺失 → -1（未上报），不能误判成「刚刚」；
+     * - `enabled` 缺失（老面板）时按「已启用」处理，避免误报为未开启上报。
+     *
+     * 排序：节点按 ts 降序（最新上报在前）；客户端按信号降序（弱信号排后面），
+     * 信号未知的排最后，同级按 MAC 保证稳定。
+     */
+    fun parseStations(body: String): StationsData {
+        val root = JSONObject(body)
+        val enabled = if (root.has("enabled")) root.optBoolean("enabled", false) else true
+
+        val nodes = ArrayList<StationNode>()
+        val nodeArray = root.optJSONArray("nodes")
+        if (nodeArray != null) {
+            for (i in 0 until nodeArray.length()) {
+                val o = nodeArray.optJSONObject(i) ?: continue
+                nodes.add(
+                    StationNode(
+                        nodeId = o.optString("node_id", "").trim(),
+                        name = o.optString("name", "").trim(),
+                        ts = o.optLong("ts", 0L),
+                        ageSec = o.optLong("age_sec", -1L),
+                        count = o.optInt("count", 0).coerceAtLeast(0)
+                    )
+                )
+            }
+        }
+
+        val stations = ArrayList<StationInfo>()
+        val stationArray = root.optJSONArray("stations")
+        if (stationArray != null) {
+            for (i in 0 until stationArray.length()) {
+                val o = stationArray.optJSONObject(i) ?: continue
+                val mac = o.optString("mac", "").trim()
+                if (mac.isEmpty()) continue
+                stations.add(
+                    StationInfo(
+                        mac = mac,
+                        nodeId = o.optString("node_id", "").trim(),
+                        nodeName = o.optString("node_name", "").trim(),
+                        iface = o.optString("iface", "").trim(),
+                        signal = optSignal(o),
+                        rxRate = o.optInt("rx_rate", 0).coerceAtLeast(0),
+                        txRate = o.optInt("tx_rate", 0).coerceAtLeast(0),
+                        connectedSec = o.optLong("connected_sec", 0L).coerceAtLeast(0L),
+                        ts = o.optLong("ts", 0L),
+                        ageSec = o.optLong("age_sec", -1L)
+                    )
+                )
+            }
+        }
+
+        val sortedNodes = nodes.sortedWith(compareByDescending<StationNode> { it.ts }.thenBy { it.nodeId })
+        val sortedStations = stations.sortedWith(
+            compareByDescending<StationInfo> { it.signal ?: Int.MIN_VALUE }.thenBy { it.mac }
+        )
+        return StationsData(
+            enabled = enabled,
+            nodes = sortedNodes,
+            stations = sortedStations,
+            count = root.optInt("count", stations.size).coerceAtLeast(0)
+        )
+    }
+
+    /** `signal` 字段：JSON `null` / 缺失 / 非整数都返回 `null`（= 信号未知），不伪造 0 dBm。 */
+    private fun optSignal(o: JSONObject): Int? {
+        if (!o.has("signal") || o.isNull("signal")) return null
+        val value = o.opt("signal")
+        return when (value) {
+            is Number -> value.toInt()
+            is String -> value.trim().toIntOrNull()
+            else -> null
+        }?.takeIf { it in -120..0 }
     }
 
     /**

@@ -1,0 +1,389 @@
+#!/usr/bin/ucode
+// prism-router-admin —— 棱镜路由「管理员登录 + 系统管理」只读/受控写 API
+//
+// 设计目标：让 Android/Web 客户端在验证路由器管理密码后，做少量低风险管理操作
+// （查看系统信息、网络接口、无线状态、重启、无线开关），而不是拿到 shell。
+//
+// 安全边界：
+//   * 密码只用于与 /etc/shadow 的哈希比较（openssl passwd -1/-5/-6 + 相同 salt），
+//     绝不进 argv/日志；比较后立即丢弃。
+//   * 登录成功签发 32 hex 管理 token（/tmp/prism-router/admin/<token>.json，0600，
+//     目录 0700，30 分钟 TTL）；写操作必须带有效 token（Bearer 或 body.token）。
+//   * 失败限速：同 IP 每分钟最多 5 次（/tmp/prism-router/admin-rate/<ip>）。
+//   * 所有外部命令参数固定；radio 只允许 ^radio[0-9]+$；confirm 只接受字面量 REBOOT。
+//   * 响应 Cache-Control: no-store；错误统一 {error} 且不含密码/token/堆栈。
+
+const ADMIN_DIR = '/tmp/prism-router/admin';
+const RATE_DIR = '/tmp/prism-router/admin-rate';
+const TOKEN_TTL = 1800;
+const RATE_MAX = 5;
+const RATE_WINDOW = 60;
+
+/* fs 不是 ucode 的全局模块；不 require 的话所有文件/管道调用都会抛 ReferenceError。 */
+const fs = require('fs');
+
+let SENT = false;
+
+function out(code, reason, body) {
+	if (SENT) return;
+	SENT = true;
+	printf('Status: %d %s\r\n', code, reason);
+	printf('Content-Type: application/json; charset=utf-8\r\n');
+	printf('Cache-Control: no-store\r\n');
+	printf('X-Content-Type-Options: nosniff\r\n');
+	printf('Referrer-Policy: no-referrer\r\n\r\n');
+	printf('%J\n', body);
+}
+
+function env(name) { return getenv(name) ?? ''; }
+function now() { return time(); }
+
+function ensure_dir(path, mode) {
+	try {
+		if (!fs.stat(path)) fs.mkdir(path, mode);
+	} catch (e) { }
+}
+
+function read_body() {
+	try {
+		let len = int(env('CONTENT_LENGTH'));
+		if (len <= 0 || len > 8192) return null;
+		let raw = fs.readfile('/dev/stdin');
+		if (raw == null) return null;
+		return json(raw);
+	} catch (e) { return null; }
+}
+
+function read_token_from_header() {
+	let h = env('HTTP_AUTHORIZATION');
+	let m = match(h, /^Bearer\s+([0-9a-f]{32})$/i);
+	return m ? m[1] : null;
+}
+
+function rate_key() {
+	let ip = env('REMOTE_ADDR');
+	if (ip == '') ip = 'unknown';
+	return replace(ip, /[^0-9a-fA-F:.]/g, '_');
+}
+
+function rate_check(ip) {
+	ensure_dir(RATE_DIR, 0700);
+	let f = RATE_DIR + '/' + ip;
+	let list = [];
+	try { if (fs.stat(f)) list = json(fs.readfile(f)) ?? []; } catch (e) { list = []; }
+	let t = now();
+	list = filter(list, function(x) { return type(x) == 'int' && t - x < RATE_WINDOW; });
+	return length(list);
+}
+
+function rate_hit(ip) {
+	let t = now();
+	let f = RATE_DIR + '/' + ip;
+	let list = [];
+	try { if (fs.stat(f)) list = json(fs.readfile(f)) ?? []; } catch (e) { list = []; }
+	list = filter(list, function(x) { return type(x) == 'int' && t - x < RATE_WINDOW; });
+	push(list, t);
+	fs.writefile(f, sprintf('%J', list));
+	try { fs.chmod(f, 0600); } catch (e) { }
+}
+
+function valid_token(tok) {
+	if (type(tok) != 'string' || !match(tok, /^[0-9a-f]{32}$/)) return null;
+	let f = ADMIN_DIR + '/' + tok + '.json';
+	let meta = null;
+	try { meta = json(fs.readfile(f)); } catch (e) { return null; }
+	if (type(meta) != 'object') return null;
+	if (type(meta.expires) != 'int' || now() > meta.expires) {
+		try { fs.unlink(f); } catch (e) { }
+		return null;
+	}
+	return meta;
+}
+
+function require_token(body) {
+	let tok = (type(body) == 'object' && type(body.token) == 'string') ? body.token : read_token_from_header();
+	let meta = valid_token(tok);
+	if (meta == null) { out(401, 'Unauthorized', { error: 'unauthorized' }); return null; }
+	return { token: tok, meta: meta };
+}
+
+/* 单引号转义：只用于固定算法名/salt 与临时文件路径，绝不拼请求原文。 */
+function shell_quote(s) {
+	return "'" + replace(s, /'/g, "'\\''") + "'";
+}
+
+/* 从 /etc/shadow 读取用户哈希，并按算法用 openssl passwd 校验密码。 */
+function check_password(user, password) {
+	if (type(user) != 'string' || !match(user, /^[a-z_][a-z0-9_-]{0,31}$/)) return false;
+	let shadow = fs.readfile('/etc/shadow');
+	if (shadow == null) return false;
+	let lines = split(shadow, '\n');
+	let hash = null;
+	for (let line in lines) {
+		let parts = split(line, ':');
+		if (length(parts) > 2 && parts[0] == user) { hash = parts[1]; break; }
+	}
+	if (hash == null || length(hash) < 8) return false;
+	let alg = null;
+	if (substr(hash, 0, 3) == '$1$') alg = '-1';
+	else if (substr(hash, 0, 3) == '$5$') alg = '-5';
+	else if (substr(hash, 0, 3) == '$6$') alg = '-6';
+	if (alg == null) return false;
+
+	/* $alg$salt$rest：取 salt（$ 之间第二段）。 */
+	let rest = substr(hash, 3);
+	let idx = index(rest, '$');
+	if (idx <= 0) return false;
+	let salt = substr(rest, 0, idx);
+
+	/* 密码经临时文件传给 openssl（不进 argv、不进日志）。 */
+	/* 临时文件名用 urandom（ucode 没有 getpid），0600、用后删除。 */
+	let rnd = '';
+	let raw = fs.readfile('/dev/urandom', 6);
+	if (raw != null) for (let i = 0; i < 6; i++) rnd += sprintf('%02x', ord(substr(raw, i, 1)));
+	if (rnd == '') rnd = sprintf('%d', time());
+	let tmp = '/tmp/prism-router/.pw-' + rnd;
+	try {
+		fs.writefile(tmp, password + '\n');
+		fs.chmod(tmp, 0600);
+		let cmd = sprintf('openssl passwd %s -salt %s -in %s 2>/dev/null', alg, shell_quote(salt), shell_quote(tmp));
+		let p = fs.popen(cmd);
+		let result = p.read('all');
+		p.close();
+		fs.unlink(tmp);
+		result = trim(result);
+		if (result == '') return false;
+		/* 常量时间比较（长度相同才比较）。 */
+		if (length(result) != length(hash)) return false;
+		let diff = 0;
+		for (let i = 0; i < length(hash); i++) {
+			if (substr(result, i, 1) != substr(hash, i, 1)) diff++;
+		}
+		return diff == 0;
+	} catch (e) {
+		try { fs.unlink(tmp); } catch (e2) { }
+		return false;
+	}
+}
+
+function gen_token() {
+	let raw = fs.readfile('/dev/urandom', 16);
+	if (raw == null) return null;
+	let hex = '';
+	for (let i = 0; i < 16; i++) hex += sprintf('%02x', ord(substr(raw, i, 1)));
+	return hex;
+}
+
+function do_login(body) {
+	let user = (type(body) == 'object' && type(body.username) == 'string') ? body.username : 'root';
+	let pw = (type(body) == 'object' && type(body.password) == 'string') ? body.password : '';
+	if (pw == '') { out(400, 'Bad Request', { error: 'bad_request' }); return; }
+	let ip = rate_key();
+	if (rate_check(ip) >= RATE_MAX) { out(429, 'Too Many Requests', { error: 'rate_limited' }); return; }
+
+	if (!check_password(user, pw)) {
+		rate_hit(ip);
+		out(400, 'Bad Request', { error: 'bad_credentials' });
+		return;
+	}
+	ensure_dir(ADMIN_DIR, 0700);
+	let tok = gen_token();
+	if (tok == null) { out(500, 'Internal Server Error', { error: 'internal' }); return; }
+	let meta = { user: user, created: now(), expires: now() + TOKEN_TTL, ip: env('REMOTE_ADDR') };
+	let f = ADMIN_DIR + '/' + tok + '.json';
+	let tmp = f + '.tmp';
+	fs.writefile(tmp, sprintf('%J', meta));
+	fs.chmod(tmp, 0600);
+	fs.rename(tmp, f);
+	out(200, 'OK', { ok: true, token: tok, user: user, expires: meta.expires });
+}
+
+function ubus_json(args) {
+	try {
+		let p = fs.popen('/usr/bin/ubus ' + args + ' 2>/dev/null');
+		let s = p.read('all');
+		p.close();
+		s = trim(s);
+		return (s == '') ? null : json(s);
+	} catch (e) { return null; }
+}
+
+function do_system() {
+	let board = ubus_json('call system board') ?? {};
+	let info = ubus_json('call system info') ?? {};
+	let uname = '';
+	try {
+		let p = fs.popen('/bin/uname -r 2>/dev/null');
+		uname = trim(p.read('all'));
+		p.close();
+	} catch (e) { }
+
+	let mem = { total: info.memory?.total ?? 0, free: info.memory?.free ?? 0 };
+	mem.available = info.memory?.available ?? mem.free;
+
+	let rootfs = { total: 0, used: 0, free: 0 };
+	try {
+		let p = fs.popen('/bin/df -k /overlay 2>/dev/null');
+		let lines = split(trim(p.read('all')), '\n');
+		p.close();
+		if (length(lines) >= 2) {
+			let f = split(lines[1], /\s+/);
+			if (length(f) >= 4) {
+				rootfs.total = int(f[1]) * 1024;
+				rootfs.used = int(f[2]) * 1024;
+				rootfs.free = int(f[3]) * 1024;
+			}
+		}
+	} catch (e) { }
+
+	out(200, 'OK', {
+		hostname: board.hostname ?? '',
+		model: board.model ?? '',
+		kernel: uname,
+		version: board.release?.description ?? '',
+		uptime: info.uptime ?? 0,
+		load: info.load ?? [0, 0, 0],
+		memory: mem,
+		rootfs: rootfs
+	});
+}
+
+function do_network() {
+	let dump = ubus_json('call network.interface dump') ?? {};
+	let list = [];
+	for (let it in dump.interface ?? []) {
+		let ipv4 = [];
+		for (let a in it['ipv4-address'] ?? []) ipv4.push(a.address + '/' + a.mask);
+		let ipv6 = [];
+		for (let a in it['ipv6-address'] ?? []) ipv6.push(a.address + '/' + a.mask);
+		push(list, {
+			name: it.interface ?? '',
+			up: it.up == true,
+			proto: it.proto ?? '',
+			ipv4: ipv4,
+			ipv6: ipv6,
+			uptime: it.uptime ?? 0,
+			mac: it.macaddr ?? ''
+		});
+	}
+	out(200, 'OK', { interfaces: list });
+}
+
+function do_wifi() {
+	let status = ubus_json('call network.wireless status') ?? {};
+	let devices = [];
+	let supported = false;
+	for (let radio in keys(status)) {
+		let r = status[radio];
+		if (type(r) != 'object') continue;
+		supported = true;
+		for (let up in r.interfaces ?? []) {
+			let cfg = up.config ?? {};
+			push(devices, {
+				radio: radio,
+				ssid: cfg.ssid ?? '',
+				band: r.config?.band ?? '',
+				channel: r.config?.channel ?? '',
+				disabled: r.config?.disabled == true,
+				clients: length(up['wireless'] ?? up.stations ?? []),
+				encryption: cfg.encryption ?? ''
+			});
+		}
+		if (length(r.interfaces ?? []) == 0) {
+			push(devices, {
+				radio: radio, ssid: '', band: r.config?.band ?? '',
+				channel: r.config?.channel ?? '', disabled: r.config?.disabled == true,
+				clients: 0, encryption: ''
+			});
+		}
+	}
+	out(200, 'OK', { supported: supported, devices: devices });
+}
+
+function do_reboot(body) {
+	if (body.confirm != 'REBOOT') { out(400, 'Bad Request', { error: 'confirm_required' }); return; }
+	out(200, 'OK', { ok: true, rebooting: true });
+	/* 响应已发出，延迟 1 秒后重启（避免连接被立即掐断导致客户端看不到响应）。 */
+	try {
+		let p = fs.popen("sh -c 'sleep 1; /sbin/reboot' >/dev/null 2>&1 &");
+		p.close();
+	} catch (e) { }
+}
+
+function do_wifi_toggle(body) {
+	let radio = (type(body.radio) == 'string') ? body.radio : '';
+	if (!match(radio, /^radio[0-9]+$/)) { out(400, 'Bad Request', { error: 'bad_request' }); return; }
+	let w = ubus_json('call network.wireless status') ?? {};
+	let supported = false;
+	for (let k in keys(w)) if (type(w[k]) == 'object') supported = true;
+	if (!supported) { out(400, 'Bad Request', { error: 'wifi_unsupported' }); return; }
+	let disabled = (body.disabled == true) ? '1' : '0';
+	try {
+		/* ucode 没有全局 cursor()；必须从 uci 模块取（本包已依赖 ucode-mod-uci）。 */
+		let uci = require('uci');
+		let c = uci.cursor();
+		c.set('wireless', radio, 'disabled', disabled);
+		c.commit('wireless');
+	} catch (e) { out(500, 'Internal Server Error', { error: 'internal' }); return; }
+
+	let p = fs.popen('/sbin/wifi reload 2>/dev/null');
+	p.close();
+	out(200, 'OK', { ok: true });
+}
+
+/* 查询串解析。必须定义在 main() 之前：ucode 的函数只能引用**先定义**的函数，
+ * 否则运行时会抛 "left-hand side is not a function"（所有 GET 请求都会 500）。 */
+function opt_query(name) {
+	let q = env('QUERY_STRING');
+	if (q == '') return '';
+	for (let pair in split(q, '&')) {
+		let kv = split(pair, '=');
+		if (kv[0] == name) return (length(kv) > 1) ? kv[1] : '';
+	}
+	return '';
+}
+
+function main() {
+	/* 基本卫生：请求体上限、未知方法拒。 */
+	let method = env('REQUEST_METHOD');
+	if (method != 'GET' && method != 'POST') { out(405, 'Method Not Allowed', { error: 'method_not_allowed' }); return; }
+
+	let body = (method == 'POST') ? read_body() : null;
+	if (method == 'POST' && type(body) != 'object') { out(400, 'Bad Request', { error: 'bad_request' }); return; }
+	let action = (type(body) == 'object' && type(body.action) == 'string') ? body.action : opt_query('action');
+	if (type(action) != 'string' || action == '') { out(400, 'Bad Request', { error: 'bad_request' }); return; }
+
+	if (action == 'login') {
+		if (method != 'POST') { out(405, 'Method Not Allowed', { error: 'method_not_allowed' }); return; }
+		do_login(body);
+		return;
+	}
+	if (action == 'logout') {
+		if (method != 'POST') { out(405, 'Method Not Allowed', { error: 'method_not_allowed' }); return; }
+		let t = require_token(body);
+		if (t == null) return;
+		try { fs.unlink(ADMIN_DIR + '/' + t.token + '.json'); } catch (e) { }
+		out(200, 'OK', { ok: true });
+		return;
+	}
+
+	/* 其余操作都需要有效 token。 */
+	let body2 = (method == 'GET') ? {} : body;
+	let tok = (method == 'POST') ? require_token(body2) : null;
+	if (method == 'POST' && tok == null) return;
+
+	if (method == 'GET') {
+		let qt = opt_query('token');
+		if (valid_token(qt) == null) { out(401, 'Unauthorized', { error: 'unauthorized' }); return; }
+	}
+
+	if (action == 'system') { do_system(); return; }
+	if (action == 'network') { do_network(); return; }
+	if (action == 'wifi') { do_wifi(); return; }
+	if (action == 'reboot') { do_reboot(body); return; }
+	if (action == 'wifi_toggle') { do_wifi_toggle(body); return; }
+
+	out(400, 'Bad Request', { error: 'bad_request' });
+}
+
+try { main(); } catch (e) { out(500, 'Internal Server Error', { error: 'internal' }); }

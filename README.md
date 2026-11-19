@@ -133,6 +133,68 @@ uci commit prism-router
 - 面板数据来自 rpcd 的 `prism-router` ubus 对象（由 `luci-app-prism-router` 提供），
   两个包都要装；运行时还需要系统自带的 `uhttpd`（已声明为 `prism-router` 依赖）。
 
+## 系统信息 / 管理员 API（CGI）
+
+插件在 `/www/cgi-bin/` 安装两个 ucode CGI（0755），由 LuCI 的 uhttpd 直接执行，
+和其它 CGI 共用同一个 web 根（不需要新端口、不需要装第二个包）：
+
+### `prism-router-system`：只读、无需登录
+
+适合 Android/Web 客户端首屏、「关于」页与诊断页直接轮询：
+
+| 请求 | 返回 |
+|---|---|
+| `/cgi-bin/prism-router-system?what=system` | `{"hostname","model","kernel","uptime","load":[1,5,15],"memory":{"total","free","available"},"rootfs":{"total","used","free"},"version"}` |
+| `?what=services` | `{"services":[{"name","label","running","pid","info"}]}` |
+| `?what=processes` | `{"processes":[{"pid","user","cpu","mem","command"}]}` |
+| `?what=version` | `{"version":"1.0.0","build":"1.0.0-1","apk_version":"1.0.0","update_check":false}` |
+
+```sh
+curl -s 'http://<路由器LAN>/cgi-bin/prism-router-system?what=system'
+curl -s 'http://<路由器LAN>/cgi-bin/prism-router-system?what=version'
+```
+
+- **只读且无需 token**：只读 `/proc`、`/proc/net`、opkg control 和固定命令输出
+  （`pidof`/`pgrep`/`netstat`/`df`/`nft`），不写文件、不写日志、不改配置。
+- `memory` / `rootfs` 单位是**字节**；`uptime` 是秒；`load` 是 1/5/15 分钟负载；
+  `cpu` 是进程**累计 CPU 时间（秒）**，`mem` 是常驻内存（字节）。
+- `processes` 按常驻内存降序取前 20，内核线程（cmdline 为空）已剔除，`command` 截断到 80 字节
+  （按 UTF-8 字符边界，不会出现半个汉字）。
+- `services` 固定包含 `prism-routerd`、`prism-router-panel`、`crontab`、`dnsmasq`、`firewall`；
+  `clash`/`docker` 只在系统里确实装了对应软件时出现。判定用 `pidof`/`pgrep` +
+  `/etc/init.d status` + `netstat`（面板端口读 `prism-router.panel.port`，默认 8099），**不用 systemd**。
+- `version` 来自 `/usr/lib/opkg/info/luci-app-prism-router.control`（`build` 含 release），
+  `apk_version` 优先读 `/etc/prism-router/version`（可选）；未配置更新源，`update_check` 恒为 `false`。
+- 只允许 `GET`（其它方法 405），未知 `what` 400，缺省 `what=system`；所有响应带
+  `Cache-Control: no-store` + `application/json`。
+- 同一份 CGI 也随包安装到独立面板目录（`/www/prism-router-panel/cgi-bin/`），所以启用面板后
+  `http://<路由器LAN>:8099/cgi-bin/prism-router-system?what=…` 同样可用；两处行为一致。
+
+### `prism-router-admin`：登录后的管理接口
+
+同样的 web 根，`POST` JSON 或 `GET` + token：
+
+```sh
+# 1) 用路由器的 root 密码换取管理 token（30 分钟有效，同 IP 每分钟最多 5 次尝试）
+curl -sS -X POST http://<路由器LAN>/cgi-bin/prism-router-admin \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"login","username":"root","password":"<密码>"}'
+# {"ok":true,"token":"<32 hex>","user":"root","expires":...}
+
+# 2) 用 token 调管理接口（可用 Bearer 头或 ?token=）
+curl -sS 'http://<路由器LAN>/cgi-bin/prism-router-admin?action=system&token=<token>'
+curl -sS -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
+  -d '{"action":"wifi","token":"<token>"}' http://<路由器LAN>/cgi-bin/prism-router-admin
+```
+
+- 可用 action：`login`、`logout`、`system`、`network`、`wifi`、`reboot`、`wifi_toggle`。
+- 密码只与 `/etc/shadow` 的哈希比较（`openssl passwd -1/-5/-6` + 相同 salt），不写日志、不进 argv。
+- token 存在 `/tmp/prism-router/admin/<token>.json`（0600），重启即失效。
+- 写操作只有 `reboot`（需 `confirm: "REBOOT"`）与 `wifi_toggle`（radio 只接受 `radio0` 形式）。
+- 所有响应 `Cache-Control: no-store`，错误统一 `{"error":...}`，不返回路径/堆栈/命令输出。
+- 同样安装一份到面板目录：启用独立面板后 `http://<路由器LAN>:8099/cgi-bin/prism-router-admin`
+  也可用（token/限速逻辑不变）。
+
 ## 家长控制（按 MAC 暂停/恢复上网）
 
 只对单台设备生效：在 nftables 的 `inet fw4` **forward 链**上加一条
@@ -242,13 +304,13 @@ node tests/mobile-ui-static.js          # 手机版 App 界面（分页/分类/�
 ./tests/container-validate-features.sh   # 别名/配额/导出 156
 ./tests/container-validate-core-fixes.sh # 跨重启/去重/历史/并发 72
 ./tests/container-validate-security-fixes.sh # 独立凭证/防重放/TLS 87
-./tests/container-validate-standalone-panel.sh # 独立面板服务 68（真实 procd + uhttpd + CGI）
+./tests/container-validate-standalone-panel.sh # 独立面板服务 + 系统信息/管理员 CGI 138（真实 procd + uhttpd + CGI）
 ./tests/container-validate-feishu-oauth.sh # 飞书应用机器人扫码绑定（OAuth 回调/状态校验）
 ./tests/container-validate-control.sh    # 家长控制 123（假 nft / 保护目标 / 审计 / 重放）
 ./tests/container-validate-release.sh    # 发布物/权限/升级/卸载，23.05+24.10 各110
 ```
 
-原有回归合计 **804 项断言**，另含家长控制（123 项）、核心、安全、独立面板（68 项）、发布与前端专项；实际通过数以本次运行输出为准。真机部署后再跑 `./tests/smoke.sh`（15 项）与 `LUCI_PASS='<密码>' ./tests/ui/run.sh`（页面渲染）。
+原有回归合计 **804 项断言**，另含家长控制（123 项）、核心、安全、独立面板 + 系统信息/管理员 CGI（138 项）、发布与前端专项；实际通过数以本次运行输出为准。真机部署后再跑 `./tests/smoke.sh`（15 项）与 `LUCI_PASS='<密码>' ./tests/ui/run.sh`（页面渲染）。
 
 ```sh
 ./tests/container-validate.sh        # 28 项：包安装、属主权限、系统目录未被改动、守护进程离线用例
