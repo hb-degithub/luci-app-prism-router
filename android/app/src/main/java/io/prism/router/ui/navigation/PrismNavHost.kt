@@ -16,18 +16,20 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.Devices
-import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.Lan
-import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Speed
-import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -37,10 +39,10 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.navigation
+import androidx.navigation.createGraph
 import io.prism.router.data.MAX_SERVERS
 import io.prism.router.data.MainViewModel
 import io.prism.router.data.UiState
-import io.prism.router.data.fmtClock
 import io.prism.router.ui.AppsScreen
 import io.prism.router.ui.DevicesScreen
 import io.prism.router.ui.NetworkScreen
@@ -51,11 +53,9 @@ import io.prism.router.ui.components.Pill
 import io.prism.router.ui.components.PrismIconAction
 import io.prism.router.ui.components.PrismScaffold
 import io.prism.router.ui.components.SectionCard
-import io.prism.router.ui.components.Segmented
 import io.prism.router.ui.theme.PrismSize
 import io.prism.router.ui.theme.PrismSpacing
 import io.prism.router.ui.theme.ThemeMode
-import io.prism.router.ui.theme.isDynamicColorAvailable
 
 /* ───────────────────────── 路由表 ───────────────────────── */
 
@@ -103,6 +103,35 @@ fun NavHostController.navigateToTab(destination: PrismDestination) {
     }
 }
 
+/**
+ * 导航回调 / 主题状态的稳定载体。
+ *
+ * NavHost 的图只在首次组合时构建（见 [PrismNavHost]），因此目的地 lambda 不能直接
+ * 捕获每次重组都会变化的 `ui` / `themeMode` / 回调 lambda，否则 remember 的 key 变化
+ * 会重建 NavGraph，NavController 会清空返回栈。这里用可变状态 + SideEffect 把最新值
+ * 推给已构建的图：主题变化能触发 About 页重组，轮询更新只重组当前目的地。
+ */
+@Stable
+private class PrismNavState(
+    val vm: MainViewModel,
+    val navController: NavHostController,
+    initialThemeMode: ThemeMode,
+    initialDynamicColor: Boolean,
+    initialOnThemeModeChange: (ThemeMode) -> Unit,
+    initialOnDynamicColorChange: (Boolean) -> Unit,
+    initialNotifyEnabled: Boolean,
+    initialOnNotifyEnabledChange: (Boolean) -> Unit,
+    initialOnOnboardingComplete: () -> Unit
+) {
+    var themeMode by mutableStateOf(initialThemeMode)
+    var dynamicColor by mutableStateOf(initialDynamicColor)
+    var notifyEnabled by mutableStateOf(initialNotifyEnabled)
+    var onThemeModeChange: (ThemeMode) -> Unit = initialOnThemeModeChange
+    var onDynamicColorChange: (Boolean) -> Unit = initialOnDynamicColorChange
+    var onNotifyEnabledChange: (Boolean) -> Unit = initialOnNotifyEnabledChange
+    var onOnboardingComplete: () -> Unit = initialOnOnboardingComplete
+}
+
 /* ───────────────────────── NavHost ───────────────────────── */
 
 /**
@@ -110,7 +139,10 @@ fun NavHostController.navigateToTab(destination: PrismDestination) {
  *
  * - 首次启动（未完成引导）以 [PrismRoutes.WELCOME] 为起始，完成后跳到主图；
  * - 主图内是 5 个一级页签 + 设置子页（servers / about）；
- * - 屏幕内容全部复用现有实现，本文件只负责 Scaffold、标题与导航接线。
+ * - 屏幕内容全部复用现有实现，本文件只负责导航接线与尚未自带 Scaffold 的页面外壳。
+ *
+ * 图构建一次并缓存：目的地内部读取 `vm.ui`，轮询只触发当前页重组，
+ * 不会重建 NavGraph / 清空返回栈。
  */
 @Composable
 fun PrismNavHost(
@@ -121,173 +153,135 @@ fun PrismNavHost(
     dynamicColor: Boolean,
     onThemeModeChange: (ThemeMode) -> Unit,
     onDynamicColorChange: (Boolean) -> Unit,
+    notifyEnabled: Boolean = true,
+    onNotifyEnabledChange: (Boolean) -> Unit = {},
     onOnboardingComplete: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val ui = vm.ui
-    val startDestination = if (startWithWelcome) PrismRoutes.WELCOME else PrismRoutes.MAIN
+    val navState = remember(vm, navController) {
+        PrismNavState(
+            vm = vm,
+            navController = navController,
+            initialThemeMode = themeMode,
+            initialDynamicColor = dynamicColor,
+            initialOnThemeModeChange = onThemeModeChange,
+            initialOnDynamicColorChange = onDynamicColorChange,
+            initialNotifyEnabled = notifyEnabled,
+            initialOnNotifyEnabledChange = onNotifyEnabledChange,
+            initialOnOnboardingComplete = onOnboardingComplete
+        )
+    }
 
-    NavHost(
-        navController = navController,
-        startDestination = startDestination,
-        modifier = modifier.fillMaxSize()
-    ) {
-        /* 首启引导：填地址 / 令牌 → 保存并进入概览；「稍后设置」直接进入。 */
-        composable(PrismRoutes.WELCOME) {
-            WelcomeScreen(
-                defaultBaseUrl = ui.baseUrl,
-                defaultToken = ui.token,
-                onTest = { base, token, onResult ->
-                    vm.testConnection(base, token, onResult)
-                },
-                onConnect = { base, token ->
-                    vm.saveSettings(base, token, ui.intervalSec)
-                    onOnboardingComplete()
-                },
-                onSkip = onOnboardingComplete
-            )
-        }
+    /* 回调 / 主题每次组合的最新值；写 State 只在值变化时触发对应目的地重组。 */
+    SideEffect {
+        navState.themeMode = themeMode
+        navState.dynamicColor = dynamicColor
+        navState.onThemeModeChange = onThemeModeChange
+        navState.onDynamicColorChange = onDynamicColorChange
+        navState.notifyEnabled = notifyEnabled
+        navState.onNotifyEnabledChange = onNotifyEnabledChange
+        navState.onOnboardingComplete = onOnboardingComplete
+    }
 
-        navigation(startDestination = PrismRoutes.OVERVIEW, route = PrismRoutes.MAIN) {
-            composable(PrismRoutes.OVERVIEW) {
-                PrismScaffold(
-                    title = "概览",
-                    subtitle = overviewSubtitle(ui),
-                    actions = {
-                        PrismIconAction(
-                            icon = Icons.Rounded.Refresh,
-                            contentDescription = "刷新概览",
-                            onClick = { vm.refresh() }
-                        )
-                    }
-                ) { _ ->
+    val graph = remember(navController, startWithWelcome, navState) {
+        navController.createGraph(
+            startDestination = if (startWithWelcome) PrismRoutes.WELCOME else PrismRoutes.MAIN
+        ) {
+            /* 首启引导：填地址 / 令牌 → 保存并进入概览；「稍后设置」直接进入。 */
+            composable(PrismRoutes.WELCOME) {
+                val ui = vm.ui
+                WelcomeScreen(
+                    defaultBaseUrl = ui.baseUrl,
+                    defaultToken = ui.token,
+                    onTest = { base, token, onResult ->
+                        vm.testConnection(base, token, onResult)
+                    },
+                    onConnect = { base, token ->
+                        vm.saveSettings(base, token, ui.intervalSec)
+                        navState.onOnboardingComplete()
+                    },
+                    onSkip = { navState.onOnboardingComplete() }
+                )
+            }
+
+            navigation(startDestination = PrismRoutes.OVERVIEW, route = PrismRoutes.MAIN) {
+                /* 5 个一级页签的屏幕都自带 PrismScaffold（大标题/副标题/刷新），
+                 * 这里只负责挂载与导航回调，避免双层顶栏。 */
+                composable(PrismRoutes.OVERVIEW) {
                     OverviewScreen(
-                        ui = ui,
+                        ui = vm.ui,
                         onRefresh = { vm.refresh() },
                         onOpenDevices = {
                             navController.navigateToTab(PrismDestination.DEVICES)
+                        },
+                        onOpenNetwork = {
+                            navController.navigateToTab(PrismDestination.NETWORK)
                         }
                     )
                 }
-            }
 
-            composable(PrismRoutes.DEVICES) {
-                PrismScaffold(
-                    title = "设备",
-                    subtitle = devicesSubtitle(ui),
-                    actions = {
-                        PrismIconAction(
-                            icon = Icons.Rounded.Refresh,
-                            contentDescription = "刷新设备",
-                            onClick = { vm.refresh() }
-                        )
-                    }
-                ) { _ ->
-                    DevicesScreen(ui)
+                composable(PrismRoutes.DEVICES) {
+                    /* 设备屏自带 PrismScaffold；vm 只用于下拉刷新（屏幕仍只渲染传入的 ui）。 */
+                    DevicesScreen(ui = vm.ui, vm = vm)
                 }
-            }
 
-            composable(PrismRoutes.APPS) {
-                PrismScaffold(
-                    title = "应用",
-                    subtitle = "按域名统计 · 今日与近 7 天",
-                    actions = {
-                        PrismIconAction(
-                            icon = Icons.Rounded.Refresh,
-                            contentDescription = "刷新应用数据",
-                            onClick = { vm.refresh() }
-                        )
-                    }
-                ) { _ ->
-                    AppsScreen(ui)
+                composable(PrismRoutes.APPS) {
+                    /* 应用屏自带 PrismScaffold（标题 / 域名数副标题 / 刷新都在屏内）。 */
+                    AppsScreen(ui = vm.ui, vm = vm)
                 }
-            }
 
-            composable(PrismRoutes.NETWORK) {
-                PrismScaffold(
-                    title = "网络",
-                    subtitle = networkSubtitle(ui),
-                    actions = {
-                        PrismIconAction(
-                            icon = Icons.Rounded.Refresh,
-                            contentDescription = "刷新节点",
-                            onClick = { vm.refreshNodes() }
-                        )
-                    }
-                ) { _ ->
+                composable(PrismRoutes.NETWORK) {
                     NetworkScreen(
-                        ui = ui,
-                        onRetryNodes = { vm.refreshNodes() }
-                    )
-                }
-            }
-
-            composable(PrismRoutes.SETTINGS) {
-                PrismScaffold(
-                    title = "设置",
-                    subtitle = "服务器、外观与诊断",
-                    actions = {
-                        PrismIconAction(
-                            icon = Icons.Rounded.Storage,
-                            contentDescription = "服务器列表",
-                            onClick = { navController.navigate(PrismRoutes.SETTINGS_SERVERS) }
-                        )
-                        PrismIconAction(
-                            icon = Icons.Rounded.Info,
-                            contentDescription = "关于",
-                            onClick = { navController.navigate(PrismRoutes.SETTINGS_ABOUT) }
-                        )
-                    }
-                ) { _ ->
-                    SettingsScreen(
-                        ui = ui,
-                        onSave = { base, token, interval -> vm.saveSettings(base, token, interval) },
-                        onTest = { base, token, onResult -> vm.testConnection(base, token, onResult) },
+                        ui = vm.ui,
+                        onRetryNodes = { vm.refreshNodes() },
                         onRefresh = { vm.refresh() }
                     )
                 }
-            }
 
-            /* 设置子页：地址列表只读预览（增删切换仍在设置页，后续任务升级）。 */
-            composable(PrismRoutes.SETTINGS_SERVERS) {
-                ServersRoute(
-                    ui = ui,
-                    onBack = { navController.popBackStack() }
-                )
-            }
+                composable(PrismRoutes.SETTINGS) {
+                    val ui = vm.ui
+                    SettingsScreen(
+                        ui = ui,
+                        onSave = { base, token, interval ->
+                            vm.saveSettings(base, token, interval)
+                        },
+                        onTest = { base, token, onResult ->
+                            vm.testConnection(base, token, onResult)
+                        },
+                        onRefresh = { vm.refresh() },
+                        vm = vm,
+                        themeMode = navState.themeMode,
+                        dynamicColor = navState.dynamicColor,
+                        onThemeModeChange = { mode -> navState.onThemeModeChange(mode) },
+                        onDynamicColorChange = { enabled -> navState.onDynamicColorChange(enabled) },
+                        notifyEnabled = navState.notifyEnabled,
+                        onNotifyEnabledChange = { enabled -> navState.onNotifyEnabledChange(enabled) },
+                        onOpenServers = { navController.navigate(PrismRoutes.SETTINGS_SERVERS) },
+                        onOpenAbout = { navController.navigate(PrismRoutes.SETTINGS_ABOUT) }
+                    )
+                }
 
-            /* 设置子页：关于 + 外观（主题模式 / 动态取色开关）。 */
-            composable(PrismRoutes.SETTINGS_ABOUT) {
-                AboutRoute(
-                    themeMode = themeMode,
-                    dynamicColor = dynamicColor,
-                    onThemeModeChange = onThemeModeChange,
-                    onDynamicColorChange = onDynamicColorChange,
-                    onBack = { navController.popBackStack() }
-                )
+                /* 设置子页：地址列表只读预览（增删切换仍在设置页，后续任务升级）。 */
+                composable(PrismRoutes.SETTINGS_SERVERS) {
+                    ServersRoute(
+                        ui = vm.ui,
+                        onBack = { navController.popBackStack() }
+                    )
+                }
+
+                /* 设置子页：关于 + 外观（主题模式 / 动态取色开关）。 */
+                composable(PrismRoutes.SETTINGS_ABOUT) {
+                    AboutRoute(onBack = { navController.popBackStack() })
+                }
             }
         }
     }
-}
 
-/* ───────────────────────── 标题副文案 ───────────────────────── */
-
-private fun overviewSubtitle(ui: UiState): String = when {
-    ui.offline -> "离线缓存 · ${fmtClock(ui.offlineAt)}"
-    ui.updatedAt > 0L -> "实时监控 · 更新于 ${fmtClock(ui.updatedAt)}"
-    else -> "正在连接面板…"
-}
-
-private fun devicesSubtitle(ui: UiState): String {
-    val total = ui.state?.devices?.size ?: 0
-    val online = ui.state?.onlineCount ?: 0
-    return "$total 台设备 · 在线 $online"
-}
-
-private fun networkSubtitle(ui: UiState): String {
-    val exits = ui.state?.nodes?.size ?: 0
-    val subs = ui.nodesList.size
-    return "拓扑与节点 · $exits 个出口 · $subs 个子节点"
+    NavHost(
+        navController = navController,
+        graph = graph,
+        modifier = modifier.fillMaxSize()
+    )
 }
 
 /* ───────────────────────── 设置子页 ───────────────────────── */
@@ -337,7 +331,11 @@ private fun ServersRoute(ui: UiState, onBack: () -> Unit) {
                         if (index == ui.activeIndex) {
                             Pill("当前", color = MaterialTheme.colorScheme.primary)
                         } else if (server.token.isNotBlank()) {
-                            Pill("含令牌", color = MaterialTheme.colorScheme.onSurfaceVariant, leadingDot = false)
+                            Pill(
+                                "含令牌",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                leadingDot = false
+                            )
                         }
                     }
                     if (index != ui.servers.lastIndex) {
@@ -371,13 +369,7 @@ private fun ServersRoute(ui: UiState, onBack: () -> Unit) {
 }
 
 @Composable
-private fun AboutRoute(
-    themeMode: ThemeMode,
-    dynamicColor: Boolean,
-    onThemeModeChange: (ThemeMode) -> Unit,
-    onDynamicColorChange: (Boolean) -> Unit,
-    onBack: () -> Unit
-) {
+private fun AboutRoute(onBack: () -> Unit) {
     PrismScaffold(
         title = "关于",
         subtitle = "外观、版本与数据来源",
@@ -391,45 +383,6 @@ private fun AboutRoute(
                 .padding(PrismSpacing.lg),
             verticalArrangement = Arrangement.spacedBy(PrismSpacing.md)
         ) {
-            SectionCard(title = "外观", subtitle = "主题与动态取色") {
-                Segmented(
-                    options = ThemeMode.entries,
-                    selected = themeMode,
-                    onSelect = onThemeModeChange,
-                    label = { it.label },
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(Modifier.height(PrismSpacing.lg))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(
-                            text = "动态取色",
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Text(
-                            text = if (isDynamicColorAvailable) {
-                                "Android 12+ 跟随系统壁纸配色；关闭后固定品牌蓝 #3B5BFF"
-                            } else {
-                                "需要 Android 12 及以上系统，当前设备不支持"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                    Spacer(Modifier.width(PrismSpacing.sm))
-                    Switch(
-                        checked = dynamicColor && isDynamicColorAvailable,
-                        onCheckedChange = onDynamicColorChange,
-                        enabled = isDynamicColorAvailable
-                    )
-                }
-                Spacer(Modifier.height(PrismSpacing.sm))
-                Pill(
-                    text = if (dynamicColor && isDynamicColorAvailable) "动态取色已开启" else "品牌蓝 #3B5BFF",
-                    color = MaterialTheme.colorScheme.primary
-                )
-            }
-
             SectionCard(title = "关于棱镜路由", subtitle = "Android 原生客户端") {
                 InfoLine("应用", "棱镜路由")
                 InfoLine("版本", "1.0.0 (1)")

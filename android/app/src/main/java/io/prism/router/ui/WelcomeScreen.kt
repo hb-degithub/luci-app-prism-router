@@ -21,6 +21,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.Key
 import androidx.compose.material.icons.rounded.Router
 import androidx.compose.material.icons.rounded.Visibility
@@ -216,28 +217,26 @@ fun WelcomeScreen(
                         color = MaterialTheme.colorScheme.error
                     )
                 }
-                if (testResult != null) {
+                testResult?.let { result ->
+                    val success = result.startsWith("连接成功")
+                    val color = if (success) semantics.success else MaterialTheme.colorScheme.error
                     Spacer(Modifier.height(PrismSpacing.sm))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
-                            imageVector = Icons.Rounded.CheckCircle,
-                            contentDescription = null,
-                            tint = if (testResult.orEmpty().startsWith("连接成功")) {
-                                semantics.success
+                            imageVector = if (success) {
+                                Icons.Rounded.CheckCircle
                             } else {
-                                MaterialTheme.colorScheme.error
+                                Icons.Rounded.ErrorOutline
                             },
+                            contentDescription = if (success) "连接成功" else "连接失败",
+                            tint = color,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(Modifier.size(PrismSpacing.xs))
                         Text(
-                            text = testResult.orEmpty(),
+                            text = result,
                             style = MaterialTheme.typography.bodyMedium,
-                            color = if (testResult.orEmpty().startsWith("连接成功")) {
-                                semantics.success
-                            } else {
-                                MaterialTheme.colorScheme.error
-                            }
+                            color = color
                         )
                     }
                 }

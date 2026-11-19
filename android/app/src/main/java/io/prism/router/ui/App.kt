@@ -1,10 +1,13 @@
 package io.prism.router.ui
 
 import android.content.Context
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -39,6 +42,15 @@ object PrismPrefs {
     const val KEY_ONBOARDED = "onboarded"
 }
 
+/** 老版本写在 SharedPreferences 里的配置键；只用于判断「是否已经配置过」。 */
+private val LEGACY_CONFIG_KEYS = listOf(
+    "baseUrl",
+    "token",
+    "servers",
+    "activeServer",
+    "interval"
+)
+
 /**
  * 应用根组件：5 项底部导航 + 页面容器 + NavHost。
  *
@@ -53,8 +65,10 @@ fun App(
     vm: MainViewModel,
     themeMode: ThemeMode = ThemeMode.SYSTEM,
     dynamicColor: Boolean = false,
+    notifyEnabled: Boolean = true,
     onThemeModeChange: (ThemeMode) -> Unit = {},
-    onDynamicColorChange: (Boolean) -> Unit = {}
+    onDynamicColorChange: (Boolean) -> Unit = {},
+    onNotifyEnabledChange: (Boolean) -> Unit = {}
 ) {
     val context = LocalContext.current
     val prefs = remember(context) {
@@ -62,12 +76,24 @@ fun App(
     }
     /* 只在首次组合时决定起始页；引导完成后用导航跳转，不重建 NavHost。 */
     val initialStartWithWelcome = remember {
-        !prefs.getBoolean(PrismPrefs.KEY_ONBOARDED, false)
+        val onboarded = prefs.getBoolean(PrismPrefs.KEY_ONBOARDED, false)
+        /*
+         * 升级用户的老配置仍在 SharedPreferences（data 层迁移后只读保留）：
+         * 已经配过路由器就不再弹引导，避免把有效地址覆盖成默认值。
+         */
+        val legacyConfigured = LEGACY_CONFIG_KEYS.any { prefs.contains(it) }
+        if (!onboarded && legacyConfigured) {
+            prefs.edit().putBoolean(PrismPrefs.KEY_ONBOARDED, true).apply()
+        }
+        !onboarded && !legacyConfigured
     }
     val navController = rememberNavController()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route
-    val showBottomBar = PrismDestination.entries.any { it.route == currentRoute }
+    /* 首帧 currentRoute 可能还是 null：按起始页决定是否显示，避免底部栏闪一下。 */
+    val showBottomBar = currentRoute?.let { route ->
+        PrismDestination.entries.any { it.route == route }
+    } ?: !initialStartWithWelcome
 
     LaunchedEffect(Unit) { vm.start() }
 
@@ -95,8 +121,10 @@ fun App(
             startWithWelcome = initialStartWithWelcome,
             themeMode = themeMode,
             dynamicColor = dynamicColor,
+            notifyEnabled = notifyEnabled,
             onThemeModeChange = onThemeModeChange,
             onDynamicColorChange = onDynamicColorChange,
+            onNotifyEnabledChange = onNotifyEnabledChange,
             onOnboardingComplete = {
                 prefs.edit().putBoolean(PrismPrefs.KEY_ONBOARDED, true).apply()
                 navController.navigate(PrismRoutes.MAIN) {
@@ -121,39 +149,45 @@ private fun PrismBottomBar(
     currentRoute: String?,
     onSelect: (PrismDestination) -> Unit
 ) {
-    NavigationBar(
-        modifier = Modifier.navigationBarsPadding(),
-        windowInsets = WindowInsets(0, 0, 0, 0),
-        containerColor = MaterialTheme.colorScheme.surface,
-        tonalElevation = 0.dp
-    ) {
-        PrismDestination.entries.forEach { destination ->
-            val selected = currentRoute == destination.route
-            NavigationBarItem(
-                selected = selected,
-                onClick = { onSelect(destination) },
-                icon = {
-                    Icon(
-                        imageVector = destination.icon,
-                        contentDescription = null
+    Column(Modifier.navigationBarsPadding()) {
+        /* 1dp 分隔线替代阴影：深浅色下都不会在内容区投出脏边。 */
+        HorizontalDivider(
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+        )
+        NavigationBar(
+            modifier = Modifier.fillMaxWidth(),
+            windowInsets = WindowInsets(0, 0, 0, 0),
+            containerColor = MaterialTheme.colorScheme.surface,
+            tonalElevation = 0.dp
+        ) {
+            PrismDestination.entries.forEach { destination ->
+                val selected = currentRoute == destination.route
+                NavigationBarItem(
+                    selected = selected,
+                    onClick = { onSelect(destination) },
+                    icon = {
+                        Icon(
+                            imageVector = destination.icon,
+                            contentDescription = null
+                        )
+                    },
+                    label = {
+                        Text(
+                            text = destination.label,
+                            style = MaterialTheme.typography.labelSmall,
+                            maxLines = 1
+                        )
+                    },
+                    alwaysShowLabel = true,
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = MaterialTheme.colorScheme.primary,
+                        selectedTextColor = MaterialTheme.colorScheme.primary,
+                        indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                },
-                label = {
-                    Text(
-                        text = destination.label,
-                        style = MaterialTheme.typography.labelSmall,
-                        maxLines = 1
-                    )
-                },
-                alwaysShowLabel = true,
-                colors = NavigationBarItemDefaults.colors(
-                    selectedIconColor = MaterialTheme.colorScheme.primary,
-                    selectedTextColor = MaterialTheme.colorScheme.primary,
-                    indicatorColor = MaterialTheme.colorScheme.primaryContainer,
-                    unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                    unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-            )
+            }
         }
     }
 }
