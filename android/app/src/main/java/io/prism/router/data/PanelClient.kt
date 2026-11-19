@@ -50,6 +50,41 @@ class PanelClient {
         return "连接成功：版本 $version，服务${if (running) "运行中" else "未运行"}"
     }
 
+    /**
+     * 读取 `?what=status`（rpcd status 的只读投影：version / running / confidence /
+     * sources / link_source / link_bridge / can_manage），供设置页「诊断」卡显示
+     * 版本与服务状态。失败时抛 [PanelException]，由调用方降级（不影响其它检查项）。
+     *
+     * 面板的 status 投影里没有轮询耗时，[PanelState.Health] 也没有 clash_poll_ms，
+     * 所以在 status 成功后补读一次 `?what=state`，只取 `health.clash_poll_ms`，
+     * 以顶层 `clash_poll_ms` 附带返回（status 自带 health.clash_poll_ms 时不覆盖）。
+     * 补读失败 / 字段缺失一律忽略，status 仍按成功返回。
+     *
+     * 只读：两次请求都是 GET，不改动路由器配置；返回值里不含 token。
+     */
+    fun fetchStatus(baseUrl: String, token: String?): JSONObject {
+        val status = try {
+            JSONObject(get(baseUrl, "status", token))
+        } catch (e: PanelException) {
+            throw e
+        } catch (e: Exception) {
+            throw PanelException("状态响应无法解析")
+        }
+
+        val fromHealth = status.optJSONObject("health")?.optLong("clash_poll_ms", 0L) ?: 0L
+        if (fromHealth > 0L) return status
+
+        /* 旧面板没有该字段时保持缺省，让诊断页显示「未知」而不是误报 0 ms。 */
+        val pollMs = try {
+            JSONObject(get(baseUrl, "state", token))
+                .optJSONObject("health")?.optLong("clash_poll_ms", 0L) ?: 0L
+        } catch (e: Exception) {
+            0L
+        }
+        if (pollMs > 0L) status.put("clash_poll_ms", pollMs)
+        return status
+    }
+
     private fun get(baseUrl: String, what: String, token: String?, extraQuery: String? = null): String {
         val base = baseUrl.trim().trimEnd('/')
         if (base.isEmpty()) throw PanelException("请先在设置里填写面板地址")
@@ -121,7 +156,8 @@ class PanelClient {
                         proxyTx = d.optLong("proxy_tx"),
                         monthTotal = d.optLong("month_total"),
                         lastSeen = d.optLong("last_seen"),
-                        quotaLimit = d.optLong("quota_limit")
+                        quotaLimit = d.optLong("quota_limit"),
+                        apps = parseDeviceApps(d.optJSONObject("apps"))
                     )
                 )
             }
@@ -164,6 +200,7 @@ class PanelClient {
             confidence = h.optString("accounting_confidence", "unknown"),
             reasons = reasons,
             clashConnections = h.optLong("clash_connections"),
+            clashPollMs = h.optLong("clash_poll_ms"),
             linkSource = h.optString("link_source"),
             linkBridge = h.optString("link_bridge")
         )
@@ -184,6 +221,37 @@ class PanelClient {
             conntrack = source.optString("conntrack", ""),
             quotaDeviceLimit = quota.optLong("device_limit")
         )
+    }
+
+    /**
+     * 解析单个设备的 `apps` 对象：`{ "<host>": {"rx","tx","chain"} }`。
+     *
+     * daemon 已按 rx 降序截断、长尾归并进 `__other__`，这里不做排序也不补数据：
+     * - `apps` 缺失 / 不是对象 → 空 map（老快照与离线缓存都是这种形态）；
+     * - 某一项不是对象、键为空 → 跳过该条，不影响其它条目；
+     * - `rx`/`tx` 类型错乱时 `optLong` 给 0，负值按 0 处理；
+     * - 同一 host 出现多次（大小写/空白变体）时累加，避免静默丢流量。
+     */
+    private fun parseDeviceApps(root: JSONObject?): Map<String, DeviceApp> {
+        if (root == null || root.length() == 0) return emptyMap()
+        val out = LinkedHashMap<String, DeviceApp>(root.length())
+        val keys = root.keys()
+        while (keys.hasNext()) {
+            val rawHost = keys.next()
+            val host = rawHost.trim()
+            if (host.isEmpty()) continue
+            val o = root.optJSONObject(rawHost) ?: continue
+            val rx = o.optLong("rx").coerceAtLeast(0L)
+            val tx = o.optLong("tx").coerceAtLeast(0L)
+            val prev = out[host]
+            out[host] = if (prev == null) {
+                DeviceApp(host = host, rx = rx, tx = tx, chain = o.optString("chain", "").trim())
+            } else {
+                /* 保留第一次读到的 chain（同一域名在同一设备上通常同链路）。 */
+                prev.copy(rx = prev.rx + rx, tx = prev.tx + tx)
+            }
+        }
+        return out
     }
 
     /** 解析 `?what=history`；容忍 buckets 为空、summary 缺失与字段不完整。 */

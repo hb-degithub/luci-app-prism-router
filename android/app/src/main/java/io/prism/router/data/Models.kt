@@ -36,9 +36,47 @@ data class Device(
     val monthTotal: Long,
     val lastSeen: Long,
     /** 单设备月配额（字节）；0 表示面板未下发该规则。 */
-    val quotaLimit: Long = 0
+    val quotaLimit: Long = 0,
+    /**
+     * `devices[].apps`：域名 → 单设备用量。
+     *
+     * daemon 已按 rx 降序截断、并把长尾归并进 [DEVICE_APP_OTHER_KEY]；
+     * 老快照 / 离线缓存没有该字段时为空 map（UI 显示「暂无应用明细」，不伪造数据）。
+     */
+    val apps: Map<String, DeviceApp> = emptyMap()
 ) {
     val total: Long get() = directRx + directTx + proxyRx + proxyTx
+
+    /** 应用明细合计（仅 apps 里列出的条目），与 [total] 的差即未覆盖部分。 */
+    val appsRx: Long get() = apps.values.sumOf { it.rx }
+    val appsTx: Long get() = apps.values.sumOf { it.tx }
+    val appsTotal: Long get() = appsRx + appsTx
+}
+
+/** daemon 归并长尾应用的固定键（不是真实域名）。 */
+const val DEVICE_APP_OTHER_KEY = "__other__"
+
+/**
+ * 单设备内的一个域名（应用）用量，对应 `devices[].apps[host]` 的值。
+ *
+ * [chain] 是出口链路：`DIRECT`（直连）、`MIXED`（混合 / 归并桶）、或节点名（如 `香港 IPLC 01`）。
+ */
+data class DeviceApp(
+    val host: String,
+    val rx: Long = 0,
+    val tx: Long = 0,
+    val chain: String = ""
+) {
+    val total: Long get() = rx + tx
+
+    /** `__other__` 是长尾归并桶，UI 里当成「其他」这一条展示。 */
+    val isOther: Boolean get() = host == DEVICE_APP_OTHER_KEY
+
+    /** 展示名：归并桶显示「其他」，其余就是域名本身（不显示 `__other__` 字面量）。 */
+    val displayName: String get() = if (isOther) "其他" else host
+
+    /** 只有 `DIRECT`（大小写不敏感）算直连；其余非空值都按代理 / 节点处理。 */
+    val isDirect: Boolean get() = chain.trim().equals("DIRECT", ignoreCase = true)
 }
 
 data class AppUsage(
@@ -104,7 +142,8 @@ data class Health(
     val reasons: List<String>,
     val clashConnections: Long,
     val linkSource: String,
-    val linkBridge: String
+    val linkBridge: String,
+    val clashPollMs: Long = 0
 )
 
 data class PanelState(
@@ -239,6 +278,10 @@ private fun Totals.toCacheObject(): JSONObject = JSONObject().apply {
     put("month_total", monthTotal)
 }
 
+/*
+ * 离线快照不写每设备的 apps：缓存硬上限 64KB，逐设备明细会挤掉设备 / 全局应用列表；
+ * 读回时 apps 缺省为空 map，详情弹层按「离线缓存不含应用明细」提示，不做猜测。
+ */
 private fun Device.toCacheObject(): JSONObject = JSONObject().apply {
     put("hostname", name)
     put("mac", mac)

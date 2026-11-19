@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -54,11 +55,13 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.prism.router.data.ControlClient
 import io.prism.router.data.ControlException
 import io.prism.router.data.Device
+import io.prism.router.data.DeviceApp
 import io.prism.router.data.UiState
 import io.prism.router.data.fmtAgo
 import io.prism.router.data.fmtBytes
@@ -82,6 +85,9 @@ private val PauseRed = Color(0xFFE53935)
 
 /** 家长控制写客户端无状态、线程安全，整页共用一个实例（避免每次切页重建连接池）。 */
 private val controlClient = ControlClient()
+
+/** 详情弹层「应用明细」的展示条数上限：后端已截断+归并，这里再兜一层避免弹层过长。 */
+private const val DEVICE_APP_ROWS = 8
 
 private fun Device.isOnline(nowSec: Long): Boolean =
     lastSeen > 0 && nowSec - lastSeen <= ONLINE_WINDOW_SEC
@@ -273,6 +279,7 @@ fun DevicesScreen(ui: UiState) {
             device = selected,
             online = selected.isOnline(nowSec),
             paused = normalizeMac(selected.mac) in pausedMacs,
+            offline = ui.offline,
             busy = busyMac == selected.mac,
             blocked = controlBlocked,
             error = controlError,
@@ -401,6 +408,7 @@ private fun DeviceDetailSheet(
     device: Device,
     online: Boolean,
     paused: Boolean,
+    offline: Boolean,
     busy: Boolean,
     blocked: Boolean,
     error: String?,
@@ -495,16 +503,7 @@ private fun DeviceDetailSheet(
             }
 
             Spacer(Modifier.height(10.dp))
-            DetailCard {
-                Text("应用明细", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Spacer(Modifier.height(4.dp))
-                Text("该设备暂无应用明细（数据层待扩展）", fontSize = 12.sp, color = Warn)
-                Text(
-                    "当前接口的 apps 为全局面板聚合，无法按设备拆分；数据层接入 per-device 明细后将在此展示。",
-                    fontSize = 11.sp,
-                    color = SubText
-                )
-            }
+            DeviceAppsCard(device = device, offline = offline)
 
             /* ───────── 家长控制操作区（暂停 / 恢复） ───────── */
             Spacer(Modifier.height(10.dp))
@@ -579,6 +578,142 @@ private fun DeviceDetailSheet(
             }
             Spacer(Modifier.height(24.dp))
         }
+    }
+}
+
+/**
+ * 详情弹层的「应用明细」：数据只来自 `state.devices[].apps`，不新增任何请求。
+ *
+ * - 顶部先给「应用明细覆盖 X / 总 Y」，让用户直接看出明细相对设备总量的缺口；
+ * - 列表按 `rx + tx` 降序、最多 [DEVICE_APP_ROWS] 条；
+ * - `__other__` 是 daemon 的长尾归并桶，显示「其他」并整行置灰；
+ * - 没有明细时按真实情况显示「暂无应用明细」，不伪造数据。
+ */
+@Composable
+private fun DeviceAppsCard(device: Device, offline: Boolean) {
+    val apps = remember(device.apps) {
+        device.apps.values.sortedWith(
+            compareByDescending<DeviceApp> { it.total }.thenBy { it.displayName }
+        )
+    }
+    val shown = apps.take(DEVICE_APP_ROWS)
+
+    DetailCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "应用明细",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f)
+            )
+            if (apps.isNotEmpty()) {
+                Text("${apps.size} 个域名", fontSize = 11.sp, color = SubText)
+            }
+        }
+
+        if (apps.isEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Text("暂无应用明细", fontSize = 12.sp, color = SubText)
+            if (offline) {
+                Text(
+                    "离线缓存不含每设备应用明细，连回路由器后自动出现。",
+                    fontSize = 10.sp,
+                    color = SubText
+                )
+            }
+        } else {
+            Spacer(Modifier.height(4.dp))
+            Text(appsCoverageText(device), fontSize = 11.sp, color = SubText)
+            if (device.appsTotal in 1 until device.total) {
+                Text(
+                    "缺口为未列入明细的流量（后端会按体积裁剪）。",
+                    fontSize = 10.sp,
+                    color = SubText
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            shown.forEach { app -> DeviceAppRow(app) }
+            if (shown.size < apps.size) {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "仅显示流量前 $DEVICE_APP_ROWS 条",
+                    fontSize = 10.sp,
+                    color = SubText
+                )
+            }
+        }
+    }
+}
+
+/** 「应用明细覆盖 X / 总 Y」；设备总量未知或明细反而更大时只报数字，不编造百分比。 */
+private fun appsCoverageText(device: Device): String {
+    val covered = device.appsTotal
+    val total = device.total
+    if (total <= 0) return "应用明细合计 ${fmtBytes(covered)} · 设备总量未知"
+    val pct = if (covered in 1..total) " · ${covered * 100L / total}%" else ""
+    return "应用明细覆盖 ${fmtBytes(covered)} / 总 ${fmtBytes(total)}$pct"
+}
+
+/** 单条应用：域名（`__other__` → 「其他」并置灰）+ 链路 chip + ↓rx ↑tx。 */
+@Composable
+private fun DeviceAppRow(app: DeviceApp) {
+    val dim = app.isOther
+    val numberColor = if (dim) SubText.copy(alpha = 0.7f) else SubText
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            app.displayName,
+            fontSize = 12.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            color = if (dim) SubText else Color.Unspecified,
+            fontWeight = if (dim) FontWeight.Normal else FontWeight.Medium,
+            modifier = Modifier.weight(1f)
+        )
+        Spacer(Modifier.width(6.dp))
+        ChainChip(app.chain, dim = dim)
+        Spacer(Modifier.width(8.dp))
+        Text("↓ ${fmtBytes(app.rx)}", fontSize = 10.sp, color = numberColor)
+        Spacer(Modifier.width(6.dp))
+        Text("↑ ${fmtBytes(app.tx)}", fontSize = 10.sp, color = numberColor)
+    }
+}
+
+/**
+ * 出口链路 chip：`DIRECT` 绿（直连），其余非空链路蓝（代理 / 节点名）。
+ * `chain` 缺失显示「—」、归并行（`__other__`）整行置灰——这两种都不是代理，不冒充蓝色。
+ */
+@Composable
+private fun ChainChip(chain: String, dim: Boolean = false) {
+    val color = when {
+        dim || chain.isBlank() -> SubText
+        chain.trim().equals("DIRECT", ignoreCase = true) -> Good
+        else -> Brand
+    }
+    Text(
+        chainLabel(chain),
+        fontSize = 9.sp,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        color = color,
+        fontWeight = FontWeight.Medium,
+        modifier = Modifier
+            .widthIn(max = 84.dp)
+            .background(color.copy(alpha = 0.14f), RoundedCornerShape(4.dp))
+            .padding(horizontal = 5.dp, vertical = 1.dp)
+    )
+}
+
+/** chip 文案：直连 / 混合 / 后端原样节点名；缺失时用破折号（与 Web 面板的 chainBadge 一致）。 */
+private fun chainLabel(chain: String): String {
+    val c = chain.trim()
+    return when {
+        c.isEmpty() -> "—"
+        c.equals("DIRECT", ignoreCase = true) -> "直连"
+        c.equals("MIXED", ignoreCase = true) -> "混合"
+        else -> c
     }
 }
 
