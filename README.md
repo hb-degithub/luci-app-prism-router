@@ -148,14 +148,18 @@ uci commit prism-router
 | `?what=services` | `{"services":[{"name","label","running","pid","info"}]}` |
 | `?what=processes` | `{"processes":[{"pid","user","cpu","mem","command"}]}` |
 | `?what=version` | `{"version":"1.0.0","build":"1.0.0-1","apk_version":"1.0.0","update_check":false}` |
+| `?what=update_check` | `{"configured":true,"repo":"owner/repo","current":"1.0.0","latest":"1.2.3","has_update":true,"published_at","html_url","notes","apk","ipk"}`（未配置 → `{"configured":false,"message"}`） |
 
 ```sh
 curl -s 'http://<路由器LAN>/cgi-bin/prism-router-system?what=system'
 curl -s 'http://<路由器LAN>/cgi-bin/prism-router-system?what=version'
+curl -s 'http://<路由器LAN>/cgi-bin/prism-router-system?what=update_check'
 ```
 
-- **只读且无需 token**：只读 `/proc`、`/proc/net`、opkg control 和固定命令输出
-  （`pidof`/`pgrep`/`netstat`/`df`/`nft`），不写文件、不写日志、不改配置。
+- **只读且无需 token**：只读 `/proc`、`/proc/net`、opkg control、UCI 和固定命令输出
+  （`pidof`/`pgrep`/`netstat`/`df`/`nft`/`curl`），不写配置、不写日志。唯一的写入是
+  `?what=update_check` 的成功结果缓存 `/tmp/prism-router/update-cache.json`（0600），
+  `cache_seconds=0` 可关闭。
 - `memory` / `rootfs` 单位是**字节**；`uptime` 是秒；`load` 是 1/5/15 分钟负载；
   `cpu` 是进程**累计 CPU 时间（秒）**，`mem` 是常驻内存（字节）。
 - `processes` 按常驻内存降序取前 20，内核线程（cmdline 为空）已剔除，`command` 截断到 80 字节
@@ -164,11 +168,45 @@ curl -s 'http://<路由器LAN>/cgi-bin/prism-router-system?what=version'
   `clash`/`docker` 只在系统里确实装了对应软件时出现。判定用 `pidof`/`pgrep` +
   `/etc/init.d status` + `netstat`（面板端口读 `prism-router.panel.port`，默认 8099），**不用 systemd**。
 - `version` 来自 `/usr/lib/opkg/info/luci-app-prism-router.control`（`build` 含 release），
-  `apk_version` 优先读 `/etc/prism-router/version`（可选）；未配置更新源，`update_check` 恒为 `false`。
+  `apk_version` 优先读 `/etc/prism-router/version`（可选）；`update_check` 表示是否配置了
+  `prism-router.update.github_repo`（配置后为 `true`，客户端可显示「检查更新」入口）。
 - 只允许 `GET`（其它方法 405），未知 `what` 400，缺省 `what=system`；所有响应带
   `Cache-Control: no-store` + `application/json`。
 - 同一份 CGI 也随包安装到独立面板目录（`/www/prism-router-panel/cgi-bin/`），所以启用面板后
   `http://<路由器LAN>:8099/cgi-bin/prism-router-system?what=…` 同样可用；两处行为一致。
+
+#### 自动检测更新（GitHub Releases）
+
+`?what=update_check` 用于提醒**路由器插件本身**有新版本（与 App 版本检查无关），只读、无需登录：
+
+```sh
+uci set prism-router.update.github_repo='owner/repo'   # GitHub 仓库，必填
+uci set prism-router.update.github_token=''            # 可选：私有仓库或避免匿名限流
+uci set prism-router.update.cache_seconds='600'        # 成功结果缓存秒数（0 = 不缓存）
+uci commit prism-router
+curl -s 'http://<路由器LAN>/cgi-bin/prism-router-system?what=update_check'
+curl -s 'http://<路由器LAN>/cgi-bin/prism-router-system?what=update_check&force=1'
+```
+
+- 未配置 `github_repo` → `200 {"configured":false,"message":"未配置更新源（uci set …）"}`，
+  且**不发任何网络请求**。
+- 已配置 → 请求固定 API `https://api.github.com/repos/<owner>/<repo>/releases/latest`
+  （`Accept: application/vnd.github+json`、`User-Agent: prism-router`；有 token 时加
+  `Authorization: Bearer …`），10 秒超时；系统没有 `curl` 时退回 `wget`。
+- 解析 `tag_name`（去掉前缀 `v`）、`published_at`、`html_url`、`body`（`notes` 截断 2000 字节）
+  以及 `assets[]` 里的 `.apk`/`.ipk`（返回 `name/url/size`，没有则 `null`），
+  与当前插件版本比较得到 `has_update`。
+- 失败**不返回 5xx**：`200 {"configured":true,"error":"github_unavailable","detail":"HTTP 403"}`；
+  401/404 分别是 `github_unauthorized`/`github_not_found`；网络错误 detail 为
+  `timeout`/`network_error`，不包含上游响应体或堆栈。
+- 成功结果缓存到 `/tmp/prism-router/update-cache.json`（0600，按 repo + 当前版本区分），
+  `cache_seconds` 内直接返回；`force=1` 跳过缓存。
+- **安全**：`repo` 必须匹配 `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`（额外拒绝 `.`/`..` 段；非法 →
+  `400 {"error":"invalid_repo"}` 且不联网）；只访问 `api.github.com`、不跟随重定向
+  （curl `--max-redirs 0`）；`github_token` 不进响应/日志/缓存，走 0600 临时 curl 配置
+  （不进命令行；只有无 curl 时的 wget 兜底路径受工具限制）。token 明文存在
+  `/etc/config/prism-router`（conffile 默认 0644），建议 `chmod 600` 并使用只读 Releases
+  权限的 fine-grained token。
 
 ### `prism-router-admin`：登录后的管理接口
 
@@ -185,15 +223,71 @@ curl -sS -X POST http://<路由器LAN>/cgi-bin/prism-router-admin \
 curl -sS 'http://<路由器LAN>/cgi-bin/prism-router-admin?action=system&token=<token>'
 curl -sS -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
   -d '{"action":"wifi","token":"<token>"}' http://<路由器LAN>/cgi-bin/prism-router-admin
+
+# 3) 读当前软路由配置（只读，GET + token）
+curl -sS 'http://<路由器LAN>/cgi-bin/prism-router-admin?action=config&token=<token>'
+# {"lan":{"ipaddr":"192.168.100.1","netmask":"255.255.255.0","gateway":"","dns":[...]},
+#  "wan":{"proto":"dhcp","device":"eth0","ipaddr":"...","gateway":"...","dns":[...]},
+#  "dhcp":{"enabled":true,"start":"100","limit":"150","leasetime":"12h"},
+#  "system":{"hostname":"iStoreOS","timezone":"CST-8","zonename":"Asia/Shanghai"},
+#  "redirects":[{"index":0,"name":"","src":"lan","dest":"lan","src_dport":"",
+#                "dest_ip":"","dest_port":"","proto":"tcp","enabled":true}]}
+
+# 4) 改 LAN 地址（写操作必须 POST + token + confirm 字面量 APPLY）
+curl -sS -X POST http://<路由器LAN>/cgi-bin/prism-router-admin \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"config_set","token":"<token>","section":"lan","confirm":"APPLY",
+       "options":{"ipaddr":"192.168.100.2","netmask":"255.255.255.0"}}'
+# 200 {"ok":true,"backup":"/etc/prism-router/backup/network.<ts>",
+#      "note":"LAN 地址已改，请用新地址重新连接（备份：...）"}
+# LAN 地址/掩码真的变了时：先返回 200，再等 1 秒异步 /etc/init.d/network reload，
+# 当前 HTTP 连接会断开，客户端要用新地址重连。
+
+# 5) 端口转发（DNAT redirect）
+curl -sS -X POST http://<路由器LAN>/cgi-bin/prism-router-admin -H 'Content-Type: application/json' \
+  -d '{"action":"redirect_add","token":"<token>","name":"web","src":"lan","dest":"lan",
+       "src_dport":"8080","dest_ip":"192.168.100.10","dest_port":"80","proto":"tcp"}'
+# 200 {"ok":true,"index":0}
+curl -sS -X POST http://<路由器LAN>/cgi-bin/prism-router-admin -H 'Content-Type: application/json' \
+  -d '{"action":"redirect_del","token":"<token>","index":0}'
+# 200 {"ok":true}
+
+# 6) 回滚某段配置到最近一份备份
+curl -sS -X POST http://<路由器LAN>/cgi-bin/prism-router-admin -H 'Content-Type: application/json' \
+  -d '{"action":"config_rollback","token":"<token>","section":"lan"}'
+# 200 {"ok":true,"backup":"/etc/prism-router/backup/network.<ts>"}；无备份 -> 404 {"error":"no_backup"}
 ```
 
-- 可用 action：`login`、`logout`、`system`、`network`、`wifi`、`reboot`、`wifi_toggle`。
+- 可用 action：`login`、`logout`、`system`、`network`、`wifi`、`reboot`、`wifi_toggle`、
+  `config`（只读）、`config_set`、`redirect_add`、`redirect_del`、`config_rollback`。
 - 密码只与 `/etc/shadow` 的哈希比较（`openssl passwd -1/-5/-6` + 相同 salt），不写日志、不进 argv。
 - token 存在 `/tmp/prism-router/admin/<token>.json`（0600），重启即失效。
-- 写操作只有 `reboot`（需 `confirm: "REBOOT"`）与 `wifi_toggle`（radio 只接受 `radio0` 形式）。
+- 写操作（`config_set`/`redirect_add`/`redirect_del`/`config_rollback`）**只接受 POST** 且必须有效
+  token：非 POST → 405；token 缺失/过期/格式错 → 401。`reboot` 需 `confirm: "REBOOT"`；
+  `wifi_toggle` 的 radio 只接受 `radio0` 形式；`config_set` 的 `confirm` 必须是字面量 `APPLY`。
+- `config_set` 的 `section` 只允许 `lan`/`wan`/`dhcp`/`system`，`options` 只允许白名单字段
+  （lan: `ipaddr/netmask/gateway/dns`；wan: `proto/device/ipaddr/netmask/gateway/dns`；
+  dhcp: `enabled/start/limit/leasetime`；system: `hostname/timezone/zonename`）。
+- 校验失败一律 `400 {"error":"invalid_<field>"}`，**不写任何配置、不产生备份**：
+  - lan：合法 IPv4 且掩码连续、同网段、不能是网络/广播地址（/31、/32 除外）；gateway 为空或
+    与 LAN 同网段；dns ≤3 个合法 IPv4；
+  - wan：`proto` ∈ `dhcp|static|none`；static 时 `ipaddr/netmask/gateway/dns` 必填且合法；
+  - dhcp：`start` 1–254、`limit` 1–253、`leasetime` 匹配 `^[0-9]+[smhd]$` 或空；
+  - system：`hostname` 匹配 `^[A-Za-z0-9][A-Za-z0-9-]{0,62}$`；`zonename` 必须在
+    `/usr/share/zoneinfo/<zonename>` 真实存在且不含 `..`；`timezone` 是 `CST-8` 这类 POSIX TZ 串，
+    若写成 `Asia/Shanghai` 这种 IANA 形式同样要求 zoneinfo 中存在。
+- 每个写操作前备份 `/etc/prism-router/backup/<config>.<ts>`（目录 0700、文件 0600，
+  每个 config 保留最近 10 份，超出删最旧；备份失败 → 500 且不写配置）。
+  `lan`/`wan` 共用 `network` 备份，`config_rollback` 会整份恢复 `/etc/config/network`。
+- 应用方式：lan/wan → `/sbin/network reload`（不存在则 `/etc/init.d/network reload`）；
+  dhcp → `/etc/init.d/dnsmasq restart`；system → `uci commit system` + `hostname <新值>` 立即生效；
+  redirect 增删 → `/etc/init.d/firewall reload`；**不会重启整机**。
+- 所有配置写入只经 ucode 的 `uci` cursor API，不把请求内容拼进 shell；reload 只用固定路径。
+- 写操作审计日志追加 `/tmp/prism-router/admin.log`（0600），只记 action/section/结果/IP/备份路径，
+  不含密码或 token。
 - 所有响应 `Cache-Control: no-store`，错误统一 `{"error":...}`，不返回路径/堆栈/命令输出。
 - 同样安装一份到面板目录：启用独立面板后 `http://<路由器LAN>:8099/cgi-bin/prism-router-admin`
-  也可用（token/限速逻辑不变）。
+  也可用（token/限速/备份逻辑不变）。
 
 ## 家长控制（按 MAC 暂停/恢复上网）
 
@@ -304,13 +398,13 @@ node tests/mobile-ui-static.js          # 手机版 App 界面（分页/分类/�
 ./tests/container-validate-features.sh   # 别名/配额/导出 156
 ./tests/container-validate-core-fixes.sh # 跨重启/去重/历史/并发 72
 ./tests/container-validate-security-fixes.sh # 独立凭证/防重放/TLS 87
-./tests/container-validate-standalone-panel.sh # 独立面板服务 + 系统信息/管理员 CGI 138（真实 procd + uhttpd + CGI）
+./tests/container-validate-standalone-panel.sh # 独立面板服务 + 系统信息/管理员 CGI/配置读写 190（真实 procd + uhttpd + CGI）
 ./tests/container-validate-feishu-oauth.sh # 飞书应用机器人扫码绑定（OAuth 回调/状态校验）
 ./tests/container-validate-control.sh    # 家长控制 123（假 nft / 保护目标 / 审计 / 重放）
 ./tests/container-validate-release.sh    # 发布物/权限/升级/卸载，23.05+24.10 各110
 ```
 
-原有回归合计 **804 项断言**，另含家长控制（123 项）、核心、安全、独立面板 + 系统信息/管理员 CGI（138 项）、发布与前端专项；实际通过数以本次运行输出为准。真机部署后再跑 `./tests/smoke.sh`（15 项）与 `LUCI_PASS='<密码>' ./tests/ui/run.sh`（页面渲染）。
+原有回归合计 **856 项断言**，另含家长控制（123 项）、核心、安全、独立面板 + 系统信息/管理员 CGI/配置读写/更新检查（224 项）、发布与前端专项；实际通过数以本次运行输出为准。真机部署后再跑 `./tests/smoke.sh`（15 项）与 `LUCI_PASS='<密码>' ./tests/ui/run.sh`（页面渲染）。
 
 ```sh
 ./tests/container-validate.sh        # 28 项：包安装、属主权限、系统目录未被改动、守护进程离线用例

@@ -89,9 +89,11 @@ data class UiState(
     /** `?action=wifi&token=…` 的射频列表；未登录时为 null。 */
     val wifi: WifiInfo? = null,
     val wifiLoading: Boolean = false,
+    /** 「网络配置」屏的读写状态；data 为 null 表示尚未读到。 */
+    val config: ConfigUiState = ConfigUiState(),
     /** 重启 / 无线开关等管理写操作是否在进行中（禁用按钮、防重复提交）。 */
     val adminBusy: Boolean = false,
-    /** 检查更新：App 版本、服务端版本与结论。 */
+    /** 检查更新：App 版本、GitHub `update_check` 结果与结论。 */
     val update: UpdateState = UpdateState(),
     /** 多路由器：地址列表与当前选中项（下标）。空列表时退回默认地址。 */
     val servers: List<ServerProfile> = listOf(DEFAULT_SERVER),
@@ -102,6 +104,32 @@ data class UiState(
     val offline: Boolean = false,
     /** 离线缓存的保存时间（毫秒），用于「离线数据 · 更新于 HH:mm」。 */
     val offlineAt: Long = 0
+)
+
+/**
+ * 「网络配置」屏的状态（管理员 `?action=config` 一组接口）。
+ *
+ * 只做读写编排，不缓存到 DataStore：每次进屏 / 每次写成功后都重新读一遍路由器，
+ * 保证界面展示的就是路由器当前值。令牌不在这里（仍在 ViewModel 私有字段）。
+ */
+data class ConfigUiState(
+    /** 最近一次成功读取的配置；null 表示还没读到（首屏骨架 / 错误态）。 */
+    val data: ConfigData? = null,
+    val loading: Boolean = false,
+    /** 是否有写操作（保存 / 新增 / 删除 / 回滚）在进行，用于禁用按钮与进度条。 */
+    val saving: Boolean = false,
+    /** 分组级错误（网络失败、登录过期、后端 internal 等）。 */
+    val error: String? = null,
+    /** 字段级错误：字段名 → 中文说明（invalid_ip → ipaddr）。 */
+    val fieldErrors: Map<String, String> = emptyMap(),
+    /** 最近一次写操作成功的提示（后端 note），由界面用 Snackbar 展示。 */
+    val notice: String? = null,
+    /** 提示序号：同一文案连续两次也会重新弹 Snackbar。 */
+    val noticeSeq: Long = 0,
+    /** 端口转发新增成功次数：界面据此清空「添加规则」表单（失败时保留输入）。 */
+    val redirectAddedSeq: Long = 0,
+    /** 最近一次读取完成（或失败）的时间，用于轻量节流。 */
+    val at: Long = 0
 )
 
 /**
@@ -154,6 +182,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val SYSTEM_REFRESH_MS = 5 * 60 * 1000L
         const val SYSTEM_RETRY_MS = 60 * 1000L
 
+        /* 网络配置：进屏读一次；1 分钟内重复进屏复用结果（写成功后强制重读）。 */
+        const val CONFIG_CACHE_MS = 60 * 1000L
+
         /* 告警阈值与规则见 data/AlertRules.kt（纯函数，便于单测）。 */
     }
 
@@ -170,6 +201,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val panelClient = PanelClient()
     private val systemClient = SystemClient()
     private val adminClient = AdminClient()
+    /* 路由器配置（LAN / WAN / DHCP / 系统 / 端口转发）：独立 CGI 段的轻量客户端。 */
+    private val configClient = ConfigClient()
 
     /**
      * 仅保留离线快照的 SharedPreferences（`stateCache` / `stateCacheAt`）；
@@ -184,6 +217,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private var stationsJob: Job? = null
     private var systemJob: Job? = null
     private var wifiJob: Job? = null
+    private var configJob: Job? = null
+
+    /** 配置提示的自增序号（见 [ConfigUiState.noticeSeq]）。 */
+    private var configNoticeSeq = 0L
 
     /**
      * 管理员令牌：**只保存在内存**（不进 UiState / DataStore / 日志），
@@ -330,6 +367,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         systemJob = null
         wifiJob?.cancel()
         wifiJob = null
+        configJob?.cancel()
+        configJob = null
         /* 取消后不会再有心跳回来清 loading，这里主动收起骨架屏 / 进度条。 */
         if (ui.stationsLoading || ui.systemLoading || ui.wifiLoading) {
             ui = ui.copy(stationsLoading = false, systemLoading = false, wifiLoading = false)
@@ -630,7 +669,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     adminError = null,
                     adminNotice = "登录成功",
                     wifi = null,
-                    wifiLoading = false
+                    wifiLoading = false,
+                    /* 新会话：清掉上一次登录残留的配置数据，进配置屏时会重新读取。 */
+                    config = ConfigUiState()
                 )
                 /* 登录后立刻拉射频列表，用户不必再点一次。 */
                 wifiJob?.cancel()
@@ -668,7 +709,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             adminNotice = "已退出管理员登录",
             wifi = null,
             wifiLoading = false,
-            adminBusy = false
+            adminBusy = false,
+            /* 令牌失效：配置数据（只对登录会话可见）一并清空，避免残留展示。 */
+            config = ConfigUiState()
         )
         if (token.isNullOrBlank()) return
         viewModelScope.launch {
@@ -797,6 +840,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         adminToken = null
         wifiJob?.cancel()
         wifiJob = null
+        configJob?.cancel()
+        configJob = null
         ui = ui.copy(
             adminLoggedIn = false,
             adminUser = "",
@@ -805,7 +850,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             adminNotice = null,
             wifi = null,
             wifiLoading = false,
-            adminBusy = false
+            adminBusy = false,
+            config = ConfigUiState()
         )
     }
 
@@ -814,33 +860,279 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         else -> error.message ?: "管理员操作失败"
     }
 
-    /* ───────────────────────── 检查更新 ───────────────────────── */
+    /* ───────────────────────── 网络配置（管理员 ?action=config） ───────────────────────── */
 
     /**
-     * 比较 App 版本与路由器 `?what=version`。
+     * 读取路由器网络配置（`GET ?action=config&token=…`）。
      *
-     * 结论只有四种：有新版本 / 已是最新 / 无法比较（版本号非数字）/ 失败。
-     * 不自动下载，只提示用户去获取安装包。App 版本读自 PackageManager
-     * （当前构建未开启 BuildConfig，`VERSION_NAME` 与 `versionName` 同值）。
+     * 只读不缓存：每次进屏、每次写成功后都重新读一遍，界面展示的永远是路由器当前值。
+     * [force]=false 时 60 秒内复用上次结果，避免切换分组来回打接口。
+     * 令牌过期（`unauthorized`）会清空管理员会话，界面随之回到「需先登录」状态。
      */
-    fun checkUpdate() {
+    fun configLoad(force: Boolean = false) {
+        if (!ui.adminLoggedIn) return
+        val fresh = System.currentTimeMillis() - ui.config.at < CONFIG_CACHE_MS
+        if (!force && ui.config.data != null && fresh) return
+        if (configJob?.isActive == true) return
+        val token = validAdminToken() ?: return
+        val base = ui.baseUrl
+        ui = ui.copy(config = ui.config.copy(loading = true, error = null))
+        configJob = viewModelScope.launch {
+            try {
+                val data = withContext(Dispatchers.IO) { configClient.fetchConfig(base, token) }
+                if (ui.baseUrl != base) return@launch
+                ui = ui.copy(
+                    config = ui.config.copy(
+                        data = data,
+                        loading = false,
+                        error = null,
+                        fieldErrors = emptyMap(),
+                        at = System.currentTimeMillis()
+                    )
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (ui.baseUrl != base) return@launch
+                val message = (e as? ConfigException)?.message ?: e.message ?: "配置读取失败"
+                val expired = e is ConfigException && e.code == "unauthorized"
+                if (expired) clearAdminSession()
+                ui = ui.copy(
+                    config = ui.config.copy(
+                        loading = false,
+                        error = message,
+                        at = System.currentTimeMillis()
+                    )
+                )
+            }
+        }
+    }
+
+    /**
+     * 所有配置写操作的公共流程：登录态校验 → 置 saving → 执行 → 成功提示 + 重新读取。
+     *
+     * 失败按后端错误码映射中文；后端给了 `field`（或错误码能定位字段）时把说明
+     * 落到对应输入框（[ConfigUiState.fieldErrors]），否则作为分组级错误展示。
+     * 写操作不自动重试，避免配置被重复下发。
+     */
+    private fun configWrite(
+        onSuccess: (() -> Unit)? = null,
+        action: suspend (base: String, token: String) -> String?
+    ) {
+        if (!ui.adminLoggedIn) return
+        if (ui.config.saving) return
+        val token = validAdminToken() ?: return
+        val base = ui.baseUrl
+        ui = ui.copy(
+            config = ui.config.copy(saving = true, error = null, fieldErrors = emptyMap())
+        )
+        viewModelScope.launch {
+            try {
+                val note = withContext(Dispatchers.IO) { action(base, token) }
+                if (ui.baseUrl != base) return@launch
+                configNoticeSeq += 1
+                ui = ui.copy(
+                    config = ui.config.copy(
+                        saving = false,
+                        error = null,
+                        fieldErrors = emptyMap(),
+                        notice = note?.takeIf { it.isNotBlank() } ?: "配置已保存",
+                        noticeSeq = configNoticeSeq
+                    )
+                )
+                onSuccess?.invoke()
+                /* 写完立刻重读：界面展示的永远是路由器当前值（而不是本地乐观值）。 */
+                configJob?.cancel()
+                configLoad(force = true)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (ui.baseUrl != base) return@launch
+                val code = (e as? ConfigException)?.code.orEmpty()
+                val field = (e as? ConfigException)?.field.orEmpty()
+                    .ifBlank { ConfigClient.fieldFor(code) }
+                val message = (e as? ConfigException)?.message
+                    ?: e.message
+                    ?: "配置操作失败"
+                if (code == "unauthorized") clearAdminSession()
+                ui = ui.copy(
+                    config = ui.config.copy(
+                        saving = false,
+                        error = message,
+                        fieldErrors = if (field.isBlank()) emptyMap() else mapOf(field to message)
+                    )
+                )
+            }
+        }
+    }
+
+    /** 保存 LAN：IP / 掩码 / 网关 / DNS（多值）。 */
+    fun configSaveLan(ipaddr: String, netmask: String, gateway: String, dns: List<String>) {
+        configWrite { base, token ->
+            configClient.setSection(
+                base,
+                token,
+                CONFIG_SECTION_LAN,
+                mapOf(
+                    "ipaddr" to ipaddr.trim(),
+                    "netmask" to netmask.trim(),
+                    "gateway" to gateway.trim(),
+                    "dns" to dns.map { it.trim() }.filter { it.isNotEmpty() }
+                )
+            )
+        }
+    }
+
+    /**
+     * 保存 WAN：DHCP / 无只下发 proto（不覆盖路由器当前的地址 / DNS）；
+     * 静态才下发 IP / 掩码 / 网关 / DNS，避免把空串写进 uci。
+     */
+    fun configSaveWan(
+        proto: String,
+        ipaddr: String,
+        netmask: String,
+        gateway: String,
+        dns: List<String>
+    ) {
+        configWrite { base, token ->
+            val cleanProto = WanProto.fromWire(proto).wire
+            val options = LinkedHashMap<String, Any?>()
+            options["proto"] = cleanProto
+            if (cleanProto == WanProto.STATIC.wire) {
+                options["ipaddr"] = ipaddr.trim()
+                options["netmask"] = netmask.trim()
+                options["gateway"] = gateway.trim()
+                options["dns"] = dns.map { it.trim() }.filter { it.isNotEmpty() }
+            }
+            configClient.setSection(base, token, CONFIG_SECTION_WAN, options)
+        }
+    }
+
+    /** 保存 DHCP：启用开关 / 地址池起始 / 数量 / 租期。 */
+    fun configSaveDhcp(enabled: Boolean, start: String, limit: String, leasetime: String) {
+        configWrite { base, token ->
+            configClient.setSection(
+                base,
+                token,
+                CONFIG_SECTION_DHCP,
+                mapOf(
+                    "enabled" to enabled,
+                    "start" to start.trim(),
+                    "limit" to limit.trim(),
+                    "leasetime" to leasetime.trim()
+                )
+            )
+        }
+    }
+
+    /** 保存系统分组：主机名 / POSIX 时区 / IANA 时区名。 */
+    fun configSaveSystem(hostname: String, timezone: String, zonename: String) {
+        configWrite { base, token ->
+            configClient.setSection(
+                base,
+                token,
+                CONFIG_SECTION_SYSTEM,
+                mapOf(
+                    "hostname" to hostname.trim(),
+                    "timezone" to timezone.trim(),
+                    "zonename" to zonename.trim()
+                )
+            )
+        }
+    }
+
+    /** 新增端口转发；成功后重新读取列表（下标由后端分配）并通知界面清空表单。 */
+    fun configAddRedirect(draft: RedirectDraft) {
+        configWrite(
+            onSuccess = {
+                ui = ui.copy(
+                    config = ui.config.copy(
+                        redirectAddedSeq = ui.config.redirectAddedSeq + 1
+                    )
+                )
+            }
+        ) { base, token ->
+            val index = configClient.addRedirect(base, token, draft)
+            if (index >= 0) "$CONFIG_NOTE_REDIRECT_ADDED（#$index）" else CONFIG_NOTE_REDIRECT_ADDED
+        }
+    }
+
+    /** 删除端口转发；[index] 为后端下发的规则下标，非法值直接忽略。 */
+    fun configDeleteRedirect(index: Int) {
+        if (index < 0) {
+            ui = ui.copy(config = ui.config.copy(error = "该规则没有有效的下标，请刷新后重试"))
+            return
+        }
+        configWrite { base, token ->
+            configClient.deleteRedirect(base, token, index)
+            "已删除端口转发规则"
+        }
+    }
+
+    /** 回滚某个分组到最近一次备份：section 取 lan / wan / dhcp / system。 */
+    fun configRollback(section: String) {
+        configWrite { base, token ->
+            configClient.rollback(base, token, section)
+            "已恢复该分组的最近备份"
+        }
+    }
+
+    /** 清除配置页的错误 / 字段错误 / 提示（用户重新输入或关闭弹层时调用）。 */
+    fun configClearFeedback() {
+        if (ui.config.error == null &&
+            ui.config.fieldErrors.isEmpty() &&
+            ui.config.notice == null
+        ) {
+            return
+        }
+        ui = ui.copy(
+            config = ui.config.copy(error = null, fieldErrors = emptyMap(), notice = null)
+        )
+    }
+
+    /** 只清掉已展示的 Snackbar 提示，不动错误与字段错误（提示被消费后调用）。 */
+    fun configClearNotice() {
+        if (ui.config.notice == null) return
+        ui = ui.copy(config = ui.config.copy(notice = null))
+    }
+
+    /* ───────────────────────── 检查更新（GitHub） ───────────────────────── */
+
+    /**
+     * 检查路由器配置的 GitHub 更新源：`GET ?what=update_check[&force=1]`。
+     *
+     * 结论只有四种：未配置更新源 / 有新版本 / 已是最新 / 失败（GitHub 不可达、
+     * 仓库不存在、拒绝访问）。默认 [force]=true，即用户点按钮时跳过后端短期缓存。
+     * 不自动下载任何安装包：只展示版本对比、发布时间、notes 摘要与下载 / Release 入口。
+     * App 版本读自 PackageManager（当前构建未开启 BuildConfig）。
+     */
+    fun checkUpdate(force: Boolean = true) {
         if (ui.update.status == UpdateStatus.CHECKING) return
         if (!settingsReady) return
         val base = ui.baseUrl
         val appVersion = appVersionName()
-        ui = ui.copy(update = UpdateState(UpdateStatus.CHECKING, appVersion, ui.update.server))
+        ui = ui.copy(update = UpdateState(UpdateStatus.CHECKING, appVersion, ui.update.check))
         viewModelScope.launch {
             try {
-                val server = withContext(Dispatchers.IO) { systemClient.fetchVersion(base) }
+                val check = withContext(Dispatchers.IO) {
+                    systemClient.fetchUpdateCheck(base, force)
+                }
                 if (ui.baseUrl != base) return@launch
-                val comparison = compareVersions(server.effectiveVersion, appVersion)
                 val status = when {
-                    server.effectiveVersion.isBlank() -> UpdateStatus.UNKNOWN
-                    comparison == null -> UpdateStatus.UNKNOWN
-                    comparison > 0 -> UpdateStatus.UPDATE_AVAILABLE
+                    !check.configured -> UpdateStatus.NOT_CONFIGURED
+                    check.latest.isBlank() -> UpdateStatus.UNKNOWN
+                    check.hasUpdate -> UpdateStatus.UPDATE_AVAILABLE
                     else -> UpdateStatus.UP_TO_DATE
                 }
-                ui = ui.copy(update = UpdateState(status, appVersion, server))
+                val message = when (status) {
+                    UpdateStatus.NOT_CONFIGURED -> check.message.ifBlank {
+                        "未配置更新源（可在路由器 uci 设置 github_repo）"
+                    }
+
+                    UpdateStatus.UNKNOWN -> "没有拿到最新版本号，请稍后重试"
+                    else -> null
+                }
+                ui = ui.copy(update = UpdateState(status, appVersion, check, message))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -849,7 +1141,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     update = UpdateState(
                         status = UpdateStatus.ERROR,
                         appVersion = appVersion,
-                        server = ui.update.server,
+                        check = ui.update.check,
                         message = systemErrorMessage(e)
                     )
                 )
@@ -1073,7 +1365,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             adminNotice = null,
             wifi = null,
             wifiLoading = false,
-            adminBusy = false
+            adminBusy = false,
+            config = ConfigUiState()
         )
     }
 

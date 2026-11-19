@@ -254,3 +254,21 @@ config retention 'retention'
 	option spool_max_kb '2048'
 	# 1 = 只打印将要删除/截断的清单，不实际动文件（首次启用建议先 1 跑一次看输出）
 	option dry_run '0'
+
+# ── 自动检测更新（GitHub Releases；/cgi-bin/prism-router-system?what=update_check）──
+# 只读、无需登录；未配置 github_repo 时接口返回 {configured:false}，
+# version 接口的 update_check 也为 false（客户端据此隐藏「检查更新」入口）。
+# 打开方式：
+#   uci set prism-router.update.github_repo='owner/repo'
+#   uci commit prism-router
+# 可选 github_token：私有仓库或避免匿名限流时填 fine-grained token（只需 Releases 读权限）；
+#   只存在本文件（opkg conffile），不会写进响应/日志/缓存，也不会出现在 curl 命令行。
+# cache_seconds：成功结果的缓存秒数（0 = 不缓存，上限 86400），缓存文件
+#   /tmp/prism-router/update-cache.json（0600）；force=1 可跳过缓存。
+config update 'update'
+	# 形如 owner/repo；留空 = 未配置更新源
+	option github_repo ''
+	# 可选 GitHub token；留空 = 匿名访问（受 GitHub 限流）
+	option github_token ''
+	# 成功响应缓存秒数
+	option cache_seconds '600'

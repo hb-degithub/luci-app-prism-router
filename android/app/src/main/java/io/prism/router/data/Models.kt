@@ -453,16 +453,103 @@ data class WifiInfo(
     val devices: List<WifiDevice> = emptyList()
 )
 
-/* ───────────────────────── 检查更新 ───────────────────────── */
+/* ───────────────────────── 检查更新（GitHub 更新源） ───────────────────────── */
 
-/** 检查更新的四种确定结果 + 两种过程态。 */
-enum class UpdateStatus { IDLE, CHECKING, UP_TO_DATE, UPDATE_AVAILABLE, UNKNOWN, ERROR }
+/**
+ * 检查更新的确定结果：
+ * - [IDLE]        还没检查过；
+ * - [CHECKING]    请求进行中；
+ * - [NOT_CONFIGURED] 路由器没配更新源（uci 的 github_repo 为空）；
+ * - [UP_TO_DATE]  已是最新；
+ * - [UPDATE_AVAILABLE] 有新版本；
+ * - [UNKNOWN]     后端返回了不完整的结果（没有 latest，也没给错误码）；
+ * - [ERROR]       请求失败（GitHub 不可达 / 仓库不存在 / 拒绝访问等）。
+ */
+enum class UpdateStatus {
+    IDLE, CHECKING, NOT_CONFIGURED, UP_TO_DATE, UPDATE_AVAILABLE, UNKNOWN, ERROR
+}
 
-/** 检查更新的 UI 状态：App 版本、服务端版本与结论。 */
+/**
+ * 一个更新产物（APK / IPK）。
+ *
+ * [url] 为空表示后端没给下载地址，界面不渲染对应按钮；[size] 为字节数，
+ * 缺失时为 0（界面不显示大小，而不是显示 "0 B"）。
+ */
+data class UpdateAsset(
+    val name: String = "",
+    val url: String = "",
+    val size: Long = 0L
+) {
+    /** 是否可下载：只认非空 URL（不猜文件名拼地址）。 */
+    val available: Boolean get() = url.isNotBlank()
+
+    /** 展示用文件名：后端没给时退回「安装包」。 */
+    val displayName: String get() = name.trim().ifBlank { "安装包" }
+
+    /** 大小文案；未知大小返回空串（调用方据此隐藏括号）。 */
+    val sizeText: String get() = if (size > 0L) fmtBytes(size) else ""
+}
+
+/**
+ * `GET /cgi-bin/prism-router-system?what=update_check[&force=1]` 的结果。
+ *
+ * 三种形态（与后端契约一致，缺字段一律取安全默认值）：
+ * - 未配置：`configured=false`，[message] 是后端说明；
+ * - 成功：`configured=true`，带 [repo] / [current] / [latest] / [hasUpdate] /
+ *   [publishedAt] / [htmlUrl] / [notes] / [apk] / [ipk]；
+ * - 失败：`configured=true` + [error]（`github_unavailable` / `github_not_found` /
+ *   `github_unauthorized`）+ [detail]（后端诊断，只用于排查，不进 UI 主文案）。
+ */
+data class UpdateCheck(
+    val configured: Boolean = false,
+    val message: String = "",
+    val repo: String = "",
+    val current: String = "",
+    val latest: String = "",
+    val hasUpdate: Boolean = false,
+    val publishedAt: String = "",
+    val htmlUrl: String = "",
+    val notes: String = "",
+    val apk: UpdateAsset? = null,
+    val ipk: UpdateAsset? = null,
+    val error: String = "",
+    val detail: String = ""
+) {
+    /** 当前版本展示文案：后端没给时用「?」，不猜。 */
+    val currentText: String get() = current.trim().ifBlank { "?" }
+
+    /** 最新版本展示文案。 */
+    val latestText: String get() = latest.trim().ifBlank { "?" }
+
+    /** 是否至少有一个可下载的安装包。 */
+    val hasAsset: Boolean get() = apk?.available == true || ipk?.available == true
+
+    /** 是否有 Release 页面可打开。 */
+    val hasReleasePage: Boolean get() = htmlUrl.isNotBlank()
+
+    /**
+     * Release notes 摘要：去空行、去列表符号，用「·」连成一段并截断到 [maxChars]。
+     * 只做展示裁剪，不改写原文语义。
+     */
+    fun notesSummary(maxChars: Int = 220): String {
+        val lines = notes
+            .replace("\r\n", "\n")
+            .replace('\r', '\n')
+            .split('\n')
+            .map { line -> line.trim().trimStart('-', '*', '•').trim() }
+            .filter { line -> line.isNotEmpty() && !line.startsWith("<!--") }
+        if (lines.isEmpty()) return ""
+        val joined = lines.joinToString(" · ")
+        if (joined.length <= maxChars) return joined
+        return joined.take(maxChars.coerceAtLeast(1)).trimEnd() + "…"
+    }
+}
+
+/** 检查更新的 UI 状态：App 版本、最近一次 GitHub 结果与错误文案。 */
 data class UpdateState(
     val status: UpdateStatus = UpdateStatus.IDLE,
     val appVersion: String = "",
-    val server: ServerVersion? = null,
+    val check: UpdateCheck? = null,
     val message: String? = null
 )
 
@@ -496,6 +583,33 @@ fun compareVersions(a: String, b: String): Int? {
         if (x != y) return x.compareTo(y)
     }
     return 0
+}
+
+/**
+ * GitHub 的 `published_at`（ISO 8601）→ 本地时区 `yyyy-MM-dd HH:mm`。
+ *
+ * 支持 `2026-11-19T12:30:00Z`（App 拿到的是 UTC）与 `...+08:00`；
+ * 解析失败时原样返回（后端以后可能给纯日期），绝不抛异常打断界面。
+ * [zone] 只为单测固定时区而暴露，界面不传。
+ */
+fun formatPublishedAt(
+    value: String,
+    zone: java.time.ZoneId = java.time.ZoneId.systemDefault()
+): String {
+    val text = value.trim()
+    if (text.isEmpty()) return ""
+    val formatter = java.time.format.DateTimeFormatter
+        .ofPattern("yyyy-MM-dd HH:mm")
+        .withZone(zone)
+    return try {
+        formatter.format(java.time.OffsetDateTime.parse(text).toInstant())
+    } catch (e: Exception) {
+        try {
+            formatter.format(java.time.Instant.parse(text))
+        } catch (e2: Exception) {
+            text
+        }
+    }
 }
 
 /** 面板健康状态（`state.health` 的只读投影）。 */
@@ -672,3 +786,267 @@ private fun NodeUsage.toCacheObject(): JSONObject = JSONObject().apply {
     put("rx", rx)
     put("tx", tx)
 }
+
+/* ───────────────────────── 路由器网络配置（管理员 ?action=config） ───────────────────────── */
+
+/*
+ * 契约（后端 /www/cgi-bin/prism-router-admin）：
+ *   GET  ?action=config&token=…  → lan / wan / dhcp / system / redirects
+ *   POST {action:"config_set", token, section, options, confirm:"APPLY"}
+ *   POST {action:"redirect_add", token, name, src, dest, src_dport, dest_ip, dest_port, proto}
+ *   POST {action:"redirect_del", token, index}
+ *   POST {action:"config_rollback", token, section}
+ * 令牌只允许留在内存：这里的数据类不含任何令牌字段，也不会被序列化到本机存储。
+ */
+
+/** `config_set` / `config_rollback` 的分组标识（后端只认这四个字面量）。 */
+const val CONFIG_SECTION_LAN = "lan"
+const val CONFIG_SECTION_WAN = "wan"
+const val CONFIG_SECTION_DHCP = "dhcp"
+const val CONFIG_SECTION_SYSTEM = "system"
+
+/** `config_set` 的二次确认字面量（后端校验）。 */
+const val CONFIG_CONFIRM_PHRASE = "APPLY"
+
+/** 端口转发新增成功的提示前缀；界面据此清空表单（失败时保留用户输入）。 */
+const val CONFIG_NOTE_REDIRECT_ADDED = "已添加端口转发规则"
+
+/**
+ * LAN 设置（`config.lan`）。
+ *
+ * [dns] 是后端下发的字符串数组；界面上用逗号分隔的多值输入框编辑，
+ * [dnsText] 只负责「数组 ↔ 输入框字符串」的展示转换。
+ */
+data class LanConfig(
+    val ipaddr: String = "",
+    val netmask: String = "",
+    val gateway: String = "",
+    val dns: List<String> = emptyList()
+) {
+    /** 输入框展示用：DNS 多值 → `223.5.5.5, 114.114.114.114`。 */
+    val dnsText: String get() = dns.joinToString(", ")
+}
+
+/** WAN 协议；[wire] 是发给后端的值，[label] 是分段控件文案。 */
+enum class WanProto(val wire: String, val label: String) {
+    DHCP("dhcp", "DHCP"),
+    STATIC("static", "静态"),
+    NONE("none", "无");
+
+    companion object {
+        /**
+         * 后端值 → 枚举。未知协议（例如 pppoe）回退到 DHCP：
+         * 界面只在用户主动选择时才写回 proto，不会把未知协议误改成 dhcp。
+         */
+        fun fromWire(value: String): WanProto =
+            entries.firstOrNull { it.wire.equals(value.trim(), ignoreCase = true) } ?: DHCP
+    }
+}
+
+/** WAN 设置（`config.wan`）。[device] 是只读的物理接口名（如 eth0 / pppoe-wan）。 */
+data class WanConfig(
+    val proto: String = WanProto.DHCP.wire,
+    val device: String = "",
+    val ipaddr: String = "",
+    val netmask: String = "",
+    val gateway: String = "",
+    val dns: List<String> = emptyList()
+) {
+    val protoType: WanProto get() = WanProto.fromWire(proto)
+
+    val static: Boolean get() = protoType == WanProto.STATIC
+
+    val dnsText: String get() = dns.joinToString(", ")
+}
+
+/**
+ * DHCP 服务设置（`config.dhcp`）。
+ *
+ * [start] 是地址池最后一个八位组（后端约定为字符串，如 "100"），
+ * [limit] 是分配数量；两者都是字符串以保留后端的原始写法。
+ */
+data class DhcpConfig(
+    val enabled: Boolean = true,
+    val start: String = "",
+    val limit: String = "",
+    val leasetime: String = ""
+) {
+    /** 地址池结束地址（起始 + 数量 - 1）；任一字段非数字时返回 null，不猜。 */
+    val poolEnd: Int?
+        get() {
+            val first = start.trim().toIntOrNull() ?: return null
+            val count = limit.trim().toIntOrNull() ?: return null
+            return first + count - 1
+        }
+}
+
+/** 系统设置（`config.system`）：[timezone] 是 POSIX TZ（CST-8），[zonename] 是 IANA 名称。 */
+data class RouterSystemConfig(
+    val hostname: String = "",
+    val timezone: String = "",
+    val zonename: String = ""
+)
+
+/** 一条端口转发规则（`config.redirects[]`）；[index] 是删除时用的后端下标。 */
+data class RedirectRule(
+    val index: Int = -1,
+    val name: String = "",
+    val src: String = "lan",
+    val dest: String = "lan",
+    val srcDport: String = "",
+    val destIp: String = "",
+    val destPort: String = "",
+    val proto: String = "tcp",
+    val enabled: Boolean = true
+) {
+    val displayName: String get() = name.trim().ifBlank { "未命名规则" }
+
+    val protoLabel: String get() = proto.trim().uppercase(Locale.US).ifBlank { "TCP" }
+
+    val srcLabel: String get() = src.trim().uppercase(Locale.US).ifBlank { "LAN" }
+
+    val destLabel: String get() = dest.trim().uppercase(Locale.US).ifBlank { "LAN" }
+
+    /** 目标列展示：`192.168.100.10:8080`；缺字段时给出可读占位。 */
+    val targetText: String
+        get() {
+            val ip = destIp.trim()
+            val port = destPort.trim()
+            if (ip.isBlank() && port.isBlank()) return "未填写目标"
+            return if (port.isBlank()) ip else "$ip:$port"
+        }
+}
+
+/** 新增端口转发时的前端草稿（不含 [RedirectRule.index]，下标由后端返回）。 */
+data class RedirectDraft(
+    val name: String = "",
+    val src: String = "lan",
+    val dest: String = "lan",
+    val srcDport: String = "",
+    val destIp: String = "",
+    val destPort: String = "",
+    val proto: String = "tcp"
+)
+
+/** `?action=config` 的完整响应（只含可展示字段，不含令牌）。 */
+data class ConfigData(
+    val lan: LanConfig = LanConfig(),
+    val wan: WanConfig = WanConfig(),
+    val dhcp: DhcpConfig = DhcpConfig(),
+    val system: RouterSystemConfig = RouterSystemConfig(),
+    val redirects: List<RedirectRule> = emptyList()
+)
+
+/* ───────────────────────── 配置输入校验（纯函数，便于单测） ───────────────────────── */
+
+/**
+ * 严格 IPv4 校验：四段十进制 0–255，拒绝前导零（`010` 会被路由器按八进制解释）
+ * 与空段。网关 / DNS / 目标 IP 全部复用这一份规则。
+ */
+fun isValidIpv4(value: String): Boolean {
+    val parts = value.trim().split('.')
+    if (parts.size != 4) return false
+    return parts.all { part ->
+        if (part.isEmpty() || part.length > 3) return@all false
+        if (!part.all { it.isDigit() }) return@all false
+        if (part.length > 1 && part.startsWith("0")) return@all false
+        val octet = part.toIntOrNull() ?: return@all false
+        octet in 0..255
+    }
+}
+
+/**
+ * 点分掩码校验：必须是连续的 1 后接连续的 0（`255.255.255.0` 合法，
+ * `255.0.255.0` 与 `0.0.0.0` 不合法），与后端 `invalid_netmask` 判定对齐。
+ */
+fun isValidNetmask(value: String): Boolean {
+    val text = value.trim()
+    if (!isValidIpv4(text)) return false
+    val mask = text.split('.').fold(0) { acc, part -> (acc shl 8) or part.toInt() }
+    if (mask == 0) return false
+    val inverted = mask.inv()
+    return (inverted and (inverted + 1)) == 0
+}
+
+/**
+ * 主机名校验（RFC 1123，允许点分标签）：1–253 字符，每个标签 1–63 字符，
+ * 只含 ASCII 字母 / 数字 / `-`，且首尾不能是 `-`。
+ */
+fun isValidHostname(value: String): Boolean {
+    val text = value.trim()
+    if (text.isEmpty() || text.length > 253) return false
+    return text.split('.').all { label ->
+        label.isNotEmpty() &&
+            label.length <= 63 &&
+            !label.startsWith("-") &&
+            !label.endsWith("-") &&
+            label.all { ch -> ch == '-' || (ch.isLetterOrDigit() && ch.code < 128) }
+    }
+}
+
+/** 单端口解析：1–65535 的十进制数；非法 / 空串返回 null（界面据此提示）。 */
+fun parsePortNumber(value: String): Int? {
+    val text = value.trim()
+    if (text.isEmpty() || text.length > 5 || !text.all { it.isDigit() }) return null
+    val port = text.toIntOrNull() ?: return null
+    return if (port in 1..65535) port else null
+}
+
+/**
+ * DHCP 租期校验：`12h` / `30m` / `1d` / 纯数字（秒，如 `43200`）或 `infinite`。
+ * 值为 0 或空串一律不合法，避免把 0 秒租期写进 dnsmasq。
+ */
+fun isValidLeasetime(value: String): Boolean {
+    val text = value.trim().lowercase(Locale.US)
+    if (text == "infinite" || text == "无限") return true
+    if (text.isEmpty()) return false
+    val unit = text.last()
+    val digits = if (unit == 's' || unit == 'm' || unit == 'h' || unit == 'd') {
+        text.dropLast(1)
+    } else {
+        text
+    }
+    if (digits.isEmpty() || !digits.all { it.isDigit() }) return false
+    return (digits.toLongOrNull() ?: 0L) > 0L
+}
+
+/** DNS 输入框字符串 → 地址列表：逗号 / 中文逗号 / 空格 / 分号 / 换行分隔，去空去重。 */
+fun parseDnsList(value: String): List<String> = value
+    .split(',', '，', ' ', ';', '；', '\n')
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
+    .distinct()
+
+/** DHCP 地址池校验：起始 / 数量各为 1–254，且「起始 + 数量 - 1 ≤ 254」。返回 null 表示合法。 */
+fun dhcpPoolError(start: String, limit: String): String? {
+    val first = parseLastOctet(start) ?: return "起始地址需为 1–254 的数字"
+    val count = parseLastOctet(limit) ?: return "地址数量需为 1–254 的数字"
+    if (first + count - 1 > 254) return "地址池超出范围（起始 + 数量 - 1 不能大于 254）"
+    return null
+}
+
+/** 纯函数：把 "100" 解析成 100 并限制在 1–254；非法返回 null。 */
+private fun parseLastOctet(value: String): Int? {
+    val text = value.trim()
+    if (text.isEmpty() || text.length > 3 || !text.all { it.isDigit() }) return null
+    val n = text.toIntOrNull() ?: return null
+    return if (n in 1..254) n else null
+}
+
+/** 时区下拉的一个候选：[zone] 是 IANA 名称，[posix] 是 OpenWrt 使用的 POSIX TZ。 */
+data class TimezoneOption(val zone: String, val posix: String)
+
+/** 系统分组时区下拉的常用候选（不含全部 IANA 表，可手动输入覆盖）。 */
+val COMMON_TIMEZONES: List<TimezoneOption> = listOf(
+    TimezoneOption("Asia/Shanghai", "CST-8"),
+    TimezoneOption("Asia/Hong_Kong", "HKT-8"),
+    TimezoneOption("Asia/Taipei", "CST-8"),
+    TimezoneOption("Asia/Tokyo", "JST-9"),
+    TimezoneOption("Asia/Seoul", "KST-9"),
+    TimezoneOption("Asia/Singapore", "SGT-8"),
+    TimezoneOption("Europe/London", "GMT0BST,M3.5.0/1,M10.5.0"),
+    TimezoneOption("Europe/Berlin", "CET-1CEST,M3.5.0,M10.5.0/3"),
+    TimezoneOption("America/New_York", "EST5EDT,M3.2.0,M11.1.0"),
+    TimezoneOption("America/Los_Angeles", "PST8PDT,M3.2.0,M11.1.0"),
+    TimezoneOption("UTC", "UTC0")
+)

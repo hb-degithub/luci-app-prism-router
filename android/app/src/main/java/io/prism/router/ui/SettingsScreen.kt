@@ -1,6 +1,9 @@
 package io.prism.router.ui
 
+import android.app.Activity
+import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.net.Uri
 import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -19,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
@@ -30,6 +34,7 @@ import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Lan
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Remove
 import androidx.compose.material.icons.rounded.Storage
@@ -62,6 +67,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -85,8 +92,10 @@ import io.prism.router.data.ServerProfile
 import io.prism.router.data.ServiceInfo
 import io.prism.router.data.SystemInfo
 import io.prism.router.data.UiState
+import io.prism.router.data.UpdateCheck
 import io.prism.router.data.UpdateStatus
 import io.prism.router.data.WifiDevice
+import io.prism.router.data.formatPublishedAt
 import io.prism.router.data.fmtBytes
 import io.prism.router.data.fmtUptime
 import io.prism.router.ui.components.EmptyState
@@ -110,6 +119,12 @@ import org.json.JSONObject
 import java.util.Locale
 
 /* ───────────────────────── 常量 ───────────────────────── */
+
+/**
+ * 「管理员」卡片在设置页 LazyColumn 里的下标（连接 0 → 管理员 1）。
+ * 未登录时点「网络配置」会滚到这里并把焦点放到密码框。
+ */
+private const val ADMIN_ITEM_INDEX = 1
 
 /** 刷新间隔的允许范围（与 SettingsStore / ViewModel 的收敛范围一致）。 */
 private const val INTERVAL_MIN = 5
@@ -155,7 +170,7 @@ private data class DiagItem(
  *   默认用本地 remember 展示；调用方可通过参数接入真实状态（传 null 即本地模式）；
  * - 刷新：5–300 秒步进 + 输入；
  * - 诊断：原有 9 项只读自检，折叠展示；
- * - 关于：版本、构建信息、服务端版本与「检查更新」、只读说明与开源许可。
+ * - 关于：版本、构建信息、GitHub 更新检查（下载 / Release 入口）、只读说明与开源许可。
  *
  * 底部固定「保存设置」按钮，保存后弹 Snackbar；深色 / 动态色全部走主题令牌。
  *
@@ -180,7 +195,9 @@ fun SettingsScreen(
     onNotifyEnabledChange: ((Boolean) -> Unit)? = null,
     /* 设置子页入口：由 NavHost 传入；为空时不显示顶栏动作（预览 / 单页复用时）。 */
     onOpenServers: (() -> Unit)? = null,
-    onOpenAbout: (() -> Unit)? = null
+    onOpenAbout: (() -> Unit)? = null,
+    /* 「管理员 → 网络配置」入口；null 时不渲染该行（预览 / 单页复用）。 */
+    onOpenConfig: (() -> Unit)? = null
 ) {
     val context = LocalContext.current
     val semantic = LocalPrismSemanticColors.current
@@ -213,6 +230,10 @@ fun SettingsScreen(
     var diagOpen by rememberSaveable { mutableStateOf(false) }
     var showLicenses by remember { mutableStateOf(false) }
 
+    /* 「网络配置」未登录时跳回管理员分组：列表状态 + 密码框焦点。 */
+    val listState = rememberLazyListState()
+    val loginFocus = remember { FocusRequester() }
+
     /* 切换当前服务器后，把输入框同步到新的地址；手动编辑时 ui 不变，不会被覆盖。 */
     LaunchedEffect(ui.baseUrl, ui.token) {
         if (base != ui.baseUrl) base = ui.baseUrl
@@ -237,6 +258,24 @@ fun SettingsScreen(
 
     fun toast(message: String) {
         scope.launch { snackbarHostState.showSnackbar(message) }
+    }
+
+    /**
+     * 用系统浏览器打开外部链接（更新包下载 / GitHub Release 页）。
+     *
+     * 不申请任何权限、不内置下载器：只发 ACTION_VIEW；系统没有可用浏览器时
+     * 用 Snackbar 提示，而不是崩溃（部分精简系统会没有默认浏览器）。
+     */
+    fun openExternal(url: String) {
+        val target = url.trim()
+        if (target.isEmpty()) return
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(target))
+        if (context !is Activity) intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            context.startActivity(intent)
+        } catch (e: Exception) {
+            toast("没有可打开链接的应用")
+        }
     }
 
     fun runDiagnostics() {
@@ -325,6 +364,7 @@ fun SettingsScreen(
     ) {
         Box(Modifier.fillMaxSize()) {
             LazyColumn(
+                state = listState,
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = PaddingValues(
                     start = PrismSpacing.lg,
@@ -559,7 +599,17 @@ fun SettingsScreen(
                     AdminSection(
                         ui = ui,
                         vm = vm,
-                        toast = { message -> toast(message) }
+                        toast = { message -> toast(message) },
+                        onOpenConfig = onOpenConfig,
+                        onRequireLogin = {
+                            /* 未登录：滚到管理员卡片并把焦点交给密码框（入口就是本卡片）。 */
+                            scope.launch {
+                                runCatching { listState.animateScrollToItem(ADMIN_ITEM_INDEX) }
+                                runCatching { loginFocus.requestFocus() }
+                            }
+                            toast("需先登录管理员")
+                        },
+                        passwordFocus = loginFocus
                     )
                 }
 
@@ -853,8 +903,13 @@ fun SettingsScreen(
                             "$buildType · Android ${Build.VERSION.RELEASE}（API ${Build.VERSION.SDK_INT}）"
                         )
                         InfoRow("数据来源", "路由器只读面板 /cgi-bin/panel-api")
-                        InfoRow("权限", "统计只读；管理员操作需登录，且仅限重启 / 无线开关")
-                        UpdateBlock(ui = ui, onCheck = { vm.checkUpdate() })
+                        InfoRow("权限", "统计只读；管理员操作需登录，含重启 / 无线开关 / 网络配置")
+                        UpdateBlock(
+                            ui = ui,
+                            appVersionFallback = versionName,
+                            onCheck = { vm.checkUpdate(force = true) },
+                            onOpenUrl = { url -> openExternal(url) }
+                        )
                         Spacer(Modifier.height(PrismSpacing.xs))
                         HorizontalDivider(
                             color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
@@ -887,7 +942,7 @@ fun SettingsScreen(
                         }
                         Spacer(Modifier.height(PrismSpacing.xs))
                         Text(
-                            text = "统计功能只读；管理员操作需登录，且仅限重启路由器与无线开关。" +
+                            text = "统计功能只读；管理员操作需登录，且仅限重启路由器、无线开关与网络配置。" +
                                 "面板地址、访问令牌与刷新间隔仅保存在本机 DataStore；" +
                                 "管理员令牌只存在于内存，退出应用或切换服务器即失效。",
                             style = MaterialTheme.typography.labelSmall,
@@ -1489,7 +1544,14 @@ private fun redact(message: String, token: String): String {
  * - 错误（密码错误 / 429 限速 / 令牌过期）与成功提示都在卡片内就地展示。
  */
 @Composable
-private fun AdminSection(ui: UiState, vm: MainViewModel, toast: (String) -> Unit) {
+private fun AdminSection(
+    ui: UiState,
+    vm: MainViewModel,
+    toast: (String) -> Unit,
+    onOpenConfig: (() -> Unit)?,
+    onRequireLogin: () -> Unit,
+    passwordFocus: FocusRequester
+) {
     val semantic = LocalPrismSemanticColors.current
     var username by rememberSaveable { mutableStateOf("root") }
     /* 密码不是配置：用 remember（不参与状态恢复），登录成功立即清空。 */
@@ -1549,6 +1611,9 @@ private fun AdminSection(ui: UiState, vm: MainViewModel, toast: (String) -> Unit
                     PasswordVisualTransformation()
                 },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(passwordFocus),
                 trailingIcon = {
                     IconButton(onClick = { showPassword = !showPassword }) {
                         Icon(
@@ -1560,8 +1625,7 @@ private fun AdminSection(ui: UiState, vm: MainViewModel, toast: (String) -> Unit
                             contentDescription = if (showPassword) "隐藏密码" else "显示密码"
                         )
                     }
-                },
-                modifier = Modifier.fillMaxWidth()
+                }
             )
             Spacer(Modifier.height(PrismSpacing.md))
             Button(
@@ -1641,6 +1705,70 @@ private fun AdminSection(ui: UiState, vm: MainViewModel, toast: (String) -> Unit
             Spacer(Modifier.height(PrismSpacing.xs))
             WifiBlock(ui = ui, vm = vm)
             AdminFeedback(ui)
+        }
+
+        /* 网络配置入口：登录后可用；未登录时提示先登录并跳到本卡片的登录框。 */
+        if (onOpenConfig != null) {
+            Spacer(Modifier.height(PrismSpacing.md))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            Spacer(Modifier.height(PrismSpacing.md))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp)
+                    .clip(RoundedCornerShape(PrismRadius.small))
+                    .clickable {
+                        if (ui.adminLoggedIn) {
+                            onOpenConfig()
+                        } else {
+                            onRequireLogin()
+                        }
+                    }
+                    .padding(vertical = PrismSpacing.sm),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Lan,
+                    contentDescription = null,
+                    tint = if (ui.adminLoggedIn) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+                Spacer(Modifier.width(PrismSpacing.md))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        text = "网络配置",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = if (ui.adminLoggedIn) {
+                            "LAN / WAN / DHCP / 系统 / 端口转发"
+                        } else {
+                            "需先登录管理员"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (ui.adminLoggedIn) {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        } else {
+                            semantic.warning
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Spacer(Modifier.width(PrismSpacing.sm))
+                Icon(
+                    imageVector = Icons.AutoMirrored.Rounded.KeyboardArrowRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
     }
 
@@ -2185,103 +2313,228 @@ private fun RowScope.ProcessCell(text: String, style: TextStyle, width: Dp?) {
 /* ───────────────────────── 检查更新（关于分组内） ───────────────────────── */
 
 /**
- * 检查更新：显示服务端版本、比较 App 版本与服务端版本。
+ * 检查更新（路由器的 GitHub 更新源：`?what=update_check`）。
  *
- * - 有新版本：显示「服务端有新版本 X（当前 Y）」，并说明暂不自动下载；
- * - 无更新：显示「已是最新」；
- * - 版本号不是数字 / 服务端没给版本：显示「无法比较」，不臆测；
- * - 请求失败：显示具体原因（404 → 请升级面板）。
+ * 结果与界面一一对应：
+ * - 未配置：提示在路由器 uci 设置 `github_repo`（不提供 App 内修改入口）；
+ * - 有更新：插件版本对比（当前 → 最新）、发布时间、notes 摘要，并按后端产物渲染
+ *   「下载 APK / 下载 IPK」（交给系统浏览器）与「打开 Release 页」；
+ * - 已是最新：显示「已是最新（vX）」；
+ * - 失败：`github_unavailable` / `github_not_found` / `github_unauthorized` 的中文提示。
+ *
+ * App 版本（PackageManager.versionName）始终显示，检查前也可见；
+ * [onOpenUrl] 由调用方用系统浏览器 Intent 打开，本组件不内置下载 / 安装逻辑。
  */
 @Composable
-private fun UpdateBlock(ui: UiState, onCheck: () -> Unit) {
+private fun UpdateBlock(
+    ui: UiState,
+    appVersionFallback: String,
+    onCheck: () -> Unit,
+    onOpenUrl: (String) -> Unit
+) {
     val semantic = LocalPrismSemanticColors.current
     val update = ui.update
-    val server = update.server
+    val check = update.check
+    /* 还没检查过时 UpdateState 里没有版本号：退回 PackageManager 的 versionName。 */
+    val appVersion = update.appVersion.ifBlank { appVersionFallback }
+    val checking = update.status == UpdateStatus.CHECKING
 
     Spacer(Modifier.height(PrismSpacing.md))
     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
     Spacer(Modifier.height(PrismSpacing.sm))
 
-    InfoRow(
-        label = "服务端",
-        value = server?.let { info ->
-            buildString {
-                append("v").append(info.displayVersion)
-                if (info.build.isNotBlank()) append(" · 构建 ").append(info.build)
-            }
-        } ?: "未检查"
-    )
+    InfoRow("本机 App", "v" + appVersion.ifBlank { "未知" })
+    if (check != null && check.configured && check.repo.isNotBlank()) {
+        InfoRow("更新源", check.repo)
+    }
+
     Spacer(Modifier.height(PrismSpacing.sm))
     OutlinedButton(
         onClick = onCheck,
-        enabled = update.status != UpdateStatus.CHECKING,
+        enabled = !checking,
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 48.dp)
+            .heightIn(min = PrismSize.touchTarget)
     ) {
-        Text(if (update.status == UpdateStatus.CHECKING) "检查中…" else "检查更新")
+        Text(if (checking) "检查中…" else "检查更新")
     }
     Spacer(Modifier.height(PrismSpacing.sm))
 
     when (update.status) {
         UpdateStatus.IDLE -> Text(
-            text = "比较本机 App 版本与路由器面板版本；有新版本只提示，不自动下载。",
+            text = "从路由器配置的 GitHub 更新源检查插件新版本；有新版本只提示，不自动安装。",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
         UpdateStatus.CHECKING -> LinearProgressIndicator(Modifier.fillMaxWidth())
 
-        UpdateStatus.UPDATE_AVAILABLE -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
+        UpdateStatus.NOT_CONFIGURED -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
             Text(
-                text = "服务端有新版本 ${server?.displayVersion ?: "?"}" +
-                    "（当前 ${update.appVersion.ifBlank { "?" }}）",
+                text = "未配置更新源（可在路由器 uci 设置 github_repo）",
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.primary
+                color = semantic.warning
             )
+            /*
+             * 后端会把准确的 uci 命令放在 message 里（prism-router.update.github_repo），
+             * 有就直接展示；没有时用同样的路径兜底，避免引导到错误的配置段。
+             */
             Text(
-                text = "暂不自动下载：请从路由器后台或项目发布页获取新版本安装包。",
+                text = update.message.orEmpty().trim().ifBlank {
+                    "uci set prism-router.update.github_repo='owner/repo' && uci commit prism-router"
+                },
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
+        UpdateStatus.UPDATE_AVAILABLE -> UpdateAvailableBlock(check, onOpenUrl)
+
         UpdateStatus.UP_TO_DATE -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
             Text(
-                text = "已是最新",
+                text = "已是最新（v${check?.latestText ?: appVersion.ifBlank { "?" }}）",
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = semantic.success
             )
-            if (server != null) {
-                Text(
-                    text = "当前 ${update.appVersion.ifBlank { "未知" }} · 服务端 v${server.displayVersion}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+            val published = formatPublishedAt(check?.publishedAt.orEmpty())
+            Text(
+                text = buildString {
+                    append("本机 v").append(appVersion.ifBlank { "未知" })
+                    if (published.isNotBlank()) append(" · 最新发布 ").append(published)
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
 
         UpdateStatus.UNKNOWN -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
             Text(
-                text = "无法比较版本号",
+                text = "暂时无法判断版本",
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = semantic.warning
             )
             Text(
-                text = "当前 ${update.appVersion.ifBlank { "未知" }} · " +
-                    "服务端 ${server?.displayVersion ?: "未知"}",
+                text = update.message ?: "更新源返回的数据不完整，请稍后重试。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
-        UpdateStatus.ERROR -> Text(
-            text = "检查更新失败：${update.message ?: "未知错误"}",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.error
+        UpdateStatus.ERROR -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
+            Text(
+                text = "检查更新失败",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.error
+            )
+            Text(
+                text = update.message ?: "未知错误，请稍后重试。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+    }
+}
+
+/**
+ * 有新版本时的详情：版本对比、发布时间、notes 摘要、安装包下载与 Release 页。
+ *
+ * 下载按钮按后端下发的 `apk` / `ipk` 是否存在决定（缺哪个就不渲染哪个），
+ * 打开动作由 [onOpenUrl] 交给系统浏览器，App 不请求存储或安装权限。
+ */
+@Composable
+private fun UpdateAvailableBlock(check: UpdateCheck?, onOpenUrl: (String) -> Unit) {
+    if (check == null) return
+    val assets = buildList {
+        check.apk?.takeIf { it.available }?.let { add("APK" to it) }
+        check.ipk?.takeIf { it.available }?.let { add("IPK" to it) }
+    }
+    val published = formatPublishedAt(check.publishedAt)
+    val summary = check.notesSummary()
+
+    Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
+        Text(
+            text = "发现新版本 v${check.latestText}",
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.primary
         )
+        Text(
+            text = "插件版本 v${check.currentText} → v${check.latestText}",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (published.isNotBlank()) {
+            Text(
+                text = "发布时间 $published",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        if (summary.isNotBlank()) {
+            Spacer(Modifier.height(PrismSpacing.xs))
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 4,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        if (assets.isNotEmpty()) {
+            Spacer(Modifier.height(PrismSpacing.sm))
+            Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.sm)) {
+                assets.forEach { (label, asset) ->
+                    OutlinedButton(
+                        onClick = { onOpenUrl(asset.url) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = PrismSize.touchTarget)
+                    ) {
+                        Text(
+                            text = "下载 $label",
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+            Text(
+                text = assets.joinToString(" · ") { (label, asset) ->
+                    buildString {
+                        append(label).append(" ").append(asset.displayName)
+                        if (asset.sizeText.isNotBlank()) append("（").append(asset.sizeText).append("）")
+                    }
+                },
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        if (check.hasReleasePage) {
+            Spacer(Modifier.height(PrismSpacing.sm))
+            OutlinedButton(
+                onClick = { onOpenUrl(check.htmlUrl) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = PrismSize.touchTarget)
+            ) {
+                Text("打开 Release 页")
+            }
+        }
+
+        if (assets.isEmpty() && !check.hasReleasePage) {
+            Text(
+                text = "更新源没有提供安装包或 Release 链接，请到仓库页面手动获取。",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }

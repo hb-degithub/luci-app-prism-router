@@ -44,6 +44,7 @@ import io.prism.router.data.MAX_SERVERS
 import io.prism.router.data.MainViewModel
 import io.prism.router.data.UiState
 import io.prism.router.ui.AppsScreen
+import io.prism.router.ui.ConfigScreen
 import io.prism.router.ui.DevicesScreen
 import io.prism.router.ui.NetworkScreen
 import io.prism.router.ui.OverviewScreen
@@ -74,6 +75,9 @@ object PrismRoutes {
 
     const val SETTINGS_SERVERS = "settings/servers"
     const val SETTINGS_ABOUT = "settings/about"
+
+    /** 网络配置（LAN / WAN / DHCP / 系统 / 端口转发），仅管理员登录后可用。 */
+    const val SETTINGS_CONFIG = "settings/config"
 }
 
 /** 底部导航的 5 个一级目的地（Material 指南：≤5 项）。 */
@@ -257,7 +261,8 @@ fun PrismNavHost(
                         notifyEnabled = navState.notifyEnabled,
                         onNotifyEnabledChange = { enabled -> navState.onNotifyEnabledChange(enabled) },
                         onOpenServers = { navController.navigate(PrismRoutes.SETTINGS_SERVERS) },
-                        onOpenAbout = { navController.navigate(PrismRoutes.SETTINGS_ABOUT) }
+                        onOpenAbout = { navController.navigate(PrismRoutes.SETTINGS_ABOUT) },
+                        onOpenConfig = { navController.navigate(PrismRoutes.SETTINGS_CONFIG) }
                     )
                 }
 
@@ -272,6 +277,46 @@ fun PrismNavHost(
                 /* 设置子页：关于 + 外观（主题模式 / 动态取色开关）。 */
                 composable(PrismRoutes.SETTINGS_ABOUT) {
                     AboutRoute(onBack = { navController.popBackStack() })
+                }
+
+                /*
+                 * 设置子页：网络配置（需管理员登录）。
+                 * 令牌由 ViewModel 内存持有；本页只发起读写并渲染返回的状态。
+                 */
+                composable(PrismRoutes.SETTINGS_CONFIG) {
+                    ConfigScreen(
+                        ui = vm.ui,
+                        onBack = { navController.popBackStack() },
+                        onRefresh = { vm.configLoad() },
+                        onSaveLan = { lan ->
+                            vm.configSaveLan(lan.ipaddr, lan.netmask, lan.gateway, lan.dns)
+                        },
+                        onSaveWan = { wan ->
+                            vm.configSaveWan(
+                                wan.proto,
+                                wan.ipaddr,
+                                wan.netmask,
+                                wan.gateway,
+                                wan.dns
+                            )
+                        },
+                        onSaveDhcp = { dhcp ->
+                            vm.configSaveDhcp(
+                                dhcp.enabled,
+                                dhcp.start,
+                                dhcp.limit,
+                                dhcp.leasetime
+                            )
+                        },
+                        onSaveSystem = { system ->
+                            vm.configSaveSystem(system.hostname, system.timezone, system.zonename)
+                        },
+                        onAddRedirect = { draft -> vm.configAddRedirect(draft) },
+                        onDeleteRedirect = { index -> vm.configDeleteRedirect(index) },
+                        onRollback = { section -> vm.configRollback(section) },
+                        onClearFeedback = { vm.configClearFeedback() },
+                        onConsumeNotice = { vm.configClearNotice() }
+                    )
                 }
             }
         }

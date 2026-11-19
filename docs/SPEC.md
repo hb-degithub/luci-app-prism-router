@@ -43,9 +43,10 @@
 /www/prism-router-panel/cgi-bin/panel-api  # 独立面板只读 JSON CGI（§11；0644→0755，ucode）
 /www/cgi-bin/prism-router-control      # 家长控制写操作 CGI + 本机 root 的 apply 重放（§12；0755，ucode）
 /www/cgi-bin/prism-router-system       # 系统信息/服务/进程/版本只读 CGI（§13；0755，GET-only，无需登录）
-/www/cgi-bin/prism-router-admin        # 管理员登录 + 系统/网络/无线/重启/无线开关（§14；0755，token）
+/www/cgi-bin/prism-router-admin        # 管理员登录 + 系统/网络/无线/重启/无线开关 + 配置读写（§14；0755，token）
 /etc/prism-router/paused.json          # 暂停列表（§12；0600，原子写）
 /etc/prism-router/control.log          # 家长控制审计（§12；0600，最近 200 行）
+/tmp/prism-router/update-cache.json    # GitHub Releases 更新检查缓存（§13.2；0600，原子写）
 /usr/share/rpcd/acl.d/luci-app-prism-router.json
 /usr/share/luci/menu.d/luci-app-prism-router.json
 /htdocs/luci-static/resources/view/prism-router/*.js
@@ -102,11 +103,17 @@ config feishu 'feishu'
     option alert_mem_pct ''
     option alert_disk_pct ''
     option alert_quiet_hours ''     # 免打扰，如 23:00-07:00；只抑制告警
+config update 'update'
+    option github_repo ''           # owner/repo；空=未配置更新源（update_check=false）
+    option github_token ''          # 可选 GitHub token；只读 Releases，不进响应/日志/缓存
+    option cache_seconds '600'      # 成功结果缓存秒数（0=不缓存，上限 86400）
 ```
 
 > 另有 `config retention 'retention'` 段（数据 / 日志保留与清理，8 个阈值 + 总开关，
 > 默认值与语义见 **§9**）。新装的默认配置末尾带这一段；**老配置升级不会被覆盖**
 > （`/etc/config/prism-router` 是 conffile），需要手动追加或重装配置才会出现。
+> 同理，`config update 'update'` 只在新装/重置配置时出现，老配置需要：
+> `uci set prism-router.update=update; uci set prism-router.update.github_repo='owner/repo'; uci commit prism-router`。
 
 ---
 
@@ -926,7 +933,7 @@ config panel 'panel'
 
 ### 11.6 容器门禁
 
-`tests/container-validate-standalone-panel.sh`（第 13 套，隔离容器、`--network none`，**138 项**）：
+`tests/container-validate-standalone-panel.sh`（第 13 套，隔离容器、`--network none`，**224 项**）：
 
 - 装包后落位/权限（init 755、CGI 755、静态 644）、`sh -n`/`ucode -c`、panel 段默认值；
 - **默认关闭**：`enabled=0` 时 start 退出码 0 且 18099 无监听；
@@ -946,7 +953,10 @@ config panel 'panel'
   `Content-Type`/`Cache-Control`；服务列表识别出正在监听的面板 uhttpd；POST/PUT→405；
   `what=bad`→400；缺省 `what`→`system`；
 - **管理员 CGI（§14）**：文件 755、`ucode -c`、`GET ?action=system` 未带 token→401、
-  `POST {"action":"login"}` 缺密码→400。
+  `POST {"action":"login"}` 缺密码→400；配置读写另有 52 项（未认证/错误 token 401、
+  登录换 token、`config` 200 结构、非法写 400 且不落盘、合法 `config_set lan` 200 + 备份
+  0600/0700 + UCI 已改 + 延迟 reload、system/dhcp 写入、redirect 增删、rollback 恢复、
+  备份保留 10 份、审计日志 0600 不含 token、非 POST 写 405）。
 
 
 
@@ -1129,6 +1139,7 @@ YYYY-MM-DD HH:MM:SS action mac result
 | `GET …?what=services` | 关键服务运行状态 |
 | `GET …?what=processes` | 进程 Top 20（按常驻内存） |
 | `GET …?what=version` | 插件版本（App 比对用） |
+| `GET …?what=update_check` | GitHub Releases 最新版与当前插件版本比对（见下） |
 | 省略 `what` | 等价于 `what=system` |
 | 其它 `what` | `400 {"error":"bad_request"}` |
 | 非 `GET`（含 `HEAD`/`POST`/`PUT`） | `405 {"error":"method_not_allowed"}` |
@@ -1211,7 +1222,58 @@ YYYY-MM-DD HH:MM:SS action mac result
 - `version`：`build` 去掉 `-<release>` 的短版本。
 - `apk_version`：优先 `/etc/prism-router/version`（可选文件），没有就用 `version`；
   供 App 与服务端版本比较。
-- `update_check`：**恒为 `false`**——插件未配置任何更新源，客户端应隐藏「检查更新」入口。
+- `update_check`：**是否配置了更新源**（`prism-router.update.github_repo` 非空即为 `true`）。
+  未配置时客户端应隐藏「检查更新」入口；配置后客户端可调用 `what=update_check`。
+  该值只表示「配没配」，配置是否合法由 `what=update_check` 的 `400 invalid_repo` 判定。
+
+**`what=update_check`**（自动检测插件更新，GitHub Releases）
+
+未配置：
+
+```json
+{ "configured": false, "message": "未配置更新源（uci set prism-router.update.github_repo=owner/repo）" }
+```
+
+已配置且成功：
+
+```json
+{
+  "configured": true,
+  "repo": "owner/repo",
+  "current": "1.0.0",
+  "latest": "1.2.3",
+  "has_update": true,
+  "published_at": "2026-11-01T10:00:00Z",
+  "html_url": "https://github.com/owner/repo/releases/tag/v1.2.3",
+  "notes": "release body（最多 2000 字节）",
+  "apk": { "name": "prism-router-1.2.3.apk", "url": "https://github.com/…/x.apk", "size": 2345678 },
+  "ipk": { "name": "prism-router_1.2.3_all.ipk", "url": "https://github.com/…/x.ipk", "size": 123456 }
+}
+```
+
+失败（仍返回 HTTP 200，错误码在 body）：
+
+```json
+{ "configured": true, "error": "github_unavailable", "detail": "HTTP 403" }
+```
+
+- 数据源：固定 `GET https://api.github.com/repos/<owner>/<repo>/releases/latest`，Header
+  `Accept: application/vnd.github+json`、`User-Agent: prism-router`；有 `github_token` 时加
+  `Authorization: Bearer <token>`。10 秒超时；系统无 `curl` 时退回 `wget`。
+- `tag_name` 去掉前缀 `v`/`V` 得到 `latest`；`notes` 取 release `body` 截断到 2000 字节
+  （UTF-8 字符边界）；`apk`/`ipk` 从 `assets[]` 里找首个 `.apk`/`.ipk`（大小写不敏感），
+  返回 `name`/`browser_download_url`/`size`，没有则 `null`。
+- `has_update = version_cmp(latest, current) > 0`：按数字段比较（`1.2.3 < 1.10.0`）；
+  同版本或更低 → `false`；带 `-pre` 的低于同版本正式版。
+- 错误码：`github_unauthorized`（HTTP 401）、`github_not_found`（HTTP 404）、
+  `github_unavailable`（其它 HTTP 状态、超时、网络错误、非 JSON/缺 tag、无 curl/wget）；
+  `detail` 只给 `HTTP <code>`、`timeout`、`network_error` 等固定串，绝不回传上游响应体。
+- 缓存：成功结果写 `/tmp/prism-router/update-cache.json`（0600、原子写），key 为
+  `repo + 当前版本`；`cache_seconds`（默认 600，0 = 关闭，上限 86400）内直接返回缓存。
+  `?what=update_check&force=1` 跳过缓存并刷新。错误不缓存。
+- 校验顺序：先校验 repo 再读缓存/联网；`github_repo` 必须匹配
+  `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`，且两段都不能是 `.`/`..`（防目录穿越）；非法 →
+  `400 {"error":"invalid_repo"}`，不发任何网络请求。
 
 ### 13.3 响应头与错误
 
@@ -1230,10 +1292,20 @@ Referrer-Policy: no-referrer
 ### 13.4 安全边界
 
 - **GET-only、无认证**：可被任何能访问 LuCI 的客户端读取，暴露面等于 LuCI 的 uhttpd（默认只监听 LAN）。
-- 不读 `/etc/shadow`、UCI 密钥、token、任何业务数据文件；只输出内核/进程元数据。
+- 不读 `/etc/shadow`、任何业务数据文件；只输出内核/进程元数据。唯一读取的密钥是
+  `github_token`：只用于 `Authorization` 请求头，**不返回、不写日志、不进缓存、不进 curl 命令行**
+  （写入一次性 0600 curl `--config` 文件，用后删除）。
 - **命令参数全部固定**：`pidof`/`pgrep` 的名字、`netstat`/`df`/`nft` 的参数都是文件里的字面量，
-  没有任何请求参数进入命令行（`what` 只做字符串白名单比较）。
-- 不写文件、不写日志。
+  没有任何请求参数进入命令行（`what` 只做字符串白名单比较）。更新检查只访问固定
+  `https://api.github.com/repos/<owner>/<repo>/releases/latest`，`owner/repo` 先过正则
+  （`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`，拒绝 `.`/`..` 段），非法时直接 400、不联网；
+  curl 用 `--max-redirs 0` 不跟随重定向，wget 路径也只用同一固定 URL。
+- **错误脱敏**：更新失败只回 `error` + 固定 `detail`（`HTTP <code>`/`timeout`/`network_error`），
+  不回传上游响应体、stderr、路径或堆栈；非 GET → 405，未知 what → 400。
+- 业务数据只读；唯一的写入是成功结果的 `/tmp/prism-router/update-cache.json`（0600、原子写）
+  与一次性 0600 curl 配置（用后立即 unlink）。不写 `/etc/config`、不写日志。
+  注意 `github_token` 明文存在 `/etc/config/prism-router`（conffile 默认 0644），
+  建议 `chmod 600 /etc/config/prism-router`，并使用只读 Releases 权限的 fine-grained token。
 
 ### 13.5 容器门禁
 
@@ -1242,6 +1314,10 @@ Referrer-Policy: no-referrer
 `memory.total>0`/`rootfs.total>0` + `version=1.0.0`；`what=services` 结构/必需项 +
 「正在监听 18099 的面板」被识别为 running 且 pid>0；`what=processes` ≤20、字段类型、
 `command ≤80`、按内存降序、无内核线程；`what=version` 恰好 4 字段且值正确；
+`what=update_check`（PATH 注入假 curl，不访问外网）：未配置 200 `{configured:false}` 且不联网、
+合法 repo + tag `v1.2.3` 的字段/notes≤2000/apk·ipk 提取、`v1.0.0` → `has_update=false`、
+缓存 0600 且第二次不调用 curl、`force=1` 绕过缓存、500→`github_unavailable`、401/404 映射、
+非法 repo（`../`/空格/无斜杠/多斜杠）→ 400 `invalid_repo` 且不联网、token 不进响应/argv；
 POST/PUT→405、`what=bad`→400、缺省 `what`→`system`。
 
 ### 13.6 已知不足
@@ -1253,13 +1329,20 @@ POST/PUT→405、`what=bad`→400、缺省 `what`→`system`。
 - APK 安装的 OpenWrt 25.x 没有 opkg 的 `*.control`，此时 `version`/`build` 为空
   （`apk_version` 仍可从 `/etc/prism-router/version` 得到）；尚未解析 `/lib/apk/db/installed`。
 - 容器内 `/proc` 的进程数与真机不同，门禁只断言结构、排序与截断，不比对具体进程。
+- 更新检查：无 `curl` 走 wget 兜底时，busybox wget 没有 `--max-redirs 0` 等价开关，且
+  token 只能进 argv（主路径 curl 两项都避免）；建议真机保留 `curl`。
+- GitHub 匿名 API 限流是 **60 次/小时/IP**（配 `github_token` 后 5000 次/小时），
+  `cache_seconds` 不要设得太小。
+- `tag_name` 不是数字版本（如 `nightly`、`2026.11`）时按数字段比较，可能判成「无更新」；
+  当前只支持 `1.2.3`/`v1.2.3` 这类语义化版本。
 
 ---
 
 ## 14. 管理员 API（`prism-router-admin`）
 
 让 Android/Web 客户端在验证**路由器管理密码**后做少量低风险管理操作（查看系统/网络/无线、
-重启、无线开关），而不是拿到 shell。写操作只有两个，且都要求有效 token。
+重启、无线开关），以及在显式 `confirm` 下读写 LAN/WAN/DHCP/系统标识与防火墙端口转发，
+而不是拿到 shell。所有写操作都要求有效 token + POST，且写前自动备份。
 
 ### 14.1 安装内容
 
@@ -1273,7 +1356,11 @@ POST/PUT→405、`what=bad`→400、缺省 `what`→`system`。
 ```
 /tmp/prism-router/admin/<token>.json        0600  管理 token 元数据（30 分钟 TTL）
 /tmp/prism-router/admin-rate/<ip>           0600  登录失败限速（同 IP 每分钟 5 次）
+/tmp/prism-router/admin.log                 0600  写操作审计日志（重启即失效）
+/etc/prism-router/backup/<config>.<ts>      0600  写前配置备份（目录 0700；每 config 保留 10 份）
 ```
+
+`/tmp` 下的文件重启即失效；`/etc/prism-router/backup/` 在 overlay 上持久，重启后仍可回滚。
 
 ### 14.2 认证流程
 
@@ -1303,8 +1390,14 @@ Content-Type: application/json
 | `wifi` | GET/POST | 是 | — | `{supported,devices:[{radio,ssid,band,channel,disabled,clients,encryption}]}` |
 | `reboot` | POST | 是 | `{"confirm":"REBOOT"}` | `{ok:true,rebooting:true}`，1 秒后重启 |
 | `wifi_toggle` | POST | 是 | `{"radio":"radio0","disabled":true}` | `{ok:true}`（`uci set wireless.<radio>.disabled` + `wifi reload`） |
+| `config` | GET | 是 | — | `{lan,wan,dhcp,system,redirects}`（§14.4） |
+| `config_set` | POST | 是 | `{section,options,confirm:"APPLY"}` | `{ok,backup,note?}`（§14.4） |
+| `redirect_add` | POST | 是 | `{name,src,dest,src_dport,dest_ip,dest_port,proto}` | `{ok,index}` |
+| `redirect_del` | POST | 是 | `{index}` | `{ok:true}`；index 不存在 → 400 |
+| `config_rollback` | POST | 是 | `{section}` | `{ok,backup}`；无备份 → 404 `no_backup` |
 
-校验顺序：方法 → （POST）body JSON → action 白名单 → login/logout 专用分支 → token。
+校验顺序：方法 → （POST）body JSON → action 白名单 → login/logout 专用分支 →
+写 action 只接受 POST（否则 405）→ 只读 `config` 只接受 GET（否则 405）→ token。
 
 | 情况 | 响应 |
 |---|---|
@@ -1319,25 +1412,128 @@ Content-Type: application/json
 | 无线状态读不到（无无线硬件） | `400 {"error":"wifi_unsupported"}` |
 | 内部异常 | `500 {"error":"internal"}` |
 
-### 14.4 安全边界
+### 14.4 配置读写（`config` / `config_set` / `redirect_*` / `config_rollback`）
+
+只覆盖 LAN/WAN/DHCP/系统标识与防火墙端口转发（redirect）；不提供任意 UCI 写入、
+不执行用户命令、不读写其它文件。
+
+#### 只读 `config`（GET + token）
+
+```json
+{"lan":{"ipaddr":"192.168.100.1","netmask":"255.255.255.0","gateway":"","dns":["223.5.5.5"]},
+ "wan":{"proto":"dhcp","device":"eth0","ipaddr":"...","gateway":"...","dns":[...]},
+ "dhcp":{"enabled":true,"start":"100","limit":"150","leasetime":"12h"},
+ "system":{"hostname":"iStoreOS","timezone":"CST-8","zonename":"Asia/Shanghai"},
+ "redirects":[{"index":0,"name":"","src":"lan","dest":"lan","src_dport":"",
+               "dest_ip":"","dest_port":"","proto":"tcp","enabled":true}]}
+```
+
+- 全部从 UCI 读；`wan.ipaddr/gateway` 优先用 `ubus call network.interface.wan status`
+  的运行时值，ubus 不可用/没拿到时回退 UCI 静态值，仍为空则 `""`。
+- `redirects` 按 `/etc/config/firewall` 中 redirect 出现顺序编号（0 起），`index` 就是
+  `redirect_del` 的入参；`enabled` 仅在 `option enabled '0'` 时为 `false`。
+- `dhcp.enabled` = `dhcp.lan.ignore != 1 && dhcp.dnsmasq.disabled != 1`。
+- 只接受 GET；POST → 405。
+
+#### 写入 `config_set`（POST + token + confirm）
+
+```json
+{"action":"config_set","token":"<token>","section":"lan","confirm":"APPLY",
+ "options":{"ipaddr":"192.168.100.2","netmask":"255.255.255.0"}}
+→ 200 {"ok":true,"backup":"/etc/prism-router/backup/network.<ts>"}
+```
+
+`confirm` 必须是字面量 `APPLY`，否则 `400 {"error":"confirm_required"}`；`section` 只允许
+`lan|wan|dhcp|system`（否则 `400 invalid_section`）；`options` 只允许白名单字段，未知字段
+`400 {"error":"invalid_option"}`。**先完成全部校验再备份/commit：任一字段非法立即 400，
+不产生备份、不改任何配置文件。**
+
+| section | 可写字段 | 校验规则 |
+|---|---|---|
+| `lan` | `ipaddr`,`netmask`,`gateway`,`dns` | ipaddr/netmask 合法 IPv4 且掩码连续、同网段、非网络/广播地址（/31、/32 无广播地址，跳过该检查）；gateway 为空或合法且与 LAN 同网段；dns ≤3 个合法 IPv4（空数组=删除 dns） |
+| `wan` | `proto`,`device`,`ipaddr`,`netmask`,`gateway`,`dns` | proto ∈ `dhcp|static|none`；device 匹配 `^[A-Za-z0-9_.@-]{1,32}$`；static 时 ipaddr/netmask/gateway/dns 必填且合法；dns ≤3 |
+| `dhcp` | `enabled`,`start`,`limit`,`leasetime` | enabled 必须 bool；start 1–254；limit 1–253；leasetime 匹配 `^[0-9]+[smhd]$` 或空 |
+| `system` | `hostname`,`timezone`,`zonename` | hostname 匹配 `^[A-Za-z0-9][A-Za-z0-9-]{0,62}$`；zonename 必须在 `/usr/share/zoneinfo/<zonename>` 真实存在且不含 `..`；timezone 为 `CST-8` 这类 POSIX TZ 串（含 `/` 的 IANA 形式按 zoneinfo 校验） |
+
+错误名：`invalid_ipaddr`、`invalid_netmask`、`invalid_gateway`、`invalid_dns`、`invalid_proto`、
+`invalid_device`、`invalid_enabled`、`invalid_start`、`invalid_limit`、`invalid_leasetime`、
+`invalid_hostname`、`invalid_timezone`、`invalid_zonename`、`invalid_option`、`invalid_section`、
+`confirm_required`。
+
+备份/应用/回滚：
+
+- 每次写前把 `/etc/config/<config>` 原样复制到 `/etc/prism-router/backup/<config>.<ts>`：
+  目录 0700、文件 0600；每个 config 按时间戳只保留最近 10 份（超出删最旧）；
+  备份失败 → 500，不写配置；commit 失败会自动用刚才的备份覆盖回去并返回 500 `commit_failed`。
+- lan/wan → `/sbin/network reload`（不存在时 `/etc/init.d/network reload`），不重启整机；
+  dhcp → `/etc/init.d/dnsmasq restart`；system → `uci commit system` + `hostname <新值>` 即时生效。
+- LAN `ipaddr`/`netmask` 真的变化时：**先返回 200**（`note` 含新地址提示与备份路径），
+  `sleep 1` 后异步 reload；当前 HTTP 连接会断开，客户端用新地址重连。
+- `config_rollback`：用该 config 最近一份备份原子覆盖 `/etc/config/<config>`（0600）再按
+  section reload；没有备份 → 404 `{"error":"no_backup"}`。`lan`/`wan` 共用 `network` 备份，
+  回滚会整份恢复 `/etc/config/network`。
+
+#### 写入 `redirect_add` / `redirect_del`
+
+```json
+{"action":"redirect_add","token":"<token>","name":"web","src":"lan","dest":"lan",
+ "src_dport":"8080","dest_ip":"192.168.100.10","dest_port":"80","proto":"tcp"}
+→ 200 {"ok":true,"index":0}
+```
+
+- 校验：name ≤64；src/dest ∈ lan|wan；src_dport 空或 1–65535；dest_ip 合法 IPv4；
+  dest_port 1–65535；proto ∈ `tcp|udp|"tcp udp"`。失败
+  `invalid_name` / `invalid_src` / `invalid_dest` / `invalid_src_dport` / `invalid_dest_ip` /
+  `invalid_dest_port` / `invalid_proto`。
+- 写入：`uci add firewall redirect` + `name/src/dest/src_dport/dest_ip/dest_port/proto/
+  target=DNAT/enabled=1` + commit + `/etc/init.d/firewall reload`；`index` 是新增项在 redirect
+  列表中的位置。
+- `redirect_del`：`index` 必须是 `0..N-1`，否则 400 `invalid_index`；删除 + commit +
+  firewall reload。redirect 不做自动备份（沿用 UCI 自带的配置备份机制）。
+
+#### 审计日志
+
+`/tmp/prism-router/admin.log`（0600）每次写操作追加一行：
+`ts=<unix> action=config_set section=lan result=ok ip=127.0.0.1 backup=...`。
+只记 action/section/结果/IP/备份路径/错误名，**不记 token、密码或请求原文**。
+
+### 14.5 安全边界
 
 - 密码**绝不**进入 argv、日志或响应；临时密码文件用完即删。
 - token 目录 0700、文件 0600；GET 的 `?token=` 会进浏览器历史，客户端应优先用 Bearer。
-- 写操作只有重启与无线开关；没有 UCI 任意写、没有 shell、没有文件读写接口。
+- 写操作只有 reboot、wifi_toggle、`config_set`、`redirect_add`、`redirect_del`、`config_rollback`；
+  配置写入只接受白名单 section/字段，经 uci cursor 落地；没有任意 UCI 写、没有 shell、
+  没有通用文件读写接口。写前必生成备份，备份失败/commit 失败不会留下半套配置。
 - 所有响应 `Cache-Control: no-store`，错误体不含堆栈/路径/命令输出。
 - 明文局域网 HTTP；跨不可信网络请用 TLS/WireGuard/Tailscale。
 
-### 14.5 实现注意（ucode）
+### 14.6 实现注意（ucode）
 
 - `fs`/`uci` 都是**模块**，必须 `const fs = require('fs')`；ucode 没有全局 `fs`/`cursor()`。
 - ucode 的函数只能引用**先定义**的函数：`opt_query()`、`shell_quote()` 等 helper 必须写在
   调用者之前，否则运行期抛 `left-hand side is not a function`（编译期 `ucode -c` 不会发现）。
 
-### 14.6 容器门禁
+### 14.7 容器门禁
 
-`tests/container-validate-standalone-panel.sh` 中新增：CGI 0755 root:root、`ucode -c`、
+`tests/container-validate-standalone-panel.sh` 覆盖：CGI 0755 root:root、`ucode -c`、
 `GET ?action=system` 未带 token → 401 `unauthorized`、`POST {"action":"login"}` 缺密码 →
-400 `bad_request`。更完整的登录/重启/无线开关流程需要真机（容器没有 `/etc/shadow` 与无线硬件）。
+400 `bad_request`。配置读写另有一组（`--network none`，UCI 夹具 + `/etc/init.d` mock +
+临时测试账号）：
+
+- 未认证/错误 token 的 `config` → 401；测试账号登录换 token；
+- `GET config` → 200 且 lan/wan/dhcp/system/redirects 结构正确；
+- `config_set` 缺 `confirm`、非法 IPv4/掩码/主机名/leasetime/端口 → 400 `invalid_*`，
+  且 `/etc/config/*` 与备份目录均未变；
+- 合法 `config_set lan` → 200 + `note`，备份文件 0600、目录 0700、备份内容是改前配置，
+  UCI 已改，LAN 变更后 1 秒异步 network reload；
+- `system`（hostname 即时生效）/`dhcp`（dnsmasq restart）合法写入；路径穿越 zonename → 400；
+- `redirect_add` → 200 且 firewall 新增 DNAT + firewall reload；`redirect_del` 删除；
+  不存在 index → 400；
+- `config_rollback` 恢复最近备份并 reload；无备份 → 404；
+- 每个 config 只保留 10 份备份；审计日志 0600 且不含 token；
+- GET 写 action → 405、POST 只读 config → 405、错误 token 写 → 401。
+
+重启/无线开关仍需真机（容器无无线硬件，且 reboot 会重启容器）。
 
 ---
 

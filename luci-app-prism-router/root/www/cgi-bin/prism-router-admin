@@ -1,8 +1,9 @@
 #!/usr/bin/ucode
-// prism-router-admin —— 棱镜路由「管理员登录 + 系统管理」只读/受控写 API
+// prism-router-admin —— 棱镜路由「管理员登录 + 系统管理 + 软路由配置读写」API
 //
-// 设计目标：让 Android/Web 客户端在验证路由器管理密码后，做少量低风险管理操作
-// （查看系统信息、网络接口、无线状态、重启、无线开关），而不是拿到 shell。
+// 设计目标：让 Android/Web 客户端在验证路由器管理密码后，做少量受控的管理操作
+// （查看系统信息、网络接口、无线状态、重启、无线开关），以及**显式确认后**读写
+// LAN/WAN/DHCP/系统标识与防火墙端口转发（redirect），而不是拿到 shell。
 //
 // 安全边界：
 //   * 密码只用于与 /etc/shadow 的哈希比较（openssl passwd -1/-5/-6 + 相同 salt），
@@ -10,16 +11,31 @@
 //   * 登录成功签发 32 hex 管理 token（/tmp/prism-router/admin/<token>.json，0600，
 //     目录 0700，30 分钟 TTL）；写操作必须带有效 token（Bearer 或 body.token）。
 //   * 失败限速：同 IP 每分钟最多 5 次（/tmp/prism-router/admin-rate/<ip>）。
-//   * 所有外部命令参数固定；radio 只允许 ^radio[0-9]+$；confirm 只接受字面量 REBOOT。
+//   * 所有外部命令参数固定；radio 只允许 ^radio[0-9]+$；confirm 只接受字面量 REBOOT/APPLY。
+//   * 配置写入只经 ucode 的 uci cursor API，绝不把请求内容拼进 shell；popen 只用于
+//     固定路径的 reload 命令与固定目录的 ls。
+//   * 每次写前备份 /etc/prism-router/backup/<config>.<ts>（目录 0700、文件 0600，
+//     每个 config 保留最近 10 份）；备份失败则拒绝写入。
+//   * 写操作审计日志 /tmp/prism-router/admin.log（0600），只记 action/section/结果/IP/
+//     备份路径，绝不记密码或 token。
 //   * 响应 Cache-Control: no-store；错误统一 {error} 且不含密码/token/堆栈。
 
 const ADMIN_DIR = '/tmp/prism-router/admin';
 const RATE_DIR = '/tmp/prism-router/admin-rate';
+const STATE_DIR = '/tmp/prism-router';
+const LOG_FILE = '/tmp/prism-router/admin.log';
+const BACKUP_DIR = '/etc/prism-router/backup';
+const BACKUP_KEEP = 10;
 const TOKEN_TTL = 1800;
 const RATE_MAX = 5;
 const RATE_WINDOW = 60;
 
-/* fs 不是 ucode 的全局模块；不 require 的话所有文件/管道调用都会抛 ReferenceError。 */
+/* 允许通过 API 修改的配置段：section -> /etc/config/<config>。lan/wan 共用 network 备份。 */
+const CONFIG_SECTIONS = ['lan', 'wan', 'dhcp', 'system'];
+const SECTION_CONFIG = { lan: 'network', wan: 'network', dhcp: 'dhcp', system: 'system' };
+const WRITE_ACTIONS = ['config_set', 'redirect_add', 'redirect_del', 'config_rollback'];
+
+/* fs/uci 不是 ucode 的全局模块；不 require 的话所有文件/管道调用都会抛 ReferenceError。 */
 const fs = require('fs');
 
 let SENT = false;
@@ -38,9 +54,45 @@ function out(code, reason, body) {
 function env(name) { return getenv(name) ?? ''; }
 function now() { return time(); }
 
-function ensure_dir(path, mode) {
+/* 递归建目录：ucode 的 fs.mkdir 不创建父目录，/tmp/prism-router 可能还不存在。 */
+function ensure_tree(path, mode) {
+	let parts = split(path, '/');
+	let cur = '';
+	for (let p in parts) {
+		if (p == '') continue;
+		cur += '/' + p;
+		try {
+			if (!fs.stat(cur)) fs.mkdir(cur, mode);
+		} catch (e) { }
+	}
+}
+
+/* 固定命令执行：命令串只由常量与经 shell_quote 的受校验值拼成。 */
+function run_cmd(cmd) {
 	try {
-		if (!fs.stat(path)) fs.mkdir(path, mode);
+		let p = fs.popen(cmd + ' >/dev/null 2>&1');
+		p.read('all');
+		p.close();
+	} catch (e) { }
+}
+
+function rate_key() {
+	let ip = env('REMOTE_ADDR');
+	if (ip == '') return 'unknown';
+	return replace(ip, /[^0-9a-fA-F:.]/g, '_');
+}
+
+/* 审计日志：只写 action/section/result/ip 与固定 detail，调用方不得传 token/密码。 */
+function admin_log(action, section, result, detail) {
+	try {
+		ensure_tree(STATE_DIR, 0700);
+		let line = sprintf('ts=%d action=%s section=%s result=%s ip=%s',
+			now(), action, (section == '') ? '-' : section, result, rate_key());
+		if (type(detail) == 'string' && detail != '') line += ' ' + detail;
+		let f = fs.open(LOG_FILE, 'a');
+		f.write(line + '\n');
+		f.close();
+		fs.chmod(LOG_FILE, 0600);
 	} catch (e) { }
 }
 
@@ -60,14 +112,8 @@ function read_token_from_header() {
 	return m ? m[1] : null;
 }
 
-function rate_key() {
-	let ip = env('REMOTE_ADDR');
-	if (ip == '') ip = 'unknown';
-	return replace(ip, /[^0-9a-fA-F:.]/g, '_');
-}
-
 function rate_check(ip) {
-	ensure_dir(RATE_DIR, 0700);
+	ensure_tree(RATE_DIR, 0700);
 	let f = RATE_DIR + '/' + ip;
 	let list = [];
 	try { if (fs.stat(f)) list = json(fs.readfile(f)) ?? []; } catch (e) { list = []; }
@@ -107,7 +153,7 @@ function require_token(body) {
 	return { token: tok, meta: meta };
 }
 
-/* 单引号转义：只用于固定算法名/salt 与临时文件路径，绝不拼请求原文。 */
+/* 单引号转义：用于固定算法名/salt 与受校验的 hostname 等，绝不拼请求原文。 */
 function shell_quote(s) {
 	return "'" + replace(s, /'/g, "'\\''") + "'";
 }
@@ -186,7 +232,8 @@ function do_login(body) {
 		out(400, 'Bad Request', { error: 'bad_credentials' });
 		return;
 	}
-	ensure_dir(ADMIN_DIR, 0700);
+	ensure_tree(STATE_DIR, 0700);
+	ensure_tree(ADMIN_DIR, 0700);
 	let tok = gen_token();
 	if (tok == null) { out(500, 'Internal Server Error', { error: 'internal' }); return; }
 	let meta = { user: user, created: now(), expires: now() + TOKEN_TTL, ip: env('REMOTE_ADDR') };
@@ -198,9 +245,16 @@ function do_login(body) {
 	out(200, 'OK', { ok: true, token: tok, user: user, expires: meta.expires });
 }
 
+/* ubus 在 OpenWrt 上通常是 /sbin/ubus，部分衍生版在 /usr/bin 或 /bin。 */
+function ubus_bin() {
+	if (fs.stat('/sbin/ubus')) return '/sbin/ubus';
+	if (fs.stat('/usr/bin/ubus')) return '/usr/bin/ubus';
+	return '/bin/ubus';
+}
+
 function ubus_json(args) {
 	try {
-		let p = fs.popen('/usr/bin/ubus ' + args + ' 2>/dev/null');
+		let p = fs.popen(ubus_bin() + ' ' + args + ' 2>/dev/null');
 		let s = p.read('all');
 		p.close();
 		s = trim(s);
@@ -331,6 +385,819 @@ function do_wifi_toggle(body) {
 	out(200, 'OK', { ok: true });
 }
 
+/* ───────────────────────────── UCI 读取 ───────────────────────────── */
+
+function uci_cursor() {
+	let uci = require('uci');
+	return uci.cursor();
+}
+
+function uci_str(c, config, section, option) {
+	let v = null;
+	try { v = c.get(config, section, option); } catch (e) { v = null; }
+	if (v == null) return '';
+	if (type(v) == 'string') return v;
+	return sprintf('%J', v);
+}
+
+function uci_list(c, config, section, option) {
+	let v = null;
+	try { v = c.get(config, section, option); } catch (e) { v = null; }
+	if (v == null) return [];
+	if (type(v) == 'array') {
+		let list = [];
+		for (let x in v) push(list, sprintf('%s', x));
+		return list;
+	}
+	return filter(split(sprintf('%s', v), /[ ,]+/), function(x) { return x != ''; });
+}
+
+function section_names(c, config, type) {
+	let names = [];
+	try {
+		c.foreach(config, type, function(sec) { push(names, sec['.name']); });
+	} catch (e) { }
+	return names;
+}
+
+function section_exists(c, config, section) {
+	try { return c.get(config, section) != null; } catch (e) { return false; }
+}
+
+function read_lan(c) {
+	return {
+		ipaddr: uci_str(c, 'network', 'lan', 'ipaddr'),
+		netmask: uci_str(c, 'network', 'lan', 'netmask'),
+		gateway: uci_str(c, 'network', 'lan', 'gateway'),
+		dns: uci_list(c, 'network', 'lan', 'dns')
+	};
+}
+
+function read_wan(c) {
+	return {
+		proto: uci_str(c, 'network', 'wan', 'proto'),
+		device: uci_str(c, 'network', 'wan', 'device'),
+		ipaddr: uci_str(c, 'network', 'wan', 'ipaddr'),
+		netmask: uci_str(c, 'network', 'wan', 'netmask'),
+		gateway: uci_str(c, 'network', 'wan', 'gateway'),
+		dns: uci_list(c, 'network', 'wan', 'dns')
+	};
+}
+
+function read_dhcp(c) {
+	let ignore = uci_str(c, 'dhcp', 'lan', 'ignore');
+	let dnsmasq_disabled = uci_str(c, 'dhcp', 'dnsmasq', 'disabled');
+	return {
+		enabled: !(ignore == '1' || dnsmasq_disabled == '1'),
+		start: uci_str(c, 'dhcp', 'lan', 'start'),
+		limit: uci_str(c, 'dhcp', 'lan', 'limit'),
+		leasetime: uci_str(c, 'dhcp', 'lan', 'leasetime')
+	};
+}
+
+function read_system(c) {
+	let names = section_names(c, 'system', 'system');
+	if (length(names) == 0) return { hostname: '', timezone: '', zonename: '', section: null };
+	let sec = names[0];
+	return {
+		hostname: uci_str(c, 'system', sec, 'hostname'),
+		timezone: uci_str(c, 'system', sec, 'timezone'),
+		zonename: uci_str(c, 'system', sec, 'zonename'),
+		section: sec
+	};
+}
+
+function read_redirects(c) {
+	let list = [];
+	let idx = 0;
+	try {
+		c.foreach('firewall', 'redirect', function(sec) {
+			push(list, {
+				index: idx,
+				name: sec['name'] ?? '',
+				src: sec['src'] ?? '',
+				dest: sec['dest'] ?? '',
+				src_dport: sec['src_dport'] ?? '',
+				dest_ip: sec['dest_ip'] ?? '',
+				dest_port: sec['dest_port'] ?? '',
+				proto: sec['proto'] ?? '',
+				enabled: (sec['enabled'] ?? '1') != '0'
+			});
+			idx++;
+		});
+	} catch (e) { }
+	return list;
+}
+
+/* WAN 运行时地址：ubus 拿不到就留空，由调用方回退到 UCI 静态值。 */
+function wan_runtime() {
+	let st = ubus_json('call network.interface.wan status');
+	let ipaddr = '', gateway = '', dns = [];
+	if (type(st) == 'object') {
+		let addrs = st['ipv4-address'] ?? [];
+		if (length(addrs) > 0 && type(addrs[0]) == 'object') ipaddr = addrs[0].address ?? '';
+		for (let r in st.route ?? []) {
+			if (type(r) == 'object' && (r.target ?? '') == '0.0.0.0') { gateway = r.nexthop ?? ''; break; }
+		}
+		for (let d in st['dns-server'] ?? []) if (type(d) == 'string') push(dns, d);
+	}
+	return { ipaddr: ipaddr, gateway: gateway, dns: dns };
+}
+
+/* ───────────────────────────── 校验 ───────────────────────────── */
+
+function ipv4_octets(s) {
+	if (type(s) != 'string') return null;
+	let m = match(s, /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/);
+	if (m == null) return null;
+	let o = [];
+	for (let i = 1; i <= 4; i++) {
+		if (length(m[i]) > 1 && substr(m[i], 0, 1) == '0') return null;
+		let v = int(m[i]);
+		if (v < 0 || v > 255) return null;
+		push(o, v);
+	}
+	return o;
+}
+
+function ipv4_int(s) {
+	let o = ipv4_octets(s);
+	if (o == null) return null;
+	return o[0] * 16777216 + o[1] * 65536 + o[2] * 256 + o[3];
+}
+
+/* 返回前缀长度；非 IPv4 或掩码不连续（如 255.0.255.0）返回 -1。 */
+function mask_prefix(s) {
+	let v = ipv4_int(s);
+	if (v == null) return -1;
+	let prefix = 0, zero = false;
+	for (let i = 31; i >= 0; i--) {
+		if ((v >> i) & 1) {
+			if (zero) return -1;
+			prefix++;
+		} else {
+			zero = true;
+		}
+	}
+	return prefix;
+}
+
+function same_subnet(ip, netip, mask) {
+	let a = ipv4_int(ip), b = ipv4_int(netip), m = ipv4_int(mask);
+	if (a == null || b == null || m == null) return false;
+	return (a & m) == (b & m);
+}
+
+function dns_list(value) {
+	let list = [];
+	if (type(value) == 'string') {
+		list = filter(split(replace(value, /,/g, ' '), /\s+/), function(x) { return x != ''; });
+	} else if (type(value) == 'array') {
+		for (let x in value) {
+			if (type(x) != 'string') return null;
+			let t = trim(x);
+			if (t != '') push(list, t);
+		}
+	} else {
+		return null;
+	}
+	return list;
+}
+
+function check_option_keys(opts, allowed) {
+	for (let k in keys(opts)) {
+		if (index(allowed, k) < 0) return 'invalid_option';
+	}
+	return null;
+}
+
+function validate_lan(c, opts) {
+	if (!section_exists(c, 'network', 'lan')) return { error: 'no_section' };
+	let bad = check_option_keys(opts, ['ipaddr', 'netmask', 'gateway', 'dns']);
+	if (bad != null) return { error: bad };
+
+	let cur = read_lan(c);
+	let ipaddr = ('ipaddr' in opts) ? opts.ipaddr : cur.ipaddr;
+	let netmask = ('netmask' in opts) ? opts.netmask : cur.netmask;
+	let dns = ('dns' in opts) ? dns_list(opts.dns) : cur.dns;
+	let gateway = ('gateway' in opts) ? opts.gateway : cur.gateway;
+
+	if (dns == null) return { error: 'invalid_dns' };
+	if (length(dns) > 3) return { error: 'invalid_dns' };
+	for (let d in dns) if (ipv4_octets(d) == null) return { error: 'invalid_dns' };
+
+	if (('ipaddr' in opts) || ('netmask' in opts)) {
+		if (ipv4_octets(ipaddr) == null) return { error: 'invalid_ipaddr' };
+		let prefix = mask_prefix(netmask);
+		if (prefix <= 0 || prefix > 32) return { error: 'invalid_netmask' };
+		/* 网络地址/广播地址不能作为 LAN 地址；/31、/32 没有广播地址，跳过该检查。 */
+		if (prefix < 31) {
+			let ipi = ipv4_int(ipaddr);
+			let mi = ipv4_int(netmask);
+			let net = ipi & mi;
+			let bcast = net + (1 << (32 - prefix)) - 1;
+			if (ipi == net || ipi == bcast) return { error: 'invalid_ipaddr' };
+		}
+	}
+
+	if (type(gateway) == 'string') gateway = trim(gateway);
+	if (gateway != '') {
+		if (ipv4_octets(gateway) == null) return { error: 'invalid_gateway' };
+		if (mask_prefix(netmask) > 0 && mask_prefix(netmask) < 32 && !same_subnet(gateway, ipaddr, netmask)) {
+			return { error: 'invalid_gateway' };
+		}
+	} else if (type(gateway) != 'string') {
+		return { error: 'invalid_gateway' };
+	}
+
+	let sets = [], unsets = [];
+	if ('ipaddr' in opts) push(sets, ['ipaddr', trim(ipaddr)]);
+	if ('netmask' in opts) push(sets, ['netmask', trim(netmask)]);
+	if ('dns' in opts) {
+		if (length(dns) == 0) push(unsets, 'dns');
+		else push(sets, ['dns', dns]);
+	}
+	if ('gateway' in opts) {
+		if (gateway == '') push(unsets, 'gateway');
+		else push(sets, ['gateway', gateway]);
+	}
+	return { error: null, sets: sets, unsets: unsets, section: 'lan', ipaddr: ipaddr, netmask: netmask };
+}
+
+function validate_wan(c, opts) {
+	if (!section_exists(c, 'network', 'wan')) return { error: 'no_section' };
+	let bad = check_option_keys(opts, ['proto', 'device', 'ipaddr', 'netmask', 'gateway', 'dns']);
+	if (bad != null) return { error: bad };
+
+	let cur = read_wan(c);
+	let proto = ('proto' in opts) ? opts.proto : cur.proto;
+	if (type(proto) != 'string' || index(['dhcp', 'static', 'none'], proto) < 0) return { error: 'invalid_proto' };
+
+	let device = ('device' in opts) ? opts.device : cur.device;
+	if ('device' in opts && (type(device) != 'string' || !match(device, /^[A-Za-z0-9_.@-]{1,32}$/))) {
+		return { error: 'invalid_device' };
+	}
+
+	let ipaddr = ('ipaddr' in opts) ? opts.ipaddr : cur.ipaddr;
+	let netmask = ('netmask' in opts) ? opts.netmask : cur.netmask;
+	let gateway = ('gateway' in opts) ? opts.gateway : cur.gateway;
+	let dns = ('dns' in opts) ? dns_list(opts.dns) : cur.dns;
+	if (dns == null) return { error: 'invalid_dns' };
+	if (length(dns) > 3) return { error: 'invalid_dns' };
+	for (let d in dns) if (ipv4_octets(d) == null) return { error: 'invalid_dns' };
+
+	if (proto == 'static') {
+		/* static 必须四项齐全且合法（缺一即 invalid_<field>）。 */
+		if (ipv4_octets(ipaddr) == null) return { error: 'invalid_ipaddr' };
+		if (mask_prefix(netmask) <= 0) return { error: 'invalid_netmask' };
+		if (ipv4_octets(gateway) == null) return { error: 'invalid_gateway' };
+		if (length(dns) == 0) return { error: 'invalid_dns' };
+	} else {
+		if (('ipaddr' in opts) && ipaddr != '' && ipv4_octets(ipaddr) == null) return { error: 'invalid_ipaddr' };
+		if (('netmask' in opts) && netmask != '' && mask_prefix(netmask) <= 0) return { error: 'invalid_netmask' };
+		if (('gateway' in opts) && gateway != '' && ipv4_octets(gateway) == null) return { error: 'invalid_gateway' };
+	}
+
+	let sets = [], unsets = [];
+	push(sets, ['proto', proto]);
+	if ('device' in opts) {
+		if (trim(device) == '') return { error: 'invalid_device' };
+		push(sets, ['device', trim(device)]);
+	}
+	if ('ipaddr' in opts) {
+		if (trim(ipaddr) == '') push(unsets, 'ipaddr');
+		else push(sets, ['ipaddr', trim(ipaddr)]);
+	}
+	if ('netmask' in opts) {
+		if (trim(netmask) == '') push(unsets, 'netmask');
+		else push(sets, ['netmask', trim(netmask)]);
+	}
+	if ('gateway' in opts) {
+		if (trim(gateway) == '') push(unsets, 'gateway');
+		else push(sets, ['gateway', trim(gateway)]);
+	}
+	if ('dns' in opts) {
+		if (length(dns) == 0) push(unsets, 'dns');
+		else push(sets, ['dns', dns]);
+	}
+	return { error: null, sets: sets, unsets: unsets, section: 'wan' };
+}
+
+function int_in_range(v, min, max) {
+	if (type(v) == 'int') return v >= min && v <= max;
+	if (type(v) == 'string' && match(v, /^[0-9]{1,4}$/)) {
+		let n = int(v);
+		return n >= min && n <= max;
+	}
+	return false;
+}
+
+function validate_dhcp(c, opts) {
+	if (!section_exists(c, 'dhcp', 'lan')) return { error: 'no_section' };
+	let bad = check_option_keys(opts, ['enabled', 'start', 'limit', 'leasetime']);
+	if (bad != null) return { error: bad };
+
+	let sets = [], unsets = [];
+	if ('enabled' in opts) {
+		if (type(opts.enabled) != 'bool') return { error: 'invalid_enabled' };
+		push(sets, ['ignore', (opts.enabled == true) ? '0' : '1']);
+	}
+	if ('start' in opts) {
+		if (!int_in_range(opts.start, 1, 254)) return { error: 'invalid_start' };
+		push(sets, ['start', sprintf('%d', int(opts.start))]);
+	}
+	if ('limit' in opts) {
+		if (!int_in_range(opts.limit, 1, 253)) return { error: 'invalid_limit' };
+		push(sets, ['limit', sprintf('%d', int(opts.limit))]);
+	}
+	if ('leasetime' in opts) {
+		if (type(opts.leasetime) != 'string') return { error: 'invalid_leasetime' };
+		let lt = trim(opts.leasetime);
+		if (lt != '' && !match(lt, /^[0-9]+[smhd]$/)) return { error: 'invalid_leasetime' };
+		if (lt == '') push(unsets, 'leasetime');
+		else push(sets, ['leasetime', lt]);
+	}
+	return { error: null, sets: sets, unsets: unsets, section: 'lan' };
+}
+
+function zoneinfo_exists(name) {
+	/* 只允许字母数字、下划线、加号、减号、斜杠；不接受点（杜绝 .. 穿越）。 */
+	if (!match(name, /^[A-Za-z0-9_+\/-]{1,64}$/)) return false;
+	return fs.stat('/usr/share/zoneinfo/' + name) != null;
+}
+
+function validate_system(c, opts) {
+	let bad = check_option_keys(opts, ['hostname', 'timezone', 'zonename']);
+	if (bad != null) return { error: bad };
+
+	let sets = [];
+	if ('hostname' in opts) {
+		if (type(opts.hostname) != 'string' || !match(opts.hostname, /^[A-Za-z0-9][A-Za-z0-9-]{0,62}$/)) {
+			return { error: 'invalid_hostname' };
+		}
+		push(sets, ['hostname', opts.hostname]);
+	}
+	if ('timezone' in opts) {
+		if (type(opts.timezone) != 'string') return { error: 'invalid_timezone' };
+		let tz = trim(opts.timezone);
+		if (tz == '' || !match(tz, /^[A-Za-z0-9_+\-:,\/]{1,64}$/)) return { error: 'invalid_timezone' };
+		/* IANA 形式（含 /）必须在 zoneinfo 中真实存在；CST-8 这类 POSIX TZ 串按字符集校验。 */
+		if (index(tz, '/') >= 0 && !zoneinfo_exists(tz)) return { error: 'invalid_timezone' };
+		push(sets, ['timezone', tz]);
+	}
+	if ('zonename' in opts) {
+		if (type(opts.zonename) != 'string') return { error: 'invalid_zonename' };
+		let zn = trim(opts.zonename);
+		if (zn == '' || !zoneinfo_exists(zn)) return { error: 'invalid_zonename' };
+		push(sets, ['zonename', zn]);
+	}
+
+	let names = section_names(c, 'system', 'system');
+	return { error: null, sets: sets, unsets: [], section: (length(names) > 0) ? names[0] : null };
+}
+
+/* ───────────────────────────── 备份 / 回滚 ───────────────────────────── */
+
+function backup_ts_list(config) {
+	let list = [];
+	try {
+		let p = fs.popen('/bin/ls -1 ' + shell_quote(BACKUP_DIR) + ' 2>/dev/null');
+		let raw = p.read('all');
+		p.close();
+		for (let name in split(trim(raw), '\n')) {
+			let parts = split(name, '.');
+			if (length(parts) != 2 || parts[0] != config) continue;
+			if (!match(parts[1], /^[0-9]+$/)) continue;
+			push(list, int(parts[1]));
+		}
+	} catch (e) { }
+	sort(list, function(a, b) { return a - b; });
+	return list;
+}
+
+function prune_backups(config) {
+	let list = backup_ts_list(config);
+	for (let i = 0; i < length(list) - BACKUP_KEEP; i++) {
+		try { fs.unlink(BACKUP_DIR + '/' + config + '.' + list[i]); } catch (e) { }
+	}
+}
+
+function backup_config(config) {
+	ensure_tree(BACKUP_DIR, 0700);
+	try { fs.chmod(BACKUP_DIR, 0700); } catch (e) { }
+
+	let data = null;
+	try { data = fs.readfile('/etc/config/' + config); } catch (e) { data = null; }
+	if (data == null) data = '';
+
+	let ts = now();
+	while (fs.stat(BACKUP_DIR + '/' + config + '.' + ts) != null) ts++;
+	let path = BACKUP_DIR + '/' + config + '.' + ts;
+	fs.writefile(path, data);
+	fs.chmod(path, 0600);
+	prune_backups(config);
+	return path;
+}
+
+function latest_backup(config) {
+	let list = backup_ts_list(config);
+	if (length(list) == 0) return null;
+	return BACKUP_DIR + '/' + config + '.' + list[length(list) - 1];
+}
+
+/* 原子替换 /etc/config/<config>（0600），用于回滚与 commit 失败后的自愈。 */
+function write_config_file(config, data) {
+	ensure_tree('/etc/config', 0755);
+	let path = '/etc/config/' + config;
+	let tmp = path + '.prism-tmp';
+	fs.writefile(tmp, data ?? '');
+	fs.chmod(tmp, 0600);
+	fs.rename(tmp, path);
+	try { fs.chmod(path, 0600); } catch (e) { }
+}
+
+function restore_config(config, backup) {
+	try {
+		let data = fs.readfile(backup);
+		if (data == null) return false;
+		write_config_file(config, data);
+		return true;
+	} catch (e) { return false; }
+}
+
+/* ───────────────────────────── 应用 ───────────────────────────── */
+
+function apply_plan(c, config, section, plan) {
+	let sec = section;
+	if (sec == null) {
+		sec = c.add(config, 'system');
+		if (sec == null) return false;
+	}
+	for (let kv in plan.sets) {
+		if (c.set(config, sec, kv[0], kv[1]) != true) return false;
+	}
+	for (let opt in plan.unsets) {
+		try { c.delete(config, sec, opt); } catch (e) { }
+	}
+	return c.commit(config) == true;
+}
+
+function network_reload_cmd() {
+	if (fs.stat('/sbin/network')) return '/sbin/network reload';
+	return '/etc/init.d/network reload';
+}
+
+function reload_network() {
+	run_cmd(network_reload_cmd());
+}
+
+/* 响应先发、1 秒后再 reload：避免 LAN 地址变化时客户端看不到 200。 */
+function reload_network_deferred() {
+	try {
+		let cmd = 'sleep 1; ' + network_reload_cmd();
+		let p = fs.popen('sh -c ' + shell_quote(cmd) + ' >/dev/null 2>&1 &');
+		p.close();
+	} catch (e) { }
+}
+
+function restart_dnsmasq() {
+	run_cmd('/etc/init.d/dnsmasq restart');
+}
+
+function firewall_reload() {
+	run_cmd('/etc/init.d/firewall reload');
+}
+
+function apply_hostname(name) {
+	if (type(name) != 'string' || name == '') return;
+	let bin = 'hostname';
+	if (fs.stat('/bin/hostname')) bin = '/bin/hostname';
+	else if (fs.stat('/usr/bin/hostname')) bin = '/usr/bin/hostname';
+	run_cmd(bin + ' ' + shell_quote(name));
+}
+
+/* ───────────────────────────── 只读 config ───────────────────────────── */
+
+function do_config() {
+	let c = null;
+	try { c = uci_cursor(); } catch (e) {
+		out(500, 'Internal Server Error', { error: 'internal' });
+		return;
+	}
+
+	let lan = read_lan(c);
+	let wan = read_wan(c);
+	let runtime = wan_runtime();
+	let dhcp = read_dhcp(c);
+	let system = read_system(c);
+
+	let wan_ipaddr = runtime.ipaddr != '' ? runtime.ipaddr : wan.ipaddr;
+	let wan_gateway = runtime.gateway != '' ? runtime.gateway : wan.gateway;
+	let wan_dns = length(wan.dns) > 0 ? wan.dns : runtime.dns;
+
+	out(200, 'OK', {
+		lan: {
+			ipaddr: lan.ipaddr,
+			netmask: lan.netmask,
+			gateway: lan.gateway,
+			dns: lan.dns
+		},
+		wan: {
+			proto: wan.proto,
+			device: wan.device,
+			ipaddr: wan_ipaddr,
+			gateway: wan_gateway,
+			dns: wan_dns
+		},
+		dhcp: {
+			enabled: dhcp.enabled,
+			start: dhcp.start,
+			limit: dhcp.limit,
+			leasetime: dhcp.leasetime
+		},
+		system: {
+			hostname: system.hostname,
+			timezone: system.timezone,
+			zonename: system.zonename
+		},
+		redirects: read_redirects(c)
+	});
+}
+
+/* ───────────────────────────── 写：config_set ───────────────────────────── */
+
+function do_config_set(body) {
+	let section = (type(body.section) == 'string') ? body.section : '';
+	if (index(CONFIG_SECTIONS, section) < 0) {
+		out(400, 'Bad Request', { error: 'invalid_section' });
+		return;
+	}
+	if (body.confirm != 'APPLY') {
+		admin_log('config_set', section, 'rejected', 'error=confirm_required');
+		out(400, 'Bad Request', { error: 'confirm_required' });
+		return;
+	}
+	if (type(body.options) != 'object') {
+		admin_log('config_set', section, 'rejected', 'error=invalid_options');
+		out(400, 'Bad Request', { error: 'invalid_options' });
+		return;
+	}
+
+	let c = null;
+	try { c = uci_cursor(); } catch (e) {
+		out(500, 'Internal Server Error', { error: 'internal' });
+		return;
+	}
+
+	let config = SECTION_CONFIG[section];
+	let plan = null;
+	if (section == 'lan') plan = validate_lan(c, body.options);
+	else if (section == 'wan') plan = validate_wan(c, body.options);
+	else if (section == 'dhcp') plan = validate_dhcp(c, body.options);
+	else plan = validate_system(c, body.options);
+
+	if (plan.error != null) {
+		/* 校验失败：不备份、不 commit、不写任何配置文件。 */
+		admin_log('config_set', section, 'invalid', 'error=' + plan.error);
+		out(400, 'Bad Request', { error: plan.error });
+		return;
+	}
+
+	/* 改前备份；备份失败就不动配置。 */
+	let backup = null;
+	try { backup = backup_config(config); } catch (e) { backup = null; }
+	if (backup == null) {
+		admin_log('config_set', section, 'failed', 'error=backup_failed');
+		out(500, 'Internal Server Error', { error: 'backup_failed' });
+		return;
+	}
+
+	let old_ip = uci_str(c, 'network', 'lan', 'ipaddr');
+	let old_mask = uci_str(c, 'network', 'lan', 'netmask');
+
+	let ok = false;
+	try { ok = apply_plan(c, config, plan.section, plan); } catch (e) { ok = false; }
+	if (!ok) {
+		restore_config(config, backup);
+		admin_log('config_set', section, 'failed', 'error=commit_failed backup=' + backup);
+		out(500, 'Internal Server Error', { error: 'commit_failed' });
+		return;
+	}
+
+	if (section == 'system' && 'hostname' in body.options) apply_hostname(body.options.hostname);
+
+	let lan_changed = false;
+	if (section == 'lan') {
+		let new_ip = trim(plan.ipaddr);
+		let new_mask = trim(plan.netmask);
+		lan_changed = (new_ip != old_ip || new_mask != old_mask);
+	}
+
+	if (lan_changed) {
+		/* LAN 地址变了：先回 200，再异步 reload，客户端可用新地址重连。 */
+		admin_log('config_set', section, 'ok', 'backup=' + backup + ' deferred_reload=1');
+		out(200, 'OK', {
+			ok: true,
+			backup: backup,
+			note: 'LAN 地址已改，请用新地址重新连接（备份：' + backup + '）'
+		});
+		reload_network_deferred();
+		return;
+	}
+
+	if (section == 'lan' || section == 'wan') reload_network();
+	else if (section == 'dhcp') restart_dnsmasq();
+	/* system：uci commit 已完成；hostname 已在上方即时应用。 */
+
+	admin_log('config_set', section, 'ok', 'backup=' + backup);
+	out(200, 'OK', { ok: true, backup: backup });
+}
+
+/* ───────────────────────────── 写：redirect ───────────────────────────── */
+
+function valid_port(v) {
+	return int_in_range(v, 1, 65535);
+}
+
+function do_redirect_add(body) {
+	let name = (type(body.name) == 'string') ? body.name : '';
+	let src = (type(body.src) == 'string') ? body.src : '';
+	let dest = (type(body.dest) == 'string') ? body.dest : '';
+	let src_dport = '';
+	if (type(body.src_dport) == 'string') src_dport = trim(body.src_dport);
+	else if (type(body.src_dport) == 'int') src_dport = sprintf('%d', body.src_dport);
+	let dest_ip = (type(body.dest_ip) == 'string') ? trim(body.dest_ip) : '';
+	let proto = (type(body.proto) == 'string') ? body.proto : '';
+	let dest_port = body.dest_port;
+
+	let err = null;
+	if (length(name) > 64) err = 'invalid_name';
+	else if (index(['lan', 'wan'], src) < 0) err = 'invalid_src';
+	else if (index(['lan', 'wan'], dest) < 0) err = 'invalid_dest';
+	else if (src_dport != '' && !valid_port(src_dport)) err = 'invalid_src_dport';
+	else if (ipv4_octets(dest_ip) == null) err = 'invalid_dest_ip';
+	else if (!valid_port(dest_port)) err = 'invalid_dest_port';
+	else if (index(['tcp', 'udp', 'tcp udp'], proto) < 0) err = 'invalid_proto';
+
+	if (err != null) {
+		admin_log('redirect_add', '-', 'invalid', 'error=' + err);
+		out(400, 'Bad Request', { error: err });
+		return;
+	}
+
+	let c = null;
+	try { c = uci_cursor(); } catch (e) {
+		out(500, 'Internal Server Error', { error: 'internal' });
+		return;
+	}
+
+	let index = 0;
+	try { index = length(read_redirects(c)); } catch (e) { index = 0; }
+
+	let ok = false;
+	try {
+		let sec = c.add('firewall', 'redirect');
+		if (sec != null) {
+			c.set('firewall', sec, 'name', name);
+			c.set('firewall', sec, 'src', src);
+			c.set('firewall', sec, 'dest', dest);
+			if (src_dport != '') c.set('firewall', sec, 'src_dport', src_dport);
+			c.set('firewall', sec, 'dest_ip', dest_ip);
+			c.set('firewall', sec, 'dest_port', sprintf('%d', int(dest_port)));
+			c.set('firewall', sec, 'proto', proto);
+			c.set('firewall', sec, 'target', 'DNAT');
+			c.set('firewall', sec, 'enabled', '1');
+			ok = c.commit('firewall') == true;
+		}
+	} catch (e) { ok = false; }
+
+	if (!ok) {
+		admin_log('redirect_add', '-', 'failed', 'error=commit_failed');
+		out(500, 'Internal Server Error', { error: 'commit_failed' });
+		return;
+	}
+
+	firewall_reload();
+	admin_log('redirect_add', '-', 'ok', 'index=' + index);
+	out(200, 'OK', { ok: true, index: index });
+}
+
+function do_redirect_del(body) {
+	let idx = (type(body.index) == 'int') ? body.index : null;
+	if (idx == null && type(body.index) == 'string' && match(body.index, /^[0-9]+$/)) idx = int(body.index);
+	if (idx == null || idx < 0) {
+		admin_log('redirect_del', '-', 'invalid', 'error=invalid_index');
+		out(400, 'Bad Request', { error: 'invalid_index' });
+		return;
+	}
+
+	let c = null;
+	try { c = uci_cursor(); } catch (e) {
+		out(500, 'Internal Server Error', { error: 'internal' });
+		return;
+	}
+
+	let names = [];
+	try {
+		c.foreach('firewall', 'redirect', function(sec) { push(names, sec['.name']); });
+	} catch (e) { }
+	if (idx >= length(names)) {
+		admin_log('redirect_del', '-', 'invalid', 'error=invalid_index');
+		out(400, 'Bad Request', { error: 'invalid_index' });
+		return;
+	}
+
+	let ok = false;
+	try {
+		ok = c.delete('firewall', names[idx]) == true;
+		if (ok) ok = c.commit('firewall') == true;
+	} catch (e) { ok = false; }
+
+	if (!ok) {
+		admin_log('redirect_del', '-', 'failed', 'error=commit_failed');
+		out(500, 'Internal Server Error', { error: 'commit_failed' });
+		return;
+	}
+
+	firewall_reload();
+	admin_log('redirect_del', '-', 'ok', 'index=' + idx);
+	out(200, 'OK', { ok: true });
+}
+
+/* ───────────────────────────── 写：config_rollback ───────────────────────────── */
+
+function do_config_rollback(body) {
+	let section = (type(body.section) == 'string') ? body.section : '';
+	if (index(CONFIG_SECTIONS, section) < 0) {
+		out(400, 'Bad Request', { error: 'invalid_section' });
+		return;
+	}
+	let config = SECTION_CONFIG[section];
+	let backup = latest_backup(config);
+	if (backup == null) {
+		admin_log('config_rollback', section, 'notfound', 'error=no_backup');
+		out(404, 'Not Found', { error: 'no_backup' });
+		return;
+	}
+
+	let data = null;
+	try { data = fs.readfile(backup); } catch (e) { data = null; }
+	if (data == null) {
+		admin_log('config_rollback', section, 'failed', 'error=backup_unreadable');
+		out(500, 'Internal Server Error', { error: 'internal' });
+		return;
+	}
+
+	let old_ip = '', old_mask = '', new_ip = '', new_mask = '';
+	if (config == 'network') {
+		let c0 = null;
+		try { c0 = uci_cursor(); } catch (e) { c0 = null; }
+		if (c0 != null) {
+			old_ip = uci_str(c0, 'network', 'lan', 'ipaddr');
+			old_mask = uci_str(c0, 'network', 'lan', 'netmask');
+		}
+	}
+
+	try {
+		write_config_file(config, data);
+	} catch (e) {
+		admin_log('config_rollback', section, 'failed', 'error=write_failed');
+		out(500, 'Internal Server Error', { error: 'internal' });
+		return;
+	}
+
+	if (config == 'network') {
+		let c1 = null;
+		try { c1 = uci_cursor(); } catch (e) { c1 = null; }
+		if (c1 != null) {
+			new_ip = uci_str(c1, 'network', 'lan', 'ipaddr');
+			new_mask = uci_str(c1, 'network', 'lan', 'netmask');
+		}
+	}
+
+	if (config == 'dhcp') {
+		restart_dnsmasq();
+	} else if (config == 'system') {
+		let c2 = null;
+		try { c2 = uci_cursor(); } catch (e) { c2 = null; }
+		if (c2 != null) apply_hostname(read_system(c2).hostname);
+	} else if (new_ip != old_ip || new_mask != old_mask) {
+		admin_log('config_rollback', section, 'ok', 'backup=' + backup + ' deferred_reload=1');
+		out(200, 'OK', {
+			ok: true,
+			backup: backup,
+			note: 'LAN 地址已回滚，请用新地址重新连接（备份：' + backup + '）'
+		});
+		reload_network_deferred();
+		return;
+	} else {
+		reload_network();
+	}
+
+	admin_log('config_rollback', section, 'ok', 'backup=' + backup);
+	out(200, 'OK', { ok: true, backup: backup });
+}
+
 /* 查询串解析。必须定义在 main() 之前：ucode 的函数只能引用**先定义**的函数，
  * 否则运行时会抛 "left-hand side is not a function"（所有 GET 请求都会 500）。 */
 function opt_query(name) {
@@ -348,7 +1215,7 @@ function main() {
 	let method = env('REQUEST_METHOD');
 	if (method != 'GET' && method != 'POST') { out(405, 'Method Not Allowed', { error: 'method_not_allowed' }); return; }
 
-	let body = (method == 'POST') ? read_body() : null;
+	let body = (method == 'POST') ? read_body() : {};
 	if (method == 'POST' && type(body) != 'object') { out(400, 'Bad Request', { error: 'bad_request' }); return; }
 	let action = (type(body) == 'object' && type(body.action) == 'string') ? body.action : opt_query('action');
 	if (type(action) != 'string' || action == '') { out(400, 'Bad Request', { error: 'bad_request' }); return; }
@@ -367,21 +1234,35 @@ function main() {
 		return;
 	}
 
-	/* 其余操作都需要有效 token。 */
-	let body2 = (method == 'GET') ? {} : body;
-	let tok = (method == 'POST') ? require_token(body2) : null;
-	if (method == 'POST' && tok == null) return;
+	/* 写 action 只接受 POST；只读 config 只接受 GET。方法先于 token 检查。 */
+	if (index(WRITE_ACTIONS, action) >= 0 && method != 'POST') {
+		out(405, 'Method Not Allowed', { error: 'method_not_allowed' });
+		return;
+	}
+	if (action == 'config' && method != 'GET') {
+		out(405, 'Method Not Allowed', { error: 'method_not_allowed' });
+		return;
+	}
 
-	if (method == 'GET') {
+	/* 其余操作都需要有效 token。 */
+	if (method == 'POST') {
+		if (require_token(body) == null) return;
+	} else {
 		let qt = opt_query('token');
+		if (qt == '') qt = read_token_from_header();
 		if (valid_token(qt) == null) { out(401, 'Unauthorized', { error: 'unauthorized' }); return; }
 	}
 
+	if (action == 'config') { do_config(); return; }
 	if (action == 'system') { do_system(); return; }
 	if (action == 'network') { do_network(); return; }
 	if (action == 'wifi') { do_wifi(); return; }
 	if (action == 'reboot') { do_reboot(body); return; }
 	if (action == 'wifi_toggle') { do_wifi_toggle(body); return; }
+	if (action == 'config_set') { do_config_set(body); return; }
+	if (action == 'redirect_add') { do_redirect_add(body); return; }
+	if (action == 'redirect_del') { do_redirect_del(body); return; }
+	if (action == 'config_rollback') { do_config_rollback(body); return; }
 
 	out(400, 'Bad Request', { error: 'bad_request' });
 }

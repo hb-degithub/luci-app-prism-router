@@ -22,6 +22,14 @@
 #      system / services / processes / version 200 + 结构 + Content-Type/Cache-Control
 #  18. 管理员 CGI（prism-router-admin）：文件 755、ucode -c、GET 未带 token → 401、
 #      POST login 缺密码 → 400
+#  22. 管理员配置读写（容器内 mock reload 与 UCI 夹具）：未认证/错误 token 401、登录换 token、
+#      GET config 结构、非法输入 400 且不落盘、config_set lan 200+备份 0600/0700+uci 已改+延迟 reload、
+#      system/dhcp 合法写、redirect_add/del+firewall reload、config_rollback 恢复、备份保留 10 份、
+#      审计日志 0600 且不含 token、非 POST 写 405。
+#  24. 自动检测更新（?what=update_check，PATH 注入假 curl，不访问外网）：
+#      未配置 200 {configured:false} 且不联网、合法 repo+tag v1.2.3 的字段/notes 截断/apk·ipk 提取、
+#      tag v1.0.0 -> has_update=false、非法 repo 400 invalid_repo 不联网、
+#      500 -> github_unavailable、401/404 映射、缓存 0600 且第二次不调用 curl、token 不进响应/argv。
 #
 # 隔离：--network none，只有 127.0.0.1；不访问外网、不接触任何真机。
 mkdir -p /var/run/ubus /var/lock /tmp
@@ -566,11 +574,430 @@ raw=$(printf '{"action":"login"}' | env REQUEST_METHOD=POST CONTENT_LENGTH=18 uc
 printf '%s\n' "$raw" | grep -Eq '"error":[[:space:]]*"bad_request"' \
   && ok "400 响应体 {error:bad_request}" || bad "400 响应体异常"
 
-echo "=== 22. 系统目录权限未被改动 ==="
+echo "=== 22. 管理员配置读写（config / config_set / redirect / rollback；容器内 mock reload） ==="
+# 夹具按真机 UCI 事实：lan static 192.168.100.1/24、wan dhcp eth0、dhcp.lan 100/150/12h、
+# system 主机名/时区、firewall 无 redirect。容器镜像本身没有 /etc/config/network。
+mkdir -p /etc/config /usr/share/zoneinfo/Asia /tmp/mockbin
+: > /usr/share/zoneinfo/Asia/Shanghai
+cat > /etc/config/network <<'NETEOF'
+config interface 'lan'
+	option proto 'static'
+	option ipaddr '192.168.100.1'
+	option netmask '255.255.255.0'
+	option device 'br-lan'
+	list dns '223.5.5.5'
+
+config interface 'wan'
+	option proto 'dhcp'
+	option device 'eth0'
+NETEOF
+cat > /etc/config/dhcp <<'DHCPEOF'
+config dnsmasq
+	option domain 'lan'
+
+config dhcp 'lan'
+	option interface 'lan'
+	option start '100'
+	option limit '150'
+	option leasetime '12h'
+DHCPEOF
+cat > /etc/config/system <<'SYSEOF'
+config system
+	option hostname 'iStoreOS'
+	option timezone 'CST-8'
+	option zonename 'Asia/Shanghai'
+SYSEOF
+cat > /etc/config/firewall <<'FWEOF'
+config defaults
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+FWEOF
+# reload / hostname mock：绝对路径固定，容器里不真的重启网络；断言只看调用记录。
+printf '#!/bin/sh\necho "network $*" >> /tmp/admin-reload.log\n' > /etc/init.d/network
+printf '#!/bin/sh\necho "dnsmasq $*" >> /tmp/admin-reload.log\n' > /etc/init.d/dnsmasq
+printf '#!/bin/sh\necho "firewall $*" >> /tmp/admin-reload.log\n' > /etc/init.d/firewall
+chmod 755 /etc/init.d/network /etc/init.d/dnsmasq /etc/init.d/firewall
+printf '#!/bin/sh\necho "$*" >> /tmp/admin-hostname.log\n' > /tmp/mockbin/hostname
+chmod 755 /tmp/mockbin/hostname
+: > /tmp/admin-reload.log
+: > /tmp/admin-hostname.log
+# 登录测试账号：只追加一个密码已知的独立用户（不动 root）；容器用完即删。
+grep -q '^prismtest:' /etc/shadow 2>/dev/null || {
+  HASH=$(openssl passwd -1 -salt prismtest 'PrismTest!123')
+  printf 'prismtest:%s:19000:0:99999:7:::\n' "$HASH" >> /etc/shadow
+}
+ok "配置夹具 + reload/hostname mock 就绪"
+
+AH=/tmp/admin-headers.txt
+AB=/tmp/admin-body.json
+areq(){ # $1=方法 $2=查询串 $3=POST body（可选）
+  local m="$1" q="$2" b="${3-}" len=0
+  rm -f "$AH" "$AB" /tmp/admin-raw.txt
+  if [ "$m" = POST ]; then
+    len=$(printf '%s' "$b" | wc -c | tr -d ' ')
+    printf '%s' "$b" | env PATH="/tmp/mockbin:$PATH" REQUEST_METHOD=POST QUERY_STRING="$q" \
+      CONTENT_LENGTH="$len" REMOTE_ADDR=127.0.0.1 ucode "$ADMIN" 2>/dev/null
+  else
+    env PATH="/tmp/mockbin:$PATH" REQUEST_METHOD="$m" QUERY_STRING="$q" \
+      REMOTE_ADDR=127.0.0.1 ucode "$ADMIN" 2>/dev/null
+  fi > /tmp/admin-raw.txt
+  tr -d '\r' < /tmp/admin-raw.txt | awk -v h="$AH" -v b="$AB" '
+    !done { if ($0 == "") { done=1; next } print > h; next }
+    { print > b }'
+}
+acode(){ head -n 1 "$AH" 2>/dev/null | sed 's/^Status: //'; }
+ajson(){ # $1=表达式（d 为解析后的 JSON）
+  env F="$AB" ucode -e "
+    let fs = require('fs');
+    let d = null;
+    try { d = json(fs.readfile(getenv('F'))); } catch (e) { d = null; }
+    print((function(d){ return ($1); })(d) ? '1' : '0');" 2>/dev/null
+}
+ajval(){ # $1=表达式；打印原始值
+  env F="$AB" ucode -e "
+    let fs = require('fs');
+    let d = null;
+    try { d = json(fs.readfile(getenv('F'))); } catch (e) { d = null; }
+    print((function(d){ return ($1); })(d));" 2>/dev/null
+}
+
+echo "--- 22.1 未认证：GET config 无 token / 错误 token -> 401"
+areq GET "action=config"
+[ "$(acode)" = "401 Unauthorized" ] && ok "GET action=config 无 token -> 401" \
+  || bad "GET config 未认证 -> [$(acode)]"
+[ "$(ajson 'd.error=="unauthorized"')" = "1" ] && ok "401 响应体 {error:unauthorized}" \
+  || bad "401 响应体异常"
+areq GET "action=config&token=00000000000000000000000000000000"
+[ "$(acode)" = "401 Unauthorized" ] && ok "GET action=config 错误 token -> 401" \
+  || bad "GET config 错误 token -> [$(acode)]"
+
+echo "--- 22.2 登录换 token"
+areq POST "" '{"action":"login","username":"prismtest","password":"PrismTest!123"}'
+[ "$(acode)" = "200 OK" ] && ok "POST login -> 200" || bad "POST login -> [$(acode)] $(cat "$AB")"
+TOKEN=$(ajval 'd.token' | tr -d '\n')
+printf '%s' "$TOKEN" | grep -Eq '^[0-9a-f]{32}$' && ok "token 为 32 位十六进制" \
+  || bad "token 格式异常：[${TOKEN}]"
+
+echo "--- 22.3 GET config：结构 / 安全头"
+areq GET "action=config&token=$TOKEN"
+[ "$(acode)" = "200 OK" ] && ok "GET action=config -> 200" || bad "GET config -> [$(acode)] $(cat "$AB")"
+grep -qi '^Cache-Control: no-store' "$AH" && ok "config 响应 Cache-Control: no-store" \
+  || bad "config 响应缺少 Cache-Control: no-store"
+[ "$(ajson 'type(d.lan)=="object" && d.lan.ipaddr=="192.168.100.1" && d.lan.netmask=="255.255.255.0" && d.lan.gateway=="" && length(d.lan.dns)==1 && d.lan.dns[0]=="223.5.5.5"')" = "1" ] \
+  && ok "lan 结构（ipaddr/netmask/gateway/dns）正确" || bad "lan 结构异常：$(cat "$AB")"
+[ "$(ajson 'type(d.wan)=="object" && d.wan.proto=="dhcp" && d.wan.device=="eth0" && type(d.wan.ipaddr)=="string" && type(d.wan.gateway)=="string" && type(d.wan.dns)=="array"')" = "1" ] \
+  && ok "wan 结构（proto/device/运行时 ipaddr·gateway/dns）正确" || bad "wan 结构异常"
+[ "$(ajson 'type(d.dhcp)=="object" && d.dhcp.enabled==true && d.dhcp.start=="100" && d.dhcp.limit=="150" && d.dhcp.leasetime=="12h"')" = "1" ] \
+  && ok "dhcp 结构（enabled/start/limit/leasetime）正确" || bad "dhcp 结构异常"
+[ "$(ajson 'type(d.system)=="object" && d.system.hostname=="iStoreOS" && d.system.timezone=="CST-8" && d.system.zonename=="Asia/Shanghai"')" = "1" ] \
+  && ok "system 结构（hostname/timezone/zonename）正确" || bad "system 结构异常"
+[ "$(ajson 'type(d.redirects)=="array" && length(d.redirects)==0')" = "1" ] \
+  && ok "redirects 为数组且初始为空" || bad "redirects 结构异常"
+
+echo "--- 22.4 非法写：400 且不落盘（无备份/配置不变）"
+NET_BEFORE=$(sha256sum /etc/config/network | awk '{print $1}')
+FW_BEFORE=$(sha256sum /etc/config/firewall | awk '{print $1}')
+areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"lan\",\"options\":{\"ipaddr\":\"192.168.100.2\"}}"
+[ "$(acode)" = "400 Bad Request" ] && [ "$(ajson 'd.error=="confirm_required"')" = "1" ] \
+  && ok "config_set 缺 confirm -> 400 confirm_required" || bad "缺 confirm -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"lan\",\"confirm\":\"APPLY\",\"options\":{\"ipaddr\":\"192.168.100.1.1\"}}"
+[ "$(acode)" = "400 Bad Request" ] && [ "$(ajson 'd.error=="invalid_ipaddr"')" = "1" ] \
+  && ok "非法 IPv4 -> 400 invalid_ipaddr" || bad "非法 IPv4 -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"lan\",\"confirm\":\"APPLY\",\"options\":{\"netmask\":\"255.0.255.0\"}}"
+[ "$(acode)" = "400 Bad Request" ] && [ "$(ajson 'd.error=="invalid_netmask"')" = "1" ] \
+  && ok "非连续掩码 -> 400 invalid_netmask" || bad "非连续掩码 -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"system\",\"confirm\":\"APPLY\",\"options\":{\"hostname\":\"-bad_host\"}}"
+[ "$(acode)" = "400 Bad Request" ] && [ "$(ajson 'd.error=="invalid_hostname"')" = "1" ] \
+  && ok "非法主机名 -> 400 invalid_hostname" || bad "非法主机名 -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"dhcp\",\"confirm\":\"APPLY\",\"options\":{\"leasetime\":\"12hours\"}}"
+[ "$(acode)" = "400 Bad Request" ] && [ "$(ajson 'd.error=="invalid_leasetime"')" = "1" ] \
+  && ok "非法 leasetime -> 400 invalid_leasetime" || bad "非法 leasetime -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"redirect_add\",\"token\":\"$TOKEN\",\"name\":\"bad\",\"src\":\"lan\",\"dest\":\"lan\",\"src_dport\":\"8080\",\"dest_ip\":\"192.168.100.10\",\"dest_port\":\"70000\",\"proto\":\"tcp\"}"
+[ "$(acode)" = "400 Bad Request" ] && [ "$(ajson 'd.error=="invalid_dest_port"')" = "1" ] \
+  && ok "非法端口 -> 400 invalid_dest_port" || bad "非法端口 -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"config_rollback\",\"token\":\"$TOKEN\",\"section\":\"dhcp\"}"
+[ "$(acode)" = "404 Not Found" ] && [ "$(ajson 'd.error=="no_backup"')" = "1" ] \
+  && ok "无备份回滚 -> 404 no_backup" || bad "无备份回滚 -> [$(acode)] $(cat "$AB")"
+[ "$(sha256sum /etc/config/network | awk '{print $1}')" = "$NET_BEFORE" ] \
+  && ok "非法请求后 /etc/config/network 未变" || bad "非法请求改动了 network"
+[ "$(sha256sum /etc/config/firewall | awk '{print $1}')" = "$FW_BEFORE" ] \
+  && ok "非法请求后 /etc/config/firewall 未变" || bad "非法请求改动了 firewall"
+[ ! -d /etc/prism-router/backup ] && ok "非法请求未创建备份目录" \
+  || bad "非法请求创建了备份目录"
+
+echo "--- 22.5 合法 config_set lan：200 + 备份 0600 + uci 已改 + 延迟 reload"
+areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"lan\",\"confirm\":\"APPLY\",\"options\":{\"ipaddr\":\"192.168.100.2\",\"netmask\":\"255.255.255.0\"}}"
+[ "$(acode)" = "200 OK" ] && [ "$(ajson 'd.ok==true && index(d.note,"LAN 地址已改")>=0')" = "1" ] \
+  && ok "合法 config_set lan -> 200 且含 LAN 地址变更提示" || bad "config_set lan -> [$(acode)] $(cat "$AB")"
+grep -q "option ipaddr '192.168.100.2'" /etc/config/network \
+  && ok "uci 值已改（/etc/config/network = 192.168.100.2）" || bad "uci 值未改"
+BK=$(ls -1 /etc/prism-router/backup/network.* 2>/dev/null | head -n 1)
+[ -n "$BK" ] && [ -f "$BK" ] && ok "写前备份已生成：$(basename "$BK")" || bad "未生成写前备份"
+[ "$(ls -l "$BK" 2>/dev/null | awk '{print $1}')" = "-rw-------" ] && ok "备份文件权限 0600" \
+  || bad "备份文件权限异常：[$(ls -l "$BK" 2>/dev/null | awk '{print $1}')]"
+[ "$(ls -ld /etc/prism-router/backup 2>/dev/null | awk '{print $1}')" = "drwx------" ] \
+  && ok "备份目录权限 0700" || bad "备份目录权限异常"
+grep -q "192.168.100.1" "$BK" && ok "备份内容为改前配置（含 192.168.100.1）" \
+  || bad "备份内容不是改前配置"
+sleep 2
+grep -q "network reload" /tmp/admin-reload.log && ok "LAN 变更后异步 network reload 已触发" \
+  || bad "未触发 network reload：[$(cat /tmp/admin-reload.log 2>/dev/null)]"
+
+echo "--- 22.6 system / dhcp 合法写 + 非法 zonename"
+areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"system\",\"confirm\":\"APPLY\",\"options\":{\"hostname\":\"router-test\",\"timezone\":\"CST-8\",\"zonename\":\"Asia/Shanghai\"}}"
+[ "$(acode)" = "200 OK" ] && grep -q "option hostname 'router-test'" /etc/config/system \
+  && ok "system 写入 -> 200 且 uci 已改" || bad "system 写入 -> [$(acode)] $(cat "$AB")"
+[ "$(cat /tmp/admin-hostname.log 2>/dev/null)" = "router-test" ] && ok "hostname 即时生效（hostname router-test）" \
+  || bad "hostname 未即时生效：[$(cat /tmp/admin-hostname.log 2>/dev/null)]"
+areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"system\",\"confirm\":\"APPLY\",\"options\":{\"zonename\":\"../../etc/passwd\"}}"
+[ "$(acode)" = "400 Bad Request" ] && [ "$(ajson 'd.error=="invalid_zonename"')" = "1" ] \
+  && ok "路径穿越 zonename -> 400 invalid_zonename" || bad "路径穿越 zonename -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"dhcp\",\"confirm\":\"APPLY\",\"options\":{\"start\":120,\"limit\":100,\"leasetime\":\"6h\"}}"
+[ "$(acode)" = "200 OK" ] && grep -q "option start '120'" /etc/config/dhcp \
+  && grep -q "option limit '100'" /etc/config/dhcp && grep -q "option leasetime '6h'" /etc/config/dhcp \
+  && ok "dhcp 写入 -> 200 且 start/limit/leasetime 已改" || bad "dhcp 写入 -> [$(acode)] $(cat "$AB")"
+grep -q "dnsmasq restart" /tmp/admin-reload.log && ok "dhcp 变更后 dnsmasq restart 已触发" \
+  || bad "未触发 dnsmasq restart"
+
+echo "--- 22.7 redirect_add / redirect_del"
+areq POST "" "{\"action\":\"redirect_add\",\"token\":\"$TOKEN\",\"name\":\"web\",\"src\":\"lan\",\"dest\":\"lan\",\"src_dport\":\"8080\",\"dest_ip\":\"192.168.100.10\",\"dest_port\":\"80\",\"proto\":\"tcp\"}"
+[ "$(acode)" = "200 OK" ] && [ "$(ajson 'd.ok==true && d.index==0')" = "1" ] \
+  && ok "redirect_add -> 200 index 0" || bad "redirect_add -> [$(acode)] $(cat "$AB")"
+grep -q "config redirect" /etc/config/firewall && grep -q "option dest_ip '192.168.100.10'" /etc/config/firewall \
+  && grep -q "option target 'DNAT'" /etc/config/firewall \
+  && ok "firewall 配置新增 redirect（dest_ip/target=DNAT）" || bad "firewall 未新增 redirect"
+grep -q "firewall reload" /tmp/admin-reload.log && ok "redirect_add 后 firewall reload 已触发" \
+  || bad "redirect_add 未触发 firewall reload"
+areq GET "action=config&token=$TOKEN"
+[ "$(ajson 'length(d.redirects)==1 && d.redirects[0].name=="web" && d.redirects[0].dest_port=="80" && d.redirects[0].proto=="tcp" && d.redirects[0].enabled==true')" = "1" ] \
+  && ok "GET config 读到 1 条 redirect 且字段正确" || bad "GET config redirect 结构异常：$(cat "$AB")"
+areq POST "" "{\"action\":\"redirect_del\",\"token\":\"$TOKEN\",\"index\":0}"
+[ "$(acode)" = "200 OK" ] && ! grep -q "config redirect" /etc/config/firewall \
+  && ok "redirect_del -> 200 且 firewall 中 redirect 已删除" || bad "redirect_del -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"redirect_del\",\"token\":\"$TOKEN\",\"index\":9}"
+[ "$(acode)" = "400 Bad Request" ] && [ "$(ajson 'd.error=="invalid_index"')" = "1" ] \
+  && ok "不存在 index -> 400 invalid_index" || bad "不存在 index -> [$(acode)] $(cat "$AB")"
+
+echo "--- 22.8 config_rollback：最近备份恢复"
+areq POST "" "{\"action\":\"config_rollback\",\"token\":\"$TOKEN\",\"section\":\"lan\"}"
+[ "$(acode)" = "200 OK" ] && [ "$(ajson 'd.ok==true')" = "1" ] \
+  && ok "config_rollback lan -> 200" || bad "config_rollback -> [$(acode)] $(cat "$AB")"
+grep -q "option ipaddr '192.168.100.1'" /etc/config/network \
+  && ok "回滚后 /etc/config/network 恢复为 192.168.100.1" || bad "回滚未恢复 network"
+sleep 2
+grep -q "network reload" /tmp/admin-reload.log && ok "回滚后 network reload 已触发" \
+  || bad "回滚未触发 network reload"
+
+echo "--- 22.9 备份保留最近 10 份 + 审计日志"
+i=0
+while [ "$i" -lt 11 ]; do
+  areq POST "" "{\"action\":\"config_set\",\"token\":\"$TOKEN\",\"section\":\"system\",\"confirm\":\"APPLY\",\"options\":{\"hostname\":\"router-test\"}}" >/dev/null
+  i=$((i+1))
+done
+N_BK=$(ls -1 /etc/prism-router/backup/system.* 2>/dev/null | wc -l | tr -d ' ')
+[ "$N_BK" = "10" ] && ok "每个 config 仅保留最近 10 份备份（实际 $N_BK）" || bad "备份保留数量异常（$N_BK）"
+BADPERM=0
+for f in /etc/prism-router/backup/system.*; do
+  [ "$(ls -l "$f" | awk '{print $1}')" = "-rw-------" ] || BADPERM=1
+done
+[ "$BADPERM" = "0" ] && ok "全部备份文件权限 0600" || bad "存在非 0600 备份文件"
+[ "$(ls -l /tmp/prism-router/admin.log 2>/dev/null | awk '{print $1}')" = "-rw-------" ] \
+  && ok "审计日志 /tmp/prism-router/admin.log 权限 0600" || bad "审计日志权限异常"
+grep -q 'action=config_set section=lan result=ok' /tmp/prism-router/admin.log \
+  && ok "审计日志记录 config_set/lan/ok" || bad "审计日志缺少 config_set/lan/ok"
+grep -q "$TOKEN" /tmp/prism-router/admin.log && bad "审计日志泄漏 token" || ok "审计日志不含 token"
+
+echo "--- 22.10 方法 / token 边界"
+areq GET "action=config_set&token=$TOKEN"
+[ "$(acode)" = "405 Method Not Allowed" ] && [ "$(ajson 'd.error=="method_not_allowed"')" = "1" ] \
+  && ok "GET 写 action -> 405（不执行）" || bad "GET 写 action -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"config\",\"token\":\"$TOKEN\"}"
+[ "$(acode)" = "405 Method Not Allowed" ] && ok "POST 只读 config -> 405" \
+  || bad "POST config -> [$(acode)] $(cat "$AB")"
+areq POST "" "{\"action\":\"config_set\",\"token\":\"00000000000000000000000000000000\",\"section\":\"lan\",\"confirm\":\"APPLY\",\"options\":{\"dns\":[\"1.1.1.1\"]}}"
+[ "$(acode)" = "401 Unauthorized" ] && [ "$(ajson 'd.error=="unauthorized"')" = "1" ] \
+  && ok "写 action 错误 token -> 401" || bad "写 action 错误 token -> [$(acode)] $(cat "$AB")"
+
+echo "=== 23. 系统目录权限未被改动 ==="
 [ "$B_ETC" = "$(perm /etc)" ] && ok "/etc 未变" || bad "/etc 被改动"
 [ "$B_USR" = "$(perm /usr)" ] && ok "/usr 未变" || bad "/usr 被改动"
 [ "$B_WWW" = "$(perm /www)" ] && ok "/www 未变" || bad "/www 被改动"
 [ "$B_CGI" = "$(perm /www/cgi-bin)" ] && ok "/www/cgi-bin 未变" || bad "/www/cgi-bin 被改动"
+
+echo "=== 24. 自动检测更新：?what=update_check（PATH 注入假 curl；不访问外网） ==="
+[ "$(CGET prism-router.update.cache_seconds)" = "600" ] \
+  && ok "update.cache_seconds 默认 600" \
+  || bad "update.cache_seconds 默认=$(CGET prism-router.update.cache_seconds)"
+[ -z "$(CGET prism-router.update.github_repo)" ] \
+  && ok "update.github_repo 默认空（未配置更新源）" \
+  || bad "update.github_repo 默认非空"
+[ -z "$(CGET prism-router.update.github_token)" ] \
+  && ok "update.github_token 默认空" || bad "update.github_token 默认非空"
+grep -q "^config update 'update'" /etc/config/prism-router \
+  && ok "conffile 包含 config update 段" || bad "conffile 缺少 config update 段"
+
+UPBIN=/tmp/update-bin
+UPMOCK=/tmp/update-mock
+mkdir -p "$UPBIN" "$UPMOCK" /tmp/prism-router
+cat > "$UPBIN/curl" <<'MOCKCURL'
+#!/bin/sh
+# 只实现本 CGI 用到的 curl 子集：把 $MOCK_BODY 写进 -o 指定的文件，
+# 往 stdout 打印 $MOCK_HTTP（模拟 -w '%{http_code}'），并记录每次调用。
+printf '%s\n' "$*" >> /tmp/update-curl-args.log
+printf 'call\n' >> /tmp/update-curl-count.log
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+if [ -n "${MOCK_BODY:-}" ] && [ -f "$MOCK_BODY" ]; then
+  if [ -n "$out" ]; then cp "$MOCK_BODY" "$out"; else cat "$MOCK_BODY"; fi
+fi
+printf '%s' "${MOCK_HTTP:-200}"
+exit "${MOCK_EXIT:-0}"
+MOCKCURL
+chmod 755 "$UPBIN/curl"
+: > /tmp/update-curl-args.log
+: > /tmp/update-curl-count.log
+
+sysreq_mock(){ # $1=方法 $2=查询串 $3=MOCK_BODY $4=MOCK_HTTP $5=MOCK_EXIT
+  rm -f "$SH" "$SB" /tmp/sys-raw.txt
+  env PATH="$UPBIN:$PATH" REQUEST_METHOD="$1" QUERY_STRING="$2" \
+    MOCK_BODY="${3-}" MOCK_HTTP="${4-200}" MOCK_EXIT="${5-0}" \
+    ucode "$SYS" 2>/dev/null | tr -d '\r' > /tmp/sys-raw.txt
+  awk -v h="$SH" -v b="$SB" '
+    !done { if ($0 == "") { done=1; next } print > h; next }
+    { print > b }' /tmp/sys-raw.txt
+}
+curl_calls(){ wc -l < /tmp/update-curl-count.log | tr -d ' '; }
+
+TOK_UPDATE='ghp_TestToken_9f3c1a7b'
+
+echo "--- 24.1 未配置：200 {configured:false}，且不联网"
+UCI set prism-router.update.github_repo=''
+UCI set prism-router.update.github_token=''
+UCI set prism-router.update.cache_seconds='600'
+UCI commit prism-router
+rm -f /tmp/prism-router/update-cache.json
+BEFORE=$(curl_calls)
+sysreq_mock GET "what=update_check"
+[ "$(syscode)" = "200 OK" ] && ok "未配置 update_check -> 200" || bad "未配置 update_check -> [$(syscode)]"
+[ "$(sysjson 'd.configured==false')" = "1" ] && ok "未配置响应 {configured:false}" \
+  || bad "未配置响应异常：$(cat "$SB")"
+[ "$(sysjson 'type(d.message)=="string" && index(d.message, "未配置更新源") == 0')" = "1" ] \
+  && ok "未配置 message 提示 uci set prism-router.update.github_repo=owner/repo" \
+  || bad "未配置 message 异常：$(cat "$SB")"
+[ "$(curl_calls)" = "$BEFORE" ] && ok "未配置时不调用 HTTP 客户端" \
+  || bad "未配置时仍发起了网络请求"
+
+echo "--- 24.2 合法 repo + mock GitHub 200：字段 / notes 截断 / apk·ipk / token 边界"
+LONG_NOTE=$(awk 'BEGIN { for (i = 0; i < 2500; i++) printf "x" }')
+GH_OK="$UPMOCK/release-ok.json"
+cat > "$GH_OK" <<JSON
+{
+  "tag_name": "v1.2.3",
+  "published_at": "2026-11-01T10:00:00Z",
+  "html_url": "https://github.com/acme/prism-router/releases/tag/v1.2.3",
+  "body": "$LONG_NOTE",
+  "assets": [
+    {"name": "prism-router_1.2.3_all.ipk",
+     "browser_download_url": "https://github.com/acme/prism-router/releases/download/v1.2.3/prism-router_1.2.3_all.ipk",
+     "size": 123456},
+    {"name": "prism-router-1.2.3.apk",
+     "browser_download_url": "https://github.com/acme/prism-router/releases/download/v1.2.3/prism-router-1.2.3.apk",
+     "size": 2345678},
+    {"name": "source.tar.gz",
+     "browser_download_url": "https://github.com/acme/prism-router/archive/v1.2.3.tar.gz",
+     "size": 999}
+  ]
+}
+JSON
+UCI set prism-router.update.github_repo='acme/prism-router'
+UCI set prism-router.update.github_token="$TOK_UPDATE"
+UCI commit prism-router
+rm -f /tmp/prism-router/update-cache.json
+: > /tmp/update-curl-count.log
+: > /tmp/update-curl-args.log
+sysreq_mock GET "what=update_check" "$GH_OK" 200
+[ "$(syscode)" = "200 OK" ] && ok "合法 repo update_check -> 200" || bad "合法 repo -> [$(syscode)] $(cat "$SB")"
+[ "$(sysjson 'd.configured==true && d.repo=="acme/prism-router" && d.current=="1.0.0"')" = "1" ] \
+  && ok "响应含 configured/repo/current" || bad "基础字段异常：$(head -c 200 "$SB")"
+[ "$(sysjson 'd.latest=="1.2.3" && d.has_update==true')" = "1" ] \
+  && ok "tag v1.2.3 -> latest=1.2.3、has_update=true" || bad "latest/has_update 异常：$(cat "$SB")"
+[ "$(sysjson 'd.published_at=="2026-11-01T10:00:00Z" && d.html_url=="https://github.com/acme/prism-router/releases/tag/v1.2.3"')" = "1" ] \
+  && ok "published_at/html_url 透传" || bad "published_at/html_url 异常"
+[ "$(sysjson 'type(d.notes)=="string" && length(d.notes)==2000')" = "1" ] \
+  && ok "notes（原 2500 字节）截断到 2000 字节" || bad "notes 截断异常（实际 $(sysval 'length(d.notes)')）"
+[ "$(sysjson 'type(d.apk)=="object" && d.apk.name=="prism-router-1.2.3.apk" && d.apk.size==2345678 && index(d.apk.url, "/releases/download/")>0')" = "1" ] \
+  && ok "apk {name,url,size} 提取正确" || bad "apk 提取异常：$(cat "$SB")"
+[ "$(sysjson 'type(d.ipk)=="object" && d.ipk.name=="prism-router_1.2.3_all.ipk" && d.ipk.size==123456')" = "1" ] \
+  && ok "ipk {name,url,size} 提取正确" || bad "ipk 提取异常"
+[ "$(curl_calls)" = "1" ] && ok "首次请求调用 HTTP 客户端 1 次" || bad "首次请求调用次数=$(curl_calls)"
+grep -q 'https://api.github.com/repos/acme/prism-router/releases/latest' /tmp/update-curl-args.log \
+  && ok "请求固定 api.github.com/repos/<owner>/<repo>/releases/latest" || bad "请求 URL 异常"
+grep -q -- '--max-redirs 0' /tmp/update-curl-args.log \
+  && ok "curl 不跟随重定向（--max-redirs 0）" || bad "curl 缺少 --max-redirs 0"
+grep -q "$TOK_UPDATE" "$SB" && bad "响应泄漏 github_token" || ok "响应不含 github_token"
+grep -q "$TOK_UPDATE" /tmp/update-curl-args.log && bad "token 进入 curl 命令行" \
+  || ok "token 不在 curl 命令行（走 0600 --config）"
+[ "$(ls /tmp/prism-router/.update-*.conf 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+  && ok "含 token 的临时 curl 配置已删除" || bad "临时 curl 配置残留"
+grep -q "$TOK_UPDATE" /tmp/prism-router/update-cache.json 2>/dev/null && bad "缓存泄漏 token" \
+  || ok "缓存不含 token"
+[ "$(ls -l /tmp/prism-router/update-cache.json 2>/dev/null | awk '{print $1}')" = "-rw-------" ] \
+  && ok "更新缓存 0600" || bad "更新缓存权限异常"
+sysreq GET "what=version"
+[ "$(sysjson 'd.update_check==true')" = "1" ] && ok "配置 repo 后 version.update_check=true" \
+  || bad "version.update_check 未随配置变化"
+
+echo "--- 24.3 同版本 tag v1.0.0 -> has_update=false（force 绕过缓存）"
+GH_SAME="$UPMOCK/release-same.json"
+cat > "$GH_SAME" <<'JSON'
+{"tag_name":"v1.0.0","published_at":"2026-10-01T00:00:00Z","html_url":"https://github.com/acme/prism-router/releases/tag/v1.0.0","body":"same","assets":[]}
+JSON
+sysreq_mock GET "what=update_check&force=1" "$GH_SAME" 200
+[ "$(syscode)" = "200 OK" ] && [ "$(sysjson 'd.latest=="1.0.0" && d.has_update==false')" = "1" ] \
+  && ok "tag v1.0.0 -> has_update=false" || bad "同版本判定异常：$(cat "$SB")"
+
+echo "--- 24.4 缓存：第二次请求不调用 curl；force=1 绕过"
+rm -f /tmp/prism-router/update-cache.json
+: > /tmp/update-curl-count.log
+sysreq_mock GET "what=update_check" "$GH_OK" 200
+FIRST=$(curl_calls)
+sysreq_mock GET "what=update_check" "$GH_OK" 500
+[ "$(sysjson 'd.latest=="1.2.3" && d.has_update==true')" = "1" ] \
+  && ok "缓存命中：第二次仍返回 1.2.3（忽略 mock 500）" || bad "缓存未生效：$(cat "$SB")"
+[ "$(curl_calls)" = "$FIRST" ] && [ "$FIRST" = "1" ] \
+  && ok "缓存命中时不再调用 curl（$FIRST -> $(curl_calls)）" || bad "缓存期间仍调用 curl（$(curl_calls) 次）"
+sysreq_mock GET "what=update_check&force=1" "$GH_OK" 500
+[ "$(sysjson 'd.error=="github_unavailable" && d.detail=="HTTP 500"')" = "1" ] \
+  && ok "force=1 绕过缓存，mock 500 -> 200 {error:github_unavailable, detail:HTTP 500}" \
+  || bad "force/500 异常：$(cat "$SB")"
+
+echo "--- 24.5 mock 401 / 404 错误映射"
+sysreq_mock GET "what=update_check&force=1" "$GH_OK" 401
+[ "$(syscode)" = "200 OK" ] && [ "$(sysjson 'd.error=="github_unauthorized" && d.detail=="HTTP 401"')" = "1" ] \
+  && ok "mock 401 -> github_unauthorized（HTTP 200 包错误）" || bad "401 映射异常：$(cat "$SB")"
+sysreq_mock GET "what=update_check&force=1" "$GH_OK" 404
+[ "$(sysjson 'd.error=="github_not_found" && d.detail=="HTTP 404"')" = "1" ] \
+  && ok "mock 404 -> github_not_found" || bad "404 映射异常：$(cat "$SB")"
+
+echo "--- 24.6 非法 repo：400 invalid_repo，且不联网"
+for BADREPO in '../evil' 'bad repo' 'noslash' 'owner/repo/extra'; do
+  UCI set prism-router.update.github_repo="$BADREPO"
+  UCI commit prism-router
+  BEFORE=$(curl_calls)
+  sysreq_mock GET "what=update_check&force=1"
+  if [ "$(syscode)" = "400 Bad Request" ] && [ "$(sysjson 'd.error=="invalid_repo"')" = "1" ] \
+     && [ "$(curl_calls)" = "$BEFORE" ]; then
+    ok "非法 repo [$BADREPO] -> 400 invalid_repo 且不联网"
+  else
+    bad "非法 repo [$BADREPO] -> [$(syscode)] $(cat "$SB")（curl 调用 $(curl_calls) 次）"
+  fi
+done
 
 echo
 echo "=== 结果：PASS $PASS / FAIL $FAIL ==="

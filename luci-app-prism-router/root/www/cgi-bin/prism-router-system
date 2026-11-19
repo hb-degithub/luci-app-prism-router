@@ -7,24 +7,41 @@
 //   * prism-router-admin：登录后返回带 token 的系统/网络/无线信息与少量写操作。
 //
 // 契约（docs/SPEC.md §13）：
-//   GET ?what=system     -> {hostname,model,kernel,uptime,load[3],memory{},rootfs{},version}
-//   GET ?what=services   -> {services:[{name,label,running,pid,info}]}
-//   GET ?what=processes  -> {processes:[{pid,user,cpu,mem,command} × ≤20]}
-//   GET ?what=version    -> {version,build,apk_version,update_check}
+//   GET ?what=system       -> {hostname,model,kernel,uptime,load[3],memory{},rootfs{},version}
+//   GET ?what=services     -> {services:[{name,label,running,pid,info}]}
+//   GET ?what=processes    -> {processes:[{pid,user,cpu,mem,command} × ≤20]}
+//   GET ?what=version      -> {version,build,apk_version,update_check}
+//   GET ?what=update_check -> GitHub Releases 最新版与当前版本比对（见下）
 //   缺省 what -> system；未知 what -> 400；非 GET -> 405。
 //
 // 安全边界：
-//   * 不写任何文件、不写日志、不执行任何带请求参数的命令：所有命令行都是本文件里的
-//     固定字面量（pgrep/pidof 的名字、netstat/df/nft 的参数均来自硬编码白名单）。
+//   * 业务数据只读：不写 /etc/config、不写日志、不执行任何带请求参数的命令；命令行里的
+//     pgrep/pidof/netstat/df/nft/curl 参数都来自本文件的字面量或受校验值。
+//   * 唯一的写入是成功结果的 HTTP 响应缓存 /tmp/prism-router/update-cache.json（0600），
+//     以及 curl 用的一次性 0600 配置（含 Authorization，用完立刻删除）。
 //   * 只返回内核与进程元数据；不返回 /etc/shadow、UCI 密钥、token 或任何文件内容。
+//   * update_check 只访问固定 API（api.github.com），repo 必须匹配 owner/repo 正则；
+//     github_token 只放进 0600 临时 curl 配置（不进命令行/响应/日志/缓存），
+//     且错误 detail 只给 "HTTP <code>"/"timeout" 等固定串，不回传上游响应体。
 //   * 响应统一 Cache-Control: no-store + application/json，避免被中间层缓存。
-//   * 未配置更新源：update_check 恒为 false（客户端据此隐藏"检查更新"入口）。
+//   * 未配置更新源：update_check=false（客户端据此隐藏"检查更新"入口）。
 
 const PROC = '/proc';
 const HZ = 100;                       // Linux USER_HZ：/proc/<pid>/stat 的 utime/stime 单位
 const MAX_PROCESSES = 20;             // processes 最多返回 20 条
 const CMD_MAX = 80;                   // command 最多 80 字节（按 UTF-8 字符边界截断）
 const DEFAULT_PANEL_PORT = 8099;      // 独立面板默认端口（读取 UCI 失败时使用）
+
+/* ── 自动检测更新（GitHub Releases）────────────────────────────────── */
+const UPDATE_STATE_DIR = '/tmp/prism-router';
+const UPDATE_CACHE = UPDATE_STATE_DIR + '/update-cache.json';
+const UPDATE_TIMEOUT = 10;            // 秒（curl --max-time / wget --timeout）
+const UPDATE_NOTES_MAX = 2000;        // notes 最多 2000 字节
+const UPDATE_DEFAULT_CACHE = 600;     // cache_seconds 缺省/非法时的秒数
+const UPDATE_CACHE_MAX = 86400;       // cache_seconds 上限，避免配置成永久缓存
+const GITHUB_API = 'https://api.github.com';
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const TOKEN_RE = /^[A-Za-z0-9_.-]{1,255}$/;
 
 /* ucode 的 fs 是模块而不是全局：不 require 时所有读写都抛 ReferenceError。 */
 const fs = require('fs');
@@ -82,13 +99,101 @@ function query(name) {
 	return '';
 }
 
+/* 截断到 max 字节，并回退到完整 UTF-8 字符边界（避免 JSON 里出现半个汉字）。 */
+function trunc_utf8(s, max) {
+	if (length(s) <= max) return s;
+	let t = substr(s, 0, max);
+	let i = length(t) - 1;
+	for (let back = 0; i >= 0 && back < 4; back++) {
+		let b = ord(substr(t, i, 1));
+		if (b < 0x80) return t;                       // ASCII：边界完整
+		if (b >= 0xC0) {                              // 多字节首字节
+			let need = (b >= 0xF0) ? 4 : (b >= 0xE0) ? 3 : 2;
+			if (length(t) - i < need) t = substr(t, 0, i);
+			return t;
+		}
+		i--;                                          // 续字节（0x80–0xBF），继续向前
+	}
+	return t;
+}
+
+/* 读取 /etc/config/prism-router 的 update 段（仅在 uci 模块不可用时兜底）。 */
+function uci_update_value(name) {
+	let raw = read_file('/etc/config/prism-router');
+	if (raw == null) return '';
+	let in_update = false;
+	for (let line in split(raw, '\n')) {
+		let t = trim(line);
+		if (t == '' || substr(t, 0, 1) == '#') continue;
+		if (match(t, /^config\s+/)) {
+			let f = split(t, /\s+/);
+			in_update = (length(f) > 1 && f[1] == 'update');
+			continue;
+		}
+		if (!in_update) continue;
+		let hit = match(t, /^option\s+([A-Za-z0-9_]+)\s+(.*)$/);
+		if (hit == null || hit[1] != name) continue;
+		let v = trim(hit[2]);
+		if (length(v) >= 2 && (substr(v, 0, 1) == "'" || substr(v, 0, 1) == '"')
+			&& substr(v, length(v) - 1, 1) == substr(v, 0, 1)) {
+			v = substr(v, 1, length(v) - 2);
+			v = replace(v, /\\'/g, "'");
+		}
+		return v;
+	}
+	return '';
+}
+
+/* 更新相关 UCI：github_repo / github_token / cache_seconds（全部只读）。 */
+function update_conf() {
+	let repo = '', token = '', cache = UPDATE_DEFAULT_CACHE;
+	let got = false;
+
+	try {
+		let uci = require('uci');
+		let c = uci.cursor();
+		let r = c.get('prism-router', 'update', 'github_repo');
+		let t = c.get('prism-router', 'update', 'github_token');
+		let s = c.get('prism-router', 'update', 'cache_seconds');
+		try { c.close(); } catch (e2) { }
+		repo = (type(r) == 'string') ? trim(r) : '';
+		token = (type(t) == 'string') ? trim(t) : '';
+		let cs = (type(s) == 'string') ? trim(s) : '';
+		if (match(cs, /^[0-9]+$/)) {
+			cache = int(cs);
+			if (cache < 0) cache = 0;
+			if (cache > UPDATE_CACHE_MAX) cache = UPDATE_CACHE_MAX;
+		}
+		got = true;
+	} catch (e) { }
+
+	if (!got) {
+		repo = trim(uci_update_value('github_repo'));
+		token = trim(uci_update_value('github_token'));
+		let cs = trim(uci_update_value('cache_seconds'));
+		if (match(cs, /^[0-9]+$/)) {
+			cache = int(cs);
+			if (cache < 0) cache = 0;
+			if (cache > UPDATE_CACHE_MAX) cache = UPDATE_CACHE_MAX;
+		}
+	}
+
+	/* token 是可选的；格式不符时当作未配置，绝不把任意配置串拼进 curl/wget。 */
+	if (token != '' && !match(token, TOKEN_RE)) token = '';
+	return { repo: repo, token: token, cache: cache };
+}
+
+function update_configured() {
+	try { return update_conf().repo != ''; } catch (e) { return false; }
+}
+
 /* ---------------- 版本 ---------------- */
 
 /* 版本来源（按优先级）：
  *   1. /usr/lib/opkg/info/luci-app-prism-router.control 的 Version: 1.0.0-1（opkg 安装后必有）
  *   2. /etc/prism-router/version（可选，由部署方写入，供 APK/App 直接比对）
  * build 是完整版本（含 -release），version 是去掉 release 的短版本。 */
-function version_info() {
+function version_short() {
 	let build = '';
 	let raw = read_file('/usr/lib/opkg/info/luci-app-prism-router.control');
 	if (raw != null) {
@@ -106,9 +211,321 @@ function version_info() {
 	if (version == '') version = alt;
 
 	/* apk_version：给 Android 端做版本比对。优先独立部署的 /etc/prism-router/version，
-	 * 没有就退化成短版本。没有更新源，所以 update_check 恒 false。 */
+	 * 没有就退化成短版本。 */
 	let apk = alt != '' ? alt : version;
-	return { version: version, build: build, apk_version: apk, update_check: false };
+	return { version: version, build: build, apk: apk };
+}
+
+function version_info() {
+	let v = version_short();
+	return { version: v.version, build: v.build, apk_version: v.apk,
+		update_check: update_configured() };
+}
+
+/* ---------------- 自动检测更新（GitHub Releases） ---------------- */
+
+/* 单引号转义：只用于本文件里的受校验值（repo、URL、临时路径），绝不拼请求原文。 */
+function shell_quote(s) {
+	return "'" + replace(s, /'/g, "'\\''") + "'";
+}
+
+/* 按 PATH 找可执行文件（顺序与 shell 一致），用于注入测试替身；
+ * 只接受绝对路径目录，找不到再回退到常见 bin 目录。 */
+function which(name) {
+	let path = env('PATH');
+	for (let dir in split(path, ':')) {
+		if (dir == '' || substr(dir, 0, 1) != '/') continue;
+		let p = ((substr(dir, length(dir) - 1) == '/') ? dir : dir + '/') + name;
+		try { if (fs.access(p, 'x')) return p; } catch (e) { }
+	}
+	for (let p in ['/usr/bin/' + name, '/bin/' + name, '/usr/sbin/' + name, '/sbin/' + name]) {
+		try { if (fs.access(p, 'x')) return p; } catch (e) { }
+	}
+	return null;
+}
+
+function ensure_tree(path, mode) {
+	let cur = '';
+	for (let p in split(path, '/')) {
+		if (p == '') continue;
+		cur += '/' + p;
+		try { if (!exists(cur)) fs.mkdir(cur, mode); } catch (e) { }
+	}
+	try { fs.chmod(path, mode); } catch (e) { }
+}
+
+let RND_SEQ = 0;
+
+/* 随机临时文件名后缀（/dev/urandom；极端环境退化为 时间+序号）。 */
+function rand_hex(n) {
+	let out = '';
+	try {
+		let raw = fs.readfile('/dev/urandom', n);
+		if (raw != null && length(raw) >= n)
+			for (let i = 0; i < n; i++) out += sprintf('%02x', ord(substr(raw, i, 1)));
+	} catch (e) { }
+	if (out == '') out = sprintf('%d%04d', time(), RND_SEQ++);
+	return out;
+}
+
+/* 只接受 owner/repo；额外拒绝 . / .. 段（正则本身会放过 "../x"）。 */
+function repo_valid(repo) {
+	if (type(repo) != 'string' || repo == '' || length(repo) > 140) return false;
+	if (!match(repo, REPO_RE)) return false;
+	let parts = split(repo, '/');
+	if (length(parts) != 2) return false;
+	for (let p in parts) {
+		if (p == '' || p == '.' || p == '..' || length(p) > 100) return false;
+	}
+	return true;
+}
+
+function is_https_url(u) {
+	if (type(u) != 'string' || length(u) < 9) return false;
+	if (substr(u, 0, 8) != 'https://') return false;
+	/* 不要用 /[\s"'<>]/：ucode 的字符类里 \s 会被当成字母 s（实测）。 */
+	for (let i = 0; i < length(u); i++) {
+		let c = ord(substr(u, i, 1));
+		if (c <= 0x20 || c == 0x7f) return false;
+	}
+	for (let c in ['"', "'", '<', '>']) if (index(u, c) >= 0) return false;
+	return true;
+}
+
+/* HTTP 状态码 → 契约里的错误码；detail 只保留状态码，不回传响应体。 */
+function github_status_error(code) {
+	if (code == '401') return { error: 'github_unauthorized', detail: 'HTTP 401' };
+	if (code == '404') return { error: 'github_not_found', detail: 'HTTP 404' };
+	return { error: 'github_unavailable', detail: 'HTTP ' + code };
+}
+
+/* 调一次 GitHub Releases API（固定 URL、固定 Header、10 秒超时、不跟随重定向）。
+ * 返回 {body} 或 {error,detail}；token 只写进 0600 的 curl --config 临时文件。 */
+function github_fetch(repo, token) {
+	let curl = which('curl');
+	let wget = (curl == null) ? which('wget') : null;
+	if (curl == null && wget == null)
+		return { error: 'github_unavailable', detail: 'http_client_missing' };
+
+	try { ensure_tree(UPDATE_STATE_DIR, 0700); } catch (e) { }
+
+	let rnd = rand_hex(8);
+	let bodyf = UPDATE_STATE_DIR + '/.update-' + rnd + '.body';
+	let errf = UPDATE_STATE_DIR + '/.update-' + rnd + '.err';
+	let cfgf = null;
+	let url = GITHUB_API + '/repos/' + repo + '/releases/latest';
+	let res = null;
+
+	try {
+		let rc = -1;
+		let rawcode = '';
+
+		if (curl != null) {
+			let a = [curl, '--silent', '--show-error',
+				'--max-time', sprintf('%d', UPDATE_TIMEOUT),
+				'--max-redirs', '0',
+				'--proto', shell_quote('=https'),
+				'-H', shell_quote('Accept: application/vnd.github+json'),
+				'-H', shell_quote('User-Agent: prism-router'),
+				'-o', shell_quote(bodyf),
+				'-w', shell_quote('%{http_code}')];
+			if (token != '') {
+				cfgf = UPDATE_STATE_DIR + '/.update-' + rnd + '.conf';
+				fs.writefile(cfgf, 'header = "Authorization: Bearer ' + token + '"\n');
+				fs.chmod(cfgf, 0600);
+				push(a, '--config', shell_quote(cfgf));
+			}
+			push(a, shell_quote(url));
+			let p = fs.popen(join(' ', a) + ' 2>' + shell_quote(errf));
+			rawcode = trim(p.read('all') ?? '');
+			rc = p.close();
+			let code = match(rawcode, /^[0-9]{3}$/) ? rawcode : '';
+			if (code == '') {
+				res = { error: 'github_unavailable',
+					detail: (rc == 28) ? 'timeout' : 'network_error' };
+			} else if (code != '200') {
+				res = github_status_error(code);
+			}
+		} else {
+			let a = [wget, '-q', '-O', shell_quote(bodyf),
+				'--timeout=' + sprintf('%d', UPDATE_TIMEOUT),
+				'--user-agent', shell_quote('prism-router'),
+				'--header=' + shell_quote('Accept: application/vnd.github+json')];
+			/* wget 没有 --config 入口，token 只能进 argv；这是 curl 缺失时的兜底路径。 */
+			if (token != '') push(a, '--header=' + shell_quote('Authorization: Bearer ' + token));
+			push(a, shell_quote(url));
+			let p = fs.popen(join(' ', a) + ' >/dev/null 2>' + shell_quote(errf));
+			p.read('all');
+			rc = p.close();
+			if (rc == 0) {
+				res = null;
+			} else {
+				let hit = match(read_file(errf) ?? '', /HTTP\/[0-9.]+\s+([0-9]{3})/);
+				res = hit ? github_status_error(hit[1])
+					: { error: 'github_unavailable', detail: 'network_error' };
+			}
+		}
+
+		if (res == null) {
+			let body = read_file(bodyf);
+			if (body == null || body == '')
+				res = { error: 'github_unavailable', detail: 'empty_response' };
+			else
+				res = { body: body };
+		}
+	} catch (e) {
+		res = { error: 'github_unavailable', detail: 'client_error' };
+	}
+
+	if (cfgf != null) { try { fs.unlink(cfgf); } catch (e) { } }
+	try { fs.unlink(bodyf); } catch (e) { }
+	try { fs.unlink(errf); } catch (e) { }
+	return res;
+}
+
+/* 版本比较：只比较数字段（1.2.3 < 1.10.0），有 -pre 的低于同版本正式版。 */
+function version_tuple(v) {
+	let s = trim(v ?? '');
+	if (length(s) > 64) s = substr(s, 0, 64);
+	if (s != '' && (substr(s, 0, 1) == 'v' || substr(s, 0, 1) == 'V')) s = substr(s, 1);
+	let base = s, pre = '';
+	let dash = index(s, '-');
+	if (dash > 0) { base = substr(s, 0, dash); pre = substr(s, dash + 1); }
+	let nums = [];
+	for (let part in split(base, '.')) {
+		let m = match(part, /^([0-9]+)/);
+		push(nums, m ? int(m[1]) : 0);
+	}
+	if (length(nums) == 0) push(nums, 0);
+	return { nums: nums, pre: pre };
+}
+
+function version_cmp(a, b) {
+	let x = version_tuple(a), y = version_tuple(b);
+	let n = (length(x.nums) > length(y.nums)) ? length(x.nums) : length(y.nums);
+	for (let i = 0; i < n; i++) {
+		let av = (i < length(x.nums)) ? x.nums[i] : 0;
+		let bv = (i < length(y.nums)) ? y.nums[i] : 0;
+		if (av < bv) return -1;
+		if (av > bv) return 1;
+	}
+	if (x.pre == y.pre) return 0;
+	if (x.pre == '') return 1;
+	if (y.pre == '') return -1;
+	return (x.pre < y.pre) ? -1 : 1;
+}
+
+/* GitHub release JSON → 对外契约；tag 去 v 前缀，notes 截断 2000 字节。 */
+function build_update(repo, body) {
+	let rel = null;
+	try { rel = json(body); } catch (e) { rel = null; }
+	if (type(rel) != 'object')
+		return { error: 'github_unavailable', detail: 'invalid_response' };
+
+	let tag = (type(rel.tag_name) == 'string') ? trim(rel.tag_name) : '';
+	if (tag == '' || length(tag) > 64)
+		return { error: 'github_unavailable', detail: 'invalid_response' };
+	let latest = tag;
+	if (substr(latest, 0, 1) == 'v' || substr(latest, 0, 1) == 'V') latest = substr(latest, 1);
+	if (latest == '' || !match(latest, /^[0-9A-Za-z.+_-]+$/))
+		return { error: 'github_unavailable', detail: 'invalid_response' };
+
+	let current = version_short().version;
+	let notes = (type(rel.body) == 'string') ? trunc_utf8(rel.body, UPDATE_NOTES_MAX) : '';
+	let published = (type(rel.published_at) == 'string') ? rel.published_at : '';
+	let html = (is_https_url(rel.html_url)) ? rel.html_url : '';
+
+	let apk = null, ipk = null;
+	let assets = (type(rel.assets) == 'array') ? rel.assets : [];
+	for (let a in assets) {
+		if (type(a) != 'object' || type(a.name) != 'string' || a.name == '') continue;
+		if (!is_https_url(a.browser_download_url)) continue;
+		let size = 0;
+		if (type(a.size) == 'int') size = a.size;
+		else if (type(a.size) == 'double') size = int(a.size);
+		let item = { name: a.name, url: a.browser_download_url, size: size };
+		let low = lc(a.name);
+		if (apk == null && match(low, /\.apk$/)) apk = item;
+		else if (ipk == null && match(low, /\.ipk$/)) ipk = item;
+	}
+
+	return {
+		configured: true,
+		repo: repo,
+		current: current,
+		latest: latest,
+		has_update: version_cmp(latest, current) > 0,
+		published_at: published,
+		html_url: html,
+		notes: notes,
+		apk: apk,
+		ipk: ipk
+	};
+}
+
+/* 缓存只保存成功结果（configured:true 的 data），key 是 repo+current：
+ * 换仓库或升级插件后旧缓存自动失效；错误不缓存，避免一次 403 卡住十分钟。 */
+function update_cache_read(repo, current, ttl) {
+	if (ttl <= 0) return null;
+	let raw = read_file(UPDATE_CACHE);
+	if (raw == null || raw == '') return null;
+	let c = null;
+	try { c = json(raw); } catch (e) { return null; }
+	if (type(c) != 'object' || c.v != 1 || c.repo != repo || c.current != current) return null;
+	if (type(c.ts) != 'int' || type(c.data) != 'object') return null;
+	let age = time() - c.ts;
+	if (age < 0 || age > ttl) return null;
+	if (c.data.repo != repo || c.data.current != current) return null;
+	return c.data;
+}
+
+function update_cache_write(repo, current, data) {
+	try {
+		ensure_tree(UPDATE_STATE_DIR, 0700);
+		let tmp = UPDATE_CACHE + '.tmp.' + rand_hex(6);
+		fs.writefile(tmp, sprintf('%J', { v: 1, ts: time(), repo: repo, current: current, data: data }));
+		fs.chmod(tmp, 0600);
+		fs.rename(tmp, UPDATE_CACHE);
+		fs.chmod(UPDATE_CACHE, 0600);
+	} catch (e) {
+		/* 缓存失败不影响本次结果；绝不把异常/路径回传给客户端。 */
+	}
+}
+
+function do_update_check() {
+	let force = (query('force') == '1');
+	let conf = update_conf();
+
+	if (conf.repo == '') {
+		out(200, 'OK', { configured: false,
+			message: '未配置更新源（uci set prism-router.update.github_repo=owner/repo）' });
+		return;
+	}
+	if (!repo_valid(conf.repo)) {
+		/* 校验在联网之前：非法 repo 不产生任何网络请求。 */
+		out(400, 'Bad Request', { error: 'invalid_repo' });
+		return;
+	}
+
+	let current = version_short().version;
+	if (!force) {
+		let cached = update_cache_read(conf.repo, current, conf.cache);
+		if (cached != null) { out(200, 'OK', cached); return; }
+	}
+
+	let res = github_fetch(conf.repo, conf.token);
+	if (type(res) == 'object' && res.error != null) {
+		out(200, 'OK', { configured: true, error: res.error, detail: res.detail });
+		return;
+	}
+
+	let data = build_update(conf.repo, res.body ?? '');
+	if (data.error != null) {
+		out(200, 'OK', { configured: true, error: data.error, detail: data.detail });
+		return;
+	}
+	if (conf.cache > 0) update_cache_write(conf.repo, data.current, data);
+	out(200, 'OK', data);
 }
 
 /* ---------------- system ---------------- */
@@ -434,24 +851,6 @@ function stat_fields(pid) {
 	return (length(f) >= 22) ? f : null;
 }
 
-/* 截断到 max 字节，并回退到完整 UTF-8 字符边界（避免 JSON 里出现半个汉字）。 */
-function trunc_utf8(s, max) {
-	if (length(s) <= max) return s;
-	let t = substr(s, 0, max);
-	let i = length(t) - 1;
-	for (let back = 0; i >= 0 && back < 4; back++) {
-		let b = ord(substr(t, i, 1));
-		if (b < 0x80) return t;                       // ASCII：边界完整
-		if (b >= 0xC0) {                              // 多字节首字节
-			let need = (b >= 0xF0) ? 4 : (b >= 0xE0) ? 3 : 2;
-			if (length(t) - i < need) t = substr(t, 0, i);
-			return t;
-		}
-		i--;                                          // 续字节（0x80–0xBF），继续向前
-	}
-	return t;
-}
-
 function cmdline_text(pid) {
 	let args = argv_of(pid);
 	let clean = [];
@@ -520,6 +919,7 @@ function main() {
 	if (what == 'services') { do_services(); return; }
 	if (what == 'processes') { do_processes(); return; }
 	if (what == 'version') { do_version(); return; }
+	if (what == 'update_check') { do_update_check(); return; }
 	out(400, 'Bad Request', { error: 'bad_request' });
 }
 

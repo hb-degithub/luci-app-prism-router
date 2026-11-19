@@ -20,11 +20,13 @@ class SystemException(val code: String, override val message: String) : Exceptio
 /**
  * 系统信息客户端：`GET <面板地址>/cgi-bin/prism-router-system?what=…`
  *
- * 只读、**无需登录**，四个查询各自独立（一个失败不影响另外两个）：
+ * 只读、**无需登录**，各查询彼此独立（一个失败不影响其它）：
  * - `what=system`    → [SystemInfo]（主机名 / 型号 / 内核 / 运行时间 / 负载 / 内存 / 根分区）；
  * - `what=services`  → [ServiceInfo] 列表（系统服务运行状态）；
  * - `what=processes` → [ProcessInfo] 列表（Top 进程）；
- * - `what=version`   → [ServerVersion]（检查更新用）。
+ * - `what=version`   → [ServerVersion]（面板 / 固件版本，只用于展示）；
+ * - `what=update_check`（可加 `&force=1`）→ [UpdateCheck]（GitHub 更新源，
+ *   未配置 / 有更新 / 已是最新 / 失败四种结果）。
  *
  * 老面板没有该接口时返回 404，这里映射成「请升级面板」的中文提示，而不是让设置页白屏。
  * 方法都是阻塞式的（与 [PanelClient] 一致），调用方负责放到 IO 线程。
@@ -35,6 +37,34 @@ class SystemClient {
         const val PATH = "/cgi-bin/prism-router-system"
         const val CONNECT_TIMEOUT_SEC = 6L
         const val READ_TIMEOUT_SEC = 12L
+
+        /**
+         * 更新检查的业务错误码 → 中文提示。
+         *
+         * `github_*` 由后端在访问 GitHub 失败时下发（契约见 prism-router-system）；
+         * 其余是本地 / 通用 HTTP 分类。未知码保留原值，避免把没见过的错误翻错。
+         */
+        fun updateErrorMessage(code: String, httpCode: Int = 0): String =
+            when (code.trim().lowercase()) {
+                "github_unavailable" -> "无法访问 GitHub：请检查路由器的外网与 DNS"
+                "github_not_found" -> "GitHub 仓库不存在：请检查路由器 uci 的 github_repo 设置"
+                "github_unauthorized" -> "GitHub 拒绝了请求：仓库可能为私有或触发了访问限制"
+                "not_configured" -> "未配置更新源（可在路由器 uci 设置 github_repo）"
+                "invalid_repo" -> "更新源格式不正确：应为 owner/repo"
+                "internal" -> "路由器内部错误，请稍后重试"
+                "no_base_url" -> "请先在设置里填写面板地址"
+                "not_found" -> "路由器没有更新检查接口（HTTP 404），请先升级面板插件"
+                "bad_request" -> "路由器不支持该查询（HTTP 400），请先升级面板插件"
+                "timeout" -> "连接超时：请检查面板地址和网络"
+                "network" -> "连接失败：请检查路由器和网络"
+                "server" -> "面板服务异常（HTTP $httpCode）"
+                "bad_response" -> "更新检查返回了无法解析的数据"
+                else -> if (code.isBlank()) {
+                    "更新检查失败（HTTP $httpCode）"
+                } else {
+                    "更新检查失败（$code）"
+                }
+            }
     }
 
     private val client = OkHttpClient.Builder()
@@ -64,20 +94,61 @@ class SystemClient {
         parseVersion(fetch(baseUrl, "version"))
     }
 
+    /**
+     * `what=update_check`（[force]=true 时带 `&force=1`，跳过后端的短期缓存）。
+     *
+     * 返回三种形态之一（见 [UpdateCheck]）；业务失败（GitHub 不可达 / 仓库不存在 /
+     * 拒绝访问）在这里统一抛 [SystemException]，[SystemException.message] 已是对用户
+     * 可读的中文，调用方无需再翻译。未配置更新源**不是**异常，而是
+     * `configured=false` 的正常结果（界面据此显示 uci 配置提示）。
+     */
+    fun fetchUpdateCheck(baseUrl: String, force: Boolean = false): UpdateCheck = wrap("检查更新") {
+        val query = if (force) "what=update_check&force=1" else "what=update_check"
+        val result = execute(baseUrl, query)
+
+        if (result.code !in 200..299) {
+            /* 后端可能用 4xx/5xx 携带 {"configured":true,"error":…}：优先按业务码翻译。 */
+            val parsed = parseOrNull(result.text)
+            val business = parsed?.error.orEmpty().trim()
+            if (business.isNotEmpty()) {
+                throw SystemException(business, updateErrorMessage(business, result.code))
+            }
+            throw updateHttpFailure(result.code, result.text)
+        }
+
+        val check = parseUpdateCheck(result.text)
+        if (check.error.isNotBlank()) {
+            throw SystemException(check.error, updateErrorMessage(check.error, result.code))
+        }
+        check
+    }
+
     /* ───────────────────────── HTTP ───────────────────────── */
 
+    /** 一次 GET 的原始结果：状态码 + 文本（不在这里判定成功与否，调用方决定）。 */
+    private data class HttpResult(val code: Int, val text: String)
+
     private fun fetch(baseUrl: String, what: String): String {
-        val base = baseUrl.trim().trimEnd('/')
-        if (base.isEmpty()) throw SystemException("no_base_url", "请先在设置里填写面板地址")
+        val result = execute(baseUrl, "what=$what")
+        if (result.code !in 200..299) throw httpFailure(result.code, result.text)
+        return result.text
+    }
+
+    /**
+     * 发一次 GET 并返回原始响应。
+     *
+     * 网络层异常在这里统一翻译成 [SystemException]（`no_base_url` / `timeout` /
+     * `network`）；HTTP 状态码留给调用方，因为 update_check 的业务错误也可能带 4xx/5xx。
+     */
+    private fun execute(baseUrl: String, query: String): HttpResult {
+        val base = normalizeBase(baseUrl)
         val request = Request.Builder()
-            .url("$base$PATH?what=$what")
+            .url("$base$PATH?$query")
             .get()
             .build()
         try {
             client.newCall(request).execute().use { res ->
-                val text = res.body?.string().orEmpty()
-                if (!res.isSuccessful) throw httpFailure(res.code, text)
-                return text
+                return HttpResult(res.code, res.body?.string().orEmpty())
             }
         } catch (e: SystemException) {
             throw e
@@ -90,6 +161,13 @@ class SystemClient {
         } catch (e: Exception) {
             throw SystemException("bad_response", "系统信息请求失败：${e.javaClass.simpleName}")
         }
+    }
+
+    /** 地址归一化：空地址直接报「请先填写面板地址」，不发请求。 */
+    private fun normalizeBase(baseUrl: String): String {
+        val base = baseUrl.trim().trimEnd('/')
+        if (base.isEmpty()) throw SystemException("no_base_url", "请先在设置里填写面板地址")
+        return base
     }
 
     /** 4xx / 5xx → 可展示的中文；404 / 400 明确指向「面板版本太旧」。 */
@@ -113,6 +191,32 @@ class SystemClient {
             else -> serverError.ifBlank { "系统信息读取失败（HTTP $httpCode）" }
         }
         return SystemException(code, message)
+    }
+
+    /** update_check 的 HTTP 失败：先看后端 `error`，再按状态码兜底。 */
+    private fun updateHttpFailure(httpCode: Int, text: String): SystemException {
+        val serverError = try {
+            JSONObject(text).optString("error", "").trim()
+        } catch (e: Exception) {
+            ""
+        }
+        if (serverError.isNotEmpty()) {
+            return SystemException(serverError, updateErrorMessage(serverError, httpCode))
+        }
+        val mapped = when {
+            httpCode == 404 -> "not_found"
+            httpCode == 400 -> "bad_request"
+            httpCode >= 500 -> "server"
+            else -> "bad_response"
+        }
+        return SystemException(mapped, updateErrorMessage(mapped, httpCode))
+    }
+
+    /** 非 2xx 时容忍解析失败：解析不出来就走 HTTP 兜底文案。 */
+    private fun parseOrNull(body: String): UpdateCheck? = try {
+        parseUpdateCheck(body)
+    } catch (e: Exception) {
+        null
     }
 
     /** 解析失败统一成 [SystemException]（JSON 坏掉时不要把 JSONException 抛给 UI）。 */
@@ -221,6 +325,45 @@ class SystemClient {
             version = root.optString("version", "").trim(),
             build = root.optString("build", "").trim(),
             apkVersion = root.optString("apk_version", "").trim()
+        )
+    }
+
+    /**
+     * 解析 `?what=update_check` 的响应（公开给单测；不访问网络）。
+     *
+     * 缺字段一律取安全默认值：`configured` 缺失时按 true 处理（真正未配置时
+     * 后端一定显式下发 `false`）；`apk` / `ipk` 只有对象存在且至少带 name/url
+     * 时才非 null（全空对象视为「没有产物」）。
+     */
+    fun parseUpdateCheck(body: String): UpdateCheck {
+        val root = JSONObject(body)
+        return UpdateCheck(
+            configured = root.optBoolean("configured", true),
+            message = root.optString("message", "").trim(),
+            repo = root.optString("repo", "").trim(),
+            current = root.optString("current", "").trim(),
+            latest = root.optString("latest", "").trim(),
+            hasUpdate = root.optBoolean("has_update", false),
+            publishedAt = root.optString("published_at", "").trim(),
+            htmlUrl = root.optString("html_url", "").trim(),
+            notes = root.optString("notes", "").trim(),
+            apk = parseAsset(root.optJSONObject("apk")),
+            ipk = parseAsset(root.optJSONObject("ipk")),
+            error = root.optString("error", "").trim(),
+            detail = root.optString("detail", "").trim()
+        )
+    }
+
+    /** `{name,url,size}` → [UpdateAsset]；对象全空时返回 null（不伪造下载入口）。 */
+    private fun parseAsset(json: JSONObject?): UpdateAsset? {
+        if (json == null) return null
+        val name = json.optString("name", "").trim()
+        val url = json.optString("url", "").trim()
+        if (name.isEmpty() && url.isEmpty()) return null
+        return UpdateAsset(
+            name = name,
+            url = url,
+            size = json.optLong("size", 0L).coerceAtLeast(0L)
         )
     }
 
