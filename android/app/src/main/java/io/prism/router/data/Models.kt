@@ -3,6 +3,45 @@ package io.prism.router.data
 import org.json.JSONArray
 import org.json.JSONObject
 
+/* ───────────────────────── 多路由器配置 ───────────────────────── */
+
+/** 多路由器地址上限。设置页据此禁用「添加」并提示。 */
+const val MAX_SERVERS = 8
+
+/** 首次启动 / 无任何配置时使用的默认面板地址。 */
+const val DEFAULT_BASE_URL = "http://192.168.100.1:8099"
+
+/**
+ * 地址归一化：去空白与末尾斜杠；空串保持空（由调用方提示）。
+ *
+ * 统一放在模型层，供设置存储、仓库与 ViewModel 共用，避免各自实现漂移。
+ */
+fun normalizeServerUrl(url: String): String = url.trim().trimEnd('/')
+
+/**
+ * 一个可切换的面板地址（多路由器）。
+ *
+ * [name] 是用户起的短名（列表标题），[url] 是面板根地址（不带末尾斜杠），
+ * [token] 是可选的访问令牌。DataStore 的 `servers` 键以 JSON 数组持久化。
+ */
+data class ServerProfile(
+    val name: String,
+    val url: String,
+    val token: String = ""
+) {
+    /** 展示名：名称缺失时退回地址里的主机名，避免列表出现空标题。 */
+    val displayName: String get() = name.trim().ifBlank { hostOf(url) }
+
+    companion object {
+        /** 从 URL 里取主机名（兼容无 scheme、带端口 / 路径的写法）。 */
+        fun hostOf(url: String): String {
+            val noScheme = url.trim().substringAfter("://", url.trim())
+            val host = noScheme.substringBefore('/').substringBefore(':')
+            return host.ifBlank { "路由器" }
+        }
+    }
+}
+
 /** 与棱镜路由面板 API（/cgi-bin/panel-api?what=state）对应的精简模型。 */
 data class Totals(
     val rx: Long = 0,

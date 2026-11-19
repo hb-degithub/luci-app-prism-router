@@ -1,85 +1,159 @@
 package io.prism.router.ui
 
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.RowScope
+import android.content.Context
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.AccountTree
-import androidx.compose.material.icons.rounded.Apps
-import androidx.compose.material.icons.rounded.Devices
-import androidx.compose.material.icons.rounded.Hub
-import androidx.compose.material.icons.rounded.Settings
-import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.rememberNavController
 import io.prism.router.data.MainViewModel
+import io.prism.router.ui.navigation.PrismDestination
+import io.prism.router.ui.navigation.PrismNavHost
+import io.prism.router.ui.navigation.PrismRoutes
+import io.prism.router.ui.navigation.navigateToTab
+import io.prism.router.ui.theme.ThemeMode
 
 /**
- * 底部导航 6 项：概览 / 设备 / 应用 / 节点 / 拓扑 / 设置。
+ * 与 UI 相关的轻量偏好（与 data 层的 DataStore 配置分开）。
  *
- * 390px 宽度下 6 个 item 均分，标签单行；文案沿用 Material3 默认字号。
- * 拓扑页只读，重试子节点数据走 ViewModel.refreshNodes()。
+ * 目前只存「首启引导是否已完成」；主题与动态色由 data 层 SettingsStore 持久化，
+ * 屏幕内容重做时再统一迁走。
+ */
+object PrismPrefs {
+    const val NAME = "prism-router"
+    const val KEY_ONBOARDED = "onboarded"
+}
+
+/**
+ * 应用根组件：5 项底部导航 + 页面容器 + NavHost。
+ *
+ * 边到边策略：
+ * - 外层 Scaffold 的 contentWindowInsets 置 0，避免与每页 PrismScaffold 的
+ *   TopAppBar 状态栏内边距重复；
+ * - 底部导航自身 navigationBarsPadding()，内容区通过 innerPadding 让出高度；
+ * - 二级页 / 引导页隐藏底部导航时，内容区补 navigationBarsPadding()。
  */
 @Composable
-fun App(vm: MainViewModel) {
-    var tab by rememberSaveable { mutableIntStateOf(0) }
-    val ui = vm.ui
+fun App(
+    vm: MainViewModel,
+    themeMode: ThemeMode = ThemeMode.SYSTEM,
+    dynamicColor: Boolean = false,
+    onThemeModeChange: (ThemeMode) -> Unit = {},
+    onDynamicColorChange: (Boolean) -> Unit = {}
+) {
+    val context = LocalContext.current
+    val prefs = remember(context) {
+        context.getSharedPreferences(PrismPrefs.NAME, Context.MODE_PRIVATE)
+    }
+    /* 只在首次组合时决定起始页；引导完成后用导航跳转，不重建 NavHost。 */
+    val initialStartWithWelcome = remember {
+        !prefs.getBoolean(PrismPrefs.KEY_ONBOARDED, false)
+    }
+    val navController = rememberNavController()
+    val backStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = backStackEntry?.destination?.route
+    val showBottomBar = PrismDestination.entries.any { it.route == currentRoute }
 
     LaunchedEffect(Unit) { vm.start() }
 
     Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        containerColor = MaterialTheme.colorScheme.background,
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
-            NavigationBar {
-                NavTab(tab, 0, "概览", Icons.Rounded.Speed) { tab = it }
-                NavTab(tab, 1, "设备", Icons.Rounded.Devices) { tab = it }
-                NavTab(tab, 2, "应用", Icons.Rounded.Apps) { tab = it }
-                NavTab(tab, 3, "节点", Icons.Rounded.Hub) { tab = it }
-                NavTab(tab, 4, "拓扑", Icons.Rounded.AccountTree) { tab = it }
-                NavTab(tab, 5, "设置", Icons.Rounded.Settings) { tab = it }
-            }
-        }
-    ) { inner ->
-        Box(Modifier.padding(inner)) {
-            when (tab) {
-                0 -> OverviewScreen(ui, onRefresh = { vm.refresh() }, onOpenDevices = { tab = 1 })
-                1 -> DevicesScreen(ui)
-                2 -> AppsScreen(ui)
-                3 -> NodesScreen(ui, onRetryNodes = { vm.refreshNodes() })
-                4 -> TopologyScreen(ui, onRetryNodes = { vm.refreshNodes() })
-                else -> SettingsScreen(
-                    ui = ui,
-                    onSave = { base, token, interval -> vm.saveSettings(base, token, interval) },
-                    onTest = { base, token, cb -> vm.testConnection(base, token, cb) },
-                    onRefresh = { vm.refresh() }
+            if (showBottomBar) {
+                PrismBottomBar(
+                    currentRoute = currentRoute,
+                    onSelect = { destination -> navController.navigateToTab(destination) }
                 )
             }
         }
+    ) { innerPadding ->
+        val contentModifier = Modifier
+            .fillMaxSize()
+            .padding(innerPadding)
+            .then(if (showBottomBar) Modifier else Modifier.navigationBarsPadding())
+
+        PrismNavHost(
+            vm = vm,
+            navController = navController,
+            startWithWelcome = initialStartWithWelcome,
+            themeMode = themeMode,
+            dynamicColor = dynamicColor,
+            onThemeModeChange = onThemeModeChange,
+            onDynamicColorChange = onDynamicColorChange,
+            onOnboardingComplete = {
+                prefs.edit().putBoolean(PrismPrefs.KEY_ONBOARDED, true).apply()
+                navController.navigate(PrismRoutes.MAIN) {
+                    popUpTo(PrismRoutes.WELCOME) { inclusive = true }
+                    launchSingleTop = true
+                }
+            },
+            modifier = contentModifier
+        )
     }
 }
 
+/**
+ * 底部导航：概览 / 设备 / 应用 / 网络 / 设置。
+ *
+ * 选中态使用 primary + primaryContainer 指示器；文字用 LabelSmall，
+ * 5 项在 390dp 宽度下均分不换行。图标是装饰性的（旁边始终有文字标签），
+ * 因此 contentDescription 交给 Text 语义，避免读屏重复播报。
+ */
 @Composable
-private fun RowScope.NavTab(
-    current: Int,
-    index: Int,
-    label: String,
-    icon: ImageVector,
-    onSelect: (Int) -> Unit
+private fun PrismBottomBar(
+    currentRoute: String?,
+    onSelect: (PrismDestination) -> Unit
 ) {
-    NavigationBarItem(
-        selected = current == index,
-        onClick = { onSelect(index) },
-        icon = { Icon(icon, contentDescription = label) },
-        label = { Text(label, maxLines = 1) }
-    )
+    NavigationBar(
+        modifier = Modifier.navigationBarsPadding(),
+        windowInsets = WindowInsets(0, 0, 0, 0),
+        containerColor = MaterialTheme.colorScheme.surface,
+        tonalElevation = 0.dp
+    ) {
+        PrismDestination.entries.forEach { destination ->
+            val selected = currentRoute == destination.route
+            NavigationBarItem(
+                selected = selected,
+                onClick = { onSelect(destination) },
+                icon = {
+                    Icon(
+                        imageVector = destination.icon,
+                        contentDescription = null
+                    )
+                },
+                label = {
+                    Text(
+                        text = destination.label,
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1
+                    )
+                },
+                alwaysShowLabel = true,
+                colors = NavigationBarItemDefaults.colors(
+                    selectedIconColor = MaterialTheme.colorScheme.primary,
+                    selectedTextColor = MaterialTheme.colorScheme.primary,
+                    indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+                    unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            )
+        }
+    }
 }

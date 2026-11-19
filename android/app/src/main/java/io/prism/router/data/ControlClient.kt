@@ -83,8 +83,17 @@ class ControlClient {
             .post(payload.toString().toRequestBody(JSON))
             .build()
 
+        var httpCode = 0
         val text = try {
-            client.newCall(request).execute().use { res -> res.body?.string().orEmpty() }
+            client.newCall(request).execute().use { res ->
+                /* 先记下 HTTP 状态：后端 5xx 也可能不带 JSON body。 */
+                httpCode = res.code
+                res.body?.string().orEmpty()
+            }
+        } catch (e: java.net.SocketTimeoutException) {
+            throw ControlException("timeout", "连接超时：请检查面板地址与网络")
+        } catch (e: java.io.InterruptedIOException) {
+            throw ControlException("timeout", "连接超时：请检查面板地址与网络")
         } catch (e: Exception) {
             throw ControlException("network", "连接失败：${e.message ?: e.javaClass.simpleName}")
         }
@@ -98,7 +107,12 @@ class ControlClient {
         /* 后端 4xx/5xx 也带 JSON body，所以先看 error 再看 HTTP 状态。 */
         val error = json?.optString("error", "").orEmpty()
         if (error.isNotEmpty()) throw ControlException(error, messageFor(error))
-        if (json == null) throw ControlException("bad_response", "面板返回异常数据")
+        if (json == null) {
+            throw ControlException(
+                if (httpCode >= 500) "server" else "bad_response",
+                if (httpCode >= 500) "面板服务异常（HTTP $httpCode）" else "面板返回异常数据"
+            )
+        }
         if (!json.optBoolean("ok", false)) throw ControlException("bad_response", "面板未确认操作结果")
         return json
     }

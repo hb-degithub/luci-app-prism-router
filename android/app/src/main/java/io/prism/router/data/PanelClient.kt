@@ -1,26 +1,65 @@
 package io.prism.router.data
 
+import android.util.Log
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import org.json.JSONObject
+import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 
-class PanelException(message: String) : Exception(message)
+/**
+ * 面板只读 API 失败。
+ *
+ * [code] 是稳定的本地 / 服务端错误码（`unauthorized` / `forbidden` / `network` /
+ * `timeout` / `server` / `badResponse`），由
+ * `PanelRepository` 统一映射为面向 UI 的 `AppError`；[message] 已是可直接展示的中文，
+ * 且绝不包含 token。
+ */
+class PanelException(
+    override val message: String,
+    val code: String = "",
+    cause: Throwable? = null
+) : Exception(message, cause)
 
 /**
  * 只读客户端：调用棱镜路由独立面板的 JSON API。
  * 默认地址 http://<路由器>:8099/ ，可在设置里改。所有请求都只读
  * （what=state / history / nodes / status），不会修改路由器配置。
+ *
+ * 网络策略：
+ * - connect 8s / read 15s（写超时同 15s，仅用于统一连接池配置）；
+ * - 仅幂等 GET 在 IOException 或 5xx 时重试 1 次；
+ * - 日志只记录 method / host / path / status / 耗时，绝不打印 query（token 在
+ *   query 里）与请求体。
  */
 class PanelClient {
+    private companion object {
+        const val CONNECT_TIMEOUT_SEC = 8L
+        const val READ_TIMEOUT_SEC = 15L
+        const val WRITE_TIMEOUT_SEC = 15L
+    }
+
     private val client = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
+        .connectTimeout(CONNECT_TIMEOUT_SEC, TimeUnit.SECONDS)
+        .readTimeout(READ_TIMEOUT_SEC, TimeUnit.SECONDS)
+        .writeTimeout(WRITE_TIMEOUT_SEC, TimeUnit.SECONDS)
+        .addInterceptor(RetryIdempotentOnceInterceptor())
+        .addInterceptor(RedactingLogInterceptor())
         .build()
 
     fun fetchState(baseUrl: String, token: String?): PanelState {
         val body = get(baseUrl, "state", token)
-        return parseState(body)
+        return try {
+            parseState(body)
+        } catch (e: PanelException) {
+            throw e
+        } catch (e: Exception) {
+            throw PanelException("状态响应无法解析", "badResponse", e)
+        }
     }
 
     /**
@@ -30,7 +69,13 @@ class PanelClient {
     fun fetchHistory(baseUrl: String, token: String?, days: Int = 7): List<DailyUsage> {
         val n = days.coerceIn(1, 31)
         val body = get(baseUrl, "history", token, "days=$n")
-        return parseHistory(body)
+        return try {
+            parseHistory(body)
+        } catch (e: PanelException) {
+            throw e
+        } catch (e: Exception) {
+            throw PanelException("历史响应无法解析", "badResponse", e)
+        }
     }
 
     /**
@@ -39,7 +84,13 @@ class PanelClient {
      */
     fun fetchNodes(baseUrl: String, token: String?): List<SubNode> {
         val body = get(baseUrl, "nodes", token)
-        return parseNodes(body)
+        return try {
+            parseNodes(body)
+        } catch (e: PanelException) {
+            throw e
+        } catch (e: Exception) {
+            throw PanelException("子节点响应无法解析", "badResponse", e)
+        }
     }
 
     /**
@@ -57,13 +108,17 @@ class PanelClient {
         } catch (e: PanelException) {
             throw e
         } catch (e: Exception) {
-            throw PanelException("应用历史响应无法解析")
+            throw PanelException("应用历史响应无法解析", "badResponse", e)
         }
     }
 
     fun testConnection(baseUrl: String, token: String?): String {
         val body = get(baseUrl, "status", token)
-        val o = JSONObject(body)
+        val o = try {
+            JSONObject(body)
+        } catch (e: Exception) {
+            throw PanelException("状态响应无法解析", "badResponse", e)
+        }
         val version = o.optString("version", "?")
         val running = o.optBoolean("running", false)
         return "连接成功：版本 $version，服务${if (running) "运行中" else "未运行"}"
@@ -87,7 +142,7 @@ class PanelClient {
         } catch (e: PanelException) {
             throw e
         } catch (e: Exception) {
-            throw PanelException("状态响应无法解析")
+            throw PanelException("状态响应无法解析", "badResponse", e)
         }
 
         val fromHealth = status.optJSONObject("health")?.optLong("clash_poll_ms", 0L) ?: 0L
@@ -106,7 +161,7 @@ class PanelClient {
 
     private fun get(baseUrl: String, what: String, token: String?, extraQuery: String? = null): String {
         val base = baseUrl.trim().trimEnd('/')
-        if (base.isEmpty()) throw PanelException("请先在设置里填写面板地址")
+        if (base.isEmpty()) throw PanelException("请先在设置里填写面板地址", "badResponse")
         var url = "$base/cgi-bin/panel-api?what=$what"
         if (!extraQuery.isNullOrBlank()) url += "&$extraQuery"
         if (!token.isNullOrBlank()) {
@@ -117,20 +172,46 @@ class PanelClient {
             client.newCall(request).execute().use { res ->
                 val text = res.body?.string().orEmpty()
                 if (!res.isSuccessful) {
-                    val err = try {
-                        JSONObject(text).optString("error", "HTTP ${res.code}")
+                    val serverError = try {
+                        JSONObject(text).optString("error", "")
                     } catch (e: Exception) {
-                        "HTTP ${res.code}"
+                        ""
                     }
-                    throw PanelException(if (err == "unauthorized") "需要访问令牌，请在设置里填写" else err)
+                    val code = when {
+                        res.code == 401 -> "unauthorized"
+                        res.code == 403 ->
+                            if (serverError.equals("forbidden", ignoreCase = true)) "forbidden" else "unauthorized"
+                        res.code >= 500 -> "server"
+                        serverError.equals("unauthorized", ignoreCase = true) -> "unauthorized"
+                        serverError.equals("forbidden", ignoreCase = true) -> "forbidden"
+                        else -> "badResponse"
+                    }
+                    val message = when (code) {
+                        "unauthorized" -> "需要访问令牌，请在设置里填写"
+                        "forbidden" -> "访问令牌无效"
+                        "server" -> "面板服务异常（HTTP ${res.code}）"
+                        else -> serverError.ifBlank { "HTTP ${res.code}" }
+                    }
+                    throw PanelException(message, code)
                 }
                 return text
             }
         } catch (e: PanelException) {
             throw e
+        } catch (e: SocketTimeoutException) {
+            throw PanelException("连接超时：${safeErrorText(e)}", "timeout", e)
+        } catch (e: InterruptedIOException) {
+            /* OkHttp 的 callTimeout / 读超时也可能表现为 InterruptedIOException。 */
+            throw PanelException("连接超时：${safeErrorText(e)}", "timeout", e)
         } catch (e: Exception) {
-            throw PanelException("连接失败：${e.message ?: e.javaClass.simpleName}")
+            throw PanelException("连接失败：${safeErrorText(e)}", "network", e)
         }
+    }
+
+    /** 错误文案脱敏：即使底层异常带上完整 URL，也不把 query 里的 token 带到界面。 */
+    private fun safeErrorText(error: Throwable): String {
+        val raw = error.message ?: error.javaClass.simpleName
+        return raw.replace(TOKEN_IN_TEXT, "token=***")
     }
 
     /** 解析 state（也用于读取离线缓存里同结构的 JSON）。缺失字段一律按默认值处理。 */
@@ -435,5 +516,71 @@ class PanelClient {
         val merged = totals.optLong(directKey) + totals.optLong(proxyKey)
         val total = totals.optLong(key)
         return if (total > 0) total else merged
+    }
+}
+
+/* ───────────────────────── OkHttp 拦截器 ───────────────────────── */
+
+private const val PANEL_LOG_TAG = "PanelClient"
+
+/** 错误文案里的 token 脱敏（query 形式 `token=...`，大小写不敏感）。 */
+private val TOKEN_IN_TEXT = Regex("""(token=)[^&\s]+""", RegexOption.IGNORE_CASE)
+
+/**
+ * 只对幂等 GET 失败重试 1 次。
+ *
+ * - 网络异常（连接重置 / 超时 / DNS 抖动）：重试一次；
+ * - HTTP 5xx：关闭响应后重试一次；
+ * - 非 GET（家长控制 POST）绝不重试，避免重复写操作；
+ * - 调用已取消时立刻放弃，不吞取消信号。
+ */
+private class RetryIdempotentOnceInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val canRetry = request.method.equals("GET", ignoreCase = true)
+        var attempt = 0
+        while (true) {
+            attempt++
+            try {
+                val response = chain.proceed(request)
+                if (canRetry && attempt == 1 && response.code >= 500) {
+                    response.close()
+                    continue
+                }
+                return response
+            } catch (e: IOException) {
+                if (!canRetry || attempt >= 2 || chain.call().isCanceled()) throw e
+                /* 幂等 GET：继续循环，再试一次。 */
+            }
+        }
+    }
+}
+
+/**
+ * 脱敏访问日志：只输出 method / scheme / host / port / path / status / 耗时。
+ *
+ * query 完全不打印（面板 token 放在 query 里），也不打印请求 / 响应体；
+ * 日志失败（例如 JVM 单测没有 android.util.Log）时静默忽略，不影响请求。
+ */
+private class RedactingLogInterceptor : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val url = request.url
+        val target = "${url.scheme}://${url.host}:${url.port}${url.encodedPath}"
+        val startedAt = System.nanoTime()
+        return try {
+            val response = chain.proceed(request)
+            log("${request.method} $target -> ${response.code} (${elapsedMs(startedAt)} ms)")
+            response
+        } catch (e: IOException) {
+            log("${request.method} $target -> ${e.javaClass.simpleName} (${elapsedMs(startedAt)} ms)")
+            throw e
+        }
+    }
+
+    private fun elapsedMs(startedAt: Long): Long = (System.nanoTime() - startedAt) / 1_000_000
+
+    private fun log(line: String) {
+        runCatching { Log.d(PANEL_LOG_TAG, line) }
     }
 }

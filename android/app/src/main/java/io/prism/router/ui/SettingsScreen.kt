@@ -155,8 +155,7 @@ fun SettingsScreen(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("设置", fontSize = 22.sp, fontWeight = FontWeight.Bold)
-
+        /* 页面标题由外层 PrismScaffold 提供，这里不再重复渲染「设置」大标题。 */
         Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("服务器", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)

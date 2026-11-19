@@ -59,6 +59,10 @@ dependencies {
     implementation("androidx.activity:activity-ktx:1.9.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+    /* 导航：5 项底部导航 + 设置子页，saveState/restoreState 保留各页签状态。 */
+    implementation("androidx.navigation:navigation-compose:2.8.3")
+    /* 设置存储：DataStore Preferences（替换原来的 SharedPreferences 配置读写）。 */
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation(platform("androidx.compose:compose-bom:2024.09.02"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-tooling-preview")

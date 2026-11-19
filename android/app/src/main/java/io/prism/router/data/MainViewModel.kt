@@ -7,19 +7,34 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import io.prism.router.notify.AlertsNotifier
+import io.prism.router.PrismApplication
+import io.prism.router.data.repository.AppError
+import io.prism.router.data.repository.PanelRepository
+import io.prism.router.data.store.AppSettings
+import io.prism.router.data.store.DEFAULT_SERVER
+import io.prism.router.data.store.SettingsStore
+import io.prism.router.di.AppContainer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
 
+/**
+ * 主界面状态。
+ *
+ * 字段保持与旧版完全一致（屏幕层零改动）；配置类字段（[baseUrl] / [token] /
+ * [intervalSec] / [servers] / [activeIndex]）由 DataStore 经 [MainViewModel] 同步，
+ * 运行数据（state / 历史 / 节点 / 应用 / 告警）由仓库轮询写入。
+ */
 data class UiState(
-    val baseUrl: String = "http://192.168.100.1:8099",
+    val baseUrl: String = DEFAULT_BASE_URL,
     val token: String = "",
     val intervalSec: Int = 15,
     val state: PanelState? = null,
@@ -43,8 +58,8 @@ data class UiState(
     /** 应用多日汇总的最近一次拉取（或尝试）时间，用于 5 分钟节流。 */
     val apps7dAt: Long = 0,
     val apps7dError: String? = null,
-    /** 多路由器：地址列表与当前选中项（下标）。空列表时由 init 迁移出单条。 */
-    val servers: List<ServerProfile> = emptyList(),
+    /** 多路由器：地址列表与当前选中项（下标）。空列表时退回默认地址。 */
+    val servers: List<ServerProfile> = listOf(DEFAULT_SERVER),
     val activeIndex: Int = 0,
     /** ViewModel 本地计算的告警，已按严重度排序。 */
     val alerts: List<Alert> = emptyList(),
@@ -54,36 +69,33 @@ data class UiState(
     val offlineAt: Long = 0
 )
 
+/**
+ * 一次性 UI 事件（用 [Channel] 而非状态，避免旋转屏幕 / 重组时重复消费）。
+ *
+ * 现有屏幕尚未接入；后续可直接 `lifecycleScope.launch { vm.eventsFlow.collect { ... } }`。
+ */
+sealed interface UiEvent {
+    /** 简短提示：连接失败、配置已保存等。 */
+    data class Snackbar(val message: String) : UiEvent
+
+    /** 已切换到另一台路由器（旧数据已清空并重新开始轮询）。 */
+    data object ServerSwitched : UiEvent
+}
+
 /** 离线缓存的读取结果。 */
 private data class CachedState(val state: PanelState, val at: Long)
 
-/** 多路由器地址上限。设置页据此禁用「添加」并提示。 */
-const val MAX_SERVERS = 8
-
 /**
- * 一个可切换的面板地址（多路由器）。
+ * 主 ViewModel：只做「状态编排」，网络 / 存储全部委托给仓库与 [SettingsStore]。
  *
- * [name] 是用户起的短名（列表标题），[url] 是面板根地址（不带末尾斜杠），
- * [token] 是可选的访问令牌。持久化在 SharedPreferences 的 `servers` JSON 数组里。
+ * - 容器来自 [PrismApplication]，用 `AndroidViewModel` 取 Application 免去 Hilt；
+ * - 配置读写是 suspend，但对外接口（[saveSettings]、[addServer] 等）保持同步签名，
+ *   内部 `viewModelScope.launch` 落盘；
+ * - 轮询 15s（可在设置里改 5–300s），历史 / 节点 / 应用多日汇总 5 分钟节流，
+ *   失败 1 分钟后重试；
+ * - 网络失败展示 ≤24h 的离线快照（仍存 SharedPreferences，兼容旧版本数据）；
+ * - 主数据失败时发一次 [UiEvent.Snackbar]（同一文案去重，避免每 15s 刷屏）。
  */
-data class ServerProfile(
-    val name: String,
-    val url: String,
-    val token: String = ""
-) {
-    /** 展示名：名称缺失时退回地址里的主机名，避免列表出现空标题。 */
-    val displayName: String get() = name.trim().ifBlank { hostOf(url) }
-
-    companion object {
-        /** 从 URL 里取主机名（兼容无 scheme、带端口 / 路径的写法）。 */
-        fun hostOf(url: String): String {
-            val noScheme = url.trim().substringAfter("://", url.trim())
-            val host = noScheme.substringBefore('/').substringBefore(':')
-            return host.ifBlank { "路由器" }
-        }
-    }
-}
-
 class MainViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         const val HISTORY_DAYS = 7
@@ -94,9 +106,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         const val CACHE_TTL_MS = 24 * 60 * 60 * 1000L
         const val PREF_STATE = "stateCache"
         const val PREF_STATE_AT = "stateCacheAt"
-        /* 多路由器：地址列表与当前下标（老键 baseUrl/token 继续同步，保持兼容）。 */
-        const val PREF_SERVERS = "servers"
-        const val PREF_ACTIVE = "activeServer"
         /* 应用多日汇总：正常 5 分钟一次，失败 1 分钟后重试。 */
         const val APPS_DAYS = 7
         const val APPS_REFRESH_MS = 5 * 60 * 1000L
@@ -105,43 +114,143 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         /* 告警阈值与规则见 data/AlertRules.kt（纯函数，便于单测）。 */
     }
 
+    /* 依赖容器：Manifest 已注册 PrismApplication；兜底分支仅用于预览 / 旧宿主环境。 */
+    private val container: AppContainer =
+        (app as? PrismApplication)?.container ?: AppContainer(app)
+    private val repository: PanelRepository = container.panelRepository
+    private val settingsStore: SettingsStore = container.settingsStore
+
+    /**
+     * 仅保留离线快照的 SharedPreferences（`stateCache` / `stateCacheAt`）；
+     * 地址 / 令牌 / 间隔等配置已全部迁移到 DataStore。
+     */
     private val prefs = app.getSharedPreferences("prism-router", Context.MODE_PRIVATE)
-    private val client = PanelClient()
+
     private var job: Job? = null
     private var historyJob: Job? = null
     private var nodesJob: Job? = null
     private var appsJob: Job? = null
 
+    /** 配置是否已从 DataStore 读出；读出前不发起网络请求，避免用默认地址空跑。 */
+    private var settingsReady = false
+    private var autoStart = false
+    private var pendingRefresh = false
+    private var notifyEnabled = true
+
+    /** 与上一次已发送的错误文案比较，避免轮询失败时重复弹 Snackbar。 */
+    private var lastEmittedError: String? = null
+
+    /** 一次性事件通道（容量有限，消费方未接入时不会阻塞主流程）。 */
+    val events: Channel<UiEvent> = Channel(Channel.BUFFERED)
+
+    /** 事件的 Flow 形式；屏幕后续可直接 collect。 */
+    val eventsFlow: Flow<UiEvent> = events.receiveAsFlow()
+
     var ui by mutableStateOf(UiState())
         private set
 
+    /** 当前地址列表（同步只读视图，兼容旧屏幕 / 新代码）。 */
+    val servers: List<ServerProfile> get() = ui.servers
+
+    /** 当前地址下标。 */
+    val activeIndex: Int get() = ui.activeIndex
+
+    /** 当前选中的地址（设置页标题 / 状态卡展示用）。 */
+    val activeServer: ServerProfile?
+        get() = ui.servers.getOrNull(ui.activeIndex)
+
     init {
-        val legacyBase = normalizeUrl(prefs.getString("baseUrl", null) ?: ui.baseUrl)
-        val legacyToken = prefs.getString("token", "") ?: ""
-        val stored = readServers()
-        /* 首次启动 / 老版本升级：把原来的单个 baseUrl + token 迁移成一条地址。 */
-        val servers = stored.ifEmpty {
-            listOf(ServerProfile("主路由", legacyBase, legacyToken))
+        observeSettings()
+    }
+
+    /* ───────────────────────── 设置状态流 ───────────────────────── */
+
+    /**
+     * 收集 [SettingsStore.settings]：首个值到达后同步到 [ui] 并启动轮询。
+     *
+     * DataStore 是所有配置的唯一真源；界面上的保存 / 切换最终都会回到这条流，
+     * 因此外部（未来设置页的主题、通知开关）改动也能自动反映。
+     */
+    private fun observeSettings() {
+        viewModelScope.launch {
+            try {
+                settingsStore.settings.collect { snapshot ->
+                    val first = !settingsReady
+                    applySettings(snapshot)
+                    if (first) onSettingsReady()
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                /* DataStore 不可用：用默认配置继续运行，不让应用停在空白页。 */
+                applySettings(settingsStore.fallbackSettings())
+                if (!settingsReady) onSettingsReady()
+            }
         }
-        val active = resolveActiveIndex(servers)
-        val current = servers[active]
+    }
+
+    private fun applySettings(settings: AppSettings) {
+        notifyEnabled = settings.notifyEnabled
+        val servers = settings.servers.ifEmpty { listOf(DEFAULT_SERVER) }
+        val index = settings.activeIndex.coerceIn(0, servers.lastIndex)
+        val current = servers[index]
+        val interval = settings.intervalSec.coerceIn(5, 300)
+        if (ui.servers == servers &&
+            ui.activeIndex == index &&
+            ui.baseUrl == current.url &&
+            ui.token == current.token &&
+            ui.intervalSec == interval
+        ) {
+            return
+        }
         ui = ui.copy(
             baseUrl = current.url,
             token = current.token,
-            intervalSec = prefs.getInt("interval", 15).coerceIn(5, 300),
+            intervalSec = interval,
             servers = servers,
-            activeIndex = active
+            activeIndex = index
         )
-        /* 迁移结果写回：老代码只认 baseUrl/token，新代码以 servers 为准，两边保持同步。 */
-        persistServers(servers, active)
     }
 
+    private fun onSettingsReady() {
+        if (settingsReady) return
+        settingsReady = true
+        when {
+            autoStart -> {
+                autoStart = false
+                val force = pendingRefresh
+                pendingRefresh = false
+                startPolling(forceHistory = force)
+            }
+
+            pendingRefresh -> {
+                pendingRefresh = false
+                refreshState(forceHistory = true)
+            }
+        }
+    }
+
+    /* ───────────────────────── 轮询生命周期 ───────────────────────── */
+
     fun start() {
+        startPolling(forceHistory = false)
+    }
+
+    private fun startPolling(forceHistory: Boolean) {
         if (job != null) return
+        if (!settingsReady) {
+            /* 界面先调 start()、配置稍后才读到：记下来，读到后自动接着启动。 */
+            autoStart = true
+            if (forceHistory) pendingRefresh = true
+            return
+        }
         job = viewModelScope.launch {
+            var force = forceHistory || pendingRefresh
+            pendingRefresh = false
             while (isActive) {
-                refreshState()
-                delay(ui.intervalSec * 1000L)
+                refreshState(forceHistory = force)
+                force = false
+                delay(ui.intervalSec.coerceIn(5, 300) * 1000L)
             }
         }
     }
@@ -159,21 +268,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 手动刷新：state 立即重取，history / nodes / 应用多日汇总一并强制重取。 */
     fun refresh() {
+        if (!settingsReady) {
+            pendingRefresh = true
+            return
+        }
         refreshState(forceHistory = true)
     }
 
     /** 子节点 / AP 手动重试（节点屏、拓扑屏的「重试」按钮）。 */
     fun refreshNodes() {
+        if (!settingsReady) return
         loadNodes(force = true)
     }
 
+    /* ───────────────────────── 主数据 ───────────────────────── */
+
     private fun refreshState(forceHistory: Boolean = false) {
+        if (!settingsReady) {
+            pendingRefresh = true
+            return
+        }
         val base = ui.baseUrl
         val token = ui.token
         ui = ui.copy(loading = true)
         viewModelScope.launch {
             try {
-                val state = client.fetchState(base, token)
+                val state = repository.state(base, token)
                 /* 请求期间用户改了服务器/令牌：丢弃这次旧结果。 */
                 if (ui.baseUrl != base || ui.token != token) return@launch
                 val rxHist = (ui.rxHistory + state.totals.rxRate).takeLast(24)
@@ -192,6 +312,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                     offline = false,
                     offlineAt = 0
                 )
+                lastEmittedError = null
                 /* 成功即覆盖缓存（同时视为清理了上次的离线态）。 */
                 saveCache(state)
                 if (alertsChanged && alerts.isNotEmpty()) notifyAlerts(alerts)
@@ -223,11 +344,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     ui = ui.copy(loading = false, error = message)
                 }
+                emitErrorOnce(message)
             }
             refreshHistory(forceHistory)
             loadNodes(force = forceHistory)
             loadAppsHistory(force = forceHistory)
         }
+    }
+
+    private fun emitErrorOnce(message: String) {
+        if (lastEmittedError == message) return
+        lastEmittedError = message
+        events.trySend(UiEvent.Snackbar(message))
     }
 
     /* ───────────────────────── 历史趋势 ───────────────────────── */
@@ -244,7 +372,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val token = ui.token
         historyJob = viewModelScope.launch {
             try {
-                val days = client.fetchHistory(base, token, HISTORY_DAYS)
+                val days = repository.history(base, token, HISTORY_DAYS)
                 if (ui.baseUrl != base || ui.token != token) return@launch
                 ui = ui.copy(
                     history = days,
@@ -284,7 +412,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val token = ui.token
         nodesJob = viewModelScope.launch {
             try {
-                val nodes = client.fetchNodes(base, token)
+                val nodes = repository.nodes(base, token)
                 if (ui.baseUrl != base || ui.token != token) return@launch
                 ui = ui.copy(
                     nodesList = nodes,
@@ -313,6 +441,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * 保留上一次成功的列表，绝不影响主数据；应用页据此显示「错误 + 重试」。
      */
     fun loadAppsHistory(force: Boolean = false) {
+        if (!settingsReady) return
         val now = System.currentTimeMillis()
         val refreshMs = if (ui.apps7dError != null) APPS_RETRY_MS else APPS_REFRESH_MS
         val due = force || ui.apps7dAt == 0L || now - ui.apps7dAt > refreshMs
@@ -323,7 +452,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         val token = ui.token
         appsJob = viewModelScope.launch {
             try {
-                val apps = client.fetchAppsHistory(base, token, APPS_DAYS)
+                val apps = repository.appsHistory(base, token, APPS_DAYS)
                 if (ui.baseUrl != base || ui.token != token) return@launch
                 ui = ui.copy(
                     apps7d = apps,
@@ -348,18 +477,19 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 把本轮告警交给通知器：只发红 / 橙，同一 key 24 小时内只发一次。
      *
-     * 用 application context；失败（无权限 / 渠道被系统关闭 / 离线）静默，
-     * 异常一律吞掉，不影响刷新与页面。
+     * 受设置项 `notifyEnabled` 控制；用 application context；失败（无权限 / 渠道被
+     * 系统关闭 / 离线）静默，异常一律吞掉，不影响刷新与页面。
      */
-    private fun notifyAlerts(alerts: List<Alert>) {
+    fun notifyAlerts(alerts: List<Alert>) {
+        if (!notifyEnabled || alerts.isEmpty()) return
         try {
-            AlertsNotifier.notifyIfNeeded(getApplication(), alerts)
+            container.alertsNotifier.notifyIfNeeded(getApplication(), alerts)
         } catch (e: Exception) {
             /* 通知只是锦上添花，异常不上抛。 */
         }
     }
 
-    /* ───────────────────────── 离线缓存 ───────────────────────── */
+    /* ───────────────────────── 离线缓存（SharedPreferences 兼容） ───────────────────────── */
 
     private suspend fun saveCache(state: PanelState) {
         try {
@@ -384,7 +514,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 clearCache()
                 return null
             }
-            CachedState(client.parseState(raw), at)
+            CachedState(repository.parseCachedState(raw), at)
         } catch (e: Exception) {
             clearCache()
             null
@@ -403,10 +533,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     /* ───────────────────────── 多路由器 ───────────────────────── */
 
-    /** 当前选中的地址（设置页标题 / 状态卡展示用）。 */
-    val activeServer: ServerProfile?
-        get() = ui.servers.getOrNull(ui.activeIndex)
-
     /**
      * 添加一台路由器（最多 [MAX_SERVERS] 条）。
      *
@@ -414,7 +540,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * 只写配置、不自动切换；用户点「切换到」才生效。
      */
     fun addServer(name: String, url: String, token: String): String? {
-        val cleanUrl = normalizeUrl(url)
+        if (!settingsReady) return "设置正在加载，请稍后重试"
+        val cleanUrl = normalizeServerUrl(url)
         if (cleanUrl.isEmpty()) return "请填写面板地址"
         if (ui.servers.size >= MAX_SERVERS) return "最多 $MAX_SERVERS 个地址，请先删除一条"
         if (ui.servers.any { it.url.equals(cleanUrl, ignoreCase = true) }) return "该地址已在列表中"
@@ -432,6 +559,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * 返回 `null` 表示成功，否则返回错误文案。
      */
     fun removeServer(index: Int): String? {
+        if (!settingsReady) return "设置正在加载，请稍后重试"
         if (index !in ui.servers.indices) return "地址不存在"
         if (ui.servers.size <= 1) return "至少保留一个地址"
         val list = ui.servers.toMutableList().apply { removeAt(index) }
@@ -493,91 +621,38 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             offline = false,
             offlineAt = 0
         )
+        lastEmittedError = null
         persistServers(ui.servers, index)
         start()
+        events.trySend(UiEvent.ServerSwitched)
     }
 
-    /** 读取 `servers`（JSON 数组）；损坏 / 缺省时返回空列表，由 init 走迁移。 */
-    private fun readServers(): List<ServerProfile> {
-        val raw = prefs.getString(PREF_SERVERS, null) ?: return emptyList()
-        return try {
-            val arr = JSONArray(raw)
-            val out = ArrayList<ServerProfile>(arr.length())
-            for (i in 0 until arr.length()) {
-                if (out.size >= MAX_SERVERS) break
-                val o = arr.optJSONObject(i) ?: continue
-                val url = normalizeUrl(o.optString("url", ""))
-                if (url.isEmpty()) continue
-                out.add(
-                    ServerProfile(
-                        name = o.optString("name", "").trim(),
-                        url = url,
-                        token = o.optString("token", "")
-                    )
-                )
-            }
-            out
-        } catch (e: Exception) {
-            /* 配置损坏按「还没有地址列表」处理，让 init 用老键迁移，不崩。 */
-            emptyList()
-        }
-    }
-
-    /**
-     * 保存 `servers` + `activeServer`，并同步老键 `baseUrl` / `token`：
-     * 老版本 / 其它模块只读这两个键，保持兼容。
-     */
+    /** 配置落盘：DataStore 原子写入（内部保证先完成首次迁移）。 */
     private fun persistServers(servers: List<ServerProfile>, active: Int) {
         val list = servers.take(MAX_SERVERS)
         val index = if (list.isEmpty()) 0 else active.coerceIn(0, list.lastIndex)
-        val arr = JSONArray()
-        list.forEach { server ->
-            arr.put(
-                JSONObject()
-                    .put("name", server.name)
-                    .put("url", server.url)
-                    .put("token", server.token)
-            )
+        val interval = ui.intervalSec
+        viewModelScope.launch {
+            try {
+                settingsStore.saveConnection(list, index, interval)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                /* 落盘失败只能提示：内存里的配置仍然可用，下一次操作会重试写入。 */
+                events.trySend(UiEvent.Snackbar("设置保存失败：${e.message ?: "未知错误"}"))
+            }
         }
-        val editor = prefs.edit()
-            .putString(PREF_SERVERS, arr.toString())
-            .putInt(PREF_ACTIVE, index)
-        if (list.isNotEmpty()) {
-            editor.putString("baseUrl", list[index].url)
-            editor.putString("token", list[index].token)
-        }
-        editor.apply()
     }
 
-    /**
-     * 当前地址下标：优先用保存的 `activeServer`（兼容 Int / 数字字符串），
-     * 越界 / 缺失时退回与老键 `baseUrl` 相同的那条，再退回第一条。
-     */
-    private fun resolveActiveIndex(servers: List<ServerProfile>): Int {
-        if (servers.isEmpty()) return 0
-        val raw = prefs.all[PREF_ACTIVE]
-        val saved = when (raw) {
-            is Int -> raw
-            is Long -> raw.toInt()
-            is String -> raw.trim().toIntOrNull() ?: -1
-            else -> -1
-        }
-        if (saved in servers.indices) return saved
-        val legacyBase = normalizeUrl(prefs.getString("baseUrl", "") ?: "")
-        val legacyIndex = servers.indexOfFirst { it.url == legacyBase }
-        return if (legacyIndex >= 0) legacyIndex else 0
-    }
-
-    /** 地址归一化：去空白与末尾斜杠；空串保持空（由调用方提示）。 */
-    private fun normalizeUrl(url: String): String = url.trim().trimEnd('/')
+    /* ───────────────────────── 设置保存 / 连接测试 ───────────────────────── */
 
     fun saveSettings(baseUrl: String, token: String, intervalSec: Int) {
-        val clean = normalizeUrl(baseUrl)
+        val clean = normalizeServerUrl(baseUrl)
         /* 当前地址的编辑直接写回列表里的当前条，保证列表与输入框一致。 */
         val list = ui.servers.toMutableList()
         val index = if (list.isEmpty()) 0 else ui.activeIndex.coerceIn(0, list.lastIndex)
         if (list.isEmpty()) {
-            list.add(ServerProfile("主路由", clean, token))
+            list.add(ServerProfile("主路由", clean.ifBlank { DEFAULT_BASE_URL }, token))
         } else {
             val current = list[index]
             list[index] = current.copy(
@@ -588,16 +663,16 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         /* 输入框留空时不把空串写进 ui，否则界面会一直停在「请填写地址」的报错态。 */
         val effective = clean.ifBlank { list[index].url }
+        val interval = intervalSec.coerceIn(5, 300)
+        /* 换了服务器，旧快照不再代表当前面板，直接清掉。 */
         prefs.edit()
-            .putInt("interval", intervalSec.coerceIn(5, 300))
-            /* 换了服务器，旧快照不再代表当前面板，直接清掉。 */
             .remove(PREF_STATE)
             .remove(PREF_STATE_AT)
             .apply()
         ui = ui.copy(
             baseUrl = effective,
             token = token,
-            intervalSec = intervalSec.coerceIn(5, 300),
+            intervalSec = interval,
             servers = list,
             activeIndex = index,
             offline = false,
@@ -613,6 +688,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             nodesAt = 0,
             nodesError = null
         )
+        lastEmittedError = null
         persistServers(list, index)
         stop()
         start()
@@ -621,9 +697,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun testConnection(baseUrl: String, token: String, onResult: (String) -> Unit) {
         viewModelScope.launch {
             val result = try {
-                client.testConnection(baseUrl.trim().trimEnd('/'), token)
+                repository.testConnection(normalizeServerUrl(baseUrl), token)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                "连接失败：${e.message}"
+                val message = (e as? AppError)?.message ?: e.message ?: "未知错误"
+                "连接失败：$message"
             }
             onResult(result)
         }
@@ -631,6 +710,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         stop()
+        events.close()
         super.onCleared()
     }
 }
