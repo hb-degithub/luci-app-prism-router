@@ -1,9 +1,11 @@
 package io.prism.router.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,6 +19,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -24,8 +27,11 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,13 +40,19 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import io.prism.router.data.MAX_SERVERS
+import io.prism.router.data.MainViewModel
 import io.prism.router.data.PanelClient
+import io.prism.router.data.ServerProfile
 import io.prism.router.data.UiState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -73,11 +85,32 @@ fun SettingsScreen(
     onTest: (String, String, (String) -> Unit) -> Unit,
     onRefresh: () -> Unit
 ) {
+    /*
+     * 多路由器的增删切换都在 ViewModel；调用方（App.kt）不在本次改动范围，只传了
+     * onSave / onTest / onRefresh，所以这里取 Activity 作用域的同一个 MainViewModel
+     * （MainActivity 用 by viewModels() 创建），仅用于地址列表的增删切换。
+     */
+    val vm: MainViewModel = viewModel()
+
     var base by rememberSaveable { mutableStateOf(ui.baseUrl) }
     var token by rememberSaveable { mutableStateOf(ui.token) }
     var interval by rememberSaveable { mutableStateOf(ui.intervalSec.toString()) }
     var testResult by rememberSaveable { mutableStateOf<String?>(null) }
     var showToken by remember { mutableStateOf(false) }
+    /* 「添加服务器」表单与操作反馈。 */
+    var showAdd by rememberSaveable { mutableStateOf(false) }
+    var addName by rememberSaveable { mutableStateOf("") }
+    var addUrl by rememberSaveable { mutableStateOf("") }
+    var addToken by rememberSaveable { mutableStateOf("") }
+    var serverMsg by rememberSaveable { mutableStateOf<String?>(null) }
+    var serverMsgError by rememberSaveable { mutableStateOf(false) }
+    var pendingDelete by remember { mutableStateOf<Int?>(null) }
+
+    /* 切换当前服务器后，把输入框同步到新的地址；手动编辑时 ui 不变，不会被覆盖。 */
+    LaunchedEffect(ui.baseUrl, ui.token) {
+        if (base != ui.baseUrl) base = ui.baseUrl
+        if (token != ui.token) token = ui.token
+    }
 
     /* 诊断：status 只在点「刷新诊断」时读取一次，失败只影响「版本与服务」一项。 */
     val client = remember { PanelClient() }
@@ -127,6 +160,13 @@ fun SettingsScreen(
         Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("服务器", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "当前：${vm.activeServer?.displayName ?: "未配置"} · 共 ${ui.servers.size} 个地址",
+                    fontSize = 11.sp,
+                    color = SubText,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
                 OutlinedTextField(
                     value = base,
                     onValueChange = { base = it },
@@ -174,10 +214,84 @@ fun SettingsScreen(
             }
         }
 
+        /* 多路由器：地址列表（切换 / 删除）+ 添加表单，最多 MAX_SERVERS 条。 */
+        Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "多路由器",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text("${ui.servers.size} / $MAX_SERVERS", fontSize = 11.sp, color = SubText)
+                }
+                Text(
+                    "点任一地址即切换；切换会停止并重启轮询，重新拉取该路由器的数据。",
+                    fontSize = 11.sp,
+                    color = SubText
+                )
+                ui.servers.forEachIndexed { index, server ->
+                    ServerRow(
+                        server = server,
+                        active = index == ui.activeIndex,
+                        canDelete = ui.servers.size > 1,
+                        onSelect = {
+                            if (index != ui.activeIndex) {
+                                vm.selectServer(index)
+                                serverMsg = "已切换到 ${server.displayName}"
+                                serverMsgError = false
+                            }
+                        },
+                        onDelete = { pendingDelete = index }
+                    )
+                }
+                Spacer(Modifier.height(2.dp))
+                if (showAdd) {
+                    AddServerForm(
+                        name = addName,
+                        url = addUrl,
+                        token = addToken,
+                        showToken = showToken,
+                        onName = { addName = it },
+                        onUrl = { addUrl = it },
+                        onToken = { addToken = it },
+                        onCancel = { showAdd = false; serverMsg = null },
+                        onAdd = {
+                            val error = vm.addServer(addName, addUrl, addToken)
+                            if (error == null) {
+                                serverMsg = "已添加 ${addName.ifBlank { ServerProfile.hostOf(addUrl) }}"
+                                serverMsgError = false
+                                addName = ""
+                                addUrl = ""
+                                addToken = ""
+                                showAdd = false
+                            } else {
+                                serverMsg = error
+                                serverMsgError = true
+                            }
+                        }
+                    )
+                } else if (ui.servers.size < MAX_SERVERS) {
+                    OutlinedButton(onClick = { showAdd = true; serverMsg = null }) { Text("添加服务器") }
+                } else {
+                    Text("已达 $MAX_SERVERS 条上限，删除一条后可继续添加。", fontSize = 11.sp, color = SubText)
+                }
+                serverMsg?.let { message ->
+                    Text(
+                        message,
+                        fontSize = 12.sp,
+                        color = if (serverMsgError) MaterialTheme.colorScheme.error else Good
+                    )
+                }
+            }
+        }
+
         Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
             Column(Modifier.padding(16.dp)) {
                 Text("当前状态", fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
                 Spacer(Modifier.height(6.dp))
+                Text("服务器：${vm.activeServer?.displayName ?: "—"}", fontSize = 12.sp)
                 Text("服务：${if (ui.state?.running == true) "运行中" else "未运行"}", fontSize = 12.sp)
                 Text("记账：${ui.state?.health?.confidence ?: "unknown"}", fontSize = 12.sp)
                 Text("数据时间：${io.prism.router.data.fmtClock(ui.state?.ts ?: 0)}", fontSize = 12.sp)
@@ -239,6 +353,145 @@ fun SettingsScreen(
                 Text("数据来自路由器的独立面板只读 API（/cgi-bin/panel-api）。", fontSize = 12.sp, color = SubText)
                 Text("本应用只读展示，不修改路由器配置。", fontSize = 12.sp, color = SubText)
             }
+        }
+    }
+
+    /* 删除地址前确认一次，避免误删令牌。 */
+    val deleteTarget = pendingDelete?.let { index -> ui.servers.getOrNull(index)?.let { index to it } }
+    if (deleteTarget != null) {
+        val (index, target) = deleteTarget
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("删除服务器") },
+            text = { Text("确定从地址列表删除「${target.displayName}」？") },
+            confirmButton = {
+                TextButton(onClick = {
+                    val error = vm.removeServer(index)
+                    serverMsg = error ?: "已删除 ${target.displayName}"
+                    serverMsgError = error != null
+                    pendingDelete = null
+                }) {
+                    Text("删除", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) { Text("取消") }
+            }
+        )
+    }
+}
+
+/* ───────────────────────── 多路由器：地址行 / 新增表单 ───────────────────────── */
+
+/** 地址列表的一行：单选点 + 名称/地址 + 删除；整行可点（当前项不可点）。 */
+@Composable
+private fun ServerRow(
+    server: ServerProfile,
+    active: Boolean,
+    canDelete: Boolean,
+    onSelect: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(enabled = !active, onClick = onSelect)
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RadioButton(selected = active, onClick = { if (!active) onSelect() })
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    server.displayName,
+                    fontSize = 13.sp,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                if (active) {
+                    Spacer(Modifier.width(6.dp))
+                    ActiveBadge()
+                }
+            }
+            Text(
+                server.url,
+                fontSize = 11.sp,
+                color = SubText,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Spacer(Modifier.width(6.dp))
+        TextButton(
+            onClick = onDelete,
+            enabled = canDelete,
+            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+        ) {
+            Text(
+                "删除",
+                fontSize = 11.sp,
+                color = if (canDelete) MaterialTheme.colorScheme.error else SubText
+            )
+        }
+    }
+}
+
+@Composable
+private fun ActiveBadge() {
+    Box(
+        Modifier
+            .background(Brand.copy(alpha = 0.14f), RoundedCornerShape(6.dp))
+            .padding(horizontal = 6.dp, vertical = 1.dp)
+    ) {
+        Text("当前", fontSize = 10.sp, color = Brand, fontWeight = FontWeight.Medium)
+    }
+}
+
+/** 新增地址表单：名称 / 地址 / 令牌。校验与去重都由 ViewModel 负责。 */
+@Composable
+private fun AddServerForm(
+    name: String,
+    url: String,
+    token: String,
+    showToken: Boolean,
+    onName: (String) -> Unit,
+    onUrl: (String) -> Unit,
+    onToken: (String) -> Unit,
+    onCancel: () -> Unit,
+    onAdd: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+            value = name,
+            onValueChange = onName,
+            label = { Text("名称") },
+            placeholder = { Text("如：客厅路由器") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = url,
+            onValueChange = onUrl,
+            label = { Text("面板地址") },
+            placeholder = { Text("http://192.168.1.1:8099") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
+            value = token,
+            onValueChange = onToken,
+            label = { Text("访问令牌（可留空）") },
+            singleLine = true,
+            visualTransformation = if (showToken) androidx.compose.ui.text.input.VisualTransformation.None else PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row {
+            Button(onClick = onAdd) { Text("添加") }
+            Spacer(Modifier.width(12.dp))
+            OutlinedButton(onClick = onCancel) { Text("取消") }
         }
     }
 }

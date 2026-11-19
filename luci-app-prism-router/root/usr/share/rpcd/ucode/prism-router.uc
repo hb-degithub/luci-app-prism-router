@@ -23,6 +23,7 @@
 // 会直接 Reference error，所以走环境变量）：
 //   PRISM_ROUTER_METHOD=status        ucode -L /usr/lib/ucode prism-router.uc
 //   PRISM_ROUTER_METHOD=get_history PRISM_ROUTER_ARGS='{"days":7}' ucode -L /usr/lib/ucode prism-router.uc
+//   PRISM_ROUTER_METHOD=get_apps_history PRISM_ROUTER_ARGS='{"days":7}' ucode -L /usr/lib/ucode prism-router.uc
 //   PRISM_ROUTER_METHOD=set_config  PRISM_ROUTER_ARGS='{"section":"settings","options":"{\"poll_interval\":\"9\"}"}' ...
 //
 'use strict';
@@ -74,6 +75,19 @@ const STATE_BUDGET = 180 * 1024;
 /* get_history 的预算：30/31 天 + 当天 288 个 5 分钟桶也必须装得下。 */
 const HISTORY_BUDGET = 180 * 1024;
 const HISTORY_MAX_BUCKETS = 400;
+
+/* get_apps_history 的边界（只读，近 N 天应用聚合）：
+   * days 夹到 1..31，缺省 7；
+   * 单文件 >512KB 视为异常（正常 daily 几十 KB），整份跳过并计入 skipped；
+   * 返回最多 100 条，host / chain 也做长度上限，避免脏数据撑大 ubus 报文；
+   * 源数据每天 apps[] 最多 50 条（守护进程侧截断），所以任何窗口聚合都只是
+     "每天 Top 50 之和"，返回值固定带 truncated=true，调用方必须按"下限"解读。 */
+const APPS_HISTORY_DEFAULT_DAYS = 7;
+const APPS_HISTORY_MAX_DAYS     = 31;
+const APPS_HISTORY_MAX_APPS     = 100;
+const APPS_HISTORY_FILE_MAX     = 512 * 1024;
+const APPS_HISTORY_HOST_MAX     = 253;
+const APPS_HISTORY_CHAIN_MAX    = 64;
 
 /* devices.json 写锁：ucode 没有 flock，用 mkdir 的原子性互斥；有限重试 +
    陈旧锁回收，避免一个崩溃的写者让另一个永久卡住。 */
@@ -1950,6 +1964,147 @@ function daily_totals(data) {
 	return { rx: max(0, rx), tx: max(0, tx) };
 }
 
+/* 近 N 天应用历史聚合（只读，不写任何文件）：
+     取 daily/ 下按文件名倒序的最近 N 个 YYYY-MM-DD.json，把每天的 apps[] 按 host
+     汇总 rx/tx、出现天数（days），并保留"最近一天优先"的出口链路（chain），
+     最后按 rx+tx 降序返回最多 100 条。
+
+   为什么不让前端逐天调 get_daily：近 7 天要 7 次 ubus 往返，每次都可能撞上
+   单条消息上限；这里一次读文件、一次回包，Android/Web 只发一个请求。
+
+   边界（门禁会验）：
+     * 坏 JSON / 非对象 / 文件内 day 与文件名不一致 -> 跳过并计入 skipped，绝不抛错；
+     * 文件 >512KB -> 不读 apps，整份跳过并计入 skipped；
+     * 非法日期 / 未来日期的文件按"损坏"跳过（时钟错乱时不让前端出现明天）；
+     * apps 里 host 为空或超长、rx/tx 非数字的行直接忽略；
+     * daily 目录不存在 / 一个文件都没有 -> apps=[], files=0, skipped=0。 */
+function apps_history_scan(requested_days) {
+	const days = clamp(integer(requested_days, APPS_HISTORY_DEFAULT_DAYS),
+	                   1, APPS_HISTORY_MAX_DAYS);
+
+	/* truncated 恒为 true：源数据每天只有 Top 50，聚合结果天然是下限。 */
+	const out = { days: days, files: 0, skipped: 0, truncated: true, apps: [] };
+
+	let files = [];
+
+	try {
+		files = glob(`${DAILY_DIR}/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].json`) ?? [];
+	}
+	catch (e) {
+		files = [];
+	}
+
+	/* 新的在前：文件名就是日期，倒序即"最近优先"；只取前 N 个文件。 */
+	files = sort(files ?? [], (a, b) => (a > b) ? -1 : ((a < b) ? 1 : 0));
+
+	if (length(files) > days)
+		files = slice(files, 0, days);
+
+	const today = day_of(time());
+	const by_host = {};
+
+	for (let file in files) {
+		const day = replace(basename(file), /\.json$/, '');
+
+		if (!valid_day(day) || day > today) {
+			out.skipped++;
+			continue;
+		}
+
+		/* 先看大小再读：>512KB 的 daily 只可能是坏文件或被塞了垃圾。 */
+		let size = 0;
+
+		try {
+			size = integer(stat(file)?.size, 0);
+		}
+		catch (e) {
+			size = 0;
+		}
+
+		if (size > APPS_HISTORY_FILE_MAX) {
+			out.skipped++;
+			continue;
+		}
+
+		const data = read_json(file);
+
+		if (data == null || type(data) != 'object') {
+			out.skipped++;
+			continue;
+		}
+
+		/* 文件里的 day 与文件名必须一致；老文件可能没有 day，按文件名算。 */
+		const file_day = text(data.day, '');
+
+		if (length(file_day) > 0 && file_day != day) {
+			out.skipped++;
+			continue;
+		}
+
+		out.files++;
+
+		if (type(data.apps) != 'array')
+			continue;
+
+		const seen = {};
+
+		for (let app in data.apps) {
+			if (type(app) != 'object')
+				continue;
+
+			const host = trim(text(app.host, ''));
+
+			if (length(host) == 0 || length(host) > APPS_HISTORY_HOST_MAX)
+				continue;
+
+			let item = by_host[host];
+
+			if (item == null) {
+				item = { host: host, rx: 0, tx: 0, chain: '', days: 0 };
+				by_host[host] = item;
+			}
+
+			item.rx += max(0, integer(app.rx, 0));
+			item.tx += max(0, integer(app.tx, 0));
+
+			/* 同一份文件里重复出现只算一天。 */
+			if (seen[host] != true) {
+				item.days++;
+				seen[host] = true;
+			}
+
+			/* 文件是"新的在前"：第一次见到的非空 chain 就是最近一天的出口。 */
+			if (length(item.chain) == 0) {
+				const chain = trim(text(app.chain, ''));
+
+				if (length(chain) > 0 && length(chain) <= APPS_HISTORY_CHAIN_MAX)
+					item.chain = chain;
+			}
+		}
+	}
+
+	let apps = [];
+
+	for (let host in by_host)
+		push(apps, by_host[host]);
+
+	/* rx+tx 降序；同值按 host 升序，保证同一份数据每次返回顺序一致。 */
+	apps = sort(apps, (a, b) => {
+		const diff = (b.rx + b.tx) - (a.rx + a.tx);
+
+		if (diff != 0)
+			return diff;
+
+		return (a.host > b.host) ? 1 : ((a.host < b.host) ? -1 : 0);
+	});
+
+	if (length(apps) > APPS_HISTORY_MAX_APPS)
+		apps = slice(apps, 0, APPS_HISTORY_MAX_APPS);
+
+	out.apps = apps;
+	return out;
+}
+
 function export_csv(request) {
 	const what = lc(trim(text(request.args?.what, 'devices')));
 
@@ -2351,6 +2506,26 @@ const methods = {
 			}
 
 			return { days: out, truncated: truncated };
+		}
+	},
+
+	/* 近 N 天应用聚合（只读）：Android/Web 的「应用历史」只发这一个请求，
+	   不再逐天 get_daily。返回 {days, files, skipped, truncated, apps[]}。
+	   任何异常都退回空结构（truncated=true），绝不让 ubus 调用报错。 */
+	get_apps_history: {
+		args: { days: APPS_HISTORY_DEFAULT_DAYS },
+		call: function(request) {
+			let days = APPS_HISTORY_DEFAULT_DAYS;
+
+			try {
+				days = clamp(integer(request.args?.days, APPS_HISTORY_DEFAULT_DAYS),
+				             1, APPS_HISTORY_MAX_DAYS);
+
+				return apps_history_scan(days);
+			}
+			catch (e) {
+				return { days: days, files: 0, skipped: 0, truncated: true, apps: [] };
+			}
 		}
 	},
 

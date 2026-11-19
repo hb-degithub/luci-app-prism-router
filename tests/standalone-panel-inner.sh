@@ -11,11 +11,13 @@
 #   6. 方法：POST → 405；HEAD → 200 且 CGI 不输出 body
 #   7. token：未设 → 200；设置后 无/错 → 401，query/Bearer 正确 → 200，X-Panel-Token 在 CGI 层验证
 #   8. history：days=2 → 200 且含 days 数组；非法 days 回退/夹取不报错
-#   9. 静态页面：/ → 200 text/html（页面尚未由前端任务提供时用临时占位，不写最终页面）
-#  10. 参数回退：非法 port → 8099；非法 bind → 监听所有接口；旧端口不再监听
-#  11. bind 默认取 network.lan.ipaddr
-#  12. 后端异常：rpcd 不在 → 500 {"error":"internal"}，响应体不含路径/堆栈
-#  13. 日志：init 不读 token、CGI 不写文件/不记日志、临时日志里没有 token
+#   9. apps_history：真实 daily/ 夹具 → 跨天相加/days/排序/最近 chain、坏文件 skipped 不 500、
+#      100 条上限、days 夹到 1–31、不写 daily/、token 开启时未认证仍 401
+#  10. 静态页面：/ → 200 text/html（页面尚未由前端任务提供时用临时占位，不写最终页面）
+#  11. 参数回退：非法 port → 8099；非法 bind → 监听所有接口；旧端口不再监听
+#  12. bind 默认取 network.lan.ipaddr
+#  13. 后端异常：rpcd 不在 → 500 {"error":"internal"}，响应体不含路径/堆栈
+#  14. 日志：init 不读 token、CGI 不写文件/不记日志、临时日志里没有 token
 #
 # 隔离：--network none，只有 127.0.0.1；不访问外网、不接触任何真机。
 mkdir -p /var/run/ubus /var/lock /tmp
@@ -59,6 +61,13 @@ json_expr(){ # $1=表达式（d 为解析后的 JSON）
     let d = null;
     try { d = json(fs.readfile('/tmp/panel-body.txt')); } catch (e) { d = null; }
     print((function(d){ return ($1); })(d) ? '1' : '0');" 2>/dev/null
+}
+json_val(){ # $1=表达式；打印原始值，仅用于 ok/bad 消息（不做 1/0 转换）
+  ucode -e "
+    let fs = require('fs');
+    let d = null;
+    try { d = json(fs.readfile('/tmp/panel-body.txt')); } catch (e) { d = null; }
+    print((function(d){ return ($1); })(d));" 2>/dev/null
 }
 
 echo "=== 0. 安装前基线 ==="
@@ -203,7 +212,110 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=history&days=99")
 code=$(req "$PANEL/cgi-bin/panel-api?what=history&days=abc")
 [ "$code" = "200" ] && ok "days=abc 回退默认（不报错）" || bad "days=abc -> $code"
 
-echo "=== 10. token：未设 vs 设置后 ==="
+echo "=== 10. apps_history：近 N 天应用聚合（ubus get_apps_history，只读）==="
+# 直接构造 daily/YYYY-MM-DD.json（与守护进程落盘的字段一致：day/apps[host,rx,tx,chain]）。
+# rpcd 的 ucode 插件用默认 DAILY_DIR=/etc/prism-router/daily 读，所以这里就是被测数据源。
+APPDIR=/etc/prism-router/daily
+mkdir -p "$APPDIR"
+day_ago(){ ucode -e "let t=localtime(time()-($1)*86400); print(sprintf('%04d-%02d-%02d', t.year, t.mon, t.mday));" 2>/dev/null; }
+D0=$(day_ago 0); D1=$(day_ago 1); D2=$(day_ago 2); D3=$(day_ago 3)
+cat > "$APPDIR/$D0.json" <<EOF
+{"day":"$D0","ts":1,"totals":{"rx":1,"tx":1},"nodes":{},"devices":[],
+ "apps":[{"host":"video.example.com","rx":300,"tx":30,"chain":"US2-HY2","devices":2},
+         {"host":"news.example.com","rx":100,"tx":10,"chain":"DIRECT","devices":1},
+         {"host":"onlytoday.example.com","rx":50,"tx":5,"chain":"JP1","devices":1}]}
+EOF
+cat > "$APPDIR/$D1.json" <<EOF
+{"day":"$D1","apps":[{"host":"video.example.com","rx":200,"tx":20,"chain":"JP1","devices":1}]}
+EOF
+cat > "$APPDIR/$D2.json" <<EOF
+{"day":"$D2","apps":[{"host":"video.example.com","rx":100,"tx":10,"chain":"OLD-CHAIN","devices":1},
+                      {"host":"game.example.com","rx":400,"tx":40,"chain":"SG","devices":1}]}
+EOF
+# 第 4 个文件故意写坏：必须被跳过并计入 skipped，且不能 500。
+printf '{"day":"%s","apps":[{"host":"broken' "$D3" > "$APPDIR/$D3.json"
+ls -la "$APPDIR" > /tmp/apps-hist-dir-before
+
+code=$(req "$PANEL/cgi-bin/panel-api?what=apps_history&days=7")
+[ "$code" = "200" ] && ok "apps_history&days=7 -> 200" || bad "apps_history&days=7 -> $code / $(head -c 160 "$B")"
+[ "$(json_expr 'type(d)=="object" && d.days==7 && d.files==3 && d.skipped==1 && d.truncated==true')" = "1" ] \
+  && ok "返回契约 {days:7, files:3, skipped:1, truncated:true}" \
+  || { bad "返回契约异常：$(head -c 200 "$B")"; }
+[ "$(json_expr 'type(d.apps)=="array" && length(d.apps)==4')" = "1" ] \
+  && ok "坏 JSON 文件被跳过（skipped=1）且聚合出 4 个 host" || bad "聚合 host 数=$(json_val 'type(d.apps)=="array" ? length(d.apps) : "-"')"
+# 同一 host 跨 3 天相加：300+200+100=600 / 30+20+10=60；days=3；chain 取最近的 US2-HY2。
+[ "$(json_expr 'd.apps[0].host=="video.example.com" && d.apps[0].rx==600 && d.apps[0].tx==60 && d.apps[0].days==3 && d.apps[0].chain=="US2-HY2"')" = "1" ] \
+  && ok "跨天聚合：video.example.com rx=600 tx=60 days=3 chain=US2-HY2（最近一天优先）" \
+  || { bad "跨天聚合异常：$(json_val 'sprintf("%s rx=%d tx=%d days=%d chain=%s", d.apps[0].host, d.apps[0].rx, d.apps[0].tx, d.apps[0].days, d.apps[0].chain)')"; }
+[ "$(json_expr 'join(",", map(d.apps, a => a.host))=="video.example.com,game.example.com,news.example.com,onlytoday.example.com"')" = "1" ] \
+  && ok "按 rx+tx 降序（660/440/110/55）" || { bad "排序=[$(json_val 'join(",", map(d.apps, a => sprintf("%s:%d", a.host, a.rx+a.tx)))')]"; }
+[ "$(json_expr '(function(a){ let prev=null; for (let x in a) { let t=x.rx+x.tx; if (prev!=null && t>prev) return false; prev=t; } return true; })(d.apps)')" = "1" ] \
+  && ok "apps 严格单调不增（rx+tx）" || bad "apps 未按 rx+tx 单调排序"
+
+code=$(req "$PANEL/cgi-bin/panel-api?what=apps_history&days=2")
+[ "$code" = "200" ] && ok "apps_history&days=2 -> 200" || bad "apps_history&days=2 -> $code"
+[ "$(json_expr 'd.days==2 && d.files==2 && d.skipped==0 && length(d.apps)==3 && d.apps[0].rx==500 && d.apps[0].days==2')" = "1" ] \
+  && ok "days=2 只看最近 2 个日文件（video=500/50，days=2）" \
+  || { bad "days=2 窗口异常：$(head -c 200 "$B")"; }
+[ "$(json_expr 'index(join(",", map(d.apps, a => a.host)), "game.example.com") < 0')" = "1" ] \
+  && ok "days=2 不含第 3 天的 host（窗口按文件名截取）" || bad "days=2 混入了窗口外的 host"
+
+# days 夹到 1..31（panel-api 先夹，ubus 再夹一次）；缺省 7。
+code=$(req "$PANEL/cgi-bin/panel-api?what=apps_history&days=99")
+[ "$code" = "200" ] && [ "$(json_expr 'd.days==31')" = "1" ] \
+  && ok "days=99 被夹到 31（不报错）" || bad "days=99 -> $code / days=$(json_val 'd.days')"
+code=$(req "$PANEL/cgi-bin/panel-api?what=apps_history&days=0")
+[ "$code" = "200" ] && [ "$(json_expr 'd.days==1 && d.files==1')" = "1" ] \
+  && ok "days=0 被夹到 1（只读最近 1 个文件）" || bad "days=0 -> $code / $(head -c 160 "$B")"
+code=$(req "$PANEL/cgi-bin/panel-api?what=apps_history")
+[ "$code" = "200" ] && [ "$(json_expr 'd.days==7')" = "1" ] \
+  && ok "省略 days 默认 7（不传参数不报错）" || bad "缺省 days -> $code / days=$(json_val 'd.days')"
+code=$(req "$PANEL/cgi-bin/panel-api?what=apps_history&days=abc")
+[ "$code" = "200" ] && [ "$(json_expr 'd.days==7')" = "1" ] \
+  && ok "days=abc 回退默认 7（不把脏值传给 ubus）" || bad "days=abc -> $code"
+
+# 只读：聚合只读文件，不能在 daily/ 里留下任何新文件（改动 mtime/entries 都会被发现）。
+ls -la "$APPDIR" > /tmp/apps-hist-dir-after
+if cmp -s /tmp/apps-hist-dir-before /tmp/apps-hist-dir-after; then
+  ok "apps_history 未写 daily/（目录快照前后一致）"
+else
+  bad "apps_history 改动了 daily/ 目录"; diff /tmp/apps-hist-dir-before /tmp/apps-hist-dir-after | head -5
+fi
+
+# 100 条上限：把现有用例挪开，只留一个 130 条应用的当日文件，断言被截到 100 条。
+BAK=/tmp/apps-hist-bak
+rm -rf "$BAK"; mkdir -p "$BAK"
+mv "$APPDIR/$D0.json" "$APPDIR/$D1.json" "$APPDIR/$D2.json" "$APPDIR/$D3.json" "$BAK"/
+D0="$D0" ucode -e 'let fs=require("fs"); let a=[]; for (let i=0;i<130;i++) push(a,{host:sprintf("H%03d.example.com",i),rx:i*10,tx:i,chain:"C"}); fs.writefile("/etc/prism-router/daily/"+getenv("D0")+".json", sprintf("%J",{day:getenv("D0"),apps:a}));' 2>/dev/null
+code=$(req "$PANEL/cgi-bin/panel-api?what=apps_history&days=1")
+[ "$code" = "200" ] && ok "130 条应用 -> 200" || bad "130 条应用 -> $code"
+[ "$(json_expr 'type(d.apps)=="array" && length(d.apps)==100')" = "1" ] \
+  && ok "最多返回 100 条（实际 $(json_val 'type(d.apps)=="array" ? length(d.apps) : "-"')）" \
+  || bad "未截到 100 条：$(json_val 'type(d.apps)=="array" ? length(d.apps) : "-"')"
+[ "$(json_expr 'd.apps[0].host=="H129.example.com" && d.apps[99].host=="H030.example.com"')" = "1" ] \
+  && ok "截断后仍保留最大的 100 条（H129 … H030）" \
+  || bad "截断边界异常：$(json_val 'sprintf("%s -> %s", d.apps[0].host, d.apps[99].host)')"
+[ "$(json_expr 'index(join(",", map(d.apps, a => a.host)), "H000.example.com") < 0')" = "1" ] \
+  && ok "被截掉的尾部 host（H000）不再返回" || bad "截断后仍含尾部 host"
+mv "$BAK"/*.json "$APPDIR"/ && rmdir "$BAK"
+
+# 未认证仍 401：token 开启时 apps_history 也不能绕过认证。
+UCI set prism-router.panel.token="$TOK"
+UCI commit prism-router
+code=$(req "$PANEL/cgi-bin/panel-api?what=apps_history&days=7")
+[ "$code" = "401" ] && [ "$(json_expr 'd?.error=="unauthorized"')" = "1" ] \
+  && ok "token 开启后 apps_history 未带 token -> 401 unauthorized" \
+  || bad "apps_history 未认证 -> $code / $(head -c 120 "$B")"
+code=$(req "$PANEL/cgi-bin/panel-api?what=apps_history&days=7&token=$TOK")
+[ "$code" = "200" ] && [ "$(json_expr 'length(d.apps)==4')" = "1" ] \
+  && ok "带 token 的 apps_history -> 200 且数据完整" || bad "带 token -> $code"
+UCI set prism-router.panel.token=''
+UCI commit prism-router
+
+# 清理本节的 daily 夹具，后面的用例不受影响。
+rm -f "$APPDIR/$D0.json" "$APPDIR/$D1.json" "$APPDIR/$D2.json" "$APPDIR/$D3.json"
+
+echo "=== 11. token：未设 vs 设置后 ==="
 code=$(req "$PANEL/cgi-bin/panel-api?what=settings&token=$TOK")
 [ "$code" = "200" ] && ok "settings 带 token -> 200" || bad "settings 带 token -> $code"
 if grep -q "$TOK" "$B" 2>/dev/null; then bad "settings 响应泄漏 token 明文"; else ok "settings 不含 token 明文"; fi
@@ -242,7 +354,7 @@ UCI commit prism-router
 code=$(req "$PANEL/cgi-bin/panel-api?what=state")
 [ "$code" = "200" ] && ok "清空 token 后恢复 200" || bad "清空 token 后 -> $code"
 
-echo "=== 11. 静态页面 / 静态根 ==="
+echo "=== 12. 静态页面 / 静态根 ==="
 code=$(req "$PANEL/")
 [ "$code" = "200" ] && ok "GET / -> 200" || bad "GET / -> $code"
 case "$(hdr 'Content-Type')" in
@@ -251,7 +363,7 @@ case "$(hdr 'Content-Type')" in
 esac
 [ "$PLACEHOLDER" = 1 ] && echo "  NOTE  GET / 用的是临时占位页面（前端任务尚未提供静态文件）"
 
-echo "=== 12. 非法 port / bind 回退，旧端口不再监听 ==="
+echo "=== 13. 非法 port / bind 回退，旧端口不再监听 ==="
 UCI set prism-router.panel.port='99999'
 UCI set prism-router.panel.bind='not-an-ip'
 UCI commit prism-router
@@ -270,7 +382,7 @@ else
 fi
 PANEL="$PANEL_BAK"
 
-echo "=== 13. bind 留空 -> 自动取 network.lan.ipaddr ==="
+echo "=== 14. bind 留空 -> 自动取 network.lan.ipaddr ==="
 UCI set network.lan.ipaddr='127.0.0.1'
 UCI commit network
 UCI set prism-router.panel.port="$PORT"
@@ -283,7 +395,7 @@ else
   bad "bind 未从 network.lan.ipaddr 推断"; tail -5 /tmp/panel-reload2.log
 fi
 
-echo "=== 14. 后端异常：ubus 对象不存在 -> 500 internal，且不泄漏路径/堆栈 ==="
+echo "=== 15. 后端异常：ubus 对象不存在 -> 500 internal，且不泄漏路径/堆栈 ==="
 killall rpcd 2>/dev/null || kill $(pidof rpcd) 2>/dev/null
 sleep 2
 code=$(req "$PANEL/cgi-bin/panel-api?what=state")
@@ -296,7 +408,7 @@ else
   ok "500 响应不含路径/命令/堆栈"
 fi
 
-echo "=== 15. 日志与只读边界 ==="
+echo "=== 16. 日志与只读边界 ==="
 if grep -Eq 'config_get[^#]*token|uci -q get[^#]*token' /etc/init.d/prism-router-panel; then
   bad "init 读取了 token（应只在 CGI 里读，且不写日志）"
 else
@@ -314,7 +426,7 @@ else
 fi
 grep -q 'config panel' /etc/config/prism-router && ok "conffile 已包含 panel 段" || bad "conffile 缺 panel 段"
 
-echo "=== 16. 系统目录权限未被改动 ==="
+echo "=== 17. 系统目录权限未被改动 ==="
 [ "$B_ETC" = "$(perm /etc)" ] && ok "/etc 未变" || bad "/etc 被改动"
 [ "$B_USR" = "$(perm /usr)" ] && ok "/usr 未变" || bad "/usr 被改动"
 [ "$B_WWW" = "$(perm /www)" ] && ok "/www 未变" || bad "/www 被改动"

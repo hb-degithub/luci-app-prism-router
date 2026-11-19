@@ -89,6 +89,31 @@ data class AppUsage(
     val total: Long get() = rx + tx
 }
 
+/**
+ * `?what=apps_history` 里的单条应用（域名）多日汇总。
+ *
+ * [days] 是该域名在统计窗口内实际出现过的天数。daily 摘要每天只保留 Top 50，
+ * 所以多日合计是「每日 Top 50」的近似值，UI 必须标注这一点，不能当成精确全量。
+ */
+data class AppHistory(
+    val host: String,
+    val rx: Long = 0,
+    val tx: Long = 0,
+    val chain: String = "",
+    val days: Int = 0
+) {
+    val total: Long get() = rx + tx
+
+    /** 只有 `DIRECT`（大小写不敏感）算直连；其余非空值都按代理 / 节点处理。 */
+    val isDirect: Boolean get() = chain.trim().equals("DIRECT", ignoreCase = true)
+
+    /** 日均：按「实际出现天数」平均；天数为 0（字段缺失）时退回合计，避免除零。 */
+    val dailyAvg: Long get() = if (days > 0) total / days else total
+
+    /** 展示名：长尾归并桶显示「其他」，其余就是域名本身。 */
+    val displayName: String get() = if (host == DEVICE_APP_OTHER_KEY) "其他" else host
+}
+
 data class NodeUsage(val name: String, val rx: Long, val tx: Long) {
     val total: Long get() = rx + tx
 }

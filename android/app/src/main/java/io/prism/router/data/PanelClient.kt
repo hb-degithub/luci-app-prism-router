@@ -42,6 +42,25 @@ class PanelClient {
         return parseNodes(body)
     }
 
+    /**
+     * 拉取近 [days] 天（1–31）的应用（域名）汇总：`?what=apps_history&days=n`。
+     *
+     * 返回按 rx+tx 降序的列表（后端已排序，这里再排一次保证稳定），最多 100 条。
+     * daily 摘要每天只存 Top 50，所以多日合计是近似值，调用方必须在 UI 标注。
+     * 网络 / 鉴权失败与响应无法解析都抛 [PanelException]。
+     */
+    fun fetchAppsHistory(baseUrl: String, token: String?, days: Int = 7): List<AppHistory> {
+        val n = days.coerceIn(1, 31)
+        val body = get(baseUrl, "apps_history", token, "days=$n")
+        return try {
+            parseAppsHistory(body, n)
+        } catch (e: PanelException) {
+            throw e
+        } catch (e: Exception) {
+            throw PanelException("应用历史响应无法解析")
+        }
+    }
+
     fun testConnection(baseUrl: String, token: String?): String {
         val body = get(baseUrl, "status", token)
         val o = JSONObject(body)
@@ -230,7 +249,7 @@ class PanelClient {
      * - `apps` 缺失 / 不是对象 → 空 map（老快照与离线缓存都是这种形态）；
      * - 某一项不是对象、键为空 → 跳过该条，不影响其它条目；
      * - `rx`/`tx` 类型错乱时 `optLong` 给 0，负值按 0 处理；
-     * - 同一 host 出现多次（大小写/空白变体）时累加，避免静默丢流量。
+     * - 同一 host 出现多次（仅首尾空白不同）时累加，避免静默丢流量。
      */
     private fun parseDeviceApps(root: JSONObject?): Map<String, DeviceApp> {
         if (root == null || root.length() == 0) return emptyMap()
@@ -367,6 +386,45 @@ class PanelClient {
                 .thenByDescending { it.total }
                 .thenBy { it.displayName }
         )
+    }
+
+    /**
+     * 解析 `?what=apps_history`：
+     * `{days,files,skipped,truncated,apps:[{host,rx,tx,chain,days}]}`。
+     *
+     * 容错策略与其它解析一致，坏数据不炸整页：
+     * - `apps` 缺失 / 不是数组 → 空列表；
+     * - 单条不是对象、`host` 为空 → 跳过；
+     * - `rx`/`tx` 负值按 0；`days` 收敛到 0..[daysLimit]；
+     * - 同一 host（仅首尾空白差异）多条累加，出现天数取最大值。
+     */
+    private fun parseAppsHistory(body: String, daysLimit: Int): List<AppHistory> {
+        val root = JSONObject(body)
+        val arr = root.optJSONArray("apps") ?: return emptyList()
+        val merged = LinkedHashMap<String, AppHistory>(arr.length())
+        for (i in 0 until arr.length()) {
+            val a = arr.optJSONObject(i) ?: continue
+            val host = a.optString("host", "").trim()
+            if (host.isEmpty()) continue
+            val rx = a.optLong("rx").coerceAtLeast(0L)
+            val tx = a.optLong("tx").coerceAtLeast(0L)
+            val days = a.optInt("days", 0).coerceIn(0, daysLimit.coerceAtLeast(0))
+            val chain = a.optString("chain", "").trim()
+            val prev = merged[host]
+            merged[host] = if (prev == null) {
+                AppHistory(host = host, rx = rx, tx = tx, chain = chain, days = days)
+            } else {
+                /* 同一域名的重复行：流量累加，链路保留第一个非空值。 */
+                prev.copy(
+                    rx = prev.rx + rx,
+                    tx = prev.tx + tx,
+                    chain = prev.chain.ifBlank { chain },
+                    days = maxOf(prev.days, days)
+                )
+            }
+        }
+        /* 后端约定最多 100 条；这里再兜一层，避免异常响应把列表撑爆。 */
+        return merged.values.sortedByDescending { it.total }.take(100)
     }
 
     /**
