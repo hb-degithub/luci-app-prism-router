@@ -1,8 +1,10 @@
 package io.prism.router.ui
 
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.AccountTree
 import androidx.compose.material.icons.rounded.Apps
 import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.Hub
@@ -20,8 +22,15 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
 import io.prism.router.data.MainViewModel
 
+/**
+ * 底部导航 6 项：概览 / 设备 / 应用 / 节点 / 拓扑 / 设置。
+ *
+ * 390px 宽度下 6 个 item 均分，标签单行；文案沿用 Material3 默认字号。
+ * 拓扑页只读，重试子节点数据走 ViewModel.refreshNodes()。
+ */
 @Composable
 fun App(vm: MainViewModel) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
@@ -32,36 +41,12 @@ fun App(vm: MainViewModel) {
     Scaffold(
         bottomBar = {
             NavigationBar {
-                NavigationBarItem(
-                    selected = tab == 0,
-                    onClick = { tab = 0 },
-                    icon = { Icon(Icons.Rounded.Speed, contentDescription = "概览") },
-                    label = { Text("概览") }
-                )
-                NavigationBarItem(
-                    selected = tab == 1,
-                    onClick = { tab = 1 },
-                    icon = { Icon(Icons.Rounded.Devices, contentDescription = "设备") },
-                    label = { Text("设备") }
-                )
-                NavigationBarItem(
-                    selected = tab == 2,
-                    onClick = { tab = 2 },
-                    icon = { Icon(Icons.Rounded.Apps, contentDescription = "应用") },
-                    label = { Text("应用") }
-                )
-                NavigationBarItem(
-                    selected = tab == 3,
-                    onClick = { tab = 3 },
-                    icon = { Icon(Icons.Rounded.Hub, contentDescription = "节点") },
-                    label = { Text("节点") }
-                )
-                NavigationBarItem(
-                    selected = tab == 4,
-                    onClick = { tab = 4 },
-                    icon = { Icon(Icons.Rounded.Settings, contentDescription = "设置") },
-                    label = { Text("设置") }
-                )
+                NavTab(tab, 0, "概览", Icons.Rounded.Speed) { tab = it }
+                NavTab(tab, 1, "设备", Icons.Rounded.Devices) { tab = it }
+                NavTab(tab, 2, "应用", Icons.Rounded.Apps) { tab = it }
+                NavTab(tab, 3, "节点", Icons.Rounded.Hub) { tab = it }
+                NavTab(tab, 4, "拓扑", Icons.Rounded.AccountTree) { tab = it }
+                NavTab(tab, 5, "设置", Icons.Rounded.Settings) { tab = it }
             }
         }
     ) { inner ->
@@ -70,7 +55,8 @@ fun App(vm: MainViewModel) {
                 0 -> OverviewScreen(ui, onRefresh = { vm.refresh() }, onOpenDevices = { tab = 1 })
                 1 -> DevicesScreen(ui)
                 2 -> AppsScreen(ui)
-                3 -> NodesScreen(ui)
+                3 -> NodesScreen(ui, onRetryNodes = { vm.refreshNodes() })
+                4 -> TopologyScreen(ui, onRetryNodes = { vm.refreshNodes() })
                 else -> SettingsScreen(
                     ui = ui,
                     onSave = { base, token, interval -> vm.saveSettings(base, token, interval) },
@@ -80,4 +66,20 @@ fun App(vm: MainViewModel) {
             }
         }
     }
+}
+
+@Composable
+private fun RowScope.NavTab(
+    current: Int,
+    index: Int,
+    label: String,
+    icon: ImageVector,
+    onSelect: (Int) -> Unit
+) {
+    NavigationBarItem(
+        selected = current == index,
+        onClick = { onSelect(index) },
+        icon = { Icon(icon, contentDescription = label) },
+        label = { Text(label, maxLines = 1) }
+    )
 }

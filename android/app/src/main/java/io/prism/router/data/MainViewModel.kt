@@ -30,6 +30,11 @@ data class UiState(
     /** 历史数据的最近一次拉取（或尝试）时间，用于 5 分钟节流。 */
     val historyAt: Long = 0,
     val historyError: String? = null,
+    /** `?what=nodes` 的子节点 / AP 列表；失败时保留上一次成功结果。 */
+    val nodesList: List<SubNode> = emptyList(),
+    val nodesError: String? = null,
+    /** 子节点数据的最近一次拉取（或尝试）时间，用于 5 分钟节流。 */
+    val nodesAt: Long = 0,
     /** ViewModel 本地计算的告警，已按严重度排序。 */
     val alerts: List<Alert> = emptyList(),
     /** 当前展示的是否为离线缓存数据。 */
@@ -45,6 +50,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private companion object {
         const val HISTORY_DAYS = 7
         const val HISTORY_REFRESH_MS = 5 * 60 * 1000L
+        /* 子节点 / AP 快照：正常 5 分钟一次，失败 1 分钟后重试。 */
+        const val NODES_REFRESH_MS = 5 * 60 * 1000L
+        const val NODES_RETRY_MS = 60 * 1000L
         const val CACHE_TTL_MS = 24 * 60 * 60 * 1000L
         const val PREF_STATE = "stateCache"
         const val PREF_STATE_AT = "stateCacheAt"
@@ -62,6 +70,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val client = PanelClient()
     private var job: Job? = null
     private var historyJob: Job? = null
+    private var nodesJob: Job? = null
 
     var ui by mutableStateOf(UiState())
         private set
@@ -89,11 +98,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         job = null
         historyJob?.cancel()
         historyJob = null
+        nodesJob?.cancel()
+        nodesJob = null
     }
 
-    /** 手动刷新：state 立即重取，history 一并强制重取。 */
+    /** 手动刷新：state 立即重取，history / nodes 一并强制重取。 */
     fun refresh() {
         refreshState(forceHistory = true)
+    }
+
+    /** 子节点 / AP 手动重试（节点屏、拓扑屏的「重试」按钮）。 */
+    fun refreshNodes() {
+        loadNodes(force = true)
     }
 
     private fun refreshState(forceHistory: Boolean = false) {
@@ -150,6 +166,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
             refreshHistory(forceHistory)
+            loadNodes(force = forceHistory)
         }
     }
 
@@ -182,6 +199,45 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 ui = ui.copy(
                     historyAt = System.currentTimeMillis(),
                     historyError = e.message ?: "历史数据获取失败"
+                )
+            }
+        }
+    }
+
+    /* ───────────────────────── 子节点 / AP ───────────────────────── */
+
+    /**
+     * 拉取 `?what=nodes` 的子节点快照。
+     *
+     * 主数据每 15s 轮询一次，但子节点是 5 分钟粒度的快照，所以这里独立节流：
+     * 正常 5 分钟一次；上次失败则 1 分钟后重试。失败只写 [UiState.nodesError]，
+     * 保留上一次成功的列表，绝不影响概览/设备等主数据。
+     */
+    private fun loadNodes(force: Boolean) {
+        val now = System.currentTimeMillis()
+        val refreshMs = if (ui.nodesError != null) NODES_RETRY_MS else NODES_REFRESH_MS
+        val due = force || ui.nodesAt == 0L || now - ui.nodesAt > refreshMs
+        if (!due) return
+        if (nodesJob?.isActive == true) return
+
+        val base = ui.baseUrl
+        val token = ui.token
+        nodesJob = viewModelScope.launch {
+            try {
+                val nodes = client.fetchNodes(base, token)
+                if (ui.baseUrl != base || ui.token != token) return@launch
+                ui = ui.copy(
+                    nodesList = nodes,
+                    nodesAt = System.currentTimeMillis(),
+                    nodesError = null
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (ui.baseUrl != base || ui.token != token) return@launch
+                ui = ui.copy(
+                    nodesAt = System.currentTimeMillis(),
+                    nodesError = e.message ?: "子节点数据获取失败"
                 )
             }
         }
@@ -351,10 +407,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             intervalSec = intervalSec.coerceIn(5, 300),
             offline = false,
             offlineAt = 0,
-            /* 换了面板地址：历史曲线也重新拉取。 */
+            /* 换了面板地址：历史曲线与子节点快照也重新拉取。 */
             history = emptyList(),
             historyAt = 0,
-            historyError = null
+            historyError = null,
+            nodesList = emptyList(),
+            nodesAt = 0,
+            nodesError = null
         )
         stop()
         start()

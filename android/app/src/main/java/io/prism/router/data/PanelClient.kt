@@ -33,6 +33,15 @@ class PanelClient {
         return parseHistory(body)
     }
 
+    /**
+     * 拉取子节点 / AP 列表（`?what=nodes`）。
+     * 失败时抛 [PanelException]，由调用方降级（不影响主数据）。
+     */
+    fun fetchNodes(baseUrl: String, token: String?): List<SubNode> {
+        val body = get(baseUrl, "nodes", token)
+        return parseNodes(body)
+    }
+
     fun testConnection(baseUrl: String, token: String?): String {
         val body = get(baseUrl, "status", token)
         val o = JSONObject(body)
@@ -255,5 +264,50 @@ class PanelClient {
 
         /* 后端新的日期在前；图表按时间升序绘制。 */
         return out.sortedBy { it.day }
+    }
+
+    /**
+     * 解析 `?what=nodes`：`{nodes:[{node_id,name,ts,age_sec,latest:{totals,devices,apps}}]}`。
+     *
+     * 字段类型错乱（totals 不是对象、devices 不是数组）一律按缺失处理；
+     * 结果是只读快照，不做任何写回。排序：在线优先 → 流量降序 → 名称。
+     */
+    fun parseNodes(body: String): List<SubNode> {
+        val root = JSONObject(body)
+        val arr = root.optJSONArray("nodes") ?: return emptyList()
+        val out = ArrayList<SubNode>(arr.length())
+
+        for (i in 0 until arr.length()) {
+            val n = arr.optJSONObject(i) ?: continue
+            val latest = n.optJSONObject("latest") ?: JSONObject()
+            val totals = latest.optJSONObject("totals") ?: JSONObject()
+            out.add(
+                SubNode(
+                    nodeId = n.optString("node_id", ""),
+                    name = n.optString("name", ""),
+                    /* age_sec 缺失 / 非数字 → -1（未上报），不要误判成 0 秒。 */
+                    ageSec = n.optLong("age_sec", -1L),
+                    rx = totalsSum(totals, "rx", "direct_rx", "proxy_rx"),
+                    tx = totalsSum(totals, "tx", "direct_tx", "proxy_tx"),
+                    deviceCount = latest.optJSONArray("devices")?.length() ?: 0
+                )
+            )
+        }
+
+        return out.sortedWith(
+            compareBy<SubNode> { it.freshness.ordinal }
+                .thenByDescending { it.total }
+                .thenBy { it.displayName }
+        )
+    }
+
+    /**
+     * totals 里优先取合计 rx/tx；该字段缺失或为 0 时退回 `direct_* + proxy_*`。
+     * 两种形态在快照里都出现过，这里统一成一个数，避免子节点流量显示为 0。
+     */
+    private fun totalsSum(totals: JSONObject, key: String, directKey: String, proxyKey: String): Long {
+        val merged = totals.optLong(directKey) + totals.optLong(proxyKey)
+        val total = totals.optLong(key)
+        return if (total > 0) total else merged
     }
 }

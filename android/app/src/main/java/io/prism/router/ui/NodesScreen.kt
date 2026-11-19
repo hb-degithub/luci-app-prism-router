@@ -19,60 +19,111 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Hub
+import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.prism.router.data.NodeFreshness
 import io.prism.router.data.NodeUsage
+import io.prism.router.data.SubNode
 import io.prism.router.data.UiState
 import io.prism.router.data.fmtBytes
 import java.util.Locale
 
 /**
- * 节点 / AP 屏。
+ * 节点 / AP 屏（只读）。
  *
- * 数据层目前只提供 state.nodes（出口节点：DIRECT / 代理组名，rx/tx），
- * 没有子节点、AP、上报时间字段。本屏按出口节点真实数据渲染，并显式标注数据边界。
+ * 两个数据源：
+ *  - `state.nodes`：出口节点（DIRECT / 代理组）的累计流量，按流量排序并展示占比；
+ *  - `?what=nodes`：子节点 / AP 快照，带上报新鲜度（age_sec 0–300 秒在线）、设备数与流量。
+ *
+ * 子节点单独失败只影响本区块（显示原因 + 重试），不影响出口节点与主数据。
  */
 @Composable
-fun NodesScreen(ui: UiState) {
+fun NodesScreen(ui: UiState, onRetryNodes: () -> Unit = {}) {
     val nodes = (ui.state?.nodes ?: emptyList()).sortedByDescending { it.total }
     val total = nodes.sumOf { it.total }
+    val subs = ui.nodesList
 
-    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        Spacer(Modifier.height(12.dp))
-        Text("节点 / AP", fontSize = 18.sp, fontWeight = FontWeight.Bold)
-        Text("仅出口节点，子节点待数据层扩展", fontSize = 11.sp, color = Warn)
-        Spacer(Modifier.height(10.dp))
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(top = 12.dp, bottom = 20.dp)
+    ) {
+        item { NodesHeader() }
 
+        item {
+            SectionTitle(
+                title = "出口节点",
+                detail = if (nodes.isEmpty()) null else "共 ${nodes.size} 个 · 合计 ${fmtBytes(total)}"
+            )
+        }
         if (nodes.isEmpty()) {
-            NodesEmpty(loading = ui.loading)
+            item { NodesEmpty(loading = ui.loading) }
         } else {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("共 ${nodes.size} 个出口节点", fontSize = 12.sp, color = SubText, modifier = Modifier.weight(1f))
-                Text("合计 ${fmtBytes(total)}", fontSize = 12.sp, color = SubText)
+            itemsIndexed(nodes) { index, node ->
+                NodeCard(rank = index + 1, node = node, total = total)
             }
-            Spacer(Modifier.height(8.dp))
-            LazyColumn(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(bottom = 16.dp)
-            ) {
-                itemsIndexed(nodes) { index, node ->
-                    NodeCard(rank = index + 1, node = node, total = total)
+        }
+
+        item {
+            SubNodesHeader(
+                count = subs.size,
+                error = ui.nodesError,
+                onRetry = onRetryNodes
+            )
+        }
+        when {
+            subs.isEmpty() && ui.nodesError != null -> item {
+                SubNodesError(message = ui.nodesError, onRetry = onRetryNodes)
+            }
+
+            subs.isEmpty() -> item { SubNodesEmpty(loading = ui.loading) }
+
+            else -> {
+                itemsIndexed(subs) { _, sub -> SubNodeCard(sub) }
+                /* 有旧数据但本轮刷新失败：列表照常展示，底下补一条可重试的提示。 */
+                ui.nodesError?.let { message ->
+                    item { NodesErrorBanner(message = message, onRetry = onRetryNodes) }
                 }
-                item { NodesNote() }
             }
+        }
+
+        item { NodesNote() }
+    }
+}
+
+@Composable
+private fun NodesHeader() {
+    Column(Modifier.fillMaxWidth().padding(top = 4.dp)) {
+        Text("节点 / AP", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Text(
+            "出口节点与子节点 / AP · 上报 5 分钟内视为在线",
+            fontSize = 11.sp,
+            color = SubText
+        )
+    }
+}
+
+@Composable
+private fun SectionTitle(title: String, detail: String?) {
+    Row(Modifier.fillMaxWidth().padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+        if (detail != null) {
+            Text(detail, fontSize = 11.sp, color = SubText, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -104,7 +155,9 @@ private fun NodeCard(rank: Int, node: NodeUsage, total: Long) {
                     Text(
                         "↓ ${fmtBytes(node.rx)} · ↑ ${fmtBytes(node.tx)}",
                         fontSize = 11.sp,
-                        color = SubText
+                        color = SubText,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
                 Spacer(Modifier.width(8.dp))
@@ -128,11 +181,140 @@ private fun NodeCard(rank: Int, node: NodeUsage, total: Long) {
     }
 }
 
+/* ───────────────────────── 子节点 / AP ───────────────────────── */
+
+@Composable
+private fun SubNodesHeader(count: Int, error: String?, onRetry: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text("子节点 / AP", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+        Text(
+            if (count > 0) "共 $count 个" else if (error != null) "获取失败" else "暂无上报",
+            fontSize = 11.sp,
+            color = if (error != null) Warn else SubText
+        )
+        TextButton(onClick = onRetry, contentPadding = PaddingValues(horizontal = 8.dp)) {
+            Text("刷新", fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun SubNodeCard(sub: SubNode) {
+    val color = subNodeFreshnessColor(sub.freshness)
+
+    Card(shape = RoundedCornerShape(14.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+        Row(
+            Modifier.fillMaxWidth().padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                Modifier.size(30.dp).background(color.copy(alpha = 0.14f), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Rounded.Wifi, contentDescription = null, tint = color, modifier = Modifier.size(17.dp))
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    sub.displayName,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    "${sub.freshnessText()} · ${sub.deviceCount} 台设备",
+                    fontSize = 11.sp,
+                    color = if (sub.freshness == NodeFreshness.ONLINE) SubText else color,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Column(horizontalAlignment = Alignment.End) {
+                Text(fmtBytes(sub.total), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                Text(
+                    "↓ ${fmtBytes(sub.rx)} · ↑ ${fmtBytes(sub.tx)}",
+                    fontSize = 11.sp,
+                    color = SubText,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun SubNodesEmpty(loading: Boolean) {
+    Card(shape = RoundedCornerShape(14.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Text(
+                if (loading) "正在读取子节点…" else "暂无子节点 / AP 上报",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "面板 ?what=nodes 返回空列表：可能还没有子节点 / AP 推送过快照，或该面板版本未启用节点上报。",
+                fontSize = 11.sp,
+                color = SubText
+            )
+        }
+    }
+}
+
+@Composable
+private fun SubNodesError(message: String, onRetry: () -> Unit) {
+    Card(shape = RoundedCornerShape(14.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+        Column(Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("子节点 / AP 获取失败", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                TextButton(onClick = onRetry, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                    Text("重试", fontSize = 12.sp, color = Warn)
+                }
+            }
+            Text(message, fontSize = 11.sp, color = Warn)
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "仅影响子节点 / AP 区块，出口节点与其它页面数据不受影响。",
+                fontSize = 11.sp,
+                color = SubText
+            )
+        }
+    }
+}
+
+@Composable
+private fun NodesErrorBanner(message: String, onRetry: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(Warn.copy(alpha = 0.12f), RoundedCornerShape(12.dp))
+            .padding(start = 12.dp, end = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            "刷新失败：$message",
+            fontSize = 11.sp,
+            color = Warn,
+            modifier = Modifier.weight(1f),
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
+        TextButton(onClick = onRetry, contentPadding = PaddingValues(horizontal = 8.dp)) {
+            Text("重试", fontSize = 12.sp, color = Warn)
+        }
+    }
+}
+
+/* ───────────────────────── 占位 / 说明 ───────────────────────── */
+
 @Composable
 private fun NodesEmpty(loading: Boolean) {
     Card(shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(
-            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 28.dp),
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Icon(
@@ -154,13 +336,6 @@ private fun NodesEmpty(loading: Boolean) {
                 color = SubText,
                 textAlign = TextAlign.Center
             )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "子节点 / AP、上报时间与连接数需数据层扩展后展示。",
-                fontSize = 11.sp,
-                color = SubText,
-                textAlign = TextAlign.Center
-            )
         }
     }
 }
@@ -172,10 +347,18 @@ private fun NodesNote() {
             Text("数据说明", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(4.dp))
             Text(
-                "当前接口只提供出口节点（DIRECT / 代理组）的累计流量，因此本屏按流量排序并展示占比；子节点、AP 及其上报时间待数据层扩展。",
+                "出口节点来自 state.nodes（累计流量，按流量排序并展示占比）；" +
+                    "子节点 / AP 来自 ?what=nodes，含上报新鲜度（0–300 秒在线）、设备数与流量。本屏只读。",
                 fontSize = 11.sp,
                 color = SubText
             )
         }
     }
+}
+
+/** 供拓扑屏复用的新鲜度色（与子节点卡保持一致）。 */
+internal fun subNodeFreshnessColor(freshness: NodeFreshness): Color = when (freshness) {
+    NodeFreshness.ONLINE -> Good
+    NodeFreshness.STALE -> Warn
+    NodeFreshness.UNKNOWN -> SubText
 }

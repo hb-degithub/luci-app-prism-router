@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -20,9 +21,12 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -33,12 +37,15 @@ import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -49,12 +56,18 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.prism.router.data.ControlClient
+import io.prism.router.data.ControlException
 import io.prism.router.data.Device
 import io.prism.router.data.UiState
 import io.prism.router.data.fmtAgo
 import io.prism.router.data.fmtBytes
 import io.prism.router.data.fmtClock
 import io.prism.router.data.fmtRate
+import io.prism.router.data.normalizeMac
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private enum class DeviceFilter(val label: String) { ALL("全部"), ONLINE("在线"), OFFLINE("离线") }
 
@@ -62,6 +75,12 @@ private enum class DeviceSort(val label: String) { TOTAL("累计"), RATE("速率
 
 /** 在线口径：有过活跃时间，且 10 分钟内上报过。与 PanelState.onlineCount 保持一致。 */
 private const val ONLINE_WINDOW_SEC = 600L
+
+/** 家长控制「暂停」用红：深色/浅色主题下与白字对比度都足够。 */
+private val PauseRed = Color(0xFFE53935)
+
+/** 家长控制写客户端无状态、线程安全，整页共用一个实例（避免每次切页重建连接池）。 */
+private val controlClient = ControlClient()
 
 private fun Device.isOnline(nowSec: Long): Boolean =
     lastSeen > 0 && nowSec - lastSeen <= ONLINE_WINDOW_SEC
@@ -74,6 +93,20 @@ fun DevicesScreen(ui: UiState) {
     var filterIndex by rememberSaveable { mutableIntStateOf(0) }
     var sortIndex by rememberSaveable { mutableIntStateOf(0) }
     var selectedMac by rememberSaveable { mutableStateOf<String?>(null) }
+
+    /*
+     * 家长控制状态。token 直接取 UiState.token（只读），不新增页面参数，
+     * 这样 App.kt 不需要为「暂停/恢复」做任何改动。
+     */
+    val scope = rememberCoroutineScope()
+    var pausedMacs by remember(ui.baseUrl, ui.token) { mutableStateOf<Set<String>>(emptySet()) }
+    var busyMac by remember { mutableStateOf<String?>(null) }
+    var controlError by remember { mutableStateOf<String?>(null) }
+    var controlOk by remember { mutableStateOf<String?>(null) }
+    /* write_disabled / forbidden 属于配置问题：提示后直接禁用写按钮，不再反复弹窗。 */
+    var controlBlocked by remember(ui.baseUrl, ui.token) { mutableStateOf(false) }
+    /* 待确认的设备 MAC：确认弹窗在页面层（ModalBottomSheet 之外）渲染，保证显示在弹层之上。 */
+    var confirmMac by remember { mutableStateOf<String?>(null) }
 
     val filters = DeviceFilter.values()
     val sorts = DeviceSort.values()
@@ -97,6 +130,71 @@ fun DevicesScreen(ui: UiState) {
     }
     val onlineCount = devices.count { it.isOnline(nowSec) }
     val selected = selectedMac?.let { mac -> devices.firstOrNull { it.mac == mac } }
+
+    /**
+     * 拉取「已暂停」集合。失败静默（没有列表就不显示徽章），不影响设备列表本身。
+     * [clearBlocked] 用于「用户修好路由器配置后重开详情」这条恢复路径。
+     */
+    fun refreshPaused(clearBlocked: Boolean = false) {
+        scope.launch {
+            val loaded = try {
+                withContext(Dispatchers.IO) { controlClient.list(ui.baseUrl, ui.token) }
+            } catch (e: Exception) {
+                null
+            }
+            if (loaded == null) return@launch
+            pausedMacs = loaded
+            if (clearBlocked) controlBlocked = false
+        }
+    }
+
+    /* 进入页面（或换了面板地址/令牌）时同步一次暂停状态。 */
+    LaunchedEffect(ui.baseUrl, ui.token) { refreshPaused() }
+
+    /* 打开详情弹层时再同步一次；成功即视为配置已恢复，解除按钮禁用。 */
+    LaunchedEffect(selectedMac) {
+        if (selectedMac != null) refreshPaused(clearBlocked = true)
+    }
+
+    /** 确认后真正 POST；成功后本地集合先更新（徽章立刻生效），再用服务端 list 校正。 */
+    fun submitControl(device: Device, pause: Boolean) {
+        if (busyMac != null) return
+        if (device.mac.isBlank()) {
+            controlError = "该设备没有 MAC 地址，无法暂停"
+            return
+        }
+        val mac = normalizeMac(device.mac)
+        busyMac = device.mac
+        controlError = null
+        controlOk = null
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    if (pause) {
+                        controlClient.pause(ui.baseUrl, ui.token, device.mac)
+                    } else {
+                        controlClient.resume(ui.baseUrl, ui.token, device.mac)
+                    }
+                }
+                pausedMacs = if (pause) pausedMacs + mac else pausedMacs - mac
+                controlOk = if (pause) "已暂停该设备上网" else "已恢复该设备上网"
+                val fresh = try {
+                    withContext(Dispatchers.IO) { controlClient.list(ui.baseUrl, ui.token) }
+                } catch (e: Exception) {
+                    null
+                }
+                /* 服务端列表是准绳；拿不到就保留本地结果（至少徽章是对的）。 */
+                if (fresh != null) pausedMacs = fresh
+            } catch (e: ControlException) {
+                controlError = e.message ?: "操作失败"
+                if (e.code == "write_disabled" || e.code == "forbidden") controlBlocked = true
+            } catch (e: Exception) {
+                controlError = e.message ?: "操作失败"
+            } finally {
+                busyMac = null
+            }
+        }
+    }
 
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         Spacer(Modifier.height(12.dp))
@@ -140,7 +238,15 @@ fun DevicesScreen(ui: UiState) {
             contentPadding = PaddingValues(bottom = 16.dp)
         ) {
             items(sorted) { d ->
-                DeviceCard(d, online = d.isOnline(nowSec)) { selectedMac = d.mac }
+                DeviceCard(
+                    d,
+                    online = d.isOnline(nowSec),
+                    paused = normalizeMac(d.mac) in pausedMacs
+                ) {
+                    selectedMac = d.mac
+                    controlError = null
+                    controlOk = null
+                }
             }
             if (sorted.isEmpty()) {
                 item {
@@ -159,13 +265,76 @@ fun DevicesScreen(ui: UiState) {
         DeviceDetailSheet(
             device = selected,
             online = selected.isOnline(nowSec),
-            onDismiss = { selectedMac = null }
+            paused = normalizeMac(selected.mac) in pausedMacs,
+            busy = busyMac == selected.mac,
+            blocked = controlBlocked,
+            error = controlError,
+            okMessage = controlOk,
+            onDismiss = {
+                selectedMac = null
+                controlError = null
+                controlOk = null
+            },
+            onRequestToggle = { confirmMac = selected.mac }
+        )
+    }
+
+    /* 确认弹窗放在 ModalBottomSheet 外面：新窗口后创建，稳定显示在弹层之上。 */
+    val confirming = confirmMac?.let { mac -> devices.firstOrNull { it.mac == mac } }
+    if (confirming != null) {
+        val pausing = normalizeMac(confirming.mac) !in pausedMacs
+        AlertDialog(
+            onDismissRequest = { confirmMac = null },
+            title = { Text(if (pausing) "暂停该设备上网？" else "恢复该设备上网？") },
+            text = {
+                Column {
+                    Text(confirming.name, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    Text("MAC ${confirming.mac}", fontSize = 12.sp, color = SubText)
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        if (pausing) {
+                            "暂停后该设备将无法上网，恢复立即生效。"
+                        } else {
+                            "恢复后该设备可立即正常上网。"
+                        },
+                        fontSize = 13.sp
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val target = confirming
+                        confirmMac = null
+                        submitControl(target, pausing)
+                    }
+                ) {
+                    Text(if (pausing) "暂停" else "恢复", color = if (pausing) PauseRed else Good)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmMac = null }) { Text("取消") }
+            }
         )
     }
 }
 
+/** 红色「已暂停」徽章：设备卡片与详情弹层共用。 */
 @Composable
-private fun DeviceCard(d: Device, online: Boolean, onClick: () -> Unit) {
+private fun PausedBadge(modifier: Modifier = Modifier) {
+    Text(
+        "已暂停",
+        fontSize = 10.sp,
+        fontWeight = FontWeight.SemiBold,
+        color = Color.White,
+        modifier = modifier
+            .background(PauseRed, RoundedCornerShape(6.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp)
+    )
+}
+
+@Composable
+private fun DeviceCard(d: Device, online: Boolean, paused: Boolean, onClick: () -> Unit) {
     Card(
         onClick = onClick,
         shape = RoundedCornerShape(14.dp),
@@ -180,7 +349,19 @@ private fun DeviceCard(d: Device, online: Boolean, onClick: () -> Unit) {
             }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(d.name, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        d.name,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (paused) {
+                        Spacer(Modifier.width(6.dp))
+                        PausedBadge()
+                    }
+                }
                 Text(
                     "${linkLabel(d.link)} · ${d.ip.ifBlank { d.mac }}",
                     fontSize = 11.sp,
@@ -209,7 +390,17 @@ private fun DeviceCard(d: Device, online: Boolean, onClick: () -> Unit) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DeviceDetailSheet(device: Device, online: Boolean, onDismiss: () -> Unit) {
+private fun DeviceDetailSheet(
+    device: Device,
+    online: Boolean,
+    paused: Boolean,
+    busy: Boolean,
+    blocked: Boolean,
+    error: String?,
+    okMessage: String?,
+    onDismiss: () -> Unit,
+    onRequestToggle: () -> Unit
+) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val clipboard = LocalClipboardManager.current
     var copied by remember(device.mac) { mutableStateOf(false) }
@@ -237,11 +428,17 @@ private fun DeviceDetailSheet(device: Device, online: Boolean, onDismiss: () -> 
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
                     Text(device.name, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 2)
-                    Text(
-                        "${linkLabel(device.link)} · ${if (online) "在线" else "离线"}",
-                        fontSize = 12.sp,
-                        color = if (online) Good else SubText
-                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "${linkLabel(device.link)} · ${if (online) "在线" else "离线"}",
+                            fontSize = 12.sp,
+                            color = if (online) Good else SubText
+                        )
+                        if (paused) {
+                            Spacer(Modifier.width(6.dp))
+                            PausedBadge()
+                        }
+                    }
                 }
             }
 
@@ -302,6 +499,66 @@ private fun DeviceDetailSheet(device: Device, online: Boolean, onDismiss: () -> 
                 )
             }
 
+            /* ───────── 家长控制操作区（暂停 / 恢复） ───────── */
+            Spacer(Modifier.height(10.dp))
+            DetailCard {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("家长控制", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                    if (paused) PausedBadge()
+                }
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    if (paused) "该设备当前已暂停，无法上网。" else "暂停后该设备将无法上网，恢复立即生效。",
+                    fontSize = 12.sp,
+                    color = SubText
+                )
+
+                if (error != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(error, fontSize = 12.sp, color = PauseRed)
+                }
+                if (blocked) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "写操作被路由器拒绝：请确认 panel.write_enabled=1，且设置页里的访问令牌与 panel.token 一致。修好后重开本弹层即可重试。",
+                        fontSize = 11.sp,
+                        color = SubText
+                    )
+                }
+                if (okMessage != null && error == null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(okMessage, fontSize = 12.sp, color = Good)
+                }
+
+                Spacer(Modifier.height(10.dp))
+                val actionColor = if (paused) Good else PauseRed
+                Button(
+                    onClick = onRequestToggle,
+                    enabled = !busy && !blocked && device.mac.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = actionColor,
+                        contentColor = Color.White,
+                        disabledContainerColor = actionColor.copy(alpha = 0.35f),
+                        disabledContentColor = Color.White.copy(alpha = 0.7f)
+                    ),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                ) {
+                    if (busy) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                            color = Color.White
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(
+                        if (busy) "处理中…" else if (paused) "恢复上网" else "暂停上网",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+
             Spacer(Modifier.height(16.dp))
             Button(
                 onClick = {
@@ -309,7 +566,7 @@ private fun DeviceDetailSheet(device: Device, online: Boolean, onDismiss: () -> 
                     copied = true
                 },
                 enabled = device.mac.isNotBlank(),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)
             ) {
                 Text(if (copied) "已复制 MAC" else "复制 MAC")
             }

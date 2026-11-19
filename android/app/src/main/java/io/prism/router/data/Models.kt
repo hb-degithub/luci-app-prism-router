@@ -55,6 +55,50 @@ data class NodeUsage(val name: String, val rx: Long, val tx: Long) {
     val total: Long get() = rx + tx
 }
 
+/** 子节点 / AP 上报保鲜窗口（秒）：与 Web 面板一致，0–300 秒算在线。 */
+const val SUB_NODE_ONLINE_SEC = 300L
+
+/** 子节点上报新鲜度；[UNKNOWN] 表示快照里没有可信时间戳（age_sec < 0）。 */
+enum class NodeFreshness { ONLINE, STALE, UNKNOWN }
+
+/**
+ * `?what=nodes` 里的一个子节点 / AP 快照（只取拓扑与列表需要的字段）。
+ *
+ * [ageSec] 由后端按 `now - ts` 计算；`<0` 表示时间戳不可信（未上报），
+ * 0–[SUB_NODE_ONLINE_SEC] 视为在线，更大则显示「N 分钟前」。
+ */
+data class SubNode(
+    val nodeId: String,
+    val name: String,
+    val ageSec: Long,
+    val rx: Long,
+    val tx: Long,
+    val deviceCount: Int
+) {
+    val total: Long get() = rx + tx
+
+    val freshness: NodeFreshness
+        get() = when {
+            ageSec < 0 -> NodeFreshness.UNKNOWN
+            ageSec <= SUB_NODE_ONLINE_SEC -> NodeFreshness.ONLINE
+            else -> NodeFreshness.STALE
+        }
+
+    /** 名称缺失时退回 node_id，再退回占位文案（后端允许 name 为空）。 */
+    val displayName: String
+        get() = name.trim().ifBlank { nodeId.trim().ifBlank { "未命名 AP" } }
+
+    /** 上报新鲜度文案：在线 / N 分钟前 / 未上报。 */
+    fun freshnessText(): String = when (freshness) {
+        NodeFreshness.ONLINE -> "在线"
+        NodeFreshness.UNKNOWN -> "未上报"
+        NodeFreshness.STALE -> {
+            val minutes = ageSec / 60
+            if (minutes < 60) "$minutes 分钟前" else "${minutes / 60} 小时前"
+        }
+    }
+}
+
 data class Health(
     val confidence: String,
     val reasons: List<String>,
