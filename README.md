@@ -54,7 +54,11 @@
 
 | 桌面 | 手机 |
 |---|---|
-| ![面板桌面](docs/screenshots/panel-desktop.png) | ![面板手机](docs/screenshots/mobile-panel.png) |
+| ![面板桌面](docs/screenshots/panel-desktop.png) | ![面板手机](docs/screenshots/panel-mobile.png) |
+
+面板完整手机版：
+
+![面板完整](docs/screenshots/panel-mobile-full.png)
 
 ## 安装
 
