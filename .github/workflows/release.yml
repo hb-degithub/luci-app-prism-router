@@ -4,8 +4,13 @@ name: release
 #   1) 打标签推送：git tag v1.0.1 && git push origin v1.0.1
 #   2) 或在 Actions 页手动 Run（输入 tag）
 # 产物：luci-app-prism-router_*.ipk + prism-router-android-<version>.apk
-# 说明：CI 没有签名密钥，APK 使用 debug 签名（可直接安装）；
-#       需要 release 签名时把 keystore 以 secret 注入并改 assembleRelease。
+#
+# 正式签名：仓库 Secret 配好下面三项后，CI 产出 release 签名 APK；
+# 未配置时自动退回 debug 签名（保证能构建，但安装前需卸载同包名旧版）。
+#   PRISM_KEYSTORE_BASE64   keystore 的 base64（单行）
+#   PRISM_STORE_PASSWORD    keystore 口令
+#   PRISM_KEY_PASSWORD      密钥口令（通常与 keystore 相同）
+# 别名固定 prism-router，可用 PRISM_KEY_ALIAS 覆盖。
 
 on:
   push:
@@ -13,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag（例如 v1.0.0）'
+        description: 'Release tag（例如 v1.0.1）'
         required: true
 
 permissions:
@@ -24,6 +29,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve version
+        run: |
+          VERSION="${{ inputs.tag }}"
+          if [ -z "$VERSION" ]; then VERSION="${{ github.ref_name }}"; fi
+          echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
 
       - name: Build ipk
         run: |
@@ -45,20 +56,40 @@ jobs:
             sdkmanager "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
           fi
 
+      - name: Restore release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.PRISM_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.PRISM_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.PRISM_KEY_PASSWORD }}
+        if: env.KEYSTORE_B64 != ''
+        run: |
+          mkdir -p android/keystore
+          printf '%s' "$KEYSTORE_B64" | base64 -d > android/keystore/prism-router.jks
+          {
+            echo "PRISM_STORE_PASSWORD=$STORE_PASSWORD"
+            echo "PRISM_KEY_PASSWORD=$KEY_PASSWORD"
+            echo "PRISM_KEY_ALIAS=${PRISM_KEY_ALIAS:-prism-router}"
+          } >> android/gradle.properties
+          ls -l android/keystore/prism-router.jks
+
       - name: Build Android APK
         run: |
           cd android
           echo "sdk.dir=$ANDROID_HOME" > local.properties
-          ./gradlew assembleDebug --no-daemon --console=plain
+          mkdir -p ../out
+          if [ -f keystore/prism-router.jks ]; then
+            echo "使用 release 签名构建"
+            ./gradlew assembleRelease --no-daemon --console=plain
+            cp app/build/outputs/apk/release/app-release.apk "../out/prism-router-android-${VERSION}.apk"
+          else
+            echo "未配置 keystore，退回 debug 签名"
+            ./gradlew assembleDebug --no-daemon --console=plain
+            cp app/build/outputs/apk/debug/app-debug.apk "../out/prism-router-android-${VERSION}.apk"
+          fi
 
       - name: Collect artifacts
         run: |
-          VERSION="${{ inputs.tag }}"
-          if [ -z "$VERSION" ]; then VERSION="${{ github.ref_name }}"; fi
-          VERSION="${VERSION#v}"
-          mkdir -p out
           cp dist/*.ipk out/
-          cp android/app/build/outputs/apk/debug/app-debug.apk "out/prism-router-android-${VERSION}.apk"
           ls -lh out
 
       - name: Publish release
