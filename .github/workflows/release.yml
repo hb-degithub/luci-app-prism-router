@@ -1,0 +1,71 @@
+name: release
+
+# 用法：
+#   1) 打标签推送：git tag v1.0.1 && git push origin v1.0.1
+#   2) 或在 Actions 页手动 Run（输入 tag）
+# 产物：luci-app-prism-router_*.ipk + prism-router-android-<version>.apk
+# 说明：CI 没有签名密钥，APK 使用 debug 签名（可直接安装）；
+#       需要 release 签名时把 keystore 以 secret 注入并改 assembleRelease。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（例如 v1.0.0）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ipk
+        run: |
+          chmod +x tools/build-ipk.sh
+          bash tools/build-ipk.sh
+          ls -lh dist
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK packages
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          if command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
+          fi
+
+      - name: Build Android APK
+        run: |
+          cd android
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          ./gradlew assembleDebug --no-daemon --console=plain
+
+      - name: Collect artifacts
+        run: |
+          VERSION="${{ inputs.tag }}"
+          if [ -z "$VERSION" ]; then VERSION="${{ github.ref_name }}"; fi
+          VERSION="${VERSION#v}"
+          mkdir -p out
+          cp dist/*.ipk out/
+          cp android/app/build/outputs/apk/debug/app-debug.apk "out/prism-router-android-${VERSION}.apk"
+          ls -lh out
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: 棱镜路由 ${{ inputs.tag || github.ref_name }}
+          files: out/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
