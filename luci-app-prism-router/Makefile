@@ -73,6 +73,7 @@ define Package/luci-app-prism-router/install
 	# 只读系统信息（无登录）+ 管理员 API（token）；两个都必须 755。
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-system $(1)/www/cgi-bin/prism-router-system
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-admin $(1)/www/cgi-bin/prism-router-admin
+	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-control $(1)/www/prism-router-panel/cgi-bin/prism-router-control
 	# 面板服务（8099）也要能访问 system/admin：同一份 CGI 再装一份到面板目录。
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-system $(1)/www/prism-router-panel/cgi-bin/prism-router-system
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-admin $(1)/www/prism-router-panel/cgi-bin/prism-router-admin
