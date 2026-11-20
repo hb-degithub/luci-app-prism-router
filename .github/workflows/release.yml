@@ -38,6 +38,11 @@ jobs:
 
       - name: Build ipk
         run: |
+          # 让 ipk 版本号跟随 tag（v1.0.2 -> PKG_VERSION:=1.0.2）
+          if [ -n "$VERSION" ] && [ "$VERSION" != "1.0.0" ]; then
+            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VERSION/" luci-app-prism-router/Makefile
+            sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" luci-app-prism-router/Makefile
+          fi
           chmod +x tools/build-ipk.sh
           bash tools/build-ipk.sh
           ls -lh dist
