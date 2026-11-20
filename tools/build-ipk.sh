@@ -20,7 +20,8 @@ set -euo pipefail
 umask 022
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/dist"; LEGACY=0
-VER=1.0.0; REL=1
+# 版本可用环境变量覆盖（CI 按 Release tag 注入）；默认保持 1.0.0。
+VER="${PRISM_VER:-1.0.0}"; REL="${PRISM_REL:-1}"
 
 usage() {
   sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
