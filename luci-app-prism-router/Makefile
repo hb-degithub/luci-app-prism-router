@@ -105,6 +105,15 @@ define Package/luci-app-prism-router/postinst
 			uci -q commit prism-router
 		fi
 	fi
+
+	# 升级/重装时 conffile 会保留用户配置，新版本新增的 update 段需要补建（只加空段，不覆盖已有值）。
+	if ! uci -q get prism-router.update >/dev/null 2>&1; then
+		uci -q set prism-router.update=update
+		uci -q set prism-router.update.github_repo=''
+		uci -q set prism-router.update.github_token=''
+		uci -q set prism-router.update.cache_seconds='600'
+		uci -q commit prism-router
+	fi
 	if [ -d /etc/traffic-stats ]; then
 		mkdir -p /etc/prism-router
 		cp -a /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null || cp -r /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null
