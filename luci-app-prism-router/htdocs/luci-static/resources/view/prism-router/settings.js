@@ -1007,7 +1007,8 @@ return view.extend({
 		fields.push(this.field('feishu', 'ws_enabled', _('启用长连接（接收入群/消息事件）'),
 			_('用飞书官方 SDK 常驻接收事件；机器人进群或给它发消息后，这里会出现群/用户，可一键填入。默认关闭。'),
 			'bool', null));
-		fields.push(this.feishuWsStatusField());
+		this.feishuWsBlock = this.feishuWsStatusField();
+		fields.push(this.feishuWsBlock);
 
 		/* ---- 机器人二维码（扫码加群）---- */
 		fields.push(this.feishuScanField(writeDisabled));
@@ -1092,11 +1093,11 @@ return view.extend({
 					'click': ui.createHandlerFn(this, this.testFeishu),
 					'disabled': writeDisabled
 				}, _('测试发送')),
-				E('button', {
+				(this.feishuListChatsBtn = E('button', {
 					'class': 'cbi-button',
 					'click': ui.createHandlerFn(this, this.listFeishuChats),
 					'disabled': writeDisabled
-				}, _('列出机器人所在的群')),
+				}, _('列出机器人所在的群'))),
 				this.testNode
 			]),
 			this.chatNode
@@ -1632,29 +1633,35 @@ return view.extend({
 		/* 发送方式：webhook = 群自定义机器人，app = 自建应用机器人（扫码绑定群）。
 		   后端 UCI_FIELDS 白名单里暂时没有 mode 时会静默忽略这个键，不影响其它字段落盘。 */
 		feishu.ws_enabled = this.inputChecked('feishu', 'ws_enabled') ? '1' : '0';
-		feishu.webhook = this.inputValue('feishu', 'webhook').trim();
-		feishu.secret = this.inputValue('feishu', 'secret');
 		feishu.mode = this.radioValue('feishu', 'mode', FEISHU_MODE_WEBHOOK);
-		feishu.app_id = this.inputValue('feishu', 'app_id');
-		feishu.app_secret = this.inputValue('feishu', 'app_secret');
+
 		var chatId = this.inputValue('feishu', 'chat_id').trim();
 		var target = this.inputValue('feishu', 'receive_id').trim();
 
-		if (chatId !== '') {
-			feishu.receive_id_type = 'chat_id';
-			feishu.receive_id = chatId;
-		}
-		else if (target.indexOf('@') > 0) {
-			feishu.receive_id_type = 'email';
-			feishu.receive_id = target;
-		}
-		else if (/^ou_/.test(target)) {
-			feishu.receive_id_type = 'open_id';
-			feishu.receive_id = target;
+		/* 只写当前模式相关字段：切换发送方式时不能互相清空配置。 */
+		if (feishu.mode === FEISHU_MODE_WEBHOOK) {
+			feishu.webhook = this.inputValue('feishu', 'webhook').trim();
+			feishu.secret = this.inputValue('feishu', 'secret');
 		}
 		else {
-			feishu.receive_id_type = 'user_id';
-			feishu.receive_id = target;
+			feishu.app_id = this.inputValue('feishu', 'app_id');
+			feishu.app_secret = this.inputValue('feishu', 'app_secret');
+
+			if (feishu.mode === FEISHU_MODE_APP) {
+				feishu.chat_id = chatId;
+				feishu.receive_id_type = 'chat_id';
+				feishu.receive_id = chatId;
+			}
+			else {
+				if (target.indexOf('@') > 0)
+					feishu.receive_id_type = 'email';
+				else if (/^ou_/.test(target))
+					feishu.receive_id_type = 'open_id';
+				else
+					feishu.receive_id_type = 'user_id';
+
+				feishu.receive_id = target;
+			}
 		}
 		feishu.daily_time = this.inputValue('feishu', 'daily_time');
 
@@ -2312,17 +2319,24 @@ return view.extend({
 		show('secret', webhook);
 		show('app_id', app || user);
 		show('app_secret', app || user);
-		show('receive_id', true);
+		show('chat_id', app);
+		show('receive_id', user);
 
 		if (this.feishuScanBlock != null)
 			this.feishuScanBlock.style.display = app ? '' : 'none';
+
+		if (this.feishuListChatsBtn != null)
+			this.feishuListChatsBtn.style.display = app ? '' : 'none';
+
+		if (this.feishuWsBlock != null)
+			this.feishuWsBlock.style.display = (app || user) ? '' : 'none';
 
 		if (this.feishuBindBtn != null)
 			this.setFeishuButton(this.feishuBindBtn, _('生成机器人二维码'), this.feishuWriteBlocked());
 
 		if (!app && this.feishuPolling === true) {
 			this.stopFeishuPoll();
-			this.setFeishuScanStatus(_('已切回自定义机器人，绑定轮询已停止。'), 'warn');
+			this.setFeishuScanStatus(_('已切换发送方式，绑定轮询已停止。'), 'warn');
 		}
 
 		if (app)

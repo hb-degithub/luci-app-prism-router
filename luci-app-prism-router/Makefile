@@ -23,7 +23,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-prism-router
-PKG_VERSION:=1.0.25
+PKG_VERSION:=1.0.27
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-2.0-only
@@ -178,6 +178,8 @@ define Package/luci-app-prism-router/postinst
 		/etc/init.d/prism-router-feishu-ws stop >/dev/null 2>&1
 		/etc/init.d/prism-router-feishu-ws disable >/dev/null 2>&1
 	fi
+	# 新 rpcd ucode 需要 restart 才会注册（reload 不重载脚本）
+	/etc/init.d/rpcd restart >/dev/null 2>&1
 }
 exit 0
 endef

@@ -28,7 +28,7 @@ OUT="$ROOT/dist"; LEGACY=0
 # 版本可用环境变量覆盖（CI 按 Release tag 注入）；源码默认 1.0.22，
 # 与 Makefile / Android 默认版本保持一致。包名、opkg Version 与包内版本常量
 # 全部由同一个 VER 派生，避免出现“新 UI 却打包成旧版本”的漂移。
-VER="${PRISM_VER:-1.0.25}"; REL="${PRISM_REL:-1}"
+VER="${PRISM_VER:-1.0.27}"; REL="${PRISM_REL:-1}"
 # 随包 SDK 的 .so 是 musl x86_64；Architecture 必须与之一致，不能是 all。
 ARCH="${PRISM_ARCH:-x86_64}"
 
@@ -347,7 +347,8 @@ else
 	/etc/init.d/prism-router-feishu-ws disable >/dev/null 2>&1
 fi
 rm -f /tmp/luci-indexcache* 2>/dev/null
-/etc/init.d/rpcd reload >/dev/null 2>&1
+# 新装的 rpcd ucode 脚本不会随 reload 生效，必须 restart 才能注册 feishu_ws_status 等方法
+/etc/init.d/rpcd restart >/dev/null 2>&1
 exit 0
 POSTINST
 sed -i "s/@PKG_CONF_SHA@/$CNF_SHA/" "$W/_h"

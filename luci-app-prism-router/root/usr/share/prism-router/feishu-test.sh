@@ -314,10 +314,11 @@ fi
 # 5.3 无 secret
 run_uc daily --base "$BASE" --webhook http://127.0.0.1:1/x >"$TMP/nosec.out" 2>&1
 RC=$?
-if [ "$RC" -eq 0 ] && grep -q "secret 未配置" "$BASE/feishu.log" 2>/dev/null; then
-    ok "无 secret：退出 0，日志记录跳过"
+# 自定义机器人未开「签名校验」时 secret 可以留空：不应再因缺 secret 跳过发送
+if grep -q "secret 未配置" "$BASE/feishu.log" 2>/dev/null; then
+    bad "无 secret 仍被跳过（应允许不签名发送）"
 else
-    bad "无 secret 场景异常（rc=$RC）"
+    ok "无 secret：允许不签名发送（rc=$RC）"
 fi
 
 # 5.4 history 缺失

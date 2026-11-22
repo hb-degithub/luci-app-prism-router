@@ -18,7 +18,7 @@ PASS=0; FAIL=0
 ok(){ echo "  PASS  $1"; PASS=$((PASS+1)); }
 bad(){ echo "  FAIL  $1"; FAIL=$((FAIL+1)); }
 # 版本由外层门禁从实际产物名解析后传入；单独运行 inner 时退回源码默认值。
-PRISM_VER="${PRISM_VER:-1.0.25}"
+PRISM_VER="${PRISM_VER:-1.0.27}"
 PRISM_ARCH="${PRISM_ARCH:-x86_64}"
 PRISM_IPK_NAME="${PRISM_IPK_NAME:-luci-app-prism-router_${PRISM_VER}-1_${PRISM_ARCH}.ipk}"
 IPK="/src/dist/$PRISM_IPK_NAME"

@@ -1054,10 +1054,6 @@ send_allowed = function(cfg, ignore_enabled) {
         log("INFO", "prism-router.feishu.webhook 未配置，跳过发送");
         return false;
     }
-    if (!length(cfg.secret)) {
-        log("INFO", "prism-router.feishu.secret 未配置，跳过发送（签名校验需要密钥）");
-        return false;
-    }
     if (!webhook_ok(cfg.webhook)) {
         log("ERROR", "prism-router.feishu.webhook 格式非法，跳过发送");
         return false;
