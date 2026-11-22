@@ -984,7 +984,9 @@ return view.extend({
 
 		var channelFields = [
 			[ 'feishu', 'enabled', _('启用飞书报表'), _('开启后按下面的「时间」推送日报/周报；测试发送不受这里影响。'), 'bool', null ],
-			[ 'feishu', 'app_id', _('App ID'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
+			[ 'feishu', 'webhook', _('Webhook 地址（零配置，推荐）'), _('飞书群 → 设置 → 群机器人 → 添加机器人 → 自定义机器人 → 复制 webhook。填了它就不需要 App ID/Secret、权限、发布或回调。'), 'text', { wide: true, placeholder: 'https://open.feishu.cn/open-apis/bot/v2/hook/...' } ],
+			[ 'feishu', 'secret', _('签名校验 secret（可选）'), _('机器人开启「签名校验」时填写；留空则不签名。'), 'password', { placeholder: _('留空则不签名') } ],
+			[ 'feishu', 'app_id', _('App ID（可选）'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
 			[ 'feishu', 'app_secret', _('App Secret'), _('与 App ID 配套；仅保存在本机 /etc/config/prism-router。'), 'password', null ],
 			[ 'feishu', 'chat_id', _('群 chat_id（可选）'), _('扫码把机器人加进群后，点下方「列出机器人所在的群」自动填入；留空则发给个人。'), 'text', { wide: true, placeholder: 'oc_xxxxx' } ],
 			[ 'feishu', 'receive_id', _('接收人 user_id（个人通知，无需群）'), _('飞书管理后台 → 成员与部门 → 成员详情可复制 user_id。不需要回调、不需要扫码。应用可用范围必须包含该账号。'), 'text', { wide: true, placeholder: '飞书 user_id' } ],
@@ -1510,7 +1512,10 @@ return view.extend({
 		feishu.enabled = this.inputChecked('feishu', 'enabled') ? '1' : '0';
 		/* 发送方式：webhook = 群自定义机器人，app = 自建应用机器人（扫码绑定群）。
 		   后端 UCI_FIELDS 白名单里暂时没有 mode 时会静默忽略这个键，不影响其它字段落盘。 */
-		feishu.mode = FEISHU_MODE_USER;
+		feishu.webhook = this.inputValue('feishu', 'webhook').trim();
+		feishu.secret = this.inputValue('feishu', 'secret');
+		/* 填了 webhook 就走自定义机器人；否则走应用凭证。 */
+		feishu.mode = (feishu.webhook !== '') ? FEISHU_MODE_WEBHOOK : FEISHU_MODE_USER;
 		feishu.app_id = this.inputValue('feishu', 'app_id');
 		feishu.app_secret = this.inputValue('feishu', 'app_secret');
 		var chatId = this.inputValue('feishu', 'chat_id').trim();
@@ -1667,11 +1672,16 @@ return view.extend({
 		}
 
 		/* 应用机器人没有 App ID/Secret 连 token 都换不到：保存前就拦住并说清楚，别等到发送时静默失败 */
-		if (str(feishu.app_id) === '')
+		if (str(feishu.webhook).length > 0) {
+			if (!/^https?:\/\/[^\s]+$/.test(str(feishu.webhook)))
+				return _('Webhook 地址必须是 http(s) 链接');
+		}
+		else if (str(feishu.app_id) === '')
 			return _('请先填写 App ID（应用凭证里的 App ID，形如 cli_xxxxx）');
 
 		/* 允许先保存 App ID、Secret 稍后填；但如果本机已经存过 Secret，不允许被清空。 */
-		if (str(feishu.app_secret) === '' && str(rawValue('feishu', 'app_secret') || '') !== '')
+		if (str(feishu.webhook).length === 0 &&
+		    str(feishu.app_secret) === '' && str(rawValue('feishu', 'app_secret') || '') !== '')
 			return _('App Secret 不能清空：请在输入框重新粘贴后再保存');
 
 		var chatId = str(feishu.chat_id).trim();
