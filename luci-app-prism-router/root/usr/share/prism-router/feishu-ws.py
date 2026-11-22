@@ -474,7 +474,8 @@ def build_event_handler(store, log):
 
     handler = (EventDispatcherHandler.builder("", "")
                .register_p2_im_chat_member_bot_added_v1(on_bot_added)
-               .register_p2_im_message_receive_v1(on_message))
+               .register_p2_im_message_receive_v1(on_message)
+               .build())
     return handler
 
 
