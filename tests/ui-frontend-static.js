@@ -1036,7 +1036,7 @@ async function testSettingsUciGuard() {
 	});
 
 	check('飞书写操作按钮也 disabled（测试发送）', feishuTest != null && feishuTest.attrs.disabled === true);
-	check('飞书写操作按钮也 disabled（列群）', feishuChats != null && feishuChats.attrs.disabled === true);
+	check('不再提供列群按钮（只保留个人通知）', feishuChats == null);
 
 	let collected = false;
 
