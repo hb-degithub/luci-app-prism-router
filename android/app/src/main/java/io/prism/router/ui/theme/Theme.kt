@@ -29,6 +29,9 @@ enum class ThemeMode(val label: String) {
  * @param dynamicColor Android 12+ 动态取色开关；关闭时始终使用品牌色 #3B5BFF。
  *                     Android 11 及以下自动忽略，不会报错。
  * @param content 页面内容。
+ *
+ * 方向色（下载蓝 / 上传青）不跟随动态取色：它是数据语义，不是品牌皮肤，
+ * 否则同一张图在换壁纸后上下行会变成两种不相干的颜色。
  */
 @Composable
 fun PrismTheme(
@@ -45,10 +48,14 @@ fun PrismTheme(
         else -> PrismLightColorScheme
     }
     val semantics = if (darkTheme) DarkSemanticColors else LightSemanticColors
+    val dataColors = if (darkTheme) DarkDataColors else LightDataColors
+    val categoryColors = if (darkTheme) DarkCategoryColors else LightCategoryColors
 
     CompositionLocalProvider(
         LocalPrismSpacing provides DefaultPrismSpacings,
-        LocalPrismSemanticColors provides semantics
+        LocalPrismSemanticColors provides semantics,
+        LocalPrismDataColors provides dataColors,
+        LocalPrismCategoryColors provides categoryColors
     ) {
         MaterialTheme(
             colorScheme = colorScheme,

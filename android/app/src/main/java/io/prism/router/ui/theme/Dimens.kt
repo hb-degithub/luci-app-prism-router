@@ -12,6 +12,7 @@ import androidx.compose.ui.unit.dp
  *
  * 圆角只用 12 / 16 / 20 三档：小控件 12、卡片 16、大容器 / 弹层 20。
  * 间距只用 4 / 8 / 12 / 16 / 24 五档，避免页面里出现 7dp、13dp 这类随手值。
+ * 描边默认不用：层级优先靠表面色、留白与轻量分隔线表达。
  */
 
 /** 圆角令牌。 */
@@ -56,6 +57,23 @@ object PrismSize {
     val iconLarge: Dp = 24.dp
     val avatar: Dp = 40.dp
     val emptyIcon: Dp = 64.dp
+}
+
+/** 线宽 / 透明度令牌：分隔线只用「细线 + 较高不透明度」，不做大面积苍白描边。 */
+object PrismStroke {
+    val hairline: Dp = 0.5.dp
+    val divider: Dp = 0.5.dp
+}
+
+object PrismAlpha {
+    /** 选中 / 悬浮容器上的低透明度强调。 */
+    const val emphasis: Float = 0.12f
+
+    /** 进度条轨道。 */
+    const val track: Float = 0.65f
+
+    /** 分隔线：比旧版 0.4–0.5 更实一点，避免浅色下看不见。 */
+    const val divider: Float = 0.7f
 }
 
 /** Material3 Shapes：与圆角令牌对齐。 */

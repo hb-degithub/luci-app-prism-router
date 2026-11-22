@@ -32,7 +32,10 @@ const vm = require('vm');
 
 const ROOT = path.resolve(__dirname, '..');
 const VIEW_DIR = path.join(ROOT, 'luci-app-prism-router/htdocs/luci-static/resources/view/prism-router');
+const THEME_FILE = path.join(ROOT, 'luci-app-prism-router/htdocs/luci-static/resources/prism-router/theme.js');
+const MENU_FILE = path.join(ROOT, 'luci-app-prism-router/root/usr/share/luci/menu.d/luci-app-prism-router.json');
 const VIEWS = [ 'overview', 'devices', 'apps', 'nodes', 'settings', 'mobile', 'panel', 'diagnostics' ];
+const THEMED_VIEWS = [ 'overview', 'devices', 'apps', 'nodes', 'settings', 'diagnostics' ];
 
 let passed = 0;
 let failed = 0;
@@ -52,8 +55,60 @@ function check(name, condition, detail) {
 	else bad(name, detail);
 }
 
+/* 数组逐项相等：菜单顺序、标题列表等静态断言用。 */
+function sameList(name, actual, expected) {
+	const a = JSON.stringify(actual);
+	const b = JSON.stringify(expected);
+
+	check(name, a === b, a + ' != ' + b);
+}
+
 function readView(name) {
 	return fs.readFileSync(path.join(VIEW_DIR, name + '.js'), 'utf8');
+}
+
+// ---------------------------------------------------------------- 共享主题
+
+let themeCache = null;
+
+/*
+ * 真实 LuCI require 不只执行源码：compileClass 要求工厂返回 baseclass 子类，
+ * 否则抛出 "factory yields invalid constructor"。测试用最小 baseclass.extend
+ * 模拟该契约，并显式验证结果，不能把普通对象注入视图就当加载成功。
+ */
+function themeModule() {
+	if (themeCache != null) return themeCache;
+
+	const source = fs.readFileSync(THEME_FILE, 'utf8');
+	function BaseClass() {}
+	BaseClass.extend = function (members) {
+		function SubClass() {}
+		SubClass.prototype = Object.create(BaseClass.prototype);
+		SubClass.prototype.constructor = SubClass;
+		Object.keys(members || {}).forEach(function (key) {
+			SubClass.prototype[key] = members[key];
+		});
+		return SubClass;
+	};
+	const env = {
+		console,
+		baseclass: BaseClass,
+
+		/* theme.style() 在真实 LuCI 里用全局 E()；测试里给同形状的桩节点即可。 */
+		E: function (tag, attrs, children) {
+			return { tag: tag, attrs: attrs || {}, children: children };
+		}
+	};
+	const context = vm.createContext(env);
+	const script = new vm.Script('(function (baseclass) {\n' + source + '\n})(baseclass)', { filename: 'prism-router/theme.js' });
+	const ThemeClass = script.runInContext(context, { timeout: 3000 });
+
+	if (typeof ThemeClass !== 'function' || !(ThemeClass.prototype instanceof BaseClass))
+		throw new TypeError('theme.js 不符合 LuCI require：必须返回 baseclass 子类');
+
+	themeCache = new ThemeClass();
+
+	return themeCache;
 }
 
 // ---------------------------------------------------------------- 环境桩
@@ -67,6 +122,9 @@ function makeEnvironment() {
 
 	const env = {
 		console,
+
+		/* require prism-router/theme as theme 的模块对象（见 themeModule）。 */
+		theme: themeModule(),
 
 		/* 浏览器原生 UTF-8 编码器：devices 的 128 字节校验用它。 */
 		TextEncoder: (typeof TextEncoder !== 'undefined') ? TextEncoder : undefined,
@@ -134,12 +192,23 @@ function makeEnvironment() {
 			}
 		},
 		E: function (tag, attrs, children) {
+			const classes = {};
+
 			return {
 				tag: tag,
 				attrs: attrs || {},
 				children: children,
 				style: {},
+				classList: {
+					add: function (name) { classes[name] = true; },
+					remove: function (name) { delete classes[name]; },
+					contains: function (name) { return classes[name] === true; },
+					toggle: function (name, on) { classes[name] = (on !== false); }
+				},
 				textContent: '',
+				firstChild: null,
+				/* syncStatus 用 lastChild 写服务状态文本；真实 DOM 里始终存在。 */
+				lastChild: { textContent: '' },
 				value: attrs && attrs.value != null ? attrs.value : '',
 				checked: false,
 				appendChild: function () {},
@@ -270,6 +339,8 @@ function containsText(root, needle) {
 	if (root == null) return false;
 	if (typeof root === 'string') return root.indexOf(needle) >= 0;
 	if (typeof root != 'object') return false;
+	if (Array.isArray(root)) return root.some(function(child) { return containsText(child, needle); });
+	if (typeof root.textContent === 'string' && root.textContent.indexOf(needle) >= 0) return true;
 
 	const children = root.children;
 
@@ -641,10 +712,9 @@ async function testSemantics() {
 		!/set_config|set_device_meta|method:\s*'restart'|uci\.set\s*\(/.test(diagnosticsPage) &&
 		/数据源/.test(diagnosticsPage) && /未更新|新鲜/.test(diagnosticsPage));
 
-	/* LuCI 精简为只读：详细面板由独立控制台（默认 8099）承接。 */
-	check('三处入口都指向独立控制台并新标签打开',
-		(/CONSOLE_PORT = 8099/.test(overview) || /:8099\//.test(overview)) &&
-		/target: '_blank'/.test(overview) &&
+	/* 概览不再对只读 ACL 发 UCI 探测；手机版/诊断的既有控制台入口保持兼容。 */
+	check('概览不引入默认 8099 死链，既有视图入口不变',
+		!/CONSOLE_PORT = 8099|consoleUrl\(\)/.test(overview) &&
 		/:8099\//.test(mobile) && /target: '_blank'/.test(mobile) &&
 		/:8099\//.test(diagnosticsPage) && /target: '_blank'/.test(diagnosticsPage));
 	check('概览不用 window.open 打开详细面板',
@@ -709,7 +779,7 @@ async function testOverviewLogic() {
 	const source = readView('overview');
 	const patched = source.replace(
 		/\nreturn view\.extend\(\{/,
-		'\nglobalThis.__tsTests = { yesterdayCompare: yesterdayCompare, shiftDayKey: shiftDayKey, onlineCount: onlineCount, healthLook: healthLook };\nreturn view.extend({'
+		'\nglobalThis.__tsTests = { yesterdayCompare: yesterdayCompare, shiftDayKey: shiftDayKey, onlineCount: onlineCount, healthLook: healthLook, newestDay: newestDay, trendOf: trendOf, attentionItems: attentionItems, localDayKey: localDayKey };\nreturn view.extend({'
 	);
 
 	if (patched === source) {
@@ -843,6 +913,37 @@ async function testOverviewLogic() {
 	check('health unavailable 不显示为精确',
 		tests.healthLook('unavailable').label !== '记账精确' &&
 		/不可用/.test(tests.healthLook('unavailable').label));
+
+	/* 午夜后 history.json 仍是昨天：今日 KPI/趋势必须降级，不能拿 days[0] 冒充今日。 */
+	const oldOnlyTrend = tests.trendOf(tests.newestDay(onlyYesterday, now), now);
+	check('今日筛选只接受后端 day=今天，旧 history 不冒充今日',
+		tests.newestDay(onlyYesterday, now).days.length === 0 &&
+		oldOnlyTrend.points.length === 0);
+	const actualToday = { day: todayKey, buckets: [
+		{ ts: now - 300, direct_rx: 100, direct_tx: 20 },
+		{ ts: now, direct_rx: 200, direct_tx: 40 }
+	] };
+	const mixedHistory = { days: [ onlyYesterday.days[0], actualToday ] };
+	const todayTrend = tests.trendOf(tests.newestDay(mixedHistory, now), now);
+	check('乱序历史仍能按 day 取到今天桶',
+		todayTrend.points.length === 2 && todayTrend.sumRx === 300 && todayTrend.sumTx === 60,
+		JSON.stringify(todayTrend));
+
+	/* 真实异常路径：degraded/source-bad/stale 都会走 panelHref，不能再 ReferenceError。 */
+	let attention = null;
+	let attentionError = '';
+	try {
+		attention = tests.attentionItems({
+			ts: now - 300,
+			health: { accounting_confidence: 'degraded', reasons: [] },
+			source: { clash: 'error', conntrack: 'ok' },
+			devices: [], quota: {}
+		}, now);
+	} catch (e) { attentionError = String(e); }
+	check('异常关注项可生成且下钻 LuCI 内部详细面板',
+		attentionError === '' && Array.isArray(attention) && attention.length >= 3 &&
+		attention.every(function(item) { return /prism-router\/panel|prism-router\/devices/.test(item.href || ''); }),
+		attentionError || JSON.stringify(attention));
 }
 
 // ---------------------------------------------------------------- 6c. mobile 健康状态
@@ -1112,24 +1213,435 @@ async function testDevicesMetaPermissions() {
 }
 
 
-async function testMenu() {
-	console.log('\n[7] 菜单 JSON');
 
-	const file = path.join(ROOT, 'luci-app-prism-router/root/usr/share/luci/menu.d/luci-app-prism-router.json');
+// ---------------------------------------------------------------- 6f. 共享主题
+
+function srgbToLinear(c) {
+	const v = c / 255;
+
+	return (v <= 0.03928) ? (v / 12.92) : Math.pow((v + 0.055) / 1.055, 2.4);
+}
+
+function luminance(hex) {
+	const m = /^#([0-9a-fA-F]{6})$/.exec(hex);
+
+	if (m == null) return null;
+
+	const n = parseInt(m[1], 16);
+	const r = (n >> 16) & 255;
+	const g = (n >> 8) & 255;
+	const b = n & 255;
+
+	return 0.2126 * srgbToLinear(r) + 0.7152 * srgbToLinear(g) + 0.0722 * srgbToLinear(b);
+}
+
+function contrast(a, b) {
+	const la = luminance(a);
+	const lb = luminance(b);
+
+	if (la == null || lb == null) return 0;
+
+	const hi = Math.max(la, lb);
+	const lo = Math.min(la, lb);
+
+	return (hi + 0.05) / (lo + 0.05);
+}
+
+async function testTheme() {
+	console.log('\n[6f] 共享主题 theme.js / 令牌 / 对比度 / 作用域');
+
+	const theme = themeModule();
+	const tokens = theme.TOKENS;
+
+	check('theme.js 导出 CLASS / css / style / color',
+		theme.CLASS === 'ts-prism' && typeof theme.css === 'function' &&
+		typeof theme.style === 'function' && typeof theme.color === 'function',
+		'class=' + theme.CLASS);
+	check('theme.CLASS = ts-prism（页面根共享 class）', theme.CLASS === 'ts-prism');
+
+	check('下载色：浅 #3B82F6 / 深 #60A5FA',
+		tokens.down.light === '#3B82F6' && tokens.down.dark === '#60A5FA',
+		JSON.stringify(tokens.down));
+	check('上传色：浅 #0891B2 / 深 #22D3EE',
+		tokens.up.light === '#0891B2' && tokens.up.dark === '#22D3EE',
+		JSON.stringify(tokens.up));
+
+	/* 正文/标签对比度：白底 ≥4.5:1，深色底 ≥4.5:1（WCAG 2.1 AA）。 */
+	const lightBg = '#FFFFFF';
+	const darkBg = '#12161B';
+	const textKeys = [ 'downText', 'upText', 'okText', 'warnText', 'badText', 'text', 'text2', 'text3' ];
+	const lightFail = textKeys.filter(function(key) {
+		return contrast(tokens[key].light, lightBg) < 4.5;
+	});
+	const darkFail = textKeys.filter(function(key) {
+		return contrast(tokens[key].dark, darkBg) < 4.5;
+	});
+
+	check('浅色正文/标签 token 对比度 ≥4.5:1', lightFail.length === 0,
+		lightFail.map(function(key) {
+			return key + '=' + contrast(tokens[key].light, lightBg).toFixed(2);
+		}).join(' '));
+	check('深色正文/标签 token 对比度 ≥4.5:1', darkFail.length === 0,
+		darkFail.map(function(key) {
+			return key + '=' + contrast(tokens[key].dark, darkBg).toFixed(2);
+		}).join(' '));
+
+	/* 方向色（填充）与状态色必须是两套值，避免“下载 = 正常”这类误读。 */
+	check('方向色与状态色不共用（浅色）',
+		tokens.down.light !== tokens.ok.light && tokens.down.light !== tokens.warn.light &&
+		tokens.down.light !== tokens.bad.light && tokens.up.light !== tokens.ok.light &&
+		tokens.up.light !== tokens.warn.light && tokens.up.light !== tokens.bad.light);
+	check('方向色与状态色不共用（深色）',
+		tokens.down.dark !== tokens.ok.dark && tokens.down.dark !== tokens.warn.dark &&
+		tokens.down.dark !== tokens.bad.dark && tokens.up.dark !== tokens.ok.dark &&
+		tokens.up.dark !== tokens.warn.dark && tokens.up.dark !== tokens.bad.dark);
+
+	const css = theme.css();
+
+	check('主题声明深浅两套 token',
+		/--ts-down:#3B82F6/.test(css) && /--ts-down:#60A5FA/.test(css) &&
+		/@media \(prefers-color-scheme:dark\)/.test(css));
+	check('LuCI data-darkmode 显式深色优先且显式浅色不被 OS 覆盖',
+		/:root\[data-darkmode="true"\] \.ts-prism/.test(css) &&
+		/:root:not\(\[data-darkmode="false"\]\) \.ts-prism/.test(css));
+	check('主题含 focus-visible 描边', /:focus-visible\{outline:2px solid var\(--ts-focus\)/.test(css));
+	check('主题尊重 prefers-reduced-motion',
+		/@media \(prefers-reduced-motion:reduce\)\{[\s\S]*?animation-duration:\.001ms/.test(css));
+	check('主题提供折叠说明/details 组件', /details\.ts-fold/.test(css));
+	check('主题提供方向图例（下载/上传）', /\.ts-dir-down::before/.test(css) && /\.ts-dir-up::before/.test(css));
+
+	/* 作用域：所有选择器都必须挂在 .ts-prism 下，不能泄漏到 LuCI 全局。 */
+	const leaked = [];
+	css.split('\n').forEach(function(line) {
+		const text = line.trim();
+
+		if (text.indexOf('{') < 0) return;
+
+		const selector = text.slice(0, text.indexOf('{'));
+
+		/* @media 行本身不是选择器；它内部的规则会在各自行继续检查。 */
+		if (selector.charAt(0) === '@') return;
+
+		selector.split(',').forEach(function(part) {
+			const value = part.trim();
+			if (!value.length) return;
+			if (value.indexOf('.ts-prism') === 0) return;
+			/* LuCI bootstrap 显式主题属性必须能优先于 OS 媒体查询。 */
+			if (/^:root(?::not\(\[data-darkmode="false"\]\)|\[data-darkmode="true"\]) \.ts-prism$/.test(value)) return;
+			leaked.push(text);
+		});
+	});
+
+	check('主题规则全部限定在 .ts-prism 作用域（无全局泄漏）', leaked.length === 0,
+		leaked.slice(0, 3).join(' | '));
+
+	/* 每个页面都 require 共享模块、根元素带 class、注入 theme.style()。 */
+	for (const name of THEMED_VIEWS) {
+		const source = readView(name);
+
+		check(name + ' require 共享主题模块',
+			/require prism-router\/theme as theme/.test(source));
+		check(name + ' 根元素带 theme.CLASS', /'class': theme\.CLASS/.test(source));
+		check(name + ' 注入 theme.style()', /theme\.style\(\)/.test(source));
+	}
+
+	check('概览标题统一为「概览」', /棱镜路由 · 概览/.test(readView('overview')));
+	check('节点页标题统一为「网络节点」', /棱镜路由 · 网络节点/.test(readView('nodes')));
+	check('诊断页标题统一', /棱镜路由 · 诊断/.test(readView('diagnostics')));
+	check('设置页标题统一', /棱镜路由 · 设置/.test(readView('settings')));
+}
+
+
+// ---------------------------------------------------------------- 6i. 概览渲染冒烟（DOM 桩）
+
+async function testOverviewRender() {
+	console.log('\n[6i] 概览渲染冒烟：根/4 KPI/顺序/折叠/8099 条件入口');
+
+	const loaded = loadView('overview');
+	const now = Math.floor(Date.now() / 1000);
+
+	function makeCtx(panelEnabled) {
+		const ctx = Object.create(loaded.view);
+
+		ctx.autoRefresh = false;
+		ctx.panelEnabled = panelEnabled === true;
+		ctx.state = {
+			running: true,
+			ts: now,
+			uptime: 3600,
+			totals: {
+				direct_rx: 100, direct_tx: 50, proxy_rx: 200, proxy_tx: 80,
+				rx_rate: 1000, tx_rate: 500,
+				wifi_rx: 10, wifi_tx: 5, wired_rx: 20, wired_tx: 2,
+				unknown_rx: 0, unknown_tx: 0,
+				month_total: 1073741824
+			},
+			quota: { mode: 'monthly', monthly_gb: 10, total_gb: 0, period: '' },
+			health: { accounting_confidence: 'exact', reasons: [] },
+			devices: [ {
+				mac: 'AA:BB:CC:DD:EE:FF', hostname: 'tv', ip: '192.168.1.2',
+				direct_rx: 10, direct_tx: 5, proxy_rx: 1, proxy_tx: 1,
+				last_seen: now - 10, link: 'wifi'
+			} ],
+			apps: [ { host: 'youtube.com', rx: 10, tx: 5, chain: 'DIRECT', devices: 1 } ],
+			nodes: {}
+		};
+
+		return ctx;
+	}
+
+	let root = null;
 
 	try {
-		const menu = JSON.parse(fs.readFileSync(file, 'utf8'));
+		root = loaded.view.render.call(makeCtx(false));
+	}
+	catch (err) {
+		bad('概览 render 不抛异常', err && err.message);
+		return;
+	}
+
+	ok('概览 render 不抛异常');
+
+	check('根节点 #ts-overview 且带 .ts-prism',
+		root != null && root.attrs != null && root.attrs.id === 'ts-overview' &&
+		('' + root.attrs['class']).indexOf('ts-prism') >= 0,
+		root && JSON.stringify(root.attrs));
+
+	const text = (function() {
+		const parts = [];
+
+		(function walk(node) {
+			if (node == null) return;
+			if (typeof node === 'string') { parts.push(node); return; }
+			if (typeof node !== 'object') return;
+			if (typeof node.children === 'string') parts.push(node.children);
+			else if (Array.isArray(node.children)) node.children.forEach(walk);
+			if (node.textContent) parts.push('' + node.textContent);
+		})(root);
+
+		return parts.join(' ');
+	})();
+
+	check('4 个 KPI 文案都在页面上',
+		text.indexOf('下载') >= 0 && text.indexOf('上传') >= 0 &&
+		text.indexOf('今日') >= 0 && text.indexOf('本月') >= 0);
+	check('KPI 数值按字节单位渲染（GiB/MiB/B）', /(GiB|MiB|KiB| B)/.test(text));
+	check('今日无桶时显示 —（不补 0）', text.indexOf('暂无今日桶') >= 0);
+
+	const topIndex = root.children.findIndex(function(node) {
+		return node && node.attrs && ('' + (node.attrs['class'] || '')).indexOf('tso-cols-top') >= 0;
+	});
+	const calIndex = root.children.findIndex(function(node) {
+		return node && node.attrs && ('' + (node.attrs['class'] || '')).indexOf('tso-cal-panel') >= 0;
+	});
+
+	check('DOM 顺序：Top 在日历之前', topIndex >= 0 && calIndex >= 0 && topIndex < calIndex,
+		'top=' + topIndex + ' cal=' + calIndex);
+
+	const calBox = root.children[calIndex];
+
+	check('日历是 <details> 且默认折叠（open 不为 true）',
+		calBox != null && calBox.tag === 'details' && calBox.attrs.open !== true &&
+		calBox.attrs.open !== 'open',
+		calBox && JSON.stringify(calBox.attrs));
+
+	check('概览不渲染默认 8099 控制台死链',
+		containsText(root, '独立控制台') === false);
+	check('概览仍渲染手机版快捷入口',
+		containsText(root, '手机版') === true);
+
+	const degradedCtx = makeCtx(false);
+	degradedCtx.state.health.accounting_confidence = 'degraded';
+	degradedCtx.state.source = { clash: 'error', conntrack: 'unknown' };
+	degradedCtx.state.ts = now - 600;
+	let degradedRoot = null;
+	let degradedError = '';
+	try { degradedRoot = loaded.view.render.call(degradedCtx); }
+	catch (e) { degradedError = String(e); }
+	/* DOM 桩不保留 dom.content 的子树；条目文本/URL由上方 attentionItems 行为测试验证。 */
+	check('概览 degraded/source-bad/stale 完整 render 不再因 panelHref 崩溃',
+		degradedError === '' && degradedRoot != null && degradedCtx.attnBox != null &&
+		degradedCtx.attnSig != null && degradedCtx.attnSig.indexOf('记账状态') >= 0,
+		degradedError || ('root=' + (degradedRoot != null) + ' attn=' + (degradedCtx.attnBox != null) + ' sig=' + degradedCtx.attnSig));
+}
+
+// ---------------------------------------------------------------- 6g. 概览驾驶舱 IA
+
+async function testCockpit() {
+	console.log('\n[6g] 概览驾驶舱：4 KPI / Top 在日历前 / 日历折叠 / 8099 条件入口');
+
+	const overview = readView('overview');
+	const renderBody = (overview.match(/render: function\(\)\s*\{([\s\S]*?)\n\t\},\n\n\t\/\* get_state 失败/ ) || [])[1] || '';
+	const kpiBody = (overview.match(/renderKpis: function\(state\)\s*\{([\s\S]*?)\n\t\},\n\n\t\/\/ -{10,} ②b/) || [])[1] || '';
+
+	check('概览 render 结构可定位', renderBody.length > 0 && kpiBody.length > 0,
+		'render=' + renderBody.length + ' kpi=' + kpiBody.length);
+
+	/* 4 个 KPI 去重：下载 / 上传 / 今日 / 本月；实时速率与接入维度不再占 KPI。 */
+	check('KPI = 下载/上传/今日/本月',
+		/_\('下载'\)/.test(kpiBody) && /_\('上传'\)/.test(kpiBody) &&
+		/_\('今日'\)/.test(kpiBody) && /_\('本月'\)/.test(kpiBody));
+	check('KPI 不再重复放实时速率', !/_\('实时速率'\)/.test(kpiBody));
+	check('KPI 不再重复放无线/有线接入', !/_\('无线接入'\)/.test(kpiBody) && !/_\('有线接入'\)/.test(kpiBody));
+	check('4 张 KPI 磁贴按顺序渲染',
+		/\[ downCard, upCard, todayCard, monthCard \]/.test(kpiBody));
+	check('KPI 下载/上传用方向色 token',
+		/var\(--ts-down-text\)/.test(kpiBody) && /var\(--ts-up-text\)/.test(kpiBody));
+
+	/* Top 设备/应用必须排在日历之前。 */
+	const topAt = renderBody.indexOf('renderTopDevices');
+	const calAt = renderBody.indexOf('renderCalendar');
+
+	check('Top 设备/应用在日历之前', topAt > 0 && calAt > 0 && topAt < calAt,
+		'top=' + topAt + ' cal=' + calAt);
+
+	/* 日历默认折叠（<details> 不带 open）。 */
+	check('日历用 <details> 默认折叠',
+		/E\('details', \{ 'class': 'tso-panel tso-cal-panel ts-fold' \}/.test(overview));
+	check('日历英文案在折叠体内（不再长期占页面）',
+		/ts-fold-b[\s\S]{0,260}左旧右新/.test(overview));
+	check('展开日历时滚到今天',
+		/calBox\.addEventListener\('toggle'[\s\S]{0,160}scrollCalendarToToday\(\)/.test(overview));
+
+	/* 8099 配置不能由只读 ACL 安全读取，首屏不发 UCI、不阻塞实时数据。 */
+	check('首屏不读取 UCI 探测面板开关',
+		!/uci\.load\('prism-router'\)/.test(overview) &&
+		!/readPanelEnabled\(\)/.test(overview));
+	check('概览不渲染无条件 8099 死链',
+		!/href: consoleUrl\(\)/.test(overview));
+	check('概览保留手机版入口', /admin\/services\/prism-router\/mobile/.test(overview));
+	check('30s 周期同时更新今日桶/昨日对比与日历',
+		/loadTrendHistory: function\(\)/.test(overview) &&
+		/callHistory\(2\)\.then/.test(overview) &&
+		/self\.loadTrendHistory\(\);[\s\S]{0,100}self\.loadCalendar\(\);/.test(overview));
+	check('今日历史刷新有序号保护，旧响应不能覆盖新数据',
+		/var seq = \(this\.trendSeq \|\| 0\) \+ 1/.test(overview) &&
+		/if \(seq !== self\.trendSeq\) return/.test(overview) &&
+		/historySeq === self\.trendSeq/.test(overview));
+
+	/* 方向色：趋势数据集写 var(--ts-down/up)，Canvas 再按主题解析。 */
+	check('趋势方向常量走 token',
+		/var COLOR_RX = 'var\(--ts-down\)'/.test(overview) &&
+		/var COLOR_TX = 'var\(--ts-up\)'/.test(overview));
+	check('Canvas 颜色按主题解析', /theme\.color\('down'/.test(overview) && /theme\.color\('up'/.test(overview));
+	check('状态色只用于健康/关注（ok/warn/bad token）',
+		/var\(--ts-ok-text\)/.test(overview) && /var\(--ts-warn-text\)/.test(overview) &&
+		/var\(--ts-bad-text\)/.test(overview) && !/COLOR_RX = 'var\(--ts-ok/.test(overview));
+}
+
+
+// ---------------------------------------------------------------- 6h. 设备/应用窄屏可读性
+
+async function testResponsiveReadability() {
+	console.log('\n[6h] devices/apps：窄屏不溢出 / 关键列保留 / 长说明折叠');
+
+	const devices = readView('devices');
+	const apps = readView('apps');
+
+	check('devices 根限制 max-width:100% 且可换行',
+		/#ts-devices\{max-width:100%;min-width:0;overflow-wrap:anywhere\}/.test(devices));
+	check('devices 表格容器横向滚动（页面本身不溢出）',
+		/#ts-devices \.tsd-tablewrap\{overflow-x:auto/.test(devices));
+	check('devices 窄屏隐藏次要列（首次出现/信号）',
+		/@media \(max-width:760px\)\{[\s\S]{0,120}#ts-devices \.tsd-opt\{display:none\}/.test(devices));
+	check('devices 窄屏收紧表格最小宽度并约束 LuCI flex 行',
+		/#ts-devices table\{min-width:660px\}/.test(devices) &&
+		/#ts-devices table \.tr\{min-width:660px\}/.test(devices) &&
+		/#ts-devices table \.tsd-col-name\{flex-basis:190px\}/.test(devices));
+	check('devices 窄屏把次要列留给详情抽屉', /\.tsd-col-meta\{display:none\}/.test(devices));
+	check('devices 信号表头与有/无信号单元格同步隐藏',
+		/renderSignal: function[\s\S]*?'class': 'td tsd-opt', style: 'text-align:right'/.test(devices) &&
+		/renderSignal: function[\s\S]*?'class': 'td tsd-opt',\n\t\t\tstyle: 'text-align:right;white-space:nowrap'/.test(devices));
+	check('devices 窄屏搜索/下拉换行', /\.tsd-search\{flex:1 1 100%/.test(devices) &&
+		/\.tsd-select\{flex:1 1 46%/.test(devices));
+
+	check('apps 根限制 max-width:100%',
+		/#ts-apps\{font-size:var\(--ts-fs-2\);max-width:100%;min-width:0\}/.test(apps));
+	check('apps 表格容器横向滚动', /#ts-apps \.tsa-tablewrap\{[^}]*overflow-x:auto/.test(apps));
+	check('apps 约束 LuCI flex 行与域名/数值关键列',
+		/#ts-apps \.tsa-table \.tr\{display:flex;flex-wrap:nowrap;min-width:720px/.test(apps) &&
+		/\.tsa-col-host\{flex:0 0 190px/.test(apps) &&
+		/\.tsa-col-bytes\{flex:0 0 94px;white-space:nowrap/.test(apps));
+	check('apps 窄屏有 760px / 420px 两档并隐藏次要列',
+		/@media \(max-width:760px\)\{[\s\S]*?#ts-apps \.tsa-table\{min-width:670px\}/.test(apps) &&
+		/\.tsa-col-meta\{display:none\}/.test(apps) &&
+		/@media \(max-width:420px\)\{[\s\S]*?grid-template-columns:repeat\(2,minmax\(0,1fr\)\)/.test(apps));
+	check('apps 筛选行允许换行', /\.tsa-filterline\{display:flex;gap:8px;align-items:center;flex-wrap:wrap/.test(apps));
+
+	/* 字号：正文/标签 ≥12px（方向、类别、厂商、子信息）。 */
+	check('apps 类别标签 ≥12px', /\.tsa-cat\{display:inline-block;font-size:12px/.test(apps));
+	check('apps 排序箭头 12px', /\.tsa-arrow\{font-size:12px/.test(apps));
+	check('devices 子信息/厂商 ≥12px',
+		/\.tsd-sub\{font-size:12px/.test(devices) && /\.tsd-vendor\{font-size:12px/.test(devices));
+
+	/* 长说明收进 details，默认不占页面。 */
+	check('apps 数据口径说明收进 <details>',
+		/E\('details', \{ 'class': 'tsa-note tsa-fold' \}/.test(apps) &&
+		/E\('summary', \{\}, _\('数据口径说明'\)\)/.test(apps));
+	check('apps details 默认不展开（无 open）',
+		!/E\('details', \{ 'class': 'tsa-note tsa-fold'[^}]*open/.test(apps));
+
+	/* 设备关键列保留：名称/接入/上下行/合计；直连/代理/合计带 ↓↑ title。 */
+	check('devices 保留 名称/接入/直连/代理/合计/操作 列',
+		/主机名 \/ 厂商/.test(devices) && /_\('接入'\)/.test(devices) &&
+		/_\('直连'\)/.test(devices) && /_\('代理'\)/.test(devices) &&
+		/_\('合计'\)/.test(devices) && /_\('操作'\)/.test(devices));
+	check('devices 上下行拆分写进 cell title',
+		/title: _\('直连'\) \+ ' ↓ '/.test(devices) &&
+		/title: _\('代理'\) \+ ' ↓ '/.test(devices));
+	check('apps 保留 域名/类别/下载/上传/合计 列',
+		/'class': 'th tsa-col-host'/.test(apps) && /_\('应用\/域名'\)/.test(apps) &&
+		/'class': 'th tsa-col-meta'/.test(apps) && /_\('类别'\)/.test(apps) &&
+		/this\.sortHeader\(_\('下载'\), 'rx', 'right', 'tsa-col-bytes'\)/.test(apps) &&
+		/this\.sortHeader\(_\('上传'\), 'tx', 'right', 'tsa-col-bytes'\)/.test(apps) &&
+		/this\.sortHeader\(_\('合计'\), 'total', 'right', 'tsa-col-bytes'\)/.test(apps));
+}
+
+async function testMenu() {
+	console.log('\n[7] 菜单 JSON：网络入口 + 旧路由保留（LuCI 真实可见规则）');
+
+	try {
+		const menu = JSON.parse(fs.readFileSync(MENU_FILE, 'utf8'));
 
 		check('menu.d JSON 可解析', menu != null && typeof menu === 'object');
 
-		const pluginViews = [ 'overview', 'devices', 'apps', 'nodes', 'settings', 'mobile', 'diagnostics', 'panel' ];
-		const paths = pluginViews.map(function (name) {
-			return menu['admin/services/prism-router/' + name];
+		const leafKeys = Object.keys(menu).filter(function(key) {
+			return key.indexOf('admin/services/prism-router/') === 0;
 		});
 
-		check('menu.d 含插件全部页面（概览/设备/应用/节点/设置/手机版/诊断/面板）',
-			paths.every(function (item) { return item && item.action && item.action.type === 'view'; }),
-			JSON.stringify(paths.map(function (x) { return x && x.action && x.action.path; })));
+		/*
+		 * OpenWrt 24.10 ui.js 的 UIMenu.getChildren() 只检查 satisfied 和 title；
+		 * 它不会读取 menu.d 的 hidden 字段。这里复刻真实可见性，避免用自创
+		 * hidden 断言把八项菜单误报成五项，或牺牲 mobile/diagnostics 旧路由。
+		 */
+		const visible = leafKeys.filter(function(key) {
+			const node = menu[key];
+			return node && Object.prototype.hasOwnProperty.call(node, 'title') && node.satisfied !== false;
+		}).sort(function(a, b) {
+			return (menu[a].order || 0) - (menu[b].order || 0);
+		});
+		const visibleNames = visible.map(function(key) { return key.split('/').pop(); });
+
+		sameList('LuCI 实际可见入口保持八个且路由完整', visibleNames,
+			[ 'overview', 'devices', 'apps', 'nodes', 'settings', 'mobile', 'diagnostics', 'panel' ]);
+		check('不使用 LuCI 不支持的 hidden 菜单字段',
+			leafKeys.every(function(key) { return !Object.prototype.hasOwnProperty.call(menu[key], 'hidden'); }));
+		check('主入口标题为 概览/设备/应用/网络/设置',
+			visible.slice(0, 5).map(function(key) { return menu[key].title; }).join('|') === '概览|设备|应用|网络|设置',
+			visible.map(function(key) { return menu[key].title; }).join('|'));
+
+		check('「网络」入口复用 nodes.js 且 path 不变',
+			menu['admin/services/prism-router/nodes'].title === '网络' &&
+			menu['admin/services/prism-router/nodes'].action.type === 'view' &&
+			menu['admin/services/prism-router/nodes'].action.path === 'prism-router/nodes');
+
+		/* 旧路由仍是真实 view action，设置/概览另有快捷入口，不能成为孤立页面。 */
+		[ 'mobile', 'diagnostics', 'panel' ].forEach(function(name) {
+			const node = menu['admin/services/prism-router/' + name];
+			check(name + ' 旧 URL 对应 view 路由保留',
+				node && node.action && node.action.type === 'view' &&
+				node.action.path === 'prism-router/' + name);
+		});
 
 		const root = menu['admin/services/prism-router'];
 		const rootAcl = root && root.depends && root.depends.acl;
@@ -1151,6 +1663,7 @@ async function testMenu() {
 		 * 视图 JS 里写 depends 不会被 dispatcher 读取；ACL 必须落在 menu.d 节点。
 		 */
 		const settingsView = readView('settings');
+
 		check('settings.js 不伪造 view.depends（ACL 只在 menu.d）',
 			!/(?:^|\n)\s*depends\s*:/.test(settingsView));
 
@@ -1160,6 +1673,12 @@ async function testMenu() {
 		check('mobile/panel 没有写 RPC，因此不需要 admin 子路由依赖',
 			!/set_config|set_device_meta|method:\s*'restart'|uci\.set\s*\(/.test(mobileSrc) &&
 			!/set_config|set_device_meta|method:\s*'restart'|uci\.set\s*\(/.test(panelSrc));
+
+		/* 入口补偿：设置页给诊断，概览给手机版；不制造死链。 */
+		check('设置页含诊断入口链接',
+			/admin\/services\/prism-router\/diagnostics/.test(readView('settings')));
+		check('设置页含手机版入口链接',
+			/admin\/services\/prism-router\/mobile/.test(readView('settings')));
 	}
 	catch (err) {
 		bad('menu.d JSON 可解析', err && err.message);
@@ -1181,6 +1700,10 @@ async function testMenu() {
 	await testMobileHealth();
 	await testSettingsUciGuard();
 	await testDevicesMetaPermissions();
+	await testTheme();
+	await testCockpit();
+	await testOverviewRender();
+	await testResponsiveReadability();
 	await testMenu();
 
 	console.log('\n结果：' + passed + ' passed, ' + failed + ' failed');

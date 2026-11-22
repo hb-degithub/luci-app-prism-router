@@ -87,13 +87,21 @@ function read_settings() {
 	const port = c.get(UCI_CONFIG, 'panel', 'port');
 	const bind = c.get(UCI_CONFIG, 'panel', 'bind');
 	const token = c.get(UCI_CONFIG, 'panel', 'token');
+	const write_enabled = c.get(UCI_CONFIG, 'panel', 'write_enabled');
+
+	/* 与 control 鉴权统一：忽略 UCI 值首尾空白，'true'/'yes' 仍然不是开启值。 */
+	const can_write = (type(write_enabled) == 'string' && trim(write_enabled) == '1');
 
 	out.panel = {
 		enabled: (enabled == '1'),
+		write_enabled: can_write,
 		port: (type(port) == 'string' && length(port) > 0) ? port : '8099',
 		bind: (type(bind) == 'string') ? bind : '',
-		has_token: (type(token) == 'string' && length(token) > 0)
+		has_token: (type(token) == 'string' && length(trim(token)) > 0)
 	};
+
+	/* 兼容旧客户端：write.enabled 与 panel.write_enabled 同值；面板服务本身仍只读。 */
+	out.write = { enabled: can_write };
 
 	return out;
 }
@@ -205,7 +213,7 @@ function config_token() {
 		const c = cursor();
 		const v = c.get(UCI_CONFIG, 'panel', 'token');
 
-		return (type(v) == 'string') ? v : '';
+		return (type(v) == 'string') ? trim(v) : '';
 	}
 	catch (e) {
 		/* 配置缺失/读不到按"未设 token"处理（面板默认关闭，不额外放大成 500）。 */

@@ -4,6 +4,7 @@
 'require rpc';
 'require uci';
 'require ui';
+'require prism-router/theme as theme';
 
 /*
  * 棱镜路由 · 设置
@@ -639,8 +640,18 @@ return view.extend({
 		this.feishuStartSeq = 0;
 		this.feishuBoundChat = null;
 
-		var root = E('div', {}, [
-			E('h2', {}, _('棱镜路由 · 设置')),
+		var root = E('div', { 'id': 'ts-settings', 'class': theme.CLASS }, [
+			theme.style(),
+			E('h2', { 'class': 'ts-title' }, _('棱镜路由 · 设置')),
+			/* 手机版 / 诊断的快捷入口；menu.d 旧路由保持可访问。 */
+			E('p', { 'class': 'ts-muted ts-entry-links' }, [
+				_('只读视图') + '：',
+				E('a', { href: L.url('admin/services/prism-router/overview') }, _('概览')),
+				' · ',
+				E('a', { href: L.url('admin/services/prism-router/mobile') }, _('手机版')),
+				' · ',
+				E('a', { href: L.url('admin/services/prism-router/diagnostics') }, _('诊断中心'))
+			]),
 			this.renderStatusBanner(),
 			this.uciOk ? '' : E('div', { 'class': 'alert-message error', style: 'padding:10px 14px;margin-bottom:16px' }, [
 				E('strong', {}, _('读不到 UCI 配置：已禁用保存/重启（不会用默认值覆盖现有配置）')),
@@ -669,13 +680,13 @@ return view.extend({
 
 		/* 记账 unavailable/degraded 时横幅不能是健康绿；服务没跑则一律红。 */
 		if (!running)
-			look = { color: '#c62828', bg: 'rgba(198,40,40,.12)' };
+			look = { color: 'var(--ts-bad-text)', bg: 'rgba(220,38,38,.10)' };
 		else if (conf === 'exact')
-			look = { color: '#2e7d32', bg: 'rgba(76,175,80,.12)' };
+			look = { color: 'var(--ts-ok-text)', bg: 'rgba(22,163,74,.10)' };
 		else if (conf === 'unavailable')
-			look = { color: '#c62828', bg: 'rgba(198,40,40,.12)' };
+			look = { color: 'var(--ts-bad-text)', bg: 'rgba(220,38,38,.10)' };
 		else
-			look = { color: '#e65100', bg: 'rgba(255,152,0,.14)' };
+			look = { color: 'var(--ts-warn-text)', bg: 'rgba(217,119,6,.10)' };
 
 		var bits = [];
 
@@ -1145,7 +1156,7 @@ return view.extend({
 		this.feishuBoundNode = E('div', {
 			'id': 'ts-feishu-bound',
 			'style': 'display:none;max-width:100%;align-items:center;gap:10px;flex-wrap:wrap;' +
-				'padding:8px 10px;border-radius:6px;background:rgba(76,175,80,.12)'
+				'padding:8px 10px;border-radius:6px;background:rgba(22,163,74,.10)'
 		}, [
 			this.feishuBoundText,
 			this.feishuUnbindBtn
@@ -1704,15 +1715,15 @@ return view.extend({
 		if (this.statusText != null) {
 			this.statusText.textContent = message;
 			this.statusText.style.color = (kind === 'error' || kind === true)
-				? '#c62828'
-				: ((kind === 'warn') ? '#ef6c00' : '');
+				? 'var(--ts-bad-text)'
+				: ((kind === 'warn') ? 'var(--ts-warn-text)' : '');
 		}
 	},
 
 	setTestResult: function(message, isError) {
 		if (this.testNode != null) {
 			this.testNode.textContent = message;
-			this.testNode.style.color = isError ? '#c62828' : '#2e7d32';
+			this.testNode.style.color = isError ? 'var(--ts-bad-text)' : 'var(--ts-ok-text)';
 		}
 	},
 
@@ -1908,7 +1919,7 @@ return view.extend({
 	setDryRunStatus: function(message, isError) {
 		if (this.dryRunStatus != null) {
 			this.dryRunStatus.textContent = message;
-			this.dryRunStatus.style.color = isError ? '#c62828' : '';
+			this.dryRunStatus.style.color = isError ? 'var(--ts-bad-text)' : '';
 		}
 	},
 
@@ -2162,9 +2173,9 @@ return view.extend({
 		if (this.feishuScanStatus == null) return;
 
 		this.feishuScanStatus.textContent = (message == null) ? '' : ('' + message);
-		this.feishuScanStatus.style.color = (kind === 'error') ? '#c62828'
-			: ((kind === 'ok') ? '#2e7d32'
-			: ((kind === 'warn') ? '#ef6c00' : ''));
+		this.feishuScanStatus.style.color = (kind === 'error') ? 'var(--ts-bad-text)'
+			: ((kind === 'ok') ? 'var(--ts-ok-text)'
+			: ((kind === 'warn') ? 'var(--ts-warn-text)' : ''));
 	},
 
 	setFeishuButton: function(btn, label, busy) {
@@ -2839,7 +2850,7 @@ return view.extend({
 			clearNode(host);
 			host.setAttribute('data-qr', 'fail');
 			host.appendChild(E('div', {
-				style: 'font-size:11.5px;line-height:1.5;padding:6px;color:#555;word-break:break-word'
+				style: 'font-size:12px;line-height:1.5;padding:6px;color:#555;word-break:break-word'
 			}, _('二维码组件不可用（') + str(reason || _('未知原因')) + _('）。可在电脑上打开下面的链接完成授权：')));
 			host.appendChild(E('div', {
 				style: 'font-size:11px;line-height:1.4;padding:0 6px 6px;word-break:break-all;opacity:.8'
@@ -2921,11 +2932,11 @@ return view.extend({
 				throw new Error((res != null && res.error != null) ? ('' + res.error) : _('后端没有返回 CSV 内容'));
 
 			self.saveCsv(res, 'daily');
-			self.setExportStatus(_('已导出') + ' ' + ((res.rows != null) ? res.rows : 0) + ' ' + _('行'), '#2e7d32');
+			self.setExportStatus(_('已导出') + ' ' + ((res.rows != null) ? res.rows : 0) + ' ' + _('行'), 'var(--ts-ok-text)');
 		}).catch(function(err) {
 			var message = (err != null && err.message) ? ('' + err.message) : ('' + err);
 
-			self.setExportStatus(_('导出失败：') + message, '#c62828');
+			self.setExportStatus(_('导出失败：') + message, 'var(--ts-bad-text)');
 			ui.addNotification(null, E('p', {}, _('导出失败：') + message), 'error');
 		});
 	},

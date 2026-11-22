@@ -1,4 +1,5 @@
 #!/bin/sh
+. /src/tests/lib/prism-version-inner.sh
 # feishu.uc「发什么 / 什么时候发 / 什么条件下发」可配化的容器门禁（在隔离容器内执行）
 #
 # 覆盖：
@@ -35,7 +36,7 @@ WORK=/tmp/fs-gate
 rm -rf "$WORK"; mkdir -p "$WORK"
 
 echo "=== 0. 安装 prism-router ==="
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/fs-install.log 2>&1 \
+opkg install "$PRISM_IPK" >/tmp/fs-install.log 2>&1 \
   && ok "安装成功" || { bad "安装失败"; tail -5 /tmp/fs-install.log; }
 [ -f "$FEISHU" ] && ok "feishu.uc 已安装（$FEISHU）" || { bad "feishu.uc 缺失"; exit 1; }
 if grep -q "report_items" "$CFG"; then

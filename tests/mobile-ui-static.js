@@ -14,7 +14,8 @@
  *
  * 覆盖：
  *   0. 环境：localStorage 桩（memory / throw / getter-throw / none）供离线快照测试
- *   1. 结构：根 #ts-mobile.tsm-app、5 个 .tsm-page、5 个 .tsm-dot-btn、默认第 1 屏
+ *   1. 结构：根 #ts-mobile.tsm-app、5 个 .tsm-page、顶部 5 个带文字 tab、默认第 1 屏
+ *      （底部无文字圆点导航已移除，只保留顶部 tab）
  *   2. 分页 setPage 夹紧，只改 class，不发 RPC
  *   3. 概览数据：上传/下载速率、出口节点、连接数角标、在线台数
  *   4. 设备分类：主网络 / 访客 / 离线 + 三个 tab 数量
@@ -792,7 +793,7 @@ function codeWithoutComments(source) {
 // ---------------------------------------------------------------- 1. 结构
 
 async function testStructure() {
-	console.log('\n[1] 结构：根 #ts-mobile.tsm-app / 5 屏 / 5 圆点 / 默认第 1 屏');
+	console.log('\n[1] 结构：根 #ts-mobile.tsm-app / 5 屏 / 顶部 5 tab（无底部圆点）/ 默认第 1 屏');
 
 	const booted = await boot();
 	const ctx = booted.ctx;
@@ -815,10 +816,12 @@ async function testStructure() {
 		'pagesHost=' + repr(pagesHost));
 	same('.tsm-page 数量 = 5',
 		findAll(root, function (n) { return hasClass(n, 'tsm-page'); }).length, 5);
-	same('圆点按钮 .tsm-dot-btn 数量 = 5',
-		findAll(root, function (n) { return hasClass(n, 'tsm-dot-btn'); }).length, 5);
-	same('圆点指示 .tsm-dot-i 数量 = 5',
-		findAll(root, function (n) { return hasClass(n, 'tsm-dot-i'); }).length, 5);
+	same('底部圆点导航已移除（无 .tsm-dots）',
+		findAll(root, function (n) { return hasClass(n, 'tsm-dots'); }).length, 0);
+	same('底部圆点按钮已移除（无 .tsm-dot-btn）',
+		findAll(root, function (n) { return hasClass(n, 'tsm-dot-btn'); }).length, 0);
+	same('底部圆点指示已移除（无 .tsm-dot-i）',
+		findAll(root, function (n) { return hasClass(n, 'tsm-dot-i'); }).length, 0);
 
 	const mainTabs = findByClass(root, 'tsm-tabs');
 	const tabButtons = findAll(mainTabs, function (n) { return hasClass(n, 'tsm-tab'); });
@@ -827,10 +830,8 @@ async function testStructure() {
 	sameList('顶部 tab 文案依次为 概览/设备/节点/拓扑/安装',
 		tabButtons.map(textOf), [ '概览', '设备', '节点', '拓扑', '安装' ]);
 
-	const dotButtons = findAll(root, function (n) { return hasClass(n, 'tsm-dot-btn'); });
-
-	sameList('圆点 aria-label 随 5 屏更新',
-		dotButtons.map(function (n) { return n.attrs['aria-label']; }),
+	sameList('顶部 tab aria-label 随 5 屏更新',
+		tabButtons.map(function (n) { return n.attrs['aria-label']; }),
 		[ '概览', '设备', '节点', '拓扑', '安装' ]);
 
 	same('默认 pageIndex = 0', ctx.pageIndex, 0);
@@ -841,11 +842,9 @@ async function testStructure() {
 		!hasClass(ctx.pages[3], 'on') &&
 		!hasClass(ctx.pages[4], 'on'),
 		'pages classes=' + repr(ctx.pages.map(function (p) { return p.attrs['class']; })));
-	check('默认第 1 个 tab 与第 1 个圆点选中',
-		hasClass(ctx.tabs[0], 'on') && hasClass(ctx.dots[0], 'on') &&
-		!hasClass(ctx.tabs[1], 'on') && !hasClass(ctx.dots[1], 'on'),
-		'tab classes=' + repr(ctx.tabs.map(function (t) { return t.attrs['class']; })) +
-		' dot classes=' + repr(ctx.dots.map(function (d) { return d.attrs['class']; })));
+	check('默认第 1 个 tab 选中',
+		hasClass(ctx.tabs[0], 'on') && !hasClass(ctx.tabs[1], 'on'),
+		'tab classes=' + repr(ctx.tabs.map(function (t) { return t.attrs['class']; })));
 	check('第 1 屏是概览（含上传Mbps/下载Mbps）',
 		textOf(ctx.pages[0]).indexOf('上传Mbps') >= 0 &&
 		textOf(ctx.pages[0]).indexOf('下载Mbps') >= 0,
@@ -873,7 +872,7 @@ async function testStructure() {
 // ---------------------------------------------------------------- 2. 分页
 
 async function testPaging() {
-	console.log('\n[2] 分页：夹紧 [0,4]；首次进节点/拓扑懒加载一次，之后切屏不再发 RPC');
+	console.log('\n[2] 分页：夹紧 [0,4]；顶部 tab 切屏；首次进节点/拓扑懒加载一次');
 
 	const booted = await boot();
 	const ctx = booted.ctx;
@@ -900,26 +899,21 @@ async function testPaging() {
 		!hasClass(ctx.pages[1], 'on') && !hasClass(ctx.pages[3], 'on') &&
 		!hasClass(ctx.pages[4], 'on'),
 		'pages=' + repr(ctx.pages.map(function (page) { return page.attrs['class']; })));
-	check('setPage(2)：对应 tab 与圆点同步',
-		hasClass(ctx.tabs[2], 'on') && hasClass(ctx.dots[2], 'on') &&
-		!hasClass(ctx.tabs[0], 'on') && !hasClass(ctx.dots[0], 'on'),
-		'tab=' + repr(ctx.tabs[2].attrs['class']) + ' dot=' + repr(ctx.dots[2].attrs['class']));
+	check('setPage(2)：对应顶部 tab 同步选中',
+		hasClass(ctx.tabs[2], 'on') && !hasClass(ctx.tabs[0], 'on'),
+		'tab=' + repr(ctx.tabs[2].attrs['class']));
 
 	/* 0..4 每一屏都能直接切到，且只有目标屏 .on */
-	const dotButtons = findAll(ctx.root, function (node) {
-		return hasClass(node, 'tsm-dot-btn');
-	});
-
 	for (let i = 0; i < 5; i++) {
 		ctx.setPage(i);
 
 		const others = [ 0, 1, 2, 3, 4 ].filter(function (index) { return index !== i; });
 
 		same('setPage(' + i + ') → pageIndex=' + i, ctx.pageIndex, i);
-		check('setPage(' + i + ')：目标屏 on、其余 off、tab/圆点同步',
+		check('setPage(' + i + ')：目标屏 on、其余 off、顶部 tab 同步',
 			hasClass(ctx.pages[i], 'on') &&
 			others.every(function (index) { return !hasClass(ctx.pages[index], 'on'); }) &&
-			hasClass(ctx.tabs[i], 'on') && hasClass(ctx.dots[i], 'on'),
+			hasClass(ctx.tabs[i], 'on'),
 			'pages=' + repr(ctx.pages.map(function (page) { return page.attrs['class']; })));
 	}
 
@@ -948,9 +942,8 @@ async function testPaging() {
 	ctx.tabs[2].attrs.click();
 	same('点击顶部 tab 切到第 3 屏', ctx.pageIndex, 2);
 
-	/* ctx.dots 存的是指示点 span；可点击的是外层 .tsm-dot-btn 按钮。 */
-	dotButtons[1].attrs.click();
-	same('点击底部圆点切到第 2 屏', ctx.pageIndex, 1);
+	ctx.tabs[1].attrs.click();
+	same('点击顶部「设备」tab 切到第 2 屏', ctx.pageIndex, 1);
 
 	check('切屏不重建页面节点（同一批 DOM）',
 		ctx.pages.length === 5 &&
@@ -982,9 +975,9 @@ async function testPaging() {
 	same('切到第 5 屏后滚动一次', env.__scrolls.length, 3);
 
 	env.__scrolls.length = 0;
-	dotButtons[2].attrs.click();
-	same('点击底部圆点切屏也滚到顶部', env.__scrolls.length, 1);
-	sameList('圆点切屏 scrollTo 同样传 (0,0)',
+	ctx.tabs[2].attrs.click();
+	same('点击顶部 tab 切屏也滚到顶部', env.__scrolls.length, 1);
+	sameList('tab 切屏 scrollTo 同样传 (0,0)',
 		[ env.__scrolls[0].x, env.__scrolls[0].y ], [ 0, 0 ]);
 }
 
@@ -3431,29 +3424,52 @@ async function testTouchTargets() {
 	check('筛选按钮视觉高度仍是 32px',
 		hasRule('tsm-filter', 'min-height:32px'),
 		'规则=' + repr(SOURCE.match(/\.tsm-filter\{[^}]*\}/g)));
-	check('底部圆点按钮 44×44',
-		hasRule('tsm-dot-btn', 'width:44px') && hasRule('tsm-dot-btn', 'height:44px'),
-		'规则=' + repr(SOURCE.match(/\.tsm-dot-btn\{[^}]*\}/g)));
 	check('节点卡「⋮」44×44',
 		hasRule('tsm-nmore', 'width:44px') && hasRule('tsm-nmore', 'height:44px'),
 		'规则=' + repr(SOURCE.match(/\.tsm-nmore\{[^}]*\}/g)));
-	check('圆点按钮用负 margin 抵消视觉尺寸', hasRule('tsm-dot-btn', 'margin:-7px'),
-		'规则=' + repr(SOURCE.match(/\.tsm-dot-btn\{[^}]*\}/g)));
+	check('筛选胶囊 .tsm-chip 触控高度 ≥44px',
+		hasRule('tsm-chip', 'min-height:44px'),
+		'规则=' + repr(SOURCE.match(/\.tsm-chip\{[^}]*\}/g)));
+
+	/* 深色主题：chip 背景必须走变量，不能写死白底（否则浅字白底看不见）。 */
+	check('chip 背景/文字走主题变量',
+		/\.tsm-chip\{[^}]*background:var\(--tsm-card-bg\)/.test(SOURCE) &&
+		/\.tsm-chip\{[^}]*color:var\(--tsm-text\)/.test(SOURCE) &&
+		!/\.tsm-chip\{[^}]*background:#fff/.test(SOURCE),
+		'规则=' + repr(SOURCE.match(/\.tsm-chip\{[^}]*\}/g)));
+	check('深色主题定义了 card-bg / text 变量',
+		/@media \(prefers-color-scheme: dark\)\{#ts-mobile\{[^}]*--tsm-card-bg:#1c2026/.test(SOURCE) &&
+		/@media \(prefers-color-scheme: dark\)\{#ts-mobile\{[^}]*--tsm-text:#e7eaee/.test(SOURCE),
+		'rule=' + repr((SOURCE.match(/@media \(prefers-color-scheme: dark\)\{#ts-mobile\{[^}]*\}/) || [])[0]));
+	check('chip 选中态用深色文字 + 橙色描边/浅底（不用低对比橙字）',
+		/\.tsm-chip\.on\{[^}]*color:var\(--tsm-text\)[^}]*border-color:rgba\(255,111,0[^}]*background:rgba\(255,111,0/.test(SOURCE) &&
+		!/\.tsm-chip\.on\{[^}]*color:#ff6f00/.test(SOURCE),
+		'规则=' + repr(SOURCE.match(/\.tsm-chip\.on\{[^}]*\}/g)));
+	check('搜索清空按钮用 44×44 透明覆盖层',
+		/\.tsm-dclear::before\{[^}]*width:44px[^}]*height:44px/.test(SOURCE),
+		'规则=' + repr(SOURCE.match(/\.tsm-dclear::before\{[^}]*\}/g)));
+	check('复制按钮触控高度 ≥44px', hasRule('tsm-copy', 'min-height:44px'),
+		'规则=' + repr(SOURCE.match(/\.tsm-copy\{[^}]*\}/g)));
 	check('节点「⋮」用负 top/right 保持图标位置',
 		hasRule('tsm-nmore', 'top:-4px') && hasRule('tsm-nmore', 'right:-4px'),
 		'规则=' + repr(SOURCE.match(/\.tsm-nmore\{[^}]*\}/g)));
 
 	const booted = await boot();
-	const dotButtons = findAll(booted.ctx.root, function (node) {
-		return hasClass(node, 'tsm-dot-btn');
+
+	same('页面里不再有底部圆点按钮',
+		findAll(booted.ctx.root, function (node) {
+			return hasClass(node, 'tsm-dot-btn');
+		}).length, 0);
+
+	const chips = findAll(booted.ctx.root, function (node) {
+		return hasClass(node, 'tsm-chip');
 	});
 
-	same('底部圆点按钮仍是 5 个', dotButtons.length, 5);
-	check('圆点按钮都是 <button> 且带 aria-label',
-		dotButtons.every(function (node) {
-			return node.tag === 'button' && node.attrs['aria-label'] != null;
+	check('筛选胶囊仍是 <button> 且带文案',
+		chips.length > 0 && chips.every(function (node) {
+			return node.tag === 'button' && textOf(node).length > 0;
 		}),
-		'buttons=' + repr(dotButtons.map(function (node) { return node.tag; })));
+		'chips=' + repr(chips.map(function (node) { return textOf(node); }).slice(0, 6)));
 }
 
 
@@ -3727,10 +3743,10 @@ async function testSafeArea() {
 	check('CSS 含 env(safe-area-inset-bottom)', SOURCE.indexOf('env(safe-area-inset-bottom') >= 0,
 		'match=' + repr((SOURCE.match(/[^']*safe-area-inset-bottom[^']*/g) || []).slice(0, 1)));
 	check('#ts-mobile 顶部/底部留出安全区',
-		/#ts-mobile\{padding-top:env\(safe-area-inset-top,0px\);padding-bottom:calc\(72px \+ env\(safe-area-inset-bottom,0px\)\)\}/.test(SOURCE),
+		/#ts-mobile\{padding-top:env\(safe-area-inset-top,0px\);padding-bottom:calc\(12px \+ env\(safe-area-inset-bottom,0px\)\)\}/.test(SOURCE),
 		'rule=' + repr(SOURCE.match(/#ts-mobile\{padding-top:env[^}]*\}/)));
-	check('底部圆点栏用 safe-area-inset-bottom',
-		/\.tsm-dots\{[^}]*env\(safe-area-inset-bottom/.test(SOURCE),
+	check('底部不再有固定圆点栏占位（无 .tsm-dots 规则）',
+		!/\.tsm-dots\{/.test(SOURCE),
 		'rule=' + repr(SOURCE.match(/\.tsm-dots\{[^}]*\}/g)));
 	check('sticky tab 也避开刘海',
 		/\.tsm-tabs\{top:env\(safe-area-inset-top/.test(SOURCE),

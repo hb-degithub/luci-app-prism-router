@@ -67,7 +67,7 @@
 从 [Releases](https://github.com/hb-degithub/luci-app-prism-router/releases) 下载 `luci-app-prism-router_*_all.ipk`：
 
 ```sh
-opkg install luci-app-prism-router_1.0.0-1_all.ipk
+opkg install luci-app-prism-router_1.0.4-1_all.ipk
 /etc/init.d/prism-routerd enable
 /etc/init.d/prism-routerd restart
 ```

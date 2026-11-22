@@ -18,7 +18,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AccountTree
 import androidx.compose.material.icons.rounded.Cloud
@@ -28,7 +27,6 @@ import androidx.compose.material.icons.rounded.Wifi
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -44,12 +42,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import io.prism.router.data.Device
@@ -71,12 +69,14 @@ import io.prism.router.ui.components.EmptyState
 import io.prism.router.ui.components.ErrorState
 import io.prism.router.ui.components.Pill
 import io.prism.router.ui.components.PrismIconAction
+import io.prism.router.ui.components.PrismProgressBar
 import io.prism.router.ui.components.PrismScaffold
 import io.prism.router.ui.components.SectionCard
 import io.prism.router.ui.components.Segmented
 import io.prism.router.ui.components.SkeletonList
+import io.prism.router.ui.theme.LocalPrismCategoryColors
+import io.prism.router.ui.theme.LocalPrismDataColors
 import io.prism.router.ui.theme.LocalPrismSemanticColors
-import io.prism.router.ui.theme.PrismRadius
 import io.prism.router.ui.theme.PrismSpacing
 import kotlinx.coroutines.delay
 import java.util.Locale
@@ -217,7 +217,7 @@ private fun networkSubtitle(ui: UiState): String {
     val exits = ui.state?.nodes?.count { it.total > 0 && !it.name.equals("DIRECT", true) } ?: 0
     val subs = ui.nodesList.size
     return if (ui.state == null && ui.loading) {
-        "正在连接面板…"
+        "正在连接路由器…"
     } else {
         "$exits 个出口 · $subs 个子节点"
     }
@@ -259,7 +259,7 @@ private fun TopologyContent(
 
             else -> EmptyState(
                 title = "暂无拓扑数据",
-                desc = "先在「设置」里填写面板地址，连上路由器后这里会显示互联网、出口、主路由与子节点的分层关系。",
+                desc = "先在「设置」里填写路由器地址，连上路由器后这里会显示互联网、出口、主路由与子节点的分层关系。",
                 icon = Icons.Rounded.AccountTree
             )
         }
@@ -326,19 +326,20 @@ private fun TopologyContent(
 
 @Composable
 private fun InternetCard(state: PanelState) {
+    val data = LocalPrismDataColors.current
     SectionCard(title = "互联网", subtitle = "WAN 总出口") {
         Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.lg)) {
             MetricColumn(
                 label = "下行速率",
                 value = "${fmtRateShort(state.totals.rxRate)} Mbps",
                 modifier = Modifier.weight(1f),
-                valueColor = MaterialTheme.colorScheme.primary
+                valueColor = data.download
             )
             MetricColumn(
                 label = "上行速率",
                 value = "${fmtRateShort(state.totals.txRate)} Mbps",
                 modifier = Modifier.weight(1f),
-                valueColor = MaterialTheme.colorScheme.tertiary
+                valueColor = data.upload
             )
         }
     }
@@ -346,25 +347,22 @@ private fun InternetCard(state: PanelState) {
 
 @Composable
 private fun ExitNodeCard(exit: NodeUsage, nodeTotal: Long) {
+    val data = LocalPrismDataColors.current
     val share = if (nodeTotal > 0) (exit.total.toFloat() / nodeTotal).coerceIn(0f, 1f) else 0f
     SectionCard(
         title = "出口 · ${exit.name}",
         subtitle = String.format(Locale.US, "占节点流量 %.1f%%", share * 100f)
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.lg)) {
-            MetricColumn("下行", fmtBytes(exit.rx), Modifier.weight(1f), MaterialTheme.colorScheme.primary)
-            MetricColumn("上行", fmtBytes(exit.tx), Modifier.weight(1f), MaterialTheme.colorScheme.tertiary)
+            MetricColumn("下行", fmtBytes(exit.rx), Modifier.weight(1f), data.download)
+            MetricColumn("上行", fmtBytes(exit.tx), Modifier.weight(1f), data.upload)
             MetricColumn("合计", fmtBytes(exit.total), Modifier.weight(1f))
         }
         Spacer(Modifier.height(PrismSpacing.md))
-        LinearProgressIndicator(
-            progress = { share },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(6.dp)
-                .clip(RoundedCornerShape(PrismRadius.pill)),
+        PrismProgressBar(
+            progress = share,
             color = MaterialTheme.colorScheme.primary,
-            trackColor = MaterialTheme.colorScheme.surfaceVariant
+            height = 6.dp
         )
     }
 }
@@ -385,6 +383,7 @@ private fun RouterCard(state: PanelState) {
 
 @Composable
 private fun SubNodeCard(sub: SubNode) {
+    val data = LocalPrismDataColors.current
     val tint = freshnessColor(sub.freshness)
     SectionCard(
         title = sub.displayName,
@@ -393,14 +392,15 @@ private fun SubNodeCard(sub: SubNode) {
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.md)) {
             MetricColumn("累计流量", fmtBytes(sub.total), Modifier.weight(1f))
-            MetricColumn("下行", fmtBytes(sub.rx), Modifier.weight(1f), MaterialTheme.colorScheme.primary)
-            MetricColumn("上行", fmtBytes(sub.tx), Modifier.weight(1f), MaterialTheme.colorScheme.tertiary)
+            MetricColumn("下行", fmtBytes(sub.rx), Modifier.weight(1f), data.download)
+            MetricColumn("上行", fmtBytes(sub.tx), Modifier.weight(1f), data.upload)
         }
     }
 }
 
 @Composable
 private fun DeviceCard(device: Device) {
+    val data = LocalPrismDataColors.current
     SectionCard(
         title = device.name,
         subtitle = "${linkLabel(device.link)} · ${device.ip.ifBlank { device.mac }}"
@@ -410,13 +410,13 @@ private fun DeviceCard(device: Device) {
                 label = "下行速率",
                 value = "↓ ${fmtRateShort(device.rxRate)} Mbps",
                 modifier = Modifier.weight(1f),
-                valueColor = MaterialTheme.colorScheme.primary
+                valueColor = data.download
             )
             MetricColumn(
                 label = "上行速率",
                 value = "↑ ${fmtRateShort(device.txRate)} Mbps",
                 modifier = Modifier.weight(1f),
-                valueColor = MaterialTheme.colorScheme.tertiary
+                valueColor = data.upload
             )
         }
     }
@@ -503,7 +503,7 @@ private fun NodesContent(
 
             else -> EmptyState(
                 title = "暂无节点数据",
-                desc = "面板没有返回出口节点统计。先在「设置」里确认面板地址，或稍后下拉刷新。",
+                desc = "路由器没有返回出口节点统计。先在「设置」里确认路由器地址，或稍后下拉刷新。",
                 icon = Icons.Rounded.Hub
             )
         }
@@ -518,7 +518,7 @@ private fun NodesContent(
             top = PrismSpacing.lg,
             bottom = PrismSpacing.xl
         ),
-        verticalArrangement = Arrangement.spacedBy(PrismSpacing.lg)
+        verticalArrangement = Arrangement.spacedBy(PrismSpacing.md)
     ) {
         item {
             SectionCard(
@@ -528,7 +528,7 @@ private fun NodesContent(
                 if (nodes.isEmpty()) {
                     EmptyState(
                         title = "暂无出口节点",
-                        desc = "面板还没有返回出口节点流量：可能尚未产生代理流量，或接口未启用节点统计。",
+                        desc = "路由器还没有返回出口节点流量：可能尚未产生代理流量，或接口未启用节点统计。",
                         icon = Icons.Rounded.Cloud
                     )
                 } else {
@@ -536,7 +536,7 @@ private fun NodesContent(
                         NodeRow(rank = index + 1, node = node, total = total)
                         if (index != nodes.lastIndex) {
                             HorizontalDivider(
-                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
                             )
                         }
                     }
@@ -575,7 +575,7 @@ private fun NodesContent(
 
                     subs.isEmpty() -> EmptyState(
                         title = "暂无子节点 / AP",
-                        desc = "面板 ?what=nodes 返回空列表：可能还没有子节点推送过快照，或该面板版本未启用节点上报。",
+                        desc = "?what=nodes 返回空列表：可能还没有子节点推送过快照，或该路由器版本未启用节点上报。",
                         icon = Icons.Rounded.Hub
                     )
 
@@ -584,7 +584,7 @@ private fun NodesContent(
                             SubNodeRow(sub)
                             if (index != subs.lastIndex) {
                                 HorizontalDivider(
-                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
                                 )
                             }
                         }
@@ -607,8 +607,9 @@ private fun NodesContent(
 @Composable
 private fun NodeRow(rank: Int, node: NodeUsage, total: Long) {
     val isDirect = node.name.equals("DIRECT", true)
-    val semantic = LocalPrismSemanticColors.current
-    val accent = if (isDirect) semantic.success else MaterialTheme.colorScheme.primary
+    val data = LocalPrismDataColors.current
+    /* 直连/代理是链路类别，不复用上下行方向色或 success 状态色。 */
+    val accent = if (isDirect) LocalPrismCategoryColors.current.direct else LocalPrismCategoryColors.current.proxy
     val share = if (total > 0) (node.total.toFloat() / total).coerceIn(0f, 1f) else 0f
 
     Column(
@@ -625,7 +626,7 @@ private fun NodeRow(rank: Int, node: NodeUsage, total: Long) {
             ) {
                 Text(
                     text = "$rank",
-                    style = MaterialTheme.typography.labelSmall,
+                    style = MaterialTheme.typography.labelSmall.tabular(),
                     color = accent
                 )
             }
@@ -639,45 +640,52 @@ private fun NodeRow(rank: Int, node: NodeUsage, total: Long) {
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-                Text(
-                    text = "↓ ${fmtBytes(node.rx)} · ↑ ${fmtBytes(node.tx)}",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "↓ ${fmtBytes(node.rx)}",
+                        style = MaterialTheme.typography.labelSmall.tabular(),
+                        color = data.download,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = " · ",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1
+                    )
+                    Text(
+                        text = "↑ ${fmtBytes(node.tx)}",
+                        style = MaterialTheme.typography.labelSmall.tabular(),
+                        color = data.upload,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
             Spacer(Modifier.width(PrismSpacing.sm))
             Column(horizontalAlignment = Alignment.End) {
                 Text(
                     text = fmtBytes(node.total),
-                    style = MaterialTheme.typography.titleMedium,
+                    style = MaterialTheme.typography.titleMedium.tabular(),
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1
                 )
                 Text(
                     text = String.format(Locale.US, "%.1f%%", share * 100f),
-                    style = MaterialTheme.typography.labelSmall,
+                    style = MaterialTheme.typography.labelSmall.tabular(),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1
                 )
             }
         }
         Spacer(Modifier.height(PrismSpacing.sm))
-        LinearProgressIndicator(
-            progress = { share },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(6.dp)
-                .clip(RoundedCornerShape(PrismRadius.pill)),
-            color = accent,
-            trackColor = MaterialTheme.colorScheme.surfaceVariant
-        )
+        PrismProgressBar(progress = share, color = accent, height = 6.dp)
     }
 }
 
 @Composable
 private fun SubNodeRow(sub: SubNode) {
+    val data = LocalPrismDataColors.current
     val tint = freshnessColor(sub.freshness)
     Row(
         modifier = Modifier
@@ -709,13 +717,33 @@ private fun SubNodeRow(sub: SubNode) {
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            Text(
-                text = "${sub.deviceCount} 台设备 · ↓ ${fmtBytes(sub.rx)} · ↑ ${fmtBytes(sub.tx)}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "${sub.deviceCount} 台 · ",
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
+                Text(
+                    text = "↓ ${fmtBytes(sub.rx)}",
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = data.download,
+                    maxLines = 1
+                )
+                Text(
+                    text = " · ",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
+                Text(
+                    text = "↑ ${fmtBytes(sub.tx)}",
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = data.upload,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
         Spacer(Modifier.width(PrismSpacing.sm))
         Pill(text = sub.freshnessText(), color = tint)
@@ -811,7 +839,7 @@ private fun ApContent(
             top = PrismSpacing.lg,
             bottom = PrismSpacing.xl
         ),
-        verticalArrangement = Arrangement.spacedBy(PrismSpacing.lg)
+        verticalArrangement = Arrangement.spacedBy(PrismSpacing.md)
     ) {
         if (data.nodes.isNotEmpty()) {
             itemsIndexed(data.nodes) { _, node -> StationNodeCard(node) }
@@ -844,7 +872,7 @@ private fun ApContent(
                         StationRow(station)
                         if (index != clients.lastIndex) {
                             HorizontalDivider(
-                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)
                             )
                         }
                     }
@@ -894,6 +922,7 @@ private fun StationNodeCard(node: StationNode) {
 @Composable
 private fun StationRow(station: StationInfo) {
     val semantic = LocalPrismSemanticColors.current
+    val data = LocalPrismDataColors.current
     val signalTint = signalColor(station.signalLevel)
     val ageTint = if (station.stale) semantic.warning else MaterialTheme.colorScheme.onSurfaceVariant
     val iface = station.iface.trim()
@@ -924,13 +953,27 @@ private fun StationRow(station: StationInfo) {
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            Text(
-                text = "↓ ${fmtLinkRate(station.rxRate)} · ↑ ${fmtLinkRate(station.txRate)}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "↓ ${fmtLinkRate(station.rxRate)}",
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = data.download,
+                    maxLines = 1
+                )
+                Text(
+                    text = " · ",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
+                Text(
+                    text = "↑ ${fmtLinkRate(station.txRate)}",
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = data.upload,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
         Spacer(Modifier.width(PrismSpacing.sm))
         Column(horizontalAlignment = Alignment.End) {
@@ -995,7 +1038,7 @@ private fun ApFooter(ui: UiState, data: StationsData, onRetry: () -> Unit) {
             )
         }
         Text(
-            text = "AP 面板来自 ?what=stations：AP 侧 stations.uc 每分钟上报 MAC / 信号 / 协商速率 / " +
+            text = "AP 数据来自 ?what=stations：AP 侧 stations.uc 每分钟上报 MAC / 信号 / 协商速率 / " +
                 "连接时长（不报流量）；超过 ${STATION_STALE_SEC / 60} 分钟未更新标为「数据陈旧」。",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1059,7 +1102,7 @@ private fun MetricColumn(
         Spacer(Modifier.height(PrismSpacing.xs))
         Text(
             text = value,
-            style = MaterialTheme.typography.titleMedium,
+            style = MaterialTheme.typography.titleMedium.tabular(),
             color = valueColor ?: MaterialTheme.colorScheme.onSurface,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
@@ -1131,7 +1174,7 @@ private fun LinkConnector() {
 /** 主干 → 分支 rail：从中心竖线拐到左侧主干的曲线（次要色）。 */
 @Composable
 private fun GroupConnector() {
-    val lineColor = MaterialTheme.colorScheme.secondary
+    val lineColor = MaterialTheme.colorScheme.outlineVariant
     Canvas(
         Modifier
             .fillMaxWidth()
@@ -1183,7 +1226,7 @@ private fun RailHeader(title: String, detail: String) {
  */
 @Composable
 private fun RailItem(isLast: Boolean, content: @Composable () -> Unit) {
-    val lineColor = MaterialTheme.colorScheme.secondary
+    val lineColor = MaterialTheme.colorScheme.outlineVariant
     Box(Modifier.fillMaxWidth()) {
         Canvas(Modifier.matchParentSize()) {
             val railX = RAIL_X.toPx()
@@ -1243,3 +1286,6 @@ private fun redact(message: String, token: String): String {
     if (secret.length >= 4) out = out.replace(secret, "***")
     return out
 }
+
+/** 等宽数字：刷新时数值宽度不跳动。 */
+private fun TextStyle.tabular(): TextStyle = copy(fontFeatureSettings = "tnum")

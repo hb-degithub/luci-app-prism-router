@@ -3,6 +3,7 @@
 'require dom';
 'require rpc';
 'require ui';
+'require prism-router/theme as theme';
 
 /*
  * 棱镜路由 · 应用（域名）
@@ -175,7 +176,7 @@ function chainBadge(chain) {
 
 	return E('span', {
 		style: 'font-size:11px;padding:1px 6px;border-radius:4px;white-space:nowrap;background:' +
-			(name == 'DIRECT' ? 'rgba(76,175,80,.2)' : 'rgba(43,125,233,.2)')
+			(name == 'DIRECT' ? 'rgba(15,118,110,.16)' : 'rgba(59,130,246,.16)')
 	}, name);
 }
 
@@ -193,10 +194,15 @@ function replaceChildren(node, kids) {
 
 /* 分段 / 筛选小药丸按钮（与历史页同一套视觉） */
 function chipStyle(active, color) {
+	/*
+	 * 选中态用“浅底 + 加深方向色文字”，避免白字压在品牌蓝上（3.7:1 不达正文标准），
+	 * 也和 overview/devices 的分段控件保持同一套状态语义。
+	 */
 	return 'font-size:12px;line-height:1.2;padding:5px 12px;border-radius:14px;cursor:pointer;' +
-		'border:1px solid ' + (active ? (color || '#1a73e8') : 'rgba(127,127,127,.35)') + ';' +
-		'background:' + (active ? (color || '#1a73e8') : 'transparent') + ';' +
-		'color:' + (active ? '#fff' : 'inherit');
+		'border:1px solid ' + (active ? (color || 'var(--ts-down)') : 'var(--ts-border)') + ';' +
+		'background:' + (active ? 'rgba(59,130,246,.12)' : 'transparent') + ';' +
+		'color:' + (active ? 'var(--ts-down-text)' : 'inherit') + ';' +
+		(active ? 'font-weight:600;' : '');
 }
 
 function chip(label, active, color, onclick) {
@@ -225,11 +231,11 @@ var CARD_ORDER = [ '视频', '游戏', '社交', '下载', '开发', '购物', '
 
 /* 类别配色：按 JSON 里的顺序取色，超出部分循环；「其他」固定灰 */
 var CATEGORY_LOOK = [
-	{ color: '#1e88e5', bg: 'rgba(30,136,229,.14)' },
+	{ color: '#1565c0', bg: 'rgba(21,101,192,.14)' },
 	{ color: '#8e24aa', bg: 'rgba(142,36,170,.14)' },
-	{ color: '#43a047', bg: 'rgba(67,160,71,.14)' },
-	{ color: '#ef6c00', bg: 'rgba(239,108,0,.14)' },
-	{ color: '#00838f', bg: 'rgba(0,131,143,.14)' },
+	{ color: '#00695c', bg: 'rgba(0,105,92,.14)' },
+	{ color: '#5e35b1', bg: 'rgba(94,53,177,.14)' },
+	{ color: '#3949ab', bg: 'rgba(57,73,171,.14)' },
 	{ color: '#d81b60', bg: 'rgba(216,27,96,.14)' },
 	{ color: '#6d4c41', bg: 'rgba(109,76,65,.16)' }
 ];
@@ -402,27 +408,61 @@ function weekAppsFrom(byHost) {
 
 /* 表上方的"按类别分布"与页面小件样式（纯内联样式 + 本页小段 style，不引外部资源） */
 var CSS = [
-	'#ts-apps{font-size:13px}',
+	'#ts-apps{font-size:var(--ts-fs-2);max-width:100%;min-width:0}',
 	'#ts-apps .tsa-range{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 10px 0}',
 	'#ts-apps .tsa-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}',
-	'#ts-apps .tsa-toolbar label{font-size:13px}',
-	'#ts-apps .tsa-hint{font-size:12px;opacity:.65}',
-	'#ts-apps .tsa-upd{font-size:12px;opacity:.75;white-space:nowrap}',
-	'#ts-apps .tsa-note{margin:0 0 12px 0;padding:8px 11px;border-radius:9px;background:rgba(127,127,127,.06);',
-	'border:1px solid rgba(127,127,127,.18);font-size:12px;line-height:1.7}',
+	'#ts-apps .tsa-toolbar label{font-size:var(--ts-fs-1)}',
+	'#ts-apps .tsa-hint{font-size:var(--ts-fs-1);color:var(--ts-text-3)}',
+	'#ts-apps .tsa-upd{font-size:var(--ts-fs-1);color:var(--ts-text-2);white-space:nowrap}',
+	'#ts-apps .tsa-note{margin:0 0 12px 0;padding:0;border-radius:var(--ts-r);background:var(--ts-surface);',
+	'border:1px solid var(--ts-border);font-size:var(--ts-fs-1);line-height:1.7;min-width:0}',
+	'#ts-apps .tsa-fold>summary{display:flex;align-items:center;gap:6px;padding:8px 11px;cursor:pointer;',
+	'list-style:none;font-weight:600;font-size:var(--ts-fs-1)}',
+	'#ts-apps .tsa-fold>summary::-webkit-details-marker{display:none}',
+	'#ts-apps .tsa-fold>summary::before{content:"▸";flex:none;color:var(--ts-text-3);transition:transform .15s}',
+	'#ts-apps .tsa-fold[open]>summary::before{transform:rotate(90deg)}',
+	'#ts-apps .tsa-fold[open]>summary{border-bottom:1px solid var(--ts-border)}',
+	'#ts-apps .tsa-fold-b{padding:8px 11px 10px;overflow-wrap:anywhere}',
 	'#ts-apps .tsa-cats{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:8px;margin:0 0 12px 0}',
-	'#ts-apps .tsa-card{padding:8px 10px;border-radius:9px;border:1px solid rgba(127,127,127,.22);',
-	'background:rgba(127,127,127,.05);transition:opacity .15s,border-color .15s}',
+	'#ts-apps .tsa-card{padding:8px 10px;border-radius:var(--ts-r);border:1px solid var(--ts-border);',
+	'background:var(--ts-surface);transition:opacity .15s,border-color .15s;min-width:0}',
 	'#ts-apps .tsa-card.off{opacity:.55}',
-	'#ts-apps .tsa-cat{display:inline-block;font-size:10.5px;line-height:1.6;padding:0 6px;border-radius:5px;white-space:nowrap}',
+	'#ts-apps .tsa-cat{display:inline-block;font-size:12px;line-height:1.6;padding:0 6px;border-radius:var(--ts-r-sm);white-space:nowrap}',
 	'#ts-apps .tsa-sort{cursor:pointer;user-select:none;white-space:nowrap}',
-	'#ts-apps .tsa-sort:hover{background:rgba(127,127,127,.10)}',
-	'#ts-apps .tsa-arrow{font-size:9px;opacity:.75}',
-	'#ts-apps .tsa-export{font-size:12px;opacity:.9;min-width:0;word-break:break-word}',
+	'#ts-apps .tsa-sort:hover{background:var(--ts-surface-2)}',
+	'#ts-apps .tsa-arrow{font-size:12px;opacity:.75}',
+	'#ts-apps .tsa-export{font-size:12px;color:var(--ts-text-2);min-width:0;overflow-wrap:anywhere}',
 	'#ts-apps .tsa-filterline{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 10px 0;font-size:12px}',
-	'#ts-apps .tsa-count{margin:0 0 8px 0;font-size:12px;opacity:.75}',
+	'#ts-apps .tsa-filterline label{display:inline-flex;align-items:center;gap:4px;flex-wrap:wrap;min-width:0}',
+	'#ts-apps .tsa-count{margin:0 0 8px 0;font-size:12px;color:var(--ts-text-2)}',
+	'#ts-apps .tsa-scrollhint{display:none;margin:0 0 6px;color:var(--ts-text-3);font-size:12px}',
 	'#ts-apps .tsa-empty{padding:12px 14px;margin:0 0 10px 0}',
-	'#ts-apps .tsa-empty p{margin:4px 0}'
+	'#ts-apps .tsa-empty p{margin:4px 0}',
+	'#ts-apps .tsa-foot{margin:14px 0 0 0;font-size:12px;color:var(--ts-text-3);line-height:1.6}',
+	'#ts-apps .tsa-tablewrap{max-width:100%;min-width:0;overflow-x:auto;-webkit-overflow-scrolling:touch}',
+	'#ts-apps .tsa-table{min-width:720px;display:block}',
+	'#ts-apps .tsa-table .tr{display:flex;flex-wrap:nowrap;min-width:720px;width:100%;box-sizing:border-box}',
+	'#ts-apps .tsa-table .th,#ts-apps .tsa-table .td{flex:1 1 0;min-width:0;box-sizing:border-box;font-size:12px;vertical-align:middle}',
+	'#ts-apps .tsa-table .tsa-col-rank{flex:0 0 34px}',
+	'#ts-apps .tsa-table .tsa-col-host{flex:0 0 190px;overflow-wrap:anywhere;word-break:break-word}',
+	'#ts-apps .tsa-table .tsa-col-chain{flex:0 0 100px}',
+	'#ts-apps .tsa-table .tsa-col-count{flex:0 0 60px}',
+	'#ts-apps .tsa-table .tsa-col-bytes{flex:0 0 94px;white-space:nowrap}',
+	'#ts-apps .tsa-table .td{overflow-wrap:anywhere}',
+	'@media (max-width:760px){',
+	'#ts-apps .tsa-cats{grid-template-columns:repeat(auto-fill,minmax(132px,1fr))}',
+	'#ts-apps .tsa-table{min-width:670px}',
+	'#ts-apps .tsa-table .tr{min-width:670px}',
+	'#ts-apps .tsa-col-meta{display:none}',
+	'#ts-apps .tsa-toolbar{gap:6px}',
+	'#ts-apps .tsa-toolbar input[type=search],#ts-apps .tsa-toolbar input[type=text]{flex:1 1 100%;min-width:0}',
+	'}',
+	'@media (max-width:420px){',
+	'#ts-apps .tsa-cats{grid-template-columns:repeat(2,minmax(0,1fr))}',
+	'#ts-apps .tsa-table{min-width:670px}',
+	'#ts-apps .tsa-table .tr{min-width:670px}',
+	'#ts-apps .tsa-scrollhint{display:block}',
+	'}'
 ].join('\n');
 
 return view.extend({
@@ -484,9 +524,10 @@ return view.extend({
 		var state = this.state;
 
 		if (state == null || !Array.isArray(state.apps))
-			return E('div', { 'id': 'ts-apps' }, [
+			return E('div', { 'id': 'ts-apps', 'class': theme.CLASS }, [
+				theme.style(),
 				E('style', {}, CSS),
-				E('h2', {}, _('棱镜路由 · 应用')),
+				E('h2', { 'class': 'ts-title' }, _('棱镜路由 · 应用')),
 				this.renderEmpty(state)
 			]);
 
@@ -578,9 +619,10 @@ return view.extend({
 			this.exportStatus
 		]);
 
-		this.root = E('div', { 'id': 'ts-apps' }, [
+		this.root = E('div', { 'id': 'ts-apps', 'class': theme.CLASS }, [
+			theme.style(),
 			E('style', {}, CSS),
-			E('h2', {}, _('棱镜路由 · 应用')),
+			E('h2', { 'class': 'ts-title' }, _('棱镜路由 · 应用')),
 			this.rangeWrap,
 			toolbar,
 			this.noticeWrap,
@@ -589,7 +631,7 @@ return view.extend({
 			this.filterWrap,
 			this.countEl,
 			this.listWrap,
-			E('p', { style: 'margin:14px 0 0 0;font-size:11.5px;opacity:.55' },
+			E('p', { 'class': 'tsa-foot' },
 				_('数据来自 prism-routerd 的 get_state / get_history / get_daily；时间范围、类别、搜索与排序都在前端完成，切换不重新加载页面。'))
 		]);
 
@@ -1171,7 +1213,7 @@ return view.extend({
 	renderRangeChips: function() {
 		var self = this;
 		var chips = RANGES.map(function(item) {
-			return chip(_(item.label), self.range === item.key, '#1a73e8', function() {
+			return chip(_(item.label), self.range === item.key, 'var(--ts-down)', function() {
 				self.setRange(item.key);
 			});
 		});
@@ -1236,7 +1278,11 @@ return view.extend({
 		else
 			parts.push(' ' + _('今日桶（get_history）暂不可用或今日还没有记录，本页不显示今日增量参考。'));
 
-		return [ E('div', { 'class': 'tsa-note' }, parts) ];
+		/* 口径说明长期占页面，改成默认折叠的 <details>；摘要只留一行标题。 */
+		return [ E('details', { 'class': 'tsa-note tsa-fold' }, [
+			E('summary', {}, _('数据口径说明')),
+			E('div', { 'class': 'tsa-fold-b' }, parts)
+		]) ];
 	},
 
 	renderScopeWeek: function() {
@@ -1271,7 +1317,11 @@ return view.extend({
 				parts.push(' ' + _('后端报文超预算，历史天数被裁剪过，只含部分天。'));
 		}
 
-		return [ E('div', { 'class': 'tsa-note' }, parts) ];
+		/* 口径说明长期占页面，改成默认折叠的 <details>；摘要只留一行标题。 */
+		return [ E('details', { 'class': 'tsa-note tsa-fold' }, [
+			E('summary', {}, _('数据口径说明')),
+			E('div', { 'class': 'tsa-fold-b' }, parts)
+		]) ];
 	},
 
 	renderCategoryCards: function() {
@@ -1640,15 +1690,15 @@ return view.extend({
 
 	renderTable: function(rows, data) {
 		var head = [
-			E('th', { 'class': 'th', style: 'width:36px' }, '#'),
-			E('th', { 'class': 'th' }, _('应用/域名')),
-			E('th', { 'class': 'th' }, _('类别')),
-			E('th', { 'class': 'th' }, _('出口')),
-			this.sortHeader(_('设备数'), 'devices', 'right'),
-			this.sortHeader(_('下载'), 'rx', 'right'),
-			this.sortHeader(_('上传'), 'tx', 'right'),
-			this.sortHeader(_('合计'), 'total', 'right'),
-			E('th', { 'class': 'th', style: 'width:120px' }, _('占比'))
+			E('th', { 'class': 'th tsa-col-rank', style: 'width:36px' }, '#'),
+			E('th', { 'class': 'th tsa-col-host' }, _('应用/域名')),
+			E('th', { 'class': 'th tsa-col-meta' }, _('类别')),
+			E('th', { 'class': 'th tsa-col-chain' }, _('出口')),
+			this.sortHeader(_('设备数'), 'devices', 'right', 'tsa-col-count'),
+			this.sortHeader(_('下载'), 'rx', 'right', 'tsa-col-bytes'),
+			this.sortHeader(_('上传'), 'tx', 'right', 'tsa-col-bytes'),
+			this.sortHeader(_('合计'), 'total', 'right', 'tsa-col-bytes'),
+			E('th', { 'class': 'th tsa-col-meta', style: 'width:120px' }, _('占比'))
 		];
 		var list = [], i, pair;
 
@@ -1658,19 +1708,21 @@ return view.extend({
 			list.push(pair[1]);
 		}
 
-		return E('div', { style: 'overflow-x:auto' }, [
-			E('table', { 'class': 'table' },
+		return E('div', { 'class': 'tsa-tablewrap', 'role': 'region', 'tabindex': '0',
+			'aria-label': _('应用与域名列表，可左右滑动查看更多列') }, [
+			E('p', { 'class': 'tsa-scrollhint' }, _('左右滑动表格查看更多列')),
+			E('table', { 'class': 'table tsa-table' },
 				[ E('tr', { 'class': 'tr table-titles' }, head) ].concat(list))
 		]);
 	},
 
-	sortHeader: function(label, key, align) {
+	sortHeader: function(label, key, align, className) {
 		var self = this;
 		var active = (this.sortKey === key);
 		var arrow = active ? (this.sortDesc ? '▼' : '▲') : '';
 
 		var th = E('th', {
-			'class': 'th tsa-sort',
+			'class': 'th tsa-sort' + (className ? ' ' + className : ''),
 			style: 'text-align:' + (align === 'right' ? 'right' : 'left'),
 			tabindex: '0',
 			'aria-sort': active ? (this.sortDesc ? 'descending' : 'ascending') : 'none',
@@ -1720,31 +1772,31 @@ return view.extend({
 			title: _('点击展开：该域名在各设备上的用量'),
 			'aria-expanded': open ? 'true' : 'false'
 		}, [
-			E('td', { 'class': 'td', style: 'text-align:right;opacity:.55;width:36px' }, rank),
-			E('td', { 'class': 'td', title: host }, [
+			E('td', { 'class': 'td tsa-col-rank', style: 'text-align:right;opacity:.55;width:36px' }, rank),
+			E('td', { 'class': 'td tsa-col-host', title: host }, [
 				marker,
 				' ',
 				E('strong', {}, shortHost(host, 44))
 			]),
-			E('td', { 'class': 'td' }, this.renderCategoryBadge(host)),
-			E('td', { 'class': 'td' }, this.renderChainBadge(app)),
+			E('td', { 'class': 'td tsa-col-meta' }, this.renderCategoryBadge(host)),
+			E('td', { 'class': 'td tsa-col-chain' }, this.renderChainBadge(app)),
 			E('td', {
-				'class': 'td',
+				'class': 'td tsa-col-count',
 				style: 'text-align:right',
 				title: (this.range === RANGE_WEEK)
 					? (_('近 7 天中日粒度汇总的单日最大设备数') +
 						(num(app.days) > 0 ? _('；') + num(app.days) + _(' 天有记录') : ''))
 					: _('涉及该域名的设备数')
 			}, '' + num(app.devices)),
-			E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(app.rx)),
-			E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(app.tx)),
-			E('td', { 'class': 'td', style: 'text-align:right' }, E('strong', {}, fmtBytes(total))),
-			E('td', { 'class': 'td', style: 'width:120px' }, [
+			E('td', { 'class': 'td tsa-col-bytes', style: 'text-align:right' }, fmtBytes(app.rx)),
+			E('td', { 'class': 'td tsa-col-bytes', style: 'text-align:right' }, fmtBytes(app.tx)),
+			E('td', { 'class': 'td tsa-col-bytes', style: 'text-align:right' }, E('strong', {}, fmtBytes(total))),
+			E('td', { 'class': 'td tsa-col-meta', style: 'width:120px' }, [
 				E('div', {
 					style: 'height:6px;border-radius:3px;background:rgba(127,127,127,.2);overflow:hidden'
 				}, E('div', {
 					style: 'height:6px;width:' + percent.toFixed(1) + '%;background:' +
-						(singleDirect ? '#4caf50' : '#2b7de9')
+						(singleDirect ? 'var(--ts-teal)' : 'var(--ts-down)')
 				})),
 				E('span', { style: 'font-size:11px;opacity:.7' }, percent.toFixed(1) + '%')
 			])
@@ -1781,7 +1833,7 @@ return view.extend({
 
 		if (chains.length > 1)
 			return E('span', {
-				style: 'font-size:11px;padding:1px 6px;border-radius:4px;white-space:nowrap;background:rgba(127,127,127,.2)',
+				style: 'font-size:12px;padding:1px 6px;border-radius:4px;white-space:nowrap;background:var(--ts-surface-2)',
 				title: _('多出口混合：') + chains.join(' / ')
 			}, _('混合'));
 
@@ -1929,11 +1981,11 @@ return view.extend({
 				throw new Error((res != null && res.error != null) ? ('' + res.error) : _('后端没有返回 CSV 内容'));
 
 			self.saveCsv(res, what);
-			self.setExportStatus(_('已导出') + ' ' + ((res.rows != null) ? res.rows : 0) + ' ' + _('行'), '#2e7d32');
+			self.setExportStatus(_('已导出') + ' ' + ((res.rows != null) ? res.rows : 0) + ' ' + _('行'), 'var(--ts-ok-text)');
 		}).catch(function(err) {
 			var message = errText(err);
 
-			self.setExportStatus(_('导出失败：') + message, '#c62828');
+			self.setExportStatus(_('导出失败：') + message, 'var(--ts-bad-text)');
 			ui.addNotification(null, E('p', {}, _('导出失败：') + message), 'error');
 		});
 	},

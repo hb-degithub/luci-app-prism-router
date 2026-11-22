@@ -16,7 +16,8 @@ ok(){ echo "  PASS $1"; PASS=$((PASS+1)); }
 bad(){ echo "  FAIL $1"; FAIL=$((FAIL+1)); }
 eq(){ [ "$1" = "$2" ] && ok "$3" || bad "$3（实际[$1] 期望[$2]）"; }
 
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i.log 2>&1 || { echo "安装失败"; tail -5 /tmp/i.log; exit 1; }
+IPK="${PRISM_IPK:-$(for f in /src/dist/luci-app-prism-router_*.ipk; do case "$f" in *.legacy.ipk) ;; *) printf '%s\n' "$f"; break ;; esac; done)}"
+opkg install "$IPK" >/tmp/i.log 2>&1 || { echo "安装失败"; tail -5 /tmp/i.log; exit 1; }
 
 CGI=/www/cgi-bin/prism-router-control
 TOK=testtoken1234567890

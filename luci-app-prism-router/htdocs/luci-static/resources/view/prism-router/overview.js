@@ -2,6 +2,7 @@
 'require view';
 'require dom';
 'require rpc';
+'require prism-router/theme as theme';
 
 /*
  * 棱镜路由 · 总览（高信息密度版）
@@ -85,26 +86,31 @@ var STALE_SEC = 90;         /* state.ts 超过 90s 没动 → 标黄提示 */
 var ONLINE_SEC = 600;       /* 在线口径：last_seen 10 分钟内（同 feishu.uc ONLINE_WINDOW） */
 var BUCKET_SEC = 300;       /* 兜底桶宽：守护进程 BUCKET_SECONDS=300 */
 var MAX_POINTS = 288;       /* 一天 5 分钟桶上限，跨日脏数据也只画这么久 */
-var TREND_H = 168;          /* 趋势图默认高度（px） */
-var TREND_MAX_H = 340;      /* 趋势图最大高度：右侧面板再高也不无限拉伸 */
+var TREND_H = 204;          /* 趋势图默认高度（px）：驾驶舱主视觉，比右侧维度栏更高 */
+var TREND_MAX_H = 360;      /* 趋势图最大高度：右侧面板再高也不无限拉伸 */
 var NEW_DEVICE_SEC = 86400; /* 陌生设备口径：first_seen 在 24 小时内 */
 var FIRST_SEEN_KEY = 'luci-prism-router.device-first-seen';
 var FIRST_SEEN_KEEP = 30 * 86400;  /* 本浏览器只记 30 天，避免 localStorage 越攒越多 */
 var FIRST_SEEN_MAX = 512;          /* 最多记 512 台设备（家用规模绰绰有余） */
 
-/* 出口维度（代理 / 直连） */
-var COLOR_PROXY = '#2b7de9';
-var COLOR_DIRECT = '#4caf50';
+/*
+ * 共享主题语义色（见 prism-router/theme.js）。
+ * DOM 里直接写 var(--ts-*)；只有 Canvas 需要真实色值，用 theme.color() 解析。
+ */
+var COLOR_PROXY = 'var(--ts-down)';
+var COLOR_DIRECT = 'var(--ts-teal)';
 
 /* 接入维度（无线 / 有线 / 未知）——和上面是两套色、两个维度 */
-var COLOR_WIFI = '#7b1fa2';
-var COLOR_WIRED = '#00838f';
-var COLOR_UNKNOWN = '#9e9e9e';
+var COLOR_WIFI = 'var(--ts-accent)';
+var COLOR_WIRED = 'var(--ts-neutral)';
+var COLOR_UNKNOWN = 'var(--ts-neutral)';
 
-/* 趋势图方向（下载 / 上传） */
-var COLOR_RX = '#1976d2';
-var COLOR_TX = '#ef6c00';
-var FILL_RX = 'rgba(25,118,210,.16)';
+/* 趋势图方向（下载 / 上传）：图形用 fill 色，Canvas 再解析一次 */
+var COLOR_RX = 'var(--ts-down)';
+var COLOR_TX = 'var(--ts-up)';
+var COLOR_RX_FALLBACK = '#3B82F6';
+var COLOR_TX_FALLBACK = '#0891B2';
+var FILL_RX = 'rgba(59,130,246,.16)';
 
 // ---------------------------------------------------------------- 格式化
 
@@ -243,13 +249,13 @@ function healthLook(confidence) {
 	var conf = '' + (confidence == null ? 'unknown' : confidence);
 
 	if (conf == 'exact')
-		return { color: '#2e7d32', bg: 'rgba(76,175,80,.12)', label: _('记账精确') };
+		return { color: 'var(--ts-ok-text)', bg: 'rgba(22,163,74,.10)', label: _('记账精确') };
 	if (conf == 'degraded')
-		return { color: '#e65100', bg: 'rgba(255,152,0,.14)', label: _('记账降级') };
+		return { color: 'var(--ts-warn-text)', bg: 'rgba(217,119,6,.10)', label: _('记账降级') };
 	if (conf == 'unavailable')
-		return { color: '#c62828', bg: 'rgba(198,40,40,.12)', label: _('记账不可用') };
+		return { color: 'var(--ts-bad-text)', bg: 'rgba(220,38,38,.10)', label: _('记账不可用') };
 
-	return { color: '#c62828', bg: 'rgba(198,40,40,.12)', label: _('记账状态未知') };
+	return { color: 'var(--ts-bad-text)', bg: 'rgba(220,38,38,.10)', label: _('记账状态未知') };
 }
 
 function deviceName(dev) {
@@ -723,12 +729,9 @@ function appHref(host) {
 	return base + '#host=' + encodeURIComponent(h);
 }
 
-/* 独立控制台：单独端口的服务，不在 LuCI 内嵌；端口默认 8099（见 README）。 */
-var CONSOLE_PORT = 8099;
-function consoleUrl() {
-	var host = (typeof window !== 'undefined' && window.location) ? window.location.hostname : '';
-
-	return 'http://' + host + ':' + CONSOLE_PORT + '/';
+/* 异常项下钻到 LuCI 内仍保留的详细面板路由，不跳到默认关闭的 8099 服务。 */
+function panelHref() {
+	return L.url('admin/services/prism-router/panel');
 }
 
 // ---------------------------------------------------------------- 流量日历 / 需要关注（纯数据）
@@ -875,11 +878,11 @@ function dailyViewOf(payload) {
 }
 
 function toneColor(tone) {
-	if (tone === 'bad') return '#c62828';
-	if (tone === 'warn') return '#e65100';
-	if (tone === 'info') return '#1565c0';
+	if (tone === 'bad') return 'var(--ts-bad)';
+	if (tone === 'warn') return 'var(--ts-warn)';
+	if (tone === 'info') return 'var(--ts-down)';
 
-	return '#2e7d32';
+	return 'var(--ts-ok)';
 }
 
 /*
@@ -1066,11 +1069,17 @@ function errText(err) {
 
 // ---------------------------------------------------------------- 趋势数据
 
-/* 趋势图只要最近一天：多取的昨天日汇总只给「昨日全天」用，不进图表 */
-function newestDay(history) {
+/* 趋势与「今日」只接受后端明确标记为本地今天的桶；午夜后旧 history 不得冒充今日。 */
+function newestDay(history, nowSec) {
 	var days = (history != null && Array.isArray(history.days)) ? history.days : [];
+	var today = localDayKey(nowSec);
 
-	return { days: days.slice(0, 1) };
+	for (var i = 0; i < days.length; i++) {
+		if (days[i] != null && days[i].day === today)
+			return { days: [ days[i] ] };
+	}
+
+	return { days: [] };
 }
 
 /*
@@ -1166,25 +1175,26 @@ function trendOf(history, nowSec) {
 // ---------------------------------------------------------------- 样式（内联，不引外部 CSS）
 
 var CSS = [
-	'#ts-overview{font-size:13px;line-height:1.5}',
+	'#ts-overview{font-size:var(--ts-fs-2);line-height:1.55;min-width:0}',
 	'#ts-overview *,#ts-overview *::before,#ts-overview *::after{box-sizing:border-box}',
 
 	/* ① 一行状态条 */
-	'#ts-overview .tso-head{display:flex;align-items:center;gap:10px;flex-wrap:nowrap;margin:0 0 10px 0}',
-	'#ts-overview .tso-title{margin:0;font-size:16px;font-weight:600;line-height:1.5;white-space:nowrap;flex:none}',
+	'#ts-overview .tso-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 12px 0;padding:10px 12px;',
+	'border:1px solid var(--ts-border);border-radius:var(--ts-r);background:var(--ts-surface)}',
+	'#ts-overview .tso-title{margin:0;font-size:var(--ts-fs-4);font-weight:600;line-height:1.4;white-space:nowrap;flex:none}',
 	'#ts-overview .tso-pills{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;margin-left:auto;min-width:0}',
-	'#ts-overview .tso-pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;line-height:1.7;',
-	'padding:0 8px;border-radius:9px;border:1px solid rgba(127,127,127,.22);white-space:nowrap}',
-	'#ts-overview .tso-dot{width:7px;height:7px;border-radius:50%;flex:none;display:inline-block;background:#9e9e9e}',
-	'#ts-overview .tso-meta{font-size:11.5px;opacity:.75;white-space:nowrap}',
-	'#ts-overview .tso-meta.warn{opacity:1;color:#e65100}',
+	'#ts-overview .tso-pill{display:inline-flex;align-items:center;gap:5px;font-size:var(--ts-fs-1);line-height:1.7;',
+	'padding:0 8px;border-radius:var(--ts-r-sm);border:1px solid var(--ts-border);white-space:nowrap}',
+	'#ts-overview .tso-dot{width:7px;height:7px;border-radius:50%;flex:none;display:inline-block;background:var(--ts-neutral)}',
+	'#ts-overview .tso-meta{font-size:var(--ts-fs-1);color:var(--ts-text-2);white-space:nowrap}',
+	'#ts-overview .tso-meta.warn{opacity:1;color:var(--ts-warn-text)}',
 	'#ts-overview .tso-meta.rate{font-variant-numeric:tabular-nums}',
-	'#ts-overview .tso-auto{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;line-height:1.7;',
-	'padding:0 8px;border-radius:9px;border:1px solid rgba(127,127,127,.22);white-space:nowrap;cursor:pointer}',
+	'#ts-overview .tso-auto{display:inline-flex;align-items:center;gap:4px;font-size:var(--ts-fs-1);line-height:1.7;',
+	'padding:0 8px;border-radius:var(--ts-r-sm);border:1px solid var(--ts-border);white-space:nowrap;cursor:pointer}',
 	'#ts-overview .tso-auto input{margin:0;width:12px;height:12px;flex:none;cursor:pointer}',
-	'#ts-overview .tso-auto.paused{border-color:rgba(230,81,0,.5);background:rgba(255,152,0,.12);color:#e65100}',
-	'#ts-overview .tso-btn{font:inherit;font-size:11.5px;line-height:1.7;padding:0 9px;border-radius:9px;cursor:pointer;',
-	'color:inherit;background:rgba(127,127,127,.1);border:1px solid rgba(127,127,127,.26);white-space:nowrap}',
+	'#ts-overview .tso-auto.paused{border-color:rgba(217,119,6,.5);background:rgba(217,119,6,.10);color:var(--ts-warn-text)}',
+	'#ts-overview .tso-btn{display:inline-flex;align-items:center;font:inherit;font-size:var(--ts-fs-1);line-height:1.7;padding:0 9px;border-radius:var(--ts-r-sm);cursor:pointer;',
+	'color:inherit;background:var(--ts-surface-2);border:1px solid var(--ts-border);white-space:nowrap;text-decoration:none}',
 	'#ts-overview .tso-tech{display:none;margin:0 0 10px 0;padding:8px 11px;border-radius:8px;',
 	'background:rgba(127,127,127,.07);border:1px solid rgba(127,127,127,.16);font-size:11.5px;line-height:1.8;word-break:break-word}',
 	'#ts-overview .tso-tech.open{display:block}',
@@ -1192,41 +1202,44 @@ var CSS = [
 
 	/* 空态/告警条 */
 	'#ts-overview .tso-alert{margin:0 0 10px 0;padding:9px 12px;border-radius:8px;',
-	'background:rgba(255,152,0,.12);border-left:3px solid #e65100;font-size:12px;line-height:1.7}',
+	'background:rgba(217,119,6,.10);border-left:3px solid var(--ts-warn);font-size:12px;line-height:1.7}',
 	'#ts-overview .tso-alert ul{margin:4px 0 0 0;padding-left:18px}',
-	'#ts-overview .tso-errbar{border-left-color:#c62828;background:rgba(198,40,40,.1)}',
+	'#ts-overview .tso-errbar{border-left-color:var(--ts-bad);background:rgba(220,38,38,.10)}',
 	'#ts-overview .tso-errbar .tso-btn{margin-left:8px}',
 
 	/* 记账健康卡：reasons 逐条列出，已知原因给短标签，未知原因原样展示 */
-	'#ts-overview .tso-health{margin:0 0 12px 0;padding:8px 12px 9px 12px}',
+	'#ts-overview .tso-health{margin:0;padding:8px 12px 9px 12px}',
 	'#ts-overview .tso-health-h{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:12px;font-weight:600}',
 	'#ts-overview .tso-ok{font-size:12px;opacity:.72;margin-top:3px}',
 	'#ts-overview .tso-reasons{list-style:none;margin:5px 0 0 0;padding:0;display:flex;flex-direction:column;gap:4px}',
 	'#ts-overview .tso-reasons li{display:flex;align-items:baseline;gap:6px;font-size:11.5px;line-height:1.6;min-width:0}',
 	'#ts-overview .tso-rtag{flex:none;font-size:10px;line-height:1.6;padding:0 5px;border-radius:5px;',
-	'background:rgba(198,40,40,.14);color:#c62828;white-space:nowrap}',
+	'background:rgba(220,38,38,.10);color:var(--ts-bad-text);white-space:nowrap}',
 	'#ts-overview .tso-rtext{min-width:0;opacity:.78;word-break:break-word}',
 
 	/* ② KPI 磁贴 */
-	'#ts-overview .tso-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 12px 0}',
-	'#ts-overview .tso-kpi{padding:8px 11px 9px 11px;border-radius:9px;min-width:0;',
-	'background:rgba(127,127,127,.08);border:1px solid rgba(127,127,127,.18)}',
-	'#ts-overview .tso-kpi-h{display:flex;align-items:center;gap:6px;font-size:11.5px;opacity:.75;white-space:nowrap}',
+	'#ts-overview .tso-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 12px 0;position:relative}',
+	'#ts-overview .tso-kpi{position:relative;padding:9px 12px 10px 12px;border-radius:var(--ts-r);min-width:0;',
+	'background:var(--ts-surface);border:1px solid var(--ts-border)}',
+	'#ts-overview .tso-kpi-h{display:flex;align-items:center;gap:6px;font-size:var(--ts-fs-1);color:var(--ts-text-2);white-space:nowrap}',
+	'#ts-overview .tso-kpi-dot{width:7px;height:7px;border-radius:50%;flex:none;display:inline-block}',
 	'#ts-overview .tso-kpi-t{flex:none;overflow:hidden;text-overflow:ellipsis}',
-	'#ts-overview .tso-kpi-chip{margin-left:auto;font-size:10px;opacity:.85;padding:0 5px;border-radius:6px;',
-	'background:rgba(127,127,127,.16);flex:none}',
-	'#ts-overview .tso-kpi-v{font-size:20px;font-weight:600;line-height:1.3;margin:1px 0 0 0;',
-	'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-	'#ts-overview .tso-kpi-s{font-size:11px;opacity:.72;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+	'#ts-overview .tso-kpi-chip{margin-left:auto;font-size:var(--ts-fs-1);color:var(--ts-text-2);padding:0 6px;border-radius:var(--ts-r-sm);',
+	'background:var(--ts-surface-2);flex:none}',
+	'#ts-overview .tso-kpi-v{font-size:var(--ts-fs-5);font-weight:600;line-height:1.3;margin:2px 0 0 0;',
+	'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}',
+	'#ts-overview .tso-kpi-s{font-size:var(--ts-fs-1);color:var(--ts-text-3);line-height:1.45;overflow-wrap:anywhere}',
 	'#ts-overview .tso-kpi-bar{display:flex;height:4px;border-radius:2px;overflow:hidden;margin-top:5px;background:rgba(127,127,127,.2)}',
 	'#ts-overview .tso-fill{display:block;height:100%;width:0}',
 
 	/* ③④ 面板与两列栅格 */
-	'#ts-overview .tso-cols{display:grid;gap:12px;margin:0 0 12px 0}',
+	'#ts-overview .tso-cols{display:grid;gap:12px;margin:0 0 12px 0;min-width:0}',
+	'#ts-overview .tso-cols-health{grid-template-columns:minmax(0,1fr) minmax(0,1fr);margin-bottom:12px}',
+	'#ts-overview .tso-cols-health>.tso-panel{margin:0}',
 	'#ts-overview .tso-cols-main{grid-template-columns:minmax(0,1.85fr) minmax(0,1fr)}',
 	'#ts-overview .tso-cols-top{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}',
-	'#ts-overview .tso-panel{padding:10px 12px 11px 12px;border-radius:9px;min-width:0;',
-	'background:rgba(127,127,127,.06);border:1px solid rgba(127,127,127,.18)}',
+	'#ts-overview .tso-panel{padding:10px 12px 11px 12px;border-radius:var(--ts-r);min-width:0;',
+	'background:var(--ts-surface);border:1px solid var(--ts-border)}',
 	'#ts-overview .tso-ph{display:flex;align-items:center;gap:7px;flex-wrap:wrap;',
 	'margin:0 0 8px 0;padding:0 0 6px 0;border-bottom:1px solid rgba(127,127,127,.2)}',
 	'#ts-overview .tso-ph-t{font-size:13px;font-weight:600;white-space:nowrap}',
@@ -1234,13 +1247,29 @@ var CSS = [
 	'#ts-overview .tso-ph-a{margin-left:auto;font-size:11.5px;white-space:nowrap}',
 	'#ts-overview .tso-note{font-size:10.5px;opacity:.6;line-height:1.55;margin:6px 0 0 0}',
 
+	/* 实时速率主角读数（趋势面板头部） */
+	'#ts-overview .tso-hero{display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin:2px 0 8px 0}',
+	'#ts-overview .tso-hero-item{display:flex;align-items:baseline;gap:7px;min-width:0}',
+	'#ts-overview .tso-hero-k{font-size:var(--ts-fs-1);color:var(--ts-text-2);white-space:nowrap}',
+	'#ts-overview .tso-hero-v{font-size:26px;font-weight:600;line-height:1.15;white-space:nowrap;',
+	'font-variant-numeric:tabular-nums}',
+	'#ts-overview .tso-hero-n{font-size:var(--ts-fs-1);color:var(--ts-text-3);white-space:nowrap;margin-left:auto}',
+
+	/* 日历折叠头（summary 内不套 tso-ph 的横向排布） */
+	'#ts-overview .tso-cal-panel{padding:0;overflow:hidden}',
+	'#ts-overview .tso-cal-panel>summary{padding:10px 12px;row-gap:6px}',
+	'#ts-overview .tso-cal-panel .ts-fold-b{padding:2px 12px 10px 12px}',
+	'#ts-overview .tso-cal-sum-n{min-width:0;overflow:hidden;text-overflow:ellipsis}',
+	'#ts-overview .tso-cal-sum-a{margin-left:auto}',
+	'#ts-overview .tso-cal-legend-dot{background:var(--ts-down);opacity:.38}',
+
 	/* 趋势图 */
 	'#ts-overview .tso-cols-main .tso-panel{display:flex;flex-direction:column}',
-	'#ts-overview .tso-plot{position:relative;width:100%;flex:1 1 auto;min-height:168px;min-width:0}',
+	'#ts-overview .tso-plot{position:relative;width:100%;flex:1 1 auto;min-height:204px;min-width:0}',
 	'#ts-overview .tso-plot canvas{display:block;max-width:100%}',
 	'#ts-overview .tso-axis{display:flex;align-items:baseline;justify-content:space-between;gap:10px;',
 	'margin-top:3px;font-size:10.5px;opacity:.62;white-space:nowrap}',
-	'#ts-overview .tso-empty{height:100%;min-height:140px;display:flex;flex-direction:column;',
+	'#ts-overview .tso-empty{height:100%;min-height:170px;display:flex;flex-direction:column;',
 	'align-items:center;justify-content:center;gap:3px;padding:0 12px;text-align:center;font-size:12px;opacity:.62;line-height:1.6}',
 	'#ts-overview .tso-legend{display:inline-flex;align-items:center;gap:9px;font-size:11px;opacity:.85}',
 	'#ts-overview .tso-lg{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}',
@@ -1264,10 +1293,10 @@ var CSS = [
 	'#ts-overview .tso-lrow:last-child{border-bottom:0}',
 	'#ts-overview a.tso-lrow{text-decoration:none;color:inherit}',
 	'#ts-overview .tso-lname-a{color:inherit;text-decoration:none;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-	'#ts-overview .tso-lname-a:focus-visible{outline:2px solid rgba(43,125,233,.65);outline-offset:1px;border-radius:3px}',
+	'#ts-overview .tso-lname-a:focus-visible{outline:2px solid var(--ts-focus);outline-offset:1px;border-radius:3px}',
 	'#ts-overview .tso-lrow-nav{cursor:pointer;transition:background .12s}',
 	'#ts-overview .tso-lrow-nav:hover{background:rgba(127,127,127,.08)}',
-	'#ts-overview .tso-lrow-nav:focus-visible{outline:2px solid rgba(43,125,233,.65);outline-offset:-2px;border-radius:6px}',
+	'#ts-overview .tso-lrow-nav:focus-visible{outline:2px solid var(--ts-focus);outline-offset:-2px;border-radius:6px}',
 	'#ts-overview .tso-sec-empty{display:flex;flex-direction:column;gap:2px;padding:10px 0 8px 0;',
 	'font-size:12px;line-height:1.6;opacity:.72}',
 	'#ts-overview .tso-sec-empty strong{font-size:12.5px;opacity:1}',
@@ -1282,11 +1311,11 @@ var CSS = [
 
 	/* 「新」设备标记 + 阻断建议（只读：只显示命令，不执行） */
 	'#ts-overview .tso-new{display:inline-flex;align-items:center;gap:3px;margin-left:5px;font-size:10px;',
-	'line-height:1.6;padding:0 5px;border-radius:6px;background:rgba(198,40,40,.14);color:#c62828;',
+	'line-height:1.6;padding:0 5px;border-radius:6px;background:rgba(59,130,246,.12);color:var(--ts-down-text);',
 	'flex:none;white-space:nowrap}',
-	'#ts-overview .tso-new i{width:6px;height:6px;border-radius:50%;background:#c62828;display:inline-block;flex:none}',
+	'#ts-overview .tso-new i{width:6px;height:6px;border-radius:50%;background:var(--ts-down);display:inline-block;flex:none}',
 	'#ts-overview .tso-block{margin-top:9px;padding:8px 10px;border-radius:8px;font-size:11.5px;line-height:1.7;',
-	'background:rgba(255,152,0,.1);border:1px solid rgba(255,152,0,.35)}',
+	'background:rgba(217,119,6,.08);border:1px solid rgba(217,119,6,.35)}',
 	'#ts-overview .tso-block-h{display:flex;align-items:center;gap:7px;flex-wrap:wrap}',
 	'#ts-overview .tso-block pre{margin:6px 0;padding:7px 9px;border-radius:6px;background:rgba(127,127,127,.14);',
 	'font-size:11.5px;line-height:1.6;white-space:pre-wrap;word-break:break-all;overflow-x:auto}',
@@ -1306,20 +1335,20 @@ var CSS = [
 	'#ts-overview .tso-attn-h{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:12px;font-weight:600}',
 	'#ts-overview .tso-attn-list{list-style:none;margin:6px 0 0 0;padding:0;display:grid;',
 	'grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 10px}',
-	'#ts-overview .tso-attn-item{min-width:0;border-radius:6px;border-left:3px solid #9e9e9e;',
+	'#ts-overview .tso-attn-item{min-width:0;border-radius:6px;border-left:3px solid var(--ts-neutral);',
 	'background:rgba(127,127,127,.06)}',
 	'#ts-overview .tso-attn-link{display:block;padding:5px 8px;color:inherit;text-decoration:none;min-width:0}',
 	'#ts-overview .tso-attn-link:hover{text-decoration:none;background:rgba(127,127,127,.08);border-radius:6px}',
-	'#ts-overview .tso-attn-link:focus-visible{outline:2px solid rgba(43,125,233,.65);outline-offset:-2px;border-radius:6px}',
+	'#ts-overview .tso-attn-link:focus-visible{outline:2px solid var(--ts-focus);outline-offset:-2px;border-radius:6px}',
 	'#ts-overview .tso-attn-t{display:block;font-size:11.5px;font-weight:600;line-height:1.5;',
 	'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
 	'#ts-overview .tso-attn-d{display:block;font-size:10.5px;line-height:1.55;opacity:.78;word-break:break-word}',
-	'#ts-overview .tso-attn-bad{border-left-color:#c62828;background:rgba(198,40,40,.08)}',
-	'#ts-overview .tso-attn-bad .tso-attn-t,#ts-overview .tso-attn-bad .tso-attn-d{color:#c62828}',
+	'#ts-overview .tso-attn-bad{border-left-color:var(--ts-bad);background:rgba(220,38,38,.07)}',
+	'#ts-overview .tso-attn-bad .tso-attn-t,#ts-overview .tso-attn-bad .tso-attn-d{color:var(--ts-bad-text)}',
 	'#ts-overview .tso-attn-bad .tso-attn-d{opacity:.9}',
-	'#ts-overview .tso-attn-warn{border-left-color:#e65100;background:rgba(255,152,0,.08)}',
-	'#ts-overview .tso-attn-warn .tso-attn-t{color:#e65100}',
-	'#ts-overview .tso-attn-info{border-left-color:#1565c0}',
+	'#ts-overview .tso-attn-warn{border-left-color:var(--ts-warn);background:rgba(217,119,6,.07)}',
+	'#ts-overview .tso-attn-warn .tso-attn-t{color:var(--ts-warn-text)}',
+	'#ts-overview .tso-attn-info{border-left-color:var(--ts-down)}',
 
 	/* 流量日历：28 个可聚焦按钮，窄屏外层横向滚动，不撑破页面 */
 	'#ts-overview .tso-cal-panel{margin:0 0 12px 0}',
@@ -1331,15 +1360,15 @@ var CSS = [
 	'background:rgba(127,127,127,.05);color:inherit;font:inherit;font-size:10px;line-height:1.4;',
 	'cursor:pointer;overflow:hidden}',
 	'#ts-overview .tso-cal-d:hover{background:rgba(127,127,127,.14)}',
-	'#ts-overview .tso-cal-d:focus-visible{outline:2px solid rgba(43,125,233,.7);outline-offset:1px}',
-	'#ts-overview .tso-cal-fill{position:absolute;left:0;right:0;bottom:0;background:rgba(25,118,210,.38);pointer-events:none}',
+	'#ts-overview .tso-cal-d:focus-visible{outline:2px solid var(--ts-focus);outline-offset:1px}',
+	'#ts-overview .tso-cal-fill{position:absolute;left:0;right:0;bottom:0;background:var(--ts-down);opacity:.38;pointer-events:none}',
 	'#ts-overview .tso-cal-n{position:relative;z-index:1;padding:0 1px;font-variant-numeric:tabular-nums;opacity:.9}',
 	'#ts-overview .tso-cal-miss{border-style:dashed;opacity:.55}',
 	'#ts-overview .tso-cal-miss .tso-cal-n{opacity:.7}',
 	'#ts-overview .tso-cal-zero .tso-cal-fill{display:none}',
-	'#ts-overview .tso-cal-today{border-color:rgba(25,118,210,.85);box-shadow:inset 0 0 0 1px rgba(25,118,210,.5)}',
+	'#ts-overview .tso-cal-today{border-color:var(--ts-down);box-shadow:inset 0 0 0 1px var(--ts-down)}',
 	'#ts-overview .tso-cal-today .tso-cal-n{font-weight:700;opacity:1}',
-	'#ts-overview .tso-cal-sel{background:rgba(43,125,233,.18);border-color:rgba(43,125,233,.9)}',
+	'#ts-overview .tso-cal-sel{background:rgba(59,130,246,.18);border-color:var(--ts-down)}',
 	'#ts-overview .tso-cal-empty{grid-column:1/-1;display:flex;flex-direction:column;align-items:flex-start;',
 	'gap:3px;padding:8px 2px;font-size:11.5px;line-height:1.6;opacity:.78}',
 	'#ts-overview .tso-cal-detail{margin-top:8px;padding:8px 10px;border-radius:7px;',
@@ -1357,15 +1386,15 @@ var CSS = [
 	'#ts-overview .tso-cal-list a{color:inherit;text-decoration:none;min-width:0;overflow:hidden;',
 	'text-overflow:ellipsis;white-space:nowrap}',
 	'#ts-overview .tso-cal-list a:hover{text-decoration:underline}',
-	'#ts-overview .tso-cal-list a:focus-visible{outline:2px solid rgba(43,125,233,.65);outline-offset:1px;border-radius:3px}',
+	'#ts-overview .tso-cal-list a:focus-visible{outline:2px solid var(--ts-focus);outline-offset:1px;border-radius:3px}',
 	'#ts-overview .tso-cal-list .tso-lnum{flex:none;font-size:11px}',
 	'#ts-overview .tso-cal-note{font-size:10.5px;line-height:1.6;opacity:.68;margin-top:5px}',
-	'#ts-overview .tso-cal-err{color:#c62828;opacity:1}',
+	'#ts-overview .tso-cal-err{color:var(--ts-bad-text);opacity:1}',
 	'#ts-overview .tso-cal-err .tso-btn{margin-left:8px}',
 
 	/* 窄屏：KPI 2×2、两列变一列、状态条允许换行 */
 	'@media (max-width:1000px){',
-	'#ts-overview .tso-cols-main,#ts-overview .tso-cols-top{grid-template-columns:minmax(0,1fr)}',
+	'#ts-overview .tso-cols-main,#ts-overview .tso-cols-top,#ts-overview .tso-cols-health{grid-template-columns:minmax(0,1fr)}',
 	'}',
 	'@media (max-width:760px){',
 	'#ts-overview .tso-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}',
@@ -1373,6 +1402,10 @@ var CSS = [
 	'#ts-overview .tso-pills{margin-left:0;justify-content:flex-start}',
 	'#ts-overview .tso-attn-list{grid-template-columns:minmax(0,1fr)}',
 	'#ts-overview .tso-cal-cols{grid-template-columns:minmax(0,1fr)}',
+	'#ts-overview .tso-hero{gap:12px}',
+	'#ts-overview .tso-hero-v{font-size:22px}',
+	'#ts-overview .tso-hero-n{display:none}',
+	'#ts-overview .tso-cal-sum-a{display:none}',
 	'}'
 ].join('\n');
 
@@ -1523,6 +1556,10 @@ return view.extend({
 	 */
 	loadData: function() {
 		var self = this;
+		var historySeq = (this.trendSeq || 0) + 1;
+
+		this.trendSeq = historySeq;
+		this.trendLoading = false;
 
 		this.stateError = '';
 		this.historyError = '';
@@ -1544,7 +1581,7 @@ return view.extend({
 		]).then(function(res) {
 			var nowSec = Math.floor(Date.now() / 1000);
 			var state = (res[0] != null && typeof res[0] == 'object' && res[0].totals != null) ? res[0] : null;
-			var history = (res[1] != null && typeof res[1] == 'object') ? res[1] : null;
+			var history = (historySeq === self.trendSeq && res[1] != null && typeof res[1] == 'object') ? res[1] : null;
 			var cal = (res[2] != null && typeof res[2] == 'object') ? res[2] : null;
 
 			if (state != null) {
@@ -1557,7 +1594,7 @@ return view.extend({
 			if (history != null) {
 				self.history = history;
 				/* 趋势图仍然只画最近的一天（days[0]）；多取的昨天只给「昨日全天」用 */
-				self.trend = trendOf(newestDay(history), nowSec);
+				self.trend = trendOf(newestDay(history, nowSec), nowSec);
 				self.compare = yesterdayCompare(history, nowSec);
 			}
 			else if (self.trend == null || self.compare == null) {
@@ -1618,27 +1655,34 @@ return view.extend({
 		var empty = (totalOf(state.totals) == 0) && (devices.length == 0) &&
 			(apps.length == 0) && (this.trend.points.length == 0);
 
-		this.root = E('div', { 'id': 'ts-overview' }, [
+		this.root = E('div', { 'id': 'ts-overview', 'class': theme.CLASS }, [
+			theme.style(),
 			E('style', {}, CSS),
-			E('div', { 'class': 'tso-head' }, [
-				E('h2', { 'class': 'tso-title' }, _('棱镜路由 · 总览')),
+			E('div', { 'class': 'tso-head ts-grid' }, [
+				E('h2', { 'class': 'tso-title ts-title' }, _('棱镜路由 · 概览')),
 				this.renderPills(state)
 			]),
 			this.renderErrorBar(),
 			this.renderTech(state),
 			empty ? this.renderEmptyNotice(state) : '',
 			this.renderKpis(state),
-			this.renderHealth(state),
-			this.renderAttention(state),
+			/*
+			 * 驾驶舱顺序：状态/KPI → 健康摘要（异常才突出）→ 趋势主角 + 维度栏
+			 * → Top 设备/应用（在日历之前）→ 日历（默认折叠）→ 口径说明。
+			 */
+			E('div', { 'class': 'tso-cols tso-cols-health' }, [
+				this.renderHealth(state),
+				this.renderAttention(state)
+			]),
 			E('div', { 'class': 'tso-cols tso-cols-main' }, [
 				this.renderTrendPanel(state),
 				this.renderRail(state)
 			]),
-			this.renderCalendar(state),
 			E('div', { 'class': 'tso-cols tso-cols-top' }, [
 				this.renderTopDevices(state),
 				this.renderTopApps(state)
 			]),
+			this.renderCalendar(state),
 			this.renderFootnotes()
 		]);
 
@@ -1723,9 +1767,8 @@ return view.extend({
 			E('span', {}, 'conntrack')
 		]);
 
-		/* 一行状态：在线/离线/访客 + 当前速率（都随 5s 轮询更新） */
+		/* 一行状态只留在数量与时间：实时速率由趋势面板头部承担，避免同一读数出现两次。 */
 		this.metaCount = E('span', { 'class': 'tso-meta' }, '');
-		this.metaRate = E('span', { 'class': 'tso-meta rate' }, '');
 
 		/* 「自动刷新」开关：默认开；关掉只停定时器，手动「刷新」仍可用 */
 		this.autoInput = E('input', {
@@ -1763,16 +1806,16 @@ return view.extend({
 
 		this.btnTech = more;
 
-		/* 详细内容（趋势、Top 榜、逐设备/逐应用）放到独立页面：
-		   用真正的链接而不是 window.open——可右键新标签、可分享 URL，
-		   也不会被浏览器的弹窗拦截规则挡掉。 */
-		var panelBtn = E('a', {
+		/* 8099 是可选服务，当前只读 ACL 无法安全判断其开关；不在首屏发 UCI 请求。
+		   待只读 RPC 提供无敏感信息的 panel_enabled 后再恢复条件入口。 */
+		var panelBtn = '';
+
+		/* 手机版保留原有菜单与路由，这里另给一个显式快捷入口。 */
+		var mobileBtn = E('a', {
 			'class': 'tso-btn',
-			href: consoleUrl(),
-			target: '_blank',
-			rel: 'noopener noreferrer',
-			title: _('在新标签页打开详细面板（铺满整屏，隐藏侧栏）')
-		}, _('独立控制台 ↗'));
+			href: L.url('admin/services/prism-router/mobile'),
+			title: _('打开手机版单页视图（保留原有菜单与路由）')
+		}, _('手机版'));
 
 		this.syncAutoLook();
 
@@ -1780,7 +1823,6 @@ return view.extend({
 			this.pillRun,
 			this.pillConf,
 			this.metaCount,
-			this.metaRate,
 			this.metaTime,
 			this.metaStale,
 			this.srcClash,
@@ -1788,6 +1830,7 @@ return view.extend({
 			this.autoBox,
 			this.btnRefresh,
 			more,
+			mobileBtn,
 			panelBtn
 		]);
 	},
@@ -1826,9 +1869,9 @@ return view.extend({
 
 		if (this.pillRun != null) {
 			this.pillRun.lastChild.textContent = running ? _('服务运行中') : _('服务未运行');
-			this.pillRun.style.background = running ? 'rgba(76,175,80,.14)' : 'rgba(198,40,40,.12)';
-			this.pillRun.style.borderColor = running ? 'rgba(76,175,80,.5)' : 'rgba(198,40,40,.45)';
-			this.dotRun.style.background = running ? COLOR_DIRECT : '#c62828';
+			this.pillRun.style.background = running ? 'rgba(22,163,74,.10)' : 'rgba(220,38,38,.10)';
+			this.pillRun.style.borderColor = running ? 'rgba(22,163,74,.5)' : 'rgba(220,38,38,.45)';
+			this.dotRun.style.background = running ? 'var(--ts-ok)' : 'var(--ts-bad)';
 		}
 
 		if (this.pillConf != null) {
@@ -1857,13 +1900,13 @@ return view.extend({
 		if (this.srcClash != null) {
 			var c = '' + (source.clash || 'unknown');
 			this.srcClash.title = 'clash = ' + c;
-			this.dotClash.style.background = (c == 'ok') ? COLOR_DIRECT : ((c == 'unknown') ? COLOR_UNKNOWN : '#c62828');
+			this.dotClash.style.background = (c == 'ok') ? 'var(--ts-ok)' : ((c == 'unknown') ? 'var(--ts-neutral)' : 'var(--ts-bad)');
 		}
 
 		if (this.srcConn != null) {
 			var k = '' + (source.conntrack || 'unknown');
 			this.srcConn.title = 'conntrack = ' + k;
-			this.dotConn.style.background = (k == 'ok') ? COLOR_DIRECT : ((k == 'unknown') ? COLOR_UNKNOWN : '#c62828');
+			this.dotConn.style.background = (k == 'ok') ? 'var(--ts-ok)' : ((k == 'unknown') ? 'var(--ts-neutral)' : 'var(--ts-bad)');
 		}
 
 		if (this.metaCount != null) {
@@ -1874,14 +1917,6 @@ return view.extend({
 					' · ' + _('访客') + ' ' + counts.guest + ' ' + _('台设备'))
 				: _('暂无设备');
 			this.metaCount.title = _('在线＝last_seen 在 10 分钟内；访客＝在线且 group/alias 含「访客」或 guest');
-		}
-
-		if (this.metaRate != null) {
-			var totals = (state != null && state.totals != null) ? state.totals : {};
-
-			this.metaRate.textContent = _('当前') + ' ↓ ' + fmtRateBits(num(totals.rx_rate)) +
-				' ↑ ' + fmtRateBits(num(totals.tx_rate));
-			this.metaRate.title = _('速率取最近一次采样值，不是整日平均');
 		}
 
 		if (this.techReasons != null) {
@@ -1898,8 +1933,16 @@ return view.extend({
 		}
 	},
 
-	// ------------------------------------------------------------ ② KPI 磁贴
+	// ------------------------------------------------------------ ② KPI 磁贴（4 个，去重）
 
+	/*
+	 * 驾驶舱只留 4 个互不重复的 KPI：下载 / 上传 / 今日 / 本月。
+	 *   - 下载、上传：进程启动以来累计（二进制字节，GiB/MiB），颜色固定为方向色；
+	 *   - 今日：今天 5 分钟桶合计（get_history 的桶），是“今日增量参考”，
+	 *     与上面的累计口径不同，副标题明确写出；
+	 *   - 本月：后端 totals.month_total（本月 1 号至今），有月配额时附已用比例。
+	 * 实时速率不再占 KPI：它放进趋势面板头部作为主角读数（避免同一口径出现两次）。
+	 */
 	renderKpis: function(state) {
 		var self = this;
 
@@ -1907,18 +1950,24 @@ return view.extend({
 			return E('div', { 'class': 'tso-kpi-s' }, nodes);
 		}
 
-		/* extraNode：主数字下面的额外一行小字（目前只有「昨日全天」用） */
-		function card(title, chip, chipTitle, valueNode, subNodes, extraNode, barNode) {
+		function card(title, chip, chipTitle, color, valueNode, subNodes, extraNode) {
 			return E('div', { 'class': 'tso-kpi' }, [
 				E('div', { 'class': 'tso-kpi-h' }, [
+					E('i', { 'class': 'tso-kpi-dot', style: 'background:' + (color || 'var(--ts-neutral)') }),
 					E('span', { 'class': 'tso-kpi-t' }, title),
 					chip ? E('span', { 'class': 'tso-kpi-chip', title: chipTitle || null }, chip) : ''
 				]),
-				E('div', { 'class': 'tso-kpi-v' }, valueNode),
+				E('div', { 'class': 'tso-kpi-v', style: color ? ('color:' + color) : null }, valueNode),
 				subNodes,
-				extraNode || '',
-				barNode || ''
+				extraNode || ''
 			]);
+		}
+
+		function share(part, total) {
+			var t = num(total);
+			var p = num(part);
+
+			return (t > 0) ? (p * 100 / t).toFixed(1) + '%' : '—';
 		}
 
 		/* 「昨日全天」：按 day 字段找到昨天的 summary.totals，明确不是同截止时间环比。
@@ -1927,73 +1976,95 @@ return view.extend({
 			this.cell(function() {
 				var c = (self.compare != null) ? self.compare : null;
 
-				return (c != null && c.text) ? c.text : (_('昨日全天') + ' —');
+				return (c != null && c.ok === true && c.yestBytes != null)
+					? (_('昨日总量') + ' ' + fmtBytes(c.yestBytes)) : (_('昨日总量') + ' —');
 			})
 		]);
 
 		this.cmpNode = cmpNode;
 
-		/* 总流量：代理 + 直连（rx+tx），口径是"进程启动以来累计" */
-		var totalCard = card(_('总流量'),
-			_('累计'),
-			_('prism-routerd 进程启动以来累计；进程重启归零（SPEC §3.1），不是"今日"'),
-			this.cell(function(s) { return fmtBytes(totalOf(s.totals)); }),
+		/* 今日 5 分钟桶合计：没有桶时显示 —（不补 0） */
+		function todayBytes() {
+			var t = self.trend;
+
+			if (t == null || !Array.isArray(t.points) || t.points.length == 0) return null;
+
+			return num(t.sumRx) + num(t.sumTx);
+		}
+
+		var downCard = card(_('下载'), _('累计'),
+			_('prism-routerd 进程启动以来累计；进程重启归零（SPEC §3.1），不是「今日」'),
+			'var(--ts-down-text)',
+			this.cell(function(s) { return fmtBytes(rxTotal(s.totals)); }),
 			sub([
-				'↓ ', this.cell(function(s) { return fmtBytes(rxTotal(s.totals)); }),
-				' · ↑ ', this.cell(function(s) { return fmtBytes(txTotal(s.totals)); }),
+				_('占比') + ' ', this.cell(function(s) { return share(rxTotal(s.totals), totalOf(s.totals)); }),
 				' · ', this.cell(function(s) {
 					var up = num(s.uptime);
 					return up > 0 ? (_('已运行') + ' ' + fmtDuration(up)) : '';
 				})
 			]),
-			cmpNode,
-			null);
+			cmpNode);
 
-		/* 实时速率 */
-		var rateCard = card(_('实时速率'),
-			_('↓下行'),
-			_('速率按 Mb/s（bits，链路习惯）；同一行括注十进制字节速率'),
-			this.cell(function(s) { return fmtRateBits(num((s.totals || {}).rx_rate)); }, { style: 'color:' + COLOR_RX }),
+		var upCard = card(_('上传'), _('累计'),
+			_('进程启动以来累计；与下载同口径，两者相加才是总流量'),
+			'var(--ts-up-text)',
+			this.cell(function(s) { return fmtBytes(txTotal(s.totals)); }),
 			sub([
-				'↑ ', this.cell(function(s) { return fmtRateBits(num((s.totals || {}).tx_rate)); }, { style: 'color:' + COLOR_TX }),
-				' · ', this.cell(function(s) { return fmtRateBytes(num((s.totals || {}).rx_rate)); })
+				_('占比') + ' ', this.cell(function(s) { return share(txTotal(s.totals), totalOf(s.totals)); }),
+				' · ', this.cell(function(s) { return fmtBytes(totalOf(s.totals)); }), ' ', _('总计')
 			]),
-			null,
 			null);
 
-		/* 无线 / 有线：接入维度（与代理/直连正交），数字 + 占比 + 细条 */
-		function linkCard(title, prefix, color) {
-			return card(title,
-				_('接入'),
-				_('接入方式与"代理/直连"是两个维度，不能相加（SPEC §3.2）'),
-				this.cell(function(s) { return fmtBytes(linkTotals(s.totals)[prefix]); }),
-				sub([
-					this.cell(function(s) {
-						var l = linkTotals(s.totals);
-						return fmtPercent(l[prefix], l.wifi + l.wired + l.unknown);
-					}),
-					' · ↓ ', this.cell(function(s) { return fmtBytes(linkRxTx(s.totals, prefix).rx); }),
-					' · ↑ ', this.cell(function(s) { return fmtBytes(linkRxTx(s.totals, prefix).tx); }),
-					prefix == 'wired' ? this.cell(function(s) {
-						var l = linkTotals(s.totals);
-						return l.unknown > 0 ? (' · ' + _('未知') + ' ' + fmtPercent(l.unknown, l.wifi + l.wired + l.unknown)) : '';
-					}) : ''
-				]),
-				null,
-				E('div', { 'class': 'tso-kpi-bar' }, [
-					this.bar(function(s) {
-						var l = linkTotals(s.totals);
-						return pct(l[prefix], l.wifi + l.wired + l.unknown);
-					}, color)
-				]));
-		}
+		var todayCard = card(_('今日'), _('5 分钟桶'),
+			_('今日 history.json 的 5 分钟桶合计，是今日增量参考；与累计口径不同，不能互相加减'),
+			null,
+			this.cell(function() {
+				var b = todayBytes();
 
-		return E('div', { 'class': 'tso-kpis' }, [
-			totalCard,
-			rateCard,
-			linkCard.call(this, _('无线接入'), 'wifi', COLOR_WIFI),
-			linkCard.call(this, _('有线接入'), 'wired', COLOR_WIRED)
-		]);
+				return (b == null) ? '—' : fmtBytes(b);
+			}),
+			sub([
+				this.cell(function() {
+					var t = self.trend;
+
+					if (t == null || !Array.isArray(t.points) || t.points.length == 0)
+						return _('暂无今日桶');
+
+					return _('覆盖') + ' ' + t.points.length + ' ' + _('个桶') +
+						' · ' + _('每') + ' ' + Math.max(1, Math.round(num(t.step) / 60)) + ' ' + _('分钟');
+				})
+			]),
+			null);
+
+		var monthCard = card(_('本月'), _('月'),
+			_('本月 1 号至今（后端 totals.month_total，跨月自动归零）'),
+			null,
+			this.cell(function(s) {
+				var totals = (s.totals != null) ? s.totals : {};
+				var used = num(totals.month_total);
+
+				return (used > 0) ? fmtBytes(used) : '—';
+			}),
+			sub([
+				this.cell(function(s) {
+					var quota = (s.quota != null && typeof s.quota == 'object') ? s.quota : null;
+					var totals = (s.totals != null) ? s.totals : {};
+					var used = num(totals.month_total);
+					var monthly = num(quota && quota.monthly_gb);
+
+					if (quota == null || (quota.mode == null || quota.mode == 'none') || !(monthly > 0))
+						return _('未配置月配额');
+
+					var limit = monthly * 1073741824;
+					var left = Math.max(0, limit - used);
+
+					return _('配额') + ' ' + monthly + ' GB · ' + _('已用') + ' ' +
+						share(used, limit) + ' · ' + _('剩余') + ' ' + fmtBytes(left);
+				})
+			]),
+			null);
+
+		return E('div', { 'class': 'tso-kpis' }, [ downCard, upCard, todayCard, monthCard ]);
 	},
 
 	// ------------------------------------------------------------ ②b 记账健康
@@ -2108,26 +2179,44 @@ return view.extend({
 		this.calDetailHost = E('div', { 'class': 'tso-cal-detail', style: 'display:none' });
 		this.calNote = E('div', { 'class': 'tso-cal-note' }, '');
 
-		this.calBox = E('div', { 'class': 'tso-panel tso-cal-panel' }, [
-			E('div', { 'class': 'tso-ph' }, [
+		/*
+		 * 日历默认折叠：说明文字不再长期占页面，点开才展开 28 格。
+		 * <details> 是原生可折叠控件（键盘可达），展开时再滚到“今天”那一格。
+		 */
+		var self = this;
+
+		this.calLegend = E('span', { 'class': 'tso-legend' }, [
+			E('span', { 'class': 'tso-lg' }, [
+				E('i', { style: 'background:var(--ts-down);opacity:.38' }), _('每日用量')
+			]),
+			E('span', { 'class': 'tso-lg' }, [
+				E('i', { style: 'background:transparent;border:1px dashed var(--ts-border-2)' }),
+				_('无数据')
+			])
+		]);
+
+		this.calBox = E('details', { 'class': 'tso-panel tso-cal-panel ts-fold' }, [
+			E('summary', {}, [
 				E('span', { 'class': 'tso-ph-t' }, _('流量日历')),
 				this.calCaption,
-				E('span', { 'class': 'tso-ph-a' }, E('span', { 'class': 'tso-legend' }, [
-					E('span', { 'class': 'tso-lg' }, [
-						E('i', { style: 'background:rgba(25,118,210,.38)' }), _('每日用量')
-					]),
-					E('span', { 'class': 'tso-lg' }, [
-						E('i', { style: 'background:transparent;border:1px dashed rgba(127,127,127,.6)' }),
-						_('无数据')
-					])
-				]))
+				E('span', { 'class': 'tso-ph-n tso-cal-sum-n' }, _('近 28 天 · 默认收起')),
+				E('span', { 'class': 'tso-ph-a tso-cal-sum-a' }, this.calLegend)
 			]),
-			this.calScroll,
-			this.calDetailHost,
-			this.calNote,
-			E('div', { 'class': 'tso-note' },
-				_('左旧右新，今天在最右并高亮；点某天查看当天摘要，再点一次收起。'))
+			E('div', { 'class': 'ts-fold-b' }, [
+				this.calScroll,
+				this.calDetailHost,
+				this.calNote,
+				E('div', { 'class': 'tso-note' },
+					_('左旧右新，今天在最右并高亮；点某天查看当天摘要，再点一次收起。'))
+			])
 		]);
+
+		this.calBox.addEventListener('toggle', function() {
+			if (self.calBox == null || self.calBox.open !== true) return;
+
+			self.calScrolled = false;
+			self.scrollCalendarToToday();
+		});
 
 		this.syncCalendar(true);
 
@@ -2319,6 +2408,42 @@ return view.extend({
 		this.calDetailError = '';
 		this.syncCalSelection();
 		this.loadCalendarDetail(key);
+	},
+
+	/* 30s 周期刷新今日桶与昨日全天；跨午夜后必须替换旧 trend，不能把昨天标成今日。 */
+	loadTrendHistory: function() {
+		var self = this;
+
+		if (this.trendLoading === true) return this.trendPromise || Promise.resolve();
+
+		this.trendLoading = true;
+		var seq = (this.trendSeq || 0) + 1;
+		this.trendSeq = seq;
+		this.trendPromise = callHistory(2).then(function(history) {
+			if (seq !== self.trendSeq) return;
+
+			self.trendLoading = false;
+			self.trendPromise = null;
+			if (history == null || typeof history != 'object') return;
+
+			var nowSec = Math.floor(Date.now() / 1000);
+			self.history = history;
+			self.historyError = '';
+			self.trend = trendOf(newestDay(history, nowSec), nowSec);
+			self.compare = yesterdayCompare(history, nowSec);
+			if (self.state != null) self.syncAll(self.state);
+			self.refreshTrend();
+		}).catch(function(err) {
+			if (seq !== self.trendSeq) return;
+
+			self.trendLoading = false;
+			self.trendPromise = null;
+			self.historyError = errText(err);
+			if (self.state != null) self.syncAll(self.state);
+			self.refreshTrend();
+		});
+
+		return this.trendPromise;
 	},
 
 	/* 30s / 手动刷新：只重取 get_history(28)，不动趋势与其它卡 */
@@ -2543,15 +2668,41 @@ return view.extend({
 		else
 			this.plotHost.appendChild(this.renderTrendEmpty());
 
+		/*
+		 * 实时速率 + 趋势是驾驶舱的视觉主角：
+		 * 面板头部给两个大号方向读数（颜色固定为下载蓝 / 上传青），下面才是折线。
+		 * 5s 轮询只更新这里的 cell 文本，不重画图表。
+		 */
+		function rateCell(which, color) {
+			return self.cell(function(s) {
+				var totals = (s != null && s.totals != null) ? s.totals : {};
+
+				return fmtRateBits(num(totals[which]));
+			}, { 'class': 'tso-hero-v ts-num', style: 'color:' + color });
+		}
+
+		var hero = E('div', { 'class': 'tso-hero' }, [
+			E('div', { 'class': 'tso-hero-item' }, [
+				E('span', { 'class': 'tso-hero-k ts-dir ts-dir-down' }, _('下载')),
+				rateCell('rx_rate', 'var(--ts-down-text)')
+			]),
+			E('div', { 'class': 'tso-hero-item' }, [
+				E('span', { 'class': 'tso-hero-k ts-dir ts-dir-up' }, _('上传')),
+				rateCell('tx_rate', 'var(--ts-up-text)')
+			]),
+			E('span', { 'class': 'tso-hero-n' }, _('最近一次采样，不是整日平均'))
+		]);
+
 		var nodes = [
 			E('div', { 'class': 'tso-ph' }, [
-				E('span', { 'class': 'tso-ph-t' }, _('流量趋势')),
+				E('span', { 'class': 'tso-ph-t' }, _('实时速率与趋势')),
 				E('span', { 'class': 'tso-ph-n' }, this.cell(function() { return self.trendCaption(); })),
 				E('span', { 'class': 'tso-ph-a' }, E('span', { 'class': 'tso-legend' }, [
 					E('span', { 'class': 'tso-lg' }, [ E('i', { style: 'background:' + COLOR_RX }), _('下载') ]),
 					E('span', { 'class': 'tso-lg' }, [ E('i', { style: 'background:' + COLOR_TX }), _('上传') ])
 				]))
 			]),
+			hero,
 			this.plotHost,
 			E('div', { 'class': 'tso-axis' }, [
 				E('span', {}, this.cell(function() { return self.axisUnit(); })),
@@ -2559,7 +2710,7 @@ return view.extend({
 			])
 		];
 
-		return E('div', { 'class': 'tso-panel' }, nodes);
+		return E('div', { 'class': 'tso-panel tso-hero-panel' }, nodes);
 	},
 
 	/* 趋势图的空态：明确说清"为什么没有"，而不是留一块白 */
@@ -2716,27 +2867,31 @@ return view.extend({
 			sTx.push(round3(bytesToMbps(points[i].tx, step)));
 		}
 
+		/* Canvas 不能解析 CSS 变量：按当前主题解析成真实色值，取不到就用静态兜底。 */
+		var downColor = theme.color('down', COLOR_RX_FALLBACK, this.root);
+		var upColor = theme.color('up', COLOR_TX_FALLBACK, this.root);
+
 		var data = {
 			labels: labels,
 			datasets: [
 				{
 					label: _('下载'),
 					fillColor: FILL_RX,
-					strokeColor: COLOR_RX,
-					pointColor: COLOR_RX,
+					strokeColor: downColor,
+					pointColor: downColor,
 					pointStrokeColor: '#fff',
 					pointHighlightFill: '#fff',
-					pointHighlightStroke: COLOR_RX,
+					pointHighlightStroke: downColor,
 					data: sRx
 				},
 				{
 					label: _('上传'),
 					fillColor: 'rgba(0,0,0,0)',
-					strokeColor: COLOR_TX,
-					pointColor: COLOR_TX,
+					strokeColor: upColor,
+					pointColor: upColor,
 					pointStrokeColor: '#fff',
 					pointHighlightFill: '#fff',
-					pointHighlightStroke: COLOR_TX,
+					pointHighlightStroke: upColor,
 					data: sTx
 				}
 			]
@@ -3154,7 +3309,7 @@ return view.extend({
 				E('code', { style: 'font-size:10.5px;opacity:.75' }, mac),
 				E('span', { style: 'margin-left:auto;display:flex;gap:6px' }, [ copyBtn, closeBtn ])
 			]),
-			E('p', { style: 'margin:4px 0 0 0;color:#e65100' },
+			E('p', { style: 'margin:4px 0 0 0;color:var(--ts-warn-text)' },
 				_('需在路由器 SSH 中手动执行；执行前请确认不是自己的设备')),
 			E('pre', {}, E('code', {}, cmd)),
 			E('div', { 'class': 'tso-block-n' },
@@ -3546,7 +3701,8 @@ return view.extend({
 				if (++self.tick % TOPS_EVERY == 0) {
 					self.rebuildDynamic(state);
 
-					/* 日历的 28 天数据只在 30s 周期重取，避免每 5s 拉一次 */
+					/* 今日桶/昨日对比与日历都按 30s 周期重取，跨午夜不沿用昨日。 */
+					self.loadTrendHistory();
 					self.loadCalendar();
 				}
 

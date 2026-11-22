@@ -7,17 +7,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 
 /*
- * 棱镜路由 · 字体阶梯
+ * 棱镜路由 · 字体阶梯（收敛版）
  *
  * 全部使用系统字体（FontFamily.Default），不打包字体文件：
  * - 中文字形跟随 OEM / 系统设置，体积与渲染成本最低；
- * - 字号/行高按 Material3 的 4dp 基线微调，保证 390dp 宽度下单行不挤。
+ * - 字号收敛为 12 / 14 / 16 / 22 / 24 / 28 / 36 几档，不再出现 9sp / 10sp / 11sp
+ *   这类在 360dp 屏上难读、又会把页面切碎的小字号；
+ * - 最小正文 / 说明为 12sp（labelSmall / bodySmall）；14sp 是常规正文。
  *
- * 主阶梯 5 档，页面里优先从这里取：
- * DisplaySmall（引导页大标题）/ HeadlineSmall（统计数值、欢迎标题）/
- * TitleMedium（卡片标题）/ BodyMedium（正文）/ LabelSmall（辅助说明、标签）。
- * 另加 HeadlineMedium / TitleLarge 两档，专供 Material3 大标题顶栏的展开 / 折叠态，
- * 保证顶栏字重与卡片标题一致（默认 Typography 是 Normal，偏轻）。
+ * 页面里优先取：HeadlineSmall（速率主数值）/ TitleMedium（卡片标题）/
+ * BodyMedium（正文）/ LabelSmall（辅助说明、标签）。数值统一用 tabularFigures()。
  */
 val PrismTypography = Typography(
     displaySmall = TextStyle(
@@ -34,8 +33,7 @@ val PrismTypography = Typography(
         lineHeight = 32.sp,
         letterSpacing = 0.sp
     ),
-    /* TopAppBar 展开态使用 HeadlineMedium，折叠态使用 TitleLarge；一并覆盖成半粗，
-       避免大标题在默认 Typography 下是 Normal 字重、与卡片标题层级不统一。 */
+    /* TopAppBar 折叠 / 展开态的字重：默认 Typography 是 Normal，偏轻，这里统一半粗。 */
     headlineMedium = TextStyle(
         fontFamily = FontFamily.Default,
         fontWeight = FontWeight.SemiBold,
@@ -57,6 +55,13 @@ val PrismTypography = Typography(
         lineHeight = 24.sp,
         letterSpacing = 0.1.sp
     ),
+    titleSmall = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 14.sp,
+        lineHeight = 20.sp,
+        letterSpacing = 0.1.sp
+    ),
     bodyMedium = TextStyle(
         fontFamily = FontFamily.Default,
         fontWeight = FontWeight.Normal,
@@ -64,11 +69,33 @@ val PrismTypography = Typography(
         lineHeight = 20.sp,
         letterSpacing = 0.2.sp
     ),
+    bodySmall = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Normal,
+        fontSize = 12.sp,
+        lineHeight = 16.sp,
+        letterSpacing = 0.2.sp
+    ),
+    labelLarge = TextStyle(
+        fontFamily = FontFamily.Default,
+        fontWeight = FontWeight.Medium,
+        fontSize = 14.sp,
+        lineHeight = 20.sp,
+        letterSpacing = 0.1.sp
+    ),
     labelSmall = TextStyle(
         fontFamily = FontFamily.Default,
         fontWeight = FontWeight.Medium,
-        fontSize = 11.sp,
+        fontSize = 12.sp,
         lineHeight = 16.sp,
-        letterSpacing = 0.4.sp
+        letterSpacing = 0.2.sp
     )
 )
+
+/**
+ * 等宽数字（tabular figures）。
+ *
+ * 轮询刷新时速率 / 流量值宽度不变，数字不会左右跳动；
+ * 与 Monospace 字体不同，它保留系统字体的中文与字形风格。
+ */
+fun TextStyle.tabularFigures(): TextStyle = copy(fontFeatureSettings = "tnum")

@@ -1,4 +1,5 @@
 #!/bin/sh
+. /src/tests/lib/prism-version-inner.sh
 # 数据 / 日志保留与清理（retention.uc）用例（容器内执行；
 # 由 tests/container-validate-retention.sh 调用）
 #
@@ -74,7 +75,7 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www)
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW"
 
 echo "=== 1. 安装两个包 ==="
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
+opkg install "$PRISM_IPK" >/tmp/i1.log 2>&1 \
   && ok "prism-router 安装成功" || { bad "prism-router 安装失败"; tail -5 /tmp/i1.log; }
 true >/tmp/i2.log 2>&1 \
   && ok "luci-app 安装成功" || { bad "luci-app 安装失败"; tail -5 /tmp/i2.log; }

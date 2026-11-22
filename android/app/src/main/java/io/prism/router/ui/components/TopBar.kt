@@ -7,8 +7,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LargeTopAppBar
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MediumTopAppBar
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarColors
@@ -23,11 +23,14 @@ import androidx.compose.ui.unit.dp
 import io.prism.router.ui.theme.PrismSize
 
 /**
- * 统一顶栏。
+ * 统一顶栏（紧凑可折叠）。
  *
- * - [scrollBehavior] 非空时使用 Material3 的 LargeTopAppBar：展开态是大标题，
- *   滚动后折叠为 64dp 的小标题（配合 `exitUntilCollapsedScrollBehavior`）；
- * - 为空时使用普通 TopAppBar（设置子页等二级页面）。
+ * - [scrollBehavior] 非空时使用 Material3 的 [MediumTopAppBar]：展开 112dp、
+ *   滚动后折叠为 64dp。相比旧版 LargeTopAppBar（展开约 152dp），首屏少掉一大块
+ *   空白，但「大标题 → 小标题」的折叠机制保留；
+ * - 为空时使用普通 TopAppBar（设置子页等二级页面）；
+ * - 标题固定 TitleLarge（22sp），副标题 12sp 放在同一列，折叠后自动隐藏，
+ *   不会在 64dp 内挤两行。
  *
  * 状态栏透明由 Activity 的 edge-to-edge 负责，这里只依赖 TopAppBar 默认的
  * windowInsets（会为状态栏留出高度），不做额外 padding，避免二次叠加。
@@ -54,6 +57,7 @@ fun PrismTopBar(
         Column {
             Text(
                 text = title,
+                style = MaterialTheme.typography.titleLarge,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
@@ -71,7 +75,7 @@ fun PrismTopBar(
     }
 
     if (scrollBehavior != null) {
-        LargeTopAppBar(
+        MediumTopAppBar(
             title = titleContent,
             modifier = modifier,
             navigationIcon = navigationIcon ?: {},

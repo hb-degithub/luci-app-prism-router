@@ -1,4 +1,6 @@
 #!/bin/sh
+. /src/tests/lib/prism-version-inner.sh
+VER="$PRISM_VER"
 # 独立面板服务（uhttpd 单实例 + 只读 ucode CGI）用例（容器内执行；
 # 由 tests/container-validate-standalone-panel.sh 调用）
 #
@@ -28,7 +30,7 @@
 #      审计日志 0600 且不含 token、非 POST 写 405。
 #  24. 自动检测更新（?what=update_check，PATH 注入假 curl，不访问外网）：
 #      未配置 200 {configured:false} 且不联网、合法 repo+tag v1.2.3 的字段/notes 截断/apk·ipk 提取、
-#      tag v1.0.0 -> has_update=false、非法 repo 400 invalid_repo 不联网、
+#      同版本 tag -> has_update=false、v<ver> 里混入旧版资产不被选中、非法 repo 400 invalid_repo 不联网、
 #      500 -> github_unavailable、401/404 映射、缓存 0600 且第二次不调用 curl、token 不进响应/argv。
 #
 # 隔离：--network none，只有 127.0.0.1；不访问外网、不接触任何真机。
@@ -116,7 +118,7 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=$B_CGI"
 
 echo "=== 1. 安装两个包 ==="
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
+opkg install "$PRISM_IPK" >/tmp/i1.log 2>&1 \
   && ok "prism-router 安装成功" || { bad "prism-router 安装失败"; tail -8 /tmp/i1.log; }
 true >/tmp/i2.log 2>&1 \
   && ok "luci-app 安装成功" || { bad "luci-app 安装失败"; tail -8 /tmp/i2.log; }
@@ -213,8 +215,109 @@ code=$(req "$PANEL/cgi-bin/panel-api?what=settings")
 [ "$code" = "200" ] && ok "what=settings -> 200" || bad "what=settings -> $code"
 [ "$(json_expr 'type(d.settings)=="object" && type(d.panel)=="object" && type(d.panel.port)=="string"')" = "1" ] \
   && ok "settings 含 settings/panel 字段" || bad "settings 结构异常"
-[ "$(json_expr 'd.write!=null && d.write.enabled==false')" = "1" ] \
-  && ok "settings.write.enabled=false（写能力未开放）" || bad "settings.write 异常"
+[ "$(json_expr 'type(d.panel.write_enabled)=="bool" && d.panel.write_enabled==false && type(d.write.enabled)=="bool" && d.write.enabled==false')" = "1" ] \
+  && ok "settings 默认：panel.write_enabled=false 且 write.enabled=false（写能力未开放）" \
+  || bad "settings 默认写能力投影异常（panel.write_enabled=$(json_val 'd?.panel?.write_enabled') / write.enabled=$(json_val 'd?.write?.enabled')）"
+# 写能力投影用例会临时改 UCI：先保存原值，段末恢复，避免影响后续只读 case。
+ORIG_WRITE=$(CGET prism-router.panel.write_enabled)
+ORIG_TOKEN=$(CGET prism-router.panel.token)
+
+# write_enabled=0 + token 非空：令牌已设，但总开关关闭 -> 两个 enabled 仍为 false。
+UCI set prism-router.panel.write_enabled='0'
+UCI set prism-router.panel.token="$TOK"
+UCI commit prism-router
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings&token=$TOK")
+[ "$code" = "200" ] \
+  && [ "$(json_expr 'type(d.panel.write_enabled)=="bool" && d.panel.write_enabled==false && type(d.write.enabled)=="bool" && d.write.enabled==false && type(d.panel.has_token)=="bool" && d.panel.has_token==true')" = "1" ] \
+  && ok "write_enabled=0 + token 非空：两个 enabled=false、has_token=true" \
+  || bad "write_enabled=0 + token -> $code / panel.write_enabled=$(json_val 'd?.panel?.write_enabled') / has_token=$(json_val 'd?.panel?.has_token')"
+
+# write_enabled=1 + token 非空：父控可用；只回传 has_token，绝不回传令牌/令牌字段。
+UCI set prism-router.panel.write_enabled='1'
+UCI commit prism-router
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings&token=$TOK")
+[ "$code" = "200" ] \
+  && [ "$(json_expr 'type(d.panel.write_enabled)=="bool" && d.panel.write_enabled==true && type(d.write.enabled)=="bool" && d.write.enabled==true && type(d.panel.has_token)=="bool" && d.panel.has_token==true && d.panel.token==null && d.write.token==null')" = "1" ] \
+  && ok "write_enabled=1 + token 非空：两个 enabled=true、has_token=true、无 token 字段" \
+  || bad "write_enabled=1 + token -> $code / write_enabled=$(json_val 'd?.panel?.write_enabled') / has_token=$(json_val 'd?.panel?.has_token')"
+if grep -qF "$TOK" "$B" 2>/dev/null; then
+  bad "settings 响应泄漏令牌原值"
+else
+  ok "settings 响应不含令牌原值"
+fi
+
+# write_enabled=1 + token 空：开关打开但缺令牌 -> 两个 enabled=true、has_token=false
+#（前端据此显示 notoken，而不是 on；认证仍关闭，符合"token 空仅靠网络边界"契约）。
+UCI set prism-router.panel.token=''
+UCI commit prism-router
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings")
+[ "$code" = "200" ] \
+  && [ "$(json_expr 'type(d.panel.write_enabled)=="bool" && d.panel.write_enabled==true && type(d.write.enabled)=="bool" && d.write.enabled==true && type(d.panel.has_token)=="bool" && d.panel.has_token==false && d.panel.token==null')" = "1" ] \
+  && ok "write_enabled=1 + token 空：两个 enabled=true、has_token=false" \
+  || bad "write_enabled=1 + token 空 -> $code / write_enabled=$(json_val 'd?.panel?.write_enabled') / has_token=$(json_val 'd?.panel?.has_token')"
+
+# 非法值不是字符串 '1'，一律按关闭投影（与 prism-router-control 判定一致）。
+for BADVAL in yes true; do
+  UCI set prism-router.panel.write_enabled="$BADVAL"
+  UCI commit prism-router
+  code=$(req "$PANEL/cgi-bin/panel-api?what=settings")
+  [ "$code" = "200" ] \
+    && [ "$(json_expr 'type(d.panel.write_enabled)=="bool" && d.panel.write_enabled==false && type(d.write.enabled)=="bool" && d.write.enabled==false')" = "1" ] \
+    && ok "write_enabled=$BADVAL（非法值）：两个 enabled=false" \
+    || bad "write_enabled=$BADVAL -> $code / 投影未按 false 处理"
+done
+
+# 缺配置（老 conffile 没有 write_enabled 选项）等同关闭。
+UCI delete prism-router.panel.write_enabled
+UCI commit prism-router
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings")
+[ "$code" = "200" ] \
+  && [ "$(json_expr 'type(d.panel.write_enabled)=="bool" && d.panel.write_enabled==false && type(d.write.enabled)=="bool" && d.write.enabled==false')" = "1" ] \
+  && ok "缺 write_enabled 选项：两个 enabled=false" \
+  || bad "缺 write_enabled -> $code / 投影未按 false 处理"
+
+# 带空白的 UCI 值与 control 鉴权统一：写开关 trim 后才认 '1'，空白 token 等同未设置。
+UCI set prism-router.panel.write_enabled=' 1 '
+UCI set prism-router.panel.token=" $TOK "
+UCI commit prism-router
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings&token=$TOK")
+[ "$code" = "200" ] \
+  && [ "$(json_expr 'd.panel.write_enabled==true && d.write.enabled==true && d.panel.has_token==true && d.panel.token==null')" = "1" ] \
+  && ok "带空白 write_enabled/token：与 control 一样 trim，认证和能力投影一致" \
+  || bad "带空白 write_enabled/token -> $code / 投影或认证异常"
+UCI set prism-router.panel.token='   '
+UCI commit prism-router
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings")
+[ "$code" = "200" ] \
+  && [ "$(json_expr 'd.panel.write_enabled==true && d.write.enabled==true && d.panel.has_token==false')" = "1" ] \
+  && ok "纯空白 token：等同未设置，不把家长控制误报为已可用" \
+  || bad "纯空白 token -> $code / has_token=$(json_val 'd?.panel?.has_token')"
+
+# 恢复本段开始前的 panel 配置（不打印令牌），供后续 case 继续使用默认环境。
+if [ -n "$ORIG_WRITE" ]; then
+  UCI set prism-router.panel.write_enabled="$ORIG_WRITE"
+else
+  UCI delete prism-router.panel.write_enabled
+fi
+if [ -n "$ORIG_TOKEN" ]; then
+  UCI set prism-router.panel.token="$ORIG_TOKEN"
+else
+  UCI set prism-router.panel.token=''
+fi
+UCI commit prism-router
+if [ "$(CGET prism-router.panel.write_enabled)" = "$ORIG_WRITE" ] \
+   && [ "$(CGET prism-router.panel.token)" = "$ORIG_TOKEN" ]; then
+  ok "写能力投影用例后已恢复 panel.write_enabled/panel.token 原值"
+else
+  bad "写能力投影用例后恢复 panel 配置失败"
+fi
+# 用恢复后的配置再取一次 settings，让后续断言基于新响应而不是上一场景的残留 body。
+if [ -n "$ORIG_TOKEN" ]; then
+  code=$(req "$PANEL/cgi-bin/panel-api?what=settings&token=$ORIG_TOKEN")
+else
+  code=$(req "$PANEL/cgi-bin/panel-api?what=settings")
+fi
+[ "$code" = "200" ] && ok "恢复配置后 what=settings -> 200" || bad "恢复配置后 what=settings -> $code"
 [ "$(json_expr 'd.settings.feishu_enabled!=null')" = "1" ] \
   && ok "settings 含 feishu_enabled（映射自 feishu.enabled）" || bad "settings 缺 feishu_enabled 映射"
 [ "$(json_expr 'd.settings.retention_daily_days!=null')" = "1" ] \
@@ -358,10 +461,16 @@ rm -f "$APPDIR/$D0.json" "$APPDIR/$D1.json" "$APPDIR/$D2.json" "$APPDIR/$D3.json
 
 echo "=== 11. token：未设 vs 设置后 ==="
 code=$(req "$PANEL/cgi-bin/panel-api?what=settings&token=$TOK")
-[ "$code" = "200" ] && ok "settings 带 token -> 200" || bad "settings 带 token -> $code"
+[ "$code" = "200" ] && ok "token 未设置时认证关闭 -> 200" || bad "认证关闭时 settings -> $code"
 if grep -q "$TOK" "$B" 2>/dev/null; then bad "settings 响应泄漏 token 明文"; else ok "settings 不含 token 明文"; fi
 UCI set prism-router.panel.token="$TOK"
 UCI commit prism-router
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings")
+[ "$code" = "401" ] && [ "$(json_expr 'd?.error=="unauthorized"')" = "1" ] \
+  && ok "设 token 后 settings 不带 -> 401 unauthorized" || bad "settings 不带 token -> $code"
+code=$(req "$PANEL/cgi-bin/panel-api?what=settings&token=$TOK")
+[ "$code" = "200" ] && [ "$(json_expr 'type(d.panel)=="object" && d.panel.token==null')" = "1" ] \
+  && ok "设 token 后 settings 带正确 token -> 200 且无 token 字段" || bad "settings 正确 token -> $code"
 code=$(req "$PANEL/cgi-bin/panel-api?what=state")
 [ "$code" = "401" ] && [ "$(json_expr 'd?.error=="unauthorized"')" = "1" ] \
   && ok "设 token 后不带 -> 401 unauthorized" || bad "不带 token -> $code / $(head -c 120 "$B")"
@@ -500,9 +609,9 @@ esac
   && ok "system.memory{total,free,available} 为字节且 total>0" || bad "system.memory 结构异常"
 [ "$(sysjson 'type(d.rootfs)=="object" && d.rootfs.total>0 && d.rootfs.used>=0 && d.rootfs.free>=0')" = "1" ] \
   && ok "system.rootfs{total,used,free} 为字节且 total>0" || bad "system.rootfs 结构异常"
-[ "$(sysjson 'd.version=="1.0.0"')" = "1" ] \
-  && ok "system.version=1.0.0（来自 /usr/lib/opkg/info/luci-app-prism-router.control）" \
-  || bad "system.version 不是 1.0.0"
+[ "$(sysjson "d.version==\"$VER\"")" = "1" ] \
+  && ok "system.version=$VER（来自 /usr/lib/opkg/info/luci-app-prism-router.control）" \
+  || bad "system.version 不是 $VER：$(sysval 'd.version')"
 
 echo "=== 18. 服务 / 进程：?what=services、?what=processes ==="
 sysreq GET "what=services"
@@ -542,9 +651,9 @@ sysreq GET "what=version"
 [ "$(syscode)" = "200 OK" ] && ok "what=version -> 200" || bad "what=version -> [$(syscode)]"
 [ "$(sysjson 'type(d)=="object" && length(keys(d))==4')" = "1" ] \
   && ok "version 响应恰好 4 个字段（version/build/apk_version/update_check）" || bad "version 字段数异常"
-[ "$(sysjson 'd.version=="1.0.0"')" = "1" ] && ok "version=1.0.0" || bad "version=$(sysjson 'd.version')"
-[ "$(sysjson 'd.build=="1.0.0-1"')" = "1" ] && ok "build=1.0.0-1（opkg 完整版本）" || bad "build 异常"
-[ "$(sysjson 'd.apk_version=="1.0.0"')" = "1" ] && ok "apk_version=1.0.0（供 App 比对）" || bad "apk_version 异常"
+[ "$(sysjson "d.version==\"$VER\"")" = "1" ] && ok "version=$VER" || bad "version=$(sysval 'd.version')"
+[ "$(sysjson "d.build==\"$VER-1\"")" = "1" ] && ok "build=$VER-1（opkg 完整版本）" || bad "build 异常"
+[ "$(sysjson "d.apk_version==\"$VER\"")" = "1" ] && ok "apk_version=$VER（供 App 比对）" || bad "apk_version 异常"
 [ "$(sysjson 'd.update_check==false')" = "1" ] && ok "update_check=false（未配置更新源）" || bad "update_check 异常"
 
 echo "=== 20. 方法 / 参数错误：非 GET -> 405，未知 what -> 400，缺省 what=system ==="
@@ -923,7 +1032,7 @@ rm -f /tmp/prism-router/update-cache.json
 : > /tmp/update-curl-args.log
 sysreq_mock GET "what=update_check" "$GH_OK" 200
 [ "$(syscode)" = "200 OK" ] && ok "合法 repo update_check -> 200" || bad "合法 repo -> [$(syscode)] $(cat "$SB")"
-[ "$(sysjson 'd.configured==true && d.repo=="acme/prism-router" && d.current=="1.0.0"')" = "1" ] \
+[ "$(sysjson "d.configured==true && d.repo==\"acme/prism-router\" && d.current==\"$VER\"")" = "1" ] \
   && ok "响应含 configured/repo/current" || bad "基础字段异常：$(head -c 200 "$SB")"
 [ "$(sysjson 'd.latest=="1.2.3" && d.has_update==true')" = "1" ] \
   && ok "tag v1.2.3 -> latest=1.2.3、has_update=true" || bad "latest/has_update 异常：$(cat "$SB")"
@@ -953,14 +1062,61 @@ sysreq GET "what=version"
 [ "$(sysjson 'd.update_check==true')" = "1" ] && ok "配置 repo 后 version.update_check=true" \
   || bad "version.update_check 未随配置变化"
 
-echo "--- 24.3 同版本 tag v1.0.0 -> has_update=false（force 绕过缓存）"
+echo "--- 24.2b v$VER Release 混入旧 v1.0.0 APK：不得返回旧下载链接"
+GH_MIXED="$UPMOCK/release-mixed.json"
+cat > "$GH_MIXED" <<JSON
+{
+  "tag_name": "v$VER",
+  "published_at": "2026-11-22T10:00:00Z",
+  "html_url": "https://github.com/acme/prism-router/releases/tag/v$VER",
+  "body": "mixed assets",
+  "assets": [
+    {"name": "prism-router-android-1.0.0.apk",
+     "browser_download_url": "https://github.com/acme/prism-router/releases/download/v1.0.0/prism-router-android-1.0.0.apk",
+     "size": 111},
+    {"name": "luci-app-prism-router_$VER-1_all.ipk",
+     "browser_download_url": "https://github.com/acme/prism-router/releases/download/v$VER/luci-app-prism-router_$VER-1_all.ipk",
+     "size": 222}
+  ]
+}
+JSON
+sysreq_mock GET "what=update_check&force=1" "$GH_MIXED" 200
+[ "$(sysjson "d.latest==\"$VER\" && d.apk==null && type(d.ipk)==\"object\" && index(d.ipk.name, \"$VER\")>0")" = "1" ] \
+  && ok "旧 APK 被过滤，只保留 $VER 的 IPK" \
+  || bad "资产版本筛选异常：$(cat "$SB")"
+[ "$(sysjson "d.html_url==\"https://github.com/acme/prism-router/releases/tag/v$VER\"")" = "1" ] \
+  && ok "找不到匹配 APK 时保留 html_url Release 页" || bad "html_url 缺失"
+
+echo "--- 24.2c v$VER Release 只有旧 v1.0.0 APK：apk/ipk 都为空，退回 Release 页"
+GH_OLDONLY="$UPMOCK/release-old-only.json"
+cat > "$GH_OLDONLY" <<JSON
+{
+  "tag_name": "v$VER",
+  "published_at": "2026-11-22T10:00:00Z",
+  "html_url": "https://github.com/acme/prism-router/releases/tag/v$VER",
+  "body": "old only",
+  "assets": [
+    {"name": "prism-router-android-1.0.0.apk",
+     "browser_download_url": "https://github.com/acme/prism-router/releases/download/v1.0.0/prism-router-android-1.0.0.apk",
+     "size": 111}
+  ]
+}
+JSON
+sysreq_mock GET "what=update_check&force=1" "$GH_OLDONLY" 200
+[ "$(sysjson 'd.apk==null && d.ipk==null && d.has_update==false')" = "1" ] \
+  && ok "旧 APK 不被冒充新版（apk/ipk 为空）" \
+  || bad "旧资产仍被返回：$(cat "$SB")"
+[ "$(sysjson "d.html_url==\"https://github.com/acme/prism-router/releases/tag/v$VER\"")" = "1" ] \
+  && ok "退回 html_url 供客户端打开 Release 页" || bad "html_url 缺失"
+
+echo "--- 24.3 同版本 tag v$VER -> has_update=false（force 绕过缓存）"
 GH_SAME="$UPMOCK/release-same.json"
-cat > "$GH_SAME" <<'JSON'
-{"tag_name":"v1.0.0","published_at":"2026-10-01T00:00:00Z","html_url":"https://github.com/acme/prism-router/releases/tag/v1.0.0","body":"same","assets":[]}
+cat > "$GH_SAME" <<JSON
+{"tag_name":"v$VER","published_at":"2026-10-01T00:00:00Z","html_url":"https://github.com/acme/prism-router/releases/tag/v$VER","body":"same","assets":[]}
 JSON
 sysreq_mock GET "what=update_check&force=1" "$GH_SAME" 200
-[ "$(syscode)" = "200 OK" ] && [ "$(sysjson 'd.latest=="1.0.0" && d.has_update==false')" = "1" ] \
-  && ok "tag v1.0.0 -> has_update=false" || bad "同版本判定异常：$(cat "$SB")"
+[ "$(syscode)" = "200 OK" ] && [ "$(sysjson "d.latest==\"$VER\" && d.has_update==false")" = "1" ] \
+  && ok "tag v$VER -> has_update=false" || bad "同版本判定异常：$(cat "$SB")"
 
 echo "--- 24.4 缓存：第二次请求不调用 curl；force=1 绕过"
 rm -f /tmp/prism-router/update-cache.json

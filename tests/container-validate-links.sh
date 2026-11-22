@@ -25,9 +25,8 @@ else
   echo ">>> 复用现有 dist（SKIP_BUILD=1；需要重建请加 --build）"
 fi
 DIST="$ROOT/dist"
-for p in luci-app-prism-router_1.0.0-1_all.ipk luci-app-prism-router_1.0.0-1_all.ipk; do
-  [ -f "$DIST/$p" ] || { echo "ERROR: 缺少 $DIST/$p；先运行 tools/build-ipk.sh 或本脚本加 --build" >&2; exit 1; }
-done
+source "$ROOT/tests/lib/prism-version.sh"
+prism_pick_ipk "$DIST"
 [ -f "$DIST/SHA256SUMS" ] || { echo "ERROR: 缺少 $DIST/SHA256SUMS；拒绝在未校验的产物上跑门禁" >&2; exit 1; }
 # 校验后立即快照：防止其他 agent/门禁在本门禁运行期间重建 dist，导致“验的是 A、装的是 B”。
 SNAP=$(mktemp -d)
@@ -36,6 +35,8 @@ cp -a "$DIST/." "$SNAP/"
 ( cd "$SNAP" && sha256sum -c SHA256SUMS ) >/dev/null || { echo "ERROR: dist/SHA256SUMS 校验失败（产物被改动或不完整）" >&2; exit 1; }
 echo ">>> 接入方式用例（隔离容器：--network none，仅 127.0.0.1）"
 docker run --rm --network none \
+  -e PRISM_VER="$PRISM_VER" \
+  -e PRISM_IPK_NAME="$PRISM_IPK_NAME" \
   -v "$SNAP:/src/dist:ro" \
   -v "$ROOT/tests:/src/tests:ro" \
   -v "$ROOT/tests/fixtures:/fixtures:ro" \

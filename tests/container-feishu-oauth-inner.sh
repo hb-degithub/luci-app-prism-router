@@ -1,4 +1,5 @@
 #!/bin/sh
+. /src/tests/lib/prism-version-inner.sh
 # 飞书「应用机器人 + 扫码绑定」用例（容器内执行；由 tests/container-validate-feishu-oauth.sh 调用）
 #
 # 覆盖：
@@ -182,7 +183,7 @@ wait_http "$MOCK_BASE/open-apis/im/v1/chats" && ok "mock 飞书 API 已监听 $M
   || { bad "mock 飞书 API 未就绪"; cat /tmp/mock-uhttpd.log; }
 
 echo "=== 0. 安装单包 ==="
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i.log 2>&1 \
+opkg install "$PRISM_IPK" >/tmp/i.log 2>&1 \
   && ok "安装 luci-app-prism-router" || { bad "安装失败"; tail -8 /tmp/i.log; }
 
 # rpcd 必须在装包之后再起，否则 ucode 插件不在启动时的加载列表里

@@ -1,4 +1,5 @@
 #!/bin/sh
+. /src/tests/lib/prism-version-inner.sh
 # 软路由自身性能指标（state.json 的 system 段）用例（容器内执行；
 # 由 tests/container-validate-system.sh 调用）
 #
@@ -143,7 +144,7 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 echo "=== 1. 安装两个包 ==="
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 prism-router" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
+opkg install "$PRISM_IPK" >/tmp/i1.log 2>&1 && ok "安装 prism-router" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
 true >/tmp/i2.log 2>&1 && ok "安装 luci-app-prism-router" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新配置项与文件权限 ==="

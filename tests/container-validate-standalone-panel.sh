@@ -46,9 +46,8 @@ else
   DIST="$ROOT/dist"
 fi
 
-for p in luci-app-prism-router_1.0.0-1_all.ipk luci-app-prism-router_1.0.0-1_all.ipk; do
-  [ -f "$DIST/$p" ] || { echo "ERROR: 缺少 $DIST/$p；先运行 tools/build-ipk.sh 或本脚本加 --build" >&2; exit 1; }
-done
+source "$ROOT/tests/lib/prism-version.sh"
+prism_pick_ipk "$DIST"
 [ -f "$DIST/SHA256SUMS" ] || { echo "ERROR: 缺少 $DIST/SHA256SUMS；拒绝在未校验的产物上跑门禁" >&2; exit 1; }
 
 # 先校验来源，再快照，最后校验将要挂载的那份快照：任何一步不一致都拒绝。
@@ -61,6 +60,8 @@ cp -a "$DIST/." "$SNAP/"
 
 echo ">>> 独立面板用例（隔离容器：--network none，仅 127.0.0.1）"
 docker run --rm --network none \
+  -e PRISM_VER="$PRISM_VER" \
+  -e PRISM_IPK_NAME="$PRISM_IPK_NAME" \
   -v "$SNAP:/src/dist:ro" \
   -v "$ROOT/tests:/src/tests:ro" \
   -v "$ROOT/tests/fixtures:/fixtures:ro" \

@@ -41,7 +41,7 @@
 import { readfile, open, lsdir, stat, lstat, mkdir, chmod, rename, unlink, popen } from 'fs';
 import { cursor } from 'uci';
 
-const VERSION       = '1.0.0';
+const VERSION       = '1.0.4';
 const PROD_BASE     = 'https://open.feishu.cn';
 const TMP_ROOT      = '/tmp/prism-router';
 const STATE_DIR     = `${TMP_ROOT}/feishu-oauth`;

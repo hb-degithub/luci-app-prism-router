@@ -46,7 +46,20 @@ DIST="$SNAP"
 echo ">>> 1/6 发布集与 SHA256SUMS"
 mapfile -t MODERN < <(find "$DIST" -maxdepth 1 -type f -name '*.ipk' ! -name '*.legacy.ipk' -printf '%f\n' | LC_ALL=C sort)
 [ "${#MODERN[@]}" -eq 1 ] || fail "dist 里应有 1 个 modern ipk，实际 ${#MODERN[@]} 个：${MODERN[*]:-无}"
-[ "${MODERN[0]}" = "luci-app-prism-router_1.0.0-1_all.ipk" ] || fail "modern 包名不符：${MODERN[0]}"
+IPK_NAME="${MODERN[0]}"
+# 版本从实际产物名解析（不再写死 1.0.0），并要求与 Makefile 单一来源一致。
+case "$IPK_NAME" in
+  luci-app-prism-router_*-[0-9]*_all.ipk) ;;
+  *) fail "modern 包名不符：$IPK_NAME" ;;
+esac
+VER=$(printf '%s' "$IPK_NAME" | sed -n 's/^luci-app-prism-router_\(.*\)-[0-9][0-9]*_all\.ipk$/\1/p')
+REL=$(printf '%s' "$IPK_NAME" | sed -n 's/^luci-app-prism-router_.*-\([0-9][0-9]*\)_all\.ipk$/\1/p')
+[ -n "$VER" ] && [ -n "$REL" ] || fail "无法从包名解析版本：$IPK_NAME"
+MAKE_VER=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-prism-router/Makefile" | head -1)
+[ "$VER" = "$MAKE_VER" ] || fail "包名版本 $VER 与 Makefile PKG_VERSION $MAKE_VER 不一致"
+IPK="$DIST/$IPK_NAME"
+PRISM_VER="$VER"
+PRISM_IPK_NAME="$IPK_NAME"
 if find "$DIST" -maxdepth 1 -type f -name '*.legacy.ipk' -print -quit | grep -q .; then
   fail "dist 含 *.legacy.ipk：旧包不进入发布集，请重新 build（默认不生成 legacy）"
 fi
@@ -61,13 +74,13 @@ pass "1 个 modern 插件包 + SHA256SUMS 一致"
 echo ">>> 2/6 哈希负例（篡改 / 缺文件必须被拒绝）"
 mkdir -p "$WORK/tamper" "$WORK/missing"
 cp -a "$DIST/." "$WORK/tamper/"
-printf '\000' >> "$WORK/tamper/luci-app-prism-router_1.0.0-1_all.ipk"
+printf '\000' >> "$WORK/tamper/$IPK_NAME"
 if ( cd "$WORK/tamper" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
   fail "篡改后的 ipk 仍通过 SHA256SUMS（拒绝逻辑失效）"
 fi
 pass "篡改 ipk → 哈希校验拒绝"
 cp -a "$DIST/." "$WORK/missing/"
-rm -f "$WORK/missing/luci-app-prism-router_1.0.0-1_all.ipk"
+rm -f "$WORK/missing/$IPK_NAME"
 if ( cd "$WORK/missing" && sha256sum -c SHA256SUMS >/dev/null 2>&1 ); then
   fail "缺少 ipk 仍通过 SHA256SUMS（拒绝逻辑失效）"
 fi
@@ -115,6 +128,27 @@ is_exec_name() {
     ./etc/init.d/prism-router-panel|./www/prism-router-panel/cgi-bin/panel-api) return 0 ;;
   esac
   return 1
+}
+
+# 包内版本常量必须随同一个 VER 注入；比较时先归一化常量行，再逐字节比对其余内容。
+version_var_for() { # $1=payload 相对路径（./ 开头）
+  case "$1" in
+    ./usr/bin/prism-routerd) echo DAEMON_VERSION ;;
+    ./www/cgi-bin/prism-router-metrics|./www/cgi-bin/prism-router-feishu|./usr/share/rpcd/ucode/prism-router.uc) echo VERSION ;;
+  esac
+}
+norm_version_file() { # $1=文件 $2=常量名
+  sed -E "s/^(const[[:space:]]+$2[[:space:]]*=[[:space:]]*)'[^']*';/\1'@VER@';/" "$1"
+}
+payload_matches() { # $1=已解包文件 $2=仓库源码 $3=payload 相对路径
+  local var
+  var=$(version_var_for "$3")
+  if [ -n "$var" ]; then
+    cmp -s <(norm_version_file "$1" "$var") <(norm_version_file "$2" "$var") || return 1
+    grep -Fq "'$VER';" "$1" || return 1
+    return 0
+  fi
+  cmp -s "$1" "$2"
 }
 
 check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
@@ -178,6 +212,7 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
              p == "./www/cgi-bin/prism-router-admin" ||
              p == "./www/prism-router-panel/cgi-bin/prism-router-system" ||
              p == "./www/prism-router-panel/cgi-bin/prism-router-admin" ||
+             p == "./www/prism-router-panel/cgi-bin/prism-router-control" ||
              p == "./etc/init.d/prism-router-panel" ||
              p == "./www/prism-router-panel/cgi-bin/panel-api"
     }
@@ -198,7 +233,7 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
   # control 字段
   [ -f "$ctl/control" ] || fail "$pkg 缺 control"
   grep -qx "Package: $pkg" "$ctl/control" || fail "$pkg Package 字段不符"
-  grep -qx "Version: 1.0.0-1" "$ctl/control" || fail "$pkg Version 字段不符"
+  grep -qx "Version: $VER-$REL" "$ctl/control" || fail "$pkg Version 字段不符（期望 $VER-$REL）"
   grep -qx "Architecture: all" "$ctl/control" || fail "$pkg Architecture 字段不符"
   grep -qx "Section: $section" "$ctl/control" || fail "$pkg Section 字段不符"
   local priority
@@ -253,7 +288,7 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
     local t="${entry%%:*}" s="${entry#*:}"
     [ -f "$ROOT/$s" ] || continue
     grep -qxF "$t" "$data_list" || fail "$pkg payload 缺少 $t（源 $s）"
-    cmp -s "$data/${t#./}" "$ROOT/$s" || fail "$pkg payload $t 与源码 $s 不一致"
+    payload_matches "$data/${t#./}" "$ROOT/$s" "$t" || fail "$pkg payload $t 与源码 $s 不一致（版本/内容漂移）"
   done
   local f b rel
   for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/view/prism-router/*.js; do
@@ -272,13 +307,14 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
     [ -f "$f" ] || continue
     rel="${f#"$ROOT/luci-app-prism-router/root/"}"
     grep -qxF "./$rel" "$data_list" || fail "payload 缺 root/ 文件 $rel"
-    cmp -s "$data/$rel" "$f" || fail "payload root/ 文件 $rel 与源码不一致"
+    payload_matches "$data/$rel" "$f" "./$rel" || fail "payload root/ 文件 $rel 与源码不一致（版本/内容漂移）"
   done < <(find "$ROOT/luci-app-prism-router/root" -type f | LC_ALL=C sort)
   pass "$pkg payload 与源码一致（含条件文件）"
+  pass "$pkg 版本常量与包名一致（daemon/rpcd/metrics/feishu = $VER）"
 }
 
 echo ">>> 3/6 control 元数据 / 权限 / payload↔源码"
-check_pkg "$DIST/luci-app-prism-router_1.0.0-1_all.ipk" luci-app-prism-router luci \
+check_pkg "$IPK" luci-app-prism-router luci \
   "$ROOT/luci-app-prism-router/Makefile" LUCI_DEPENDS
 
 echo ">>> 4/6 生成 legacy 负例（只用于验证旧格式被拒绝，不发布）"
@@ -295,6 +331,8 @@ RC=0
 run_release() { # $1=image $2=label
   echo "--- release gate: $2 ($1)"
   if ! docker run --rm --network none \
+    -e PRISM_VER="$PRISM_VER" \
+    -e PRISM_IPK_NAME="$PRISM_IPK_NAME" \
     -e "RELEASE_TARGET=$2" \
     -v "$ROOT:/src/repo:ro" \
     -v "$SNAP:/src/dist:ro" \

@@ -6,16 +6,14 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -33,12 +31,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDownward
 import androidx.compose.material.icons.rounded.ArrowUpward
 import androidx.compose.material.icons.rounded.BarChart
-import androidx.compose.material.icons.rounded.CalendarMonth
+import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.CloudOff
-import androidx.compose.material.icons.rounded.DataUsage
 import androidx.compose.material.icons.rounded.Devices
 import androidx.compose.material.icons.rounded.ErrorOutline
-import androidx.compose.material.icons.rounded.Link
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Router
 import androidx.compose.material.icons.rounded.TaskAlt
@@ -47,7 +43,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -61,14 +56,15 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
@@ -81,39 +77,45 @@ import androidx.compose.ui.unit.sp
 import io.prism.router.data.AlertSeverity
 import io.prism.router.data.AlertTarget
 import io.prism.router.data.DailyUsage
-import io.prism.router.data.PanelState
+import io.prism.router.data.Device
 import io.prism.router.data.NodeUsage
+import io.prism.router.data.PanelState
 import io.prism.router.data.UiState
 import io.prism.router.data.fmtBytes
 import io.prism.router.data.fmtClock
+import io.prism.router.data.fmtRate
+import io.prism.router.data.normalizeMac
 import io.prism.router.ui.components.EmptyState
 import io.prism.router.ui.components.ErrorState
 import io.prism.router.ui.components.Pill
+import io.prism.router.ui.components.PrismProgressBar
 import io.prism.router.ui.components.PrismScaffold
 import io.prism.router.ui.components.RefreshableContent
 import io.prism.router.ui.components.SectionCard
 import io.prism.router.ui.components.SkeletonBox
-import io.prism.router.ui.components.StatCard
 import io.prism.router.ui.components.StatusRow
+import io.prism.router.ui.theme.LocalPrismCategoryColors
+import io.prism.router.ui.theme.LocalPrismDataColors
 import io.prism.router.ui.theme.LocalPrismSemanticColors
 import io.prism.router.ui.theme.PrismRadius
 import io.prism.router.ui.theme.PrismSize
 import io.prism.router.ui.theme.PrismSpacing
+import io.prism.router.ui.theme.PrismStroke
 import java.time.LocalDate
 import java.util.Locale
 import kotlin.math.roundToInt
 
 /*
- * 概览屏（重做版）。
+ * 概览屏（网络驾驶舱版）。
  *
- * 设计取向对齐成熟商用路由器 App：单列、卡片、留白充足；先给结论（服务状态 / 速率），
- * 再给 KPI 与趋势，最后是告警、出口与记账健康。所有数字使用 tabular-nums（tnum），
- * 让 15 秒轮询时数字不会左右跳动。
+ * 信息顺序：紧凑状态行 → 速率主卡（含最近采样趋势）→ 今日 / 在线摘要 →
+ * Top 3 活跃设备 → 近 7 天趋势 → 告警 → 出口 → 健康。
  *
- * 顶栏说明：本屏自带 PrismScaffold（与设备 / 应用 / 网络三屏一致），大标题「概览」、
- * 副标题「服务状态 · 更新于 HH:mm:ss」、右上角刷新（加载中换成转圈）。导航层只负责
- * 挂载屏幕，不再包第二层 Scaffold —— 否则会出现两条标题栏、状态栏内边距也会叠加。
- * 滚动内容驱动大标题收起（nestedScroll 由 PrismScaffold 接到内容区）。
+ * 设计约定：
+ * - 顶部不再有独立的「运行状态」大卡：服务 / 记账 / 新鲜度压成一行，
+ *   只有离线、同步失败、服务停止、记账降级、数据陈旧时才在下面补一条明显提示；
+ * - 下载固定品牌蓝、上传固定科技青（LocalPrismDataColors），绿 / 橙 / 红只留给状态；
+ * - 数值统一 tabular figures，卡片不再使用 1dp 苍白描边，层级靠表面色与留白。
  *
  * 数据只读：本文件只消费 UiState / PanelState，不发起任何请求；刷新一律回调
  * [onRefresh]（由 MainViewModel.refresh() 负责）。
@@ -128,21 +130,41 @@ private const val MAX_EXIT_ROWS = 3
 /** 健康卡最多展示的 reasons 条数。 */
 private const val MAX_HEALTH_REASONS = 3
 
+/** 首屏活跃设备入口条数。 */
+private const val ACTIVE_DEVICE_ROWS = 3
+
+/** 状态行下的异常提示数据。 */
+private data class StatusAttentionData(
+    val message: String,
+    val color: Color,
+    val icon: ImageVector,
+    val action: String
+)
+
 /**
  * 概览页（兼容旧调用：只传刷新回调）。
  *
- * 新的接线可再传 [onOpenDevices] / [onOpenNetwork]，让设备类告警跳「设备」页签、
- * 「查看全部」跳「网络」页签；未接入时对应跳转入口自动隐藏。
+ * 新的接线可再传 [onOpenDevices] / [onOpenDevice] / [onOpenNetwork]，让设备类告警与
+ * 「查看全部」跳「设备」页签、活跃设备行进单设备详情、「查看全部」跳「网络」页签；
+ * 未接入时对应跳转入口自动隐藏。
  */
 @Composable
 fun OverviewScreen(ui: UiState, onRefresh: () -> Unit) {
-    OverviewScreen(ui = ui, onRefresh = onRefresh, onOpenDevices = null)
+    OverviewScreen(
+        ui = ui,
+        onRefresh = onRefresh,
+        onOpenDevices = null,
+        onOpenDevice = null,
+        onOpenNetwork = null
+    )
 }
 
 /**
  * 概览页。
  *
- * [onOpenDevices]：设备类告警的跳转回调（App / 导航传入后生效，为 null 时告警只展示）。
+ * [onOpenDevices]：设备类告警 / 活跃设备「查看全部」的页签级跳转；为 null 时不可点。
+ * [onOpenDevice]：Top 3 活跃设备行的单设备详情跳转；为 null 时行点击回落到
+ * [onOpenDevices]（旧行为），两者都为空则整行只读。
  * [onOpenNetwork]：出口摘要「查看全部」的跳转回调；为 null 时不显示该按钮。
  */
 @Composable
@@ -150,6 +172,7 @@ fun OverviewScreen(
     ui: UiState,
     onRefresh: () -> Unit,
     onOpenDevices: (() -> Unit)? = null,
+    onOpenDevice: ((Device) -> Unit)? = null,
     onOpenNetwork: (() -> Unit)? = null
 ) {
     /* 只在下拉 / 手动重试期间展示顶部指示器，避免 15s 自动轮询让指示器反复闪动。 */
@@ -158,10 +181,6 @@ fun OverviewScreen(
         if (!ui.loading) pulling = false
     }
 
-    /*
-     * 本屏自带上标题栏（与设备 / 应用 / 网络三屏一致，避免导航层与屏内各画一条）：
-     * 大标题滚动收起、副标题给服务状态与更新时间、右上角刷新在加载时转圈。
-     */
     PrismScaffold(
         title = "概览",
         subtitle = overviewSubtitle(ui),
@@ -182,7 +201,7 @@ fun OverviewScreen(
             when {
                 /* 首屏没有任何数据且请求失败：整页错误 + 重试。 */
                 state == null && error != null -> OverviewError(error, onRefresh)
-                /* 首屏加载：骨架屏（速率 + KPI + 趋势各一块）。 */
+                /* 首屏加载：骨架屏（状态行 + 速率 + 摘要 + 活跃设备 + 趋势）。 */
                 state == null && ui.loading -> OverviewSkeleton()
                 /* 既没有数据也不在加载：等待连接（配置未就绪 / 刚启动）。 */
                 state == null -> OverviewWaiting(onRefresh)
@@ -191,6 +210,7 @@ fun OverviewScreen(
                     state = state,
                     onRefresh = onRefresh,
                     onOpenDevices = onOpenDevices,
+                    onOpenDevice = onOpenDevice,
                     onOpenNetwork = onOpenNetwork
                 )
             }
@@ -212,7 +232,7 @@ private fun overviewSubtitle(ui: UiState): String {
         state != null && state.running -> "服务运行中"
         state != null -> "服务已停止"
         ui.error != null -> "连接失败"
-        else -> "正在连接面板"
+        else -> "正在连接路由器"
     }
     val time = when {
         ui.offline && ui.offlineAt > 0 -> "更新于 ${fmtClock(ui.offlineAt)}"
@@ -254,6 +274,7 @@ private fun OverviewList(
     state: PanelState,
     onRefresh: () -> Unit,
     onOpenDevices: (() -> Unit)?,
+    onOpenDevice: ((Device) -> Unit)?,
     onOpenNetwork: (() -> Unit)?
 ) {
     LazyColumn(
@@ -264,17 +285,20 @@ private fun OverviewList(
             top = PrismSpacing.sm,
             bottom = PrismSpacing.xl
         ),
-        verticalArrangement = Arrangement.spacedBy(PrismSpacing.lg)
+        verticalArrangement = Arrangement.spacedBy(PrismSpacing.md)
     ) {
         item(key = "status") {
-            StatusBanner(
-                ui = ui,
+            OverviewStatusRow(ui = ui, state = state, onRefresh = onRefresh)
+        }
+        item(key = "speed") { SpeedHeroCard(ui = ui, state = state) }
+        item(key = "summary") { SummaryStrip(ui = ui, state = state) }
+        item(key = "devices") {
+            ActiveDevicesCard(
                 state = state,
-                onRefresh = onRefresh
+                onOpenDevices = onOpenDevices,
+                onOpenDevice = onOpenDevice
             )
         }
-        item(key = "speed") { SpeedHeroCard(state) }
-        item(key = "kpi") { KpiGrid(ui, state) }
         item(key = "trend") { TrendCard(ui) }
         item(key = "alerts") { AlertsCard(ui, onOpenDevices) }
         item(key = "exits") { ExitsCard(state, onOpenNetwork) }
@@ -293,7 +317,7 @@ private fun OverviewError(msg: String, onRetry: () -> Unit) {
     ) {
         ErrorState(
             msg = msg,
-            title = "连接面板失败",
+            title = "连接路由器失败",
             onRetry = onRetry
         )
     }
@@ -309,7 +333,7 @@ private fun OverviewWaiting(onRefresh: () -> Unit) {
     ) {
         EmptyState(
             title = "等待路由器数据",
-            desc = "还没有拿到面板快照。请确认地址与网络后重试，或下拉刷新。",
+            desc = "还没有拿到路由器快照。请确认路由器地址与网络后重试，或下拉刷新。",
             icon = Icons.Rounded.Router,
             action = {
                 Button(
@@ -323,197 +347,202 @@ private fun OverviewWaiting(onRefresh: () -> Unit) {
     }
 }
 
-/* ───────────────────────── 状态横幅 ───────────────────────── */
+/* ───────────────────────── 状态行 ───────────────────────── */
 
 /**
- * 状态横幅：服务运行 / 记账可信度 / 数据新鲜度三颗胶囊。
+ * 紧凑状态行：服务 / 记账 / 新鲜度压成一行，异常时才追加一条明显提示。
  *
- * 颜色语义固定：绿=正常、橙=降级、红=异常；离线时整条换成「离线数据」提示条。
- * 三颗胶囊用 [FlowRow] 排布，大字号 / 窄屏会自动换行，390dp 下不会溢出。
+ * 正常态只占一行（≈20dp），不再用一张 120dp 的「运行状态」卡片挤占首屏；
+ * 离线、同步失败、服务停止、记账降级、数据陈旧分别有独立提示与重试入口。
  */
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun StatusBanner(
-    ui: UiState,
-    state: PanelState,
-    onRefresh: () -> Unit
-) {
+private fun OverviewStatusRow(ui: UiState, state: PanelState, onRefresh: () -> Unit) {
     val scheme = MaterialTheme.colorScheme
     val semantic = LocalPrismSemanticColors.current
     val health = state.health
-
-    val serviceColor = if (state.running) semantic.success else scheme.error
-    val serviceText = if (state.running) "服务运行中" else "服务已停止"
-
-    val (confidenceColor, confidenceText) = when (health.confidence.lowercase(Locale.US)) {
-        "exact" -> semantic.success to "记账精确"
-        "degraded" -> semantic.warning to "记账降级"
-        "unavailable" -> scheme.error to "记账不可用"
-        else -> semantic.neutral to "记账未知"
-    }
-
+    val confidence = health.confidence.lowercase(Locale.US)
     val ageSec = if (ui.updatedAt > 0) {
         ((System.currentTimeMillis() - ui.updatedAt) / 1000).coerceAtLeast(0)
     } else {
-        -1
+        -1L
     }
-    val (freshColor, freshText) = when {
-        ui.offline -> scheme.error to "离线缓存"
-        ageSec < 0 -> semantic.neutral to "等待数据"
-        ageSec <= 60 -> semantic.success to "数据实时"
-        ageSec <= 300 -> semantic.warning to "${ageSec / 60} 分钟前"
-        else -> scheme.error to "数据陈旧"
+    val stale = ageSec > 300
+    val normal = state.running && confidence == "exact" && !ui.offline && ui.error == null && !stale
+
+    val statusText = when {
+        ui.offline -> "离线数据"
+        ui.error != null -> "同步异常"
+        !state.running -> "服务已停止"
+        stale -> "数据延迟"
+        else -> "服务运行中"
+    }
+    val statusColor = when {
+        ui.offline -> semantic.warning
+        ui.error != null -> scheme.error
+        !state.running -> scheme.error
+        stale -> semantic.warning
+        confidence == "degraded" -> semantic.warning
+        confidence == "unavailable" -> scheme.error
+        confidence == "unknown" || confidence.isBlank() -> semantic.neutral
+        else -> semantic.success
+    }
+    val confidenceText = when (confidence) {
+        "exact" -> "记账精确"
+        "degraded" -> "记账降级"
+        "unavailable" -> "记账不可用"
+        else -> "记账未知"
+    }
+    val timeText = when {
+        ui.offline && ui.offlineAt > 0 -> "离线于 ${fmtClock(ui.offlineAt)}"
+        ui.updatedAt > 0 -> "更新于 ${fmtClock(ui.updatedAt)}"
+        else -> "等待首次数据"
     }
 
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(PrismRadius.large),
-        color = scheme.surface,
-        contentColor = scheme.onSurface,
-        tonalElevation = 0.dp,
-        border = BorderStroke(1.dp, scheme.outlineVariant.copy(alpha = 0.55f))
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(PrismSpacing.lg)
-        ) {
-            Text(
-                text = "运行状态",
-                style = MaterialTheme.typography.titleMedium
-            )
-            Spacer(Modifier.height(PrismSpacing.md))
-            FlowRow(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(PrismSpacing.sm, Alignment.Start),
-                verticalArrangement = Arrangement.spacedBy(PrismSpacing.sm)
-            ) {
-                Pill(text = serviceText, color = serviceColor)
-                Pill(text = confidenceText, color = confidenceColor)
-                Pill(text = freshText, color = freshColor)
-            }
+    val attention: StatusAttentionData? = when {
+        ui.offline -> StatusAttentionData(
+            message = "离线数据 · 更新于 ${fmtClock(if (ui.offlineAt > 0) ui.offlineAt else ui.updatedAt)}",
+            color = semantic.warning,
+            icon = Icons.Rounded.CloudOff,
+            action = "重试"
+        )
 
-            val error = ui.error
-            when {
-                ui.offline -> {
-                    Spacer(Modifier.height(PrismSpacing.md))
-                    OfflineBar(
-                        at = if (ui.offlineAt > 0) ui.offlineAt else ui.updatedAt,
-                        onRetry = onRefresh
-                    )
-                }
+        ui.error != null -> StatusAttentionData(
+            message = "同步失败：${ui.error}",
+            color = scheme.error,
+            icon = Icons.Rounded.ErrorOutline,
+            action = "重试"
+        )
 
-                error != null -> {
-                    Spacer(Modifier.height(PrismSpacing.md))
-                    InlineError(msg = error, onRetry = onRefresh)
-                }
-            }
-        }
+        !state.running -> StatusAttentionData(
+            message = "服务已停止：路由器进程未运行，速率与流量可能不再更新",
+            color = scheme.error,
+            icon = Icons.Rounded.ErrorOutline,
+            action = "刷新"
+        )
+
+        confidence == "unavailable" -> StatusAttentionData(
+            message = "记账不可用：无法从路由器获取记账数据",
+            color = scheme.error,
+            icon = Icons.Rounded.ErrorOutline,
+            action = "刷新"
+        )
+
+        confidence == "degraded" -> StatusAttentionData(
+            message = "记账降级：部分链路缺少数据，统计可能偏低",
+            color = semantic.warning,
+            icon = Icons.Rounded.ErrorOutline,
+            action = "刷新"
+        )
+
+        stale -> StatusAttentionData(
+            message = "数据已 ${(ageSec / 60).coerceAtLeast(1)} 分钟未更新",
+            color = semantic.warning,
+            icon = Icons.Rounded.CloudOff,
+            action = "刷新"
+        )
+
+        else -> null
     }
-}
 
-/** 离线数据条：橙底 + 重试，触控高度 ≥48dp。 */
-@Composable
-private fun OfflineBar(at: Long, onRetry: () -> Unit) {
-    val warning = LocalPrismSemanticColors.current.warning
-    Surface(
-        shape = RoundedCornerShape(PrismRadius.small),
-        color = warning.copy(alpha = 0.12f)
-    ) {
+    Column(Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = PrismSpacing.md, end = PrismSpacing.xs),
+                .heightIn(min = 28.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(
-                imageVector = Icons.Rounded.CloudOff,
-                contentDescription = null,
-                tint = warning,
-                modifier = Modifier.size(PrismSize.iconSmall)
+            Box(
+                Modifier
+                    .size(8.dp)
+                    .background(statusColor, CircleShape)
             )
             Spacer(Modifier.width(PrismSpacing.sm))
             Text(
-                text = "离线数据 · 更新于 ${fmtClock(at)}",
-                style = MaterialTheme.typography.labelSmall.tabular(),
-                color = warning,
+                text = statusText,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (normal) scheme.onSurface else statusColor,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1
+            )
+            Spacer(Modifier.width(PrismSpacing.sm))
+            Text(
+                text = confidenceText,
+                style = MaterialTheme.typography.labelSmall,
+                color = scheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
-            TextButton(
-                onClick = onRetry,
-                modifier = Modifier.heightIn(min = PrismSize.touchTarget)
-            ) {
-                Text(
-                    text = "重试",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = warning
-                )
-            }
+            Text(
+                text = timeText,
+                style = MaterialTheme.typography.labelSmall.tabular(),
+                color = scheme.onSurfaceVariant,
+                maxLines = 1
+            )
+        }
+        if (attention != null) {
+            Spacer(Modifier.height(PrismSpacing.xs))
+            StatusAttention(data = attention, onAction = onRefresh)
         }
     }
 }
 
-/** 在线但本轮同步失败：红底提示 + 重试，数据仍展示（避免整屏闪烁）。 */
 @Composable
-private fun InlineError(msg: String, onRetry: () -> Unit) {
-    val error = MaterialTheme.colorScheme.error
+private fun StatusAttention(data: StatusAttentionData, onAction: () -> Unit) {
     Surface(
+        modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(PrismRadius.small),
-        color = error.copy(alpha = 0.10f)
+        color = data.color.copy(alpha = 0.10f)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .heightIn(min = PrismSize.touchTarget)
                 .padding(start = PrismSpacing.md, end = PrismSpacing.xs),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector = Icons.Rounded.ErrorOutline,
+                imageVector = data.icon,
                 contentDescription = null,
-                tint = error,
+                tint = data.color,
                 modifier = Modifier.size(PrismSize.iconSmall)
             )
             Spacer(Modifier.width(PrismSpacing.sm))
             Text(
-                text = "同步失败：$msg",
+                text = data.message,
                 style = MaterialTheme.typography.labelSmall,
-                color = error,
+                color = data.color,
                 maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f)
             )
             TextButton(
-                onClick = onRetry,
+                onClick = onAction,
                 modifier = Modifier.heightIn(min = PrismSize.touchTarget)
             ) {
                 Text(
-                    text = "重试",
+                    text = data.action,
                     style = MaterialTheme.typography.labelSmall,
-                    color = error
+                    color = data.color
                 )
             }
         }
     }
 }
 
-/* ───────────────────────── 速率大卡 ───────────────────────── */
+/* ───────────────────────── 速率主卡 ───────────────────────── */
 
 /**
- * 速率大卡：左下载（品牌蓝）/ 右上传（橙），底部一行累计与本月。
+ * 速率主卡：实时下载 / 上传 + 最近 24 次采样趋势 + 本次 / 本月累计。
  *
- * 顶部叠一层品牌色 12% → 透明的竖向渐变，深浅主题下都只做很轻的强调，
- * 不依赖图片资源，也不影响数字对比度。
+ * 方向色固定：下载 Brand 蓝、上传科技青；底部数字用 tabular figures，
+ * 不再出现同一屏「132.7 GB / 132 GB」两种月流量写法。
  */
 @Composable
-private fun SpeedHeroCard(state: PanelState) {
+private fun SpeedHeroCard(ui: UiState, state: PanelState) {
     val scheme = MaterialTheme.colorScheme
-    val semantic = LocalPrismSemanticColors.current
+    val data = LocalPrismDataColors.current
     val totals = state.totals
-    val gradient = Brush.verticalGradient(
-        listOf(scheme.primary.copy(alpha = 0.12f), Color.Transparent)
-    )
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -521,20 +550,32 @@ private fun SpeedHeroCard(state: PanelState) {
         color = scheme.surface,
         contentColor = scheme.onSurface,
         tonalElevation = 0.dp,
-        border = BorderStroke(1.dp, scheme.outlineVariant.copy(alpha = 0.55f))
+        shadowElevation = 0.dp
     ) {
-        Column(Modifier.fillMaxWidth()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(gradient)
-                    .padding(horizontal = PrismSpacing.lg, vertical = PrismSpacing.lg),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(PrismSpacing.lg)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "实时速率",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = scheme.onSurfaceVariant
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = "每 ${ui.intervalSec} 秒刷新",
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = scheme.onSurfaceVariant
+                )
+            }
+            Spacer(Modifier.height(PrismSpacing.md))
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 RateColumn(
                     label = "下载",
                     rate = totals.rxRate,
-                    color = scheme.primary,
+                    color = data.download,
                     icon = Icons.Rounded.ArrowDownward,
                     modifier = Modifier.weight(1f)
                 )
@@ -542,23 +583,41 @@ private fun SpeedHeroCard(state: PanelState) {
                     Modifier
                         .padding(horizontal = PrismSpacing.md)
                         .width(1.dp)
-                        .height(64.dp)
-                        .background(scheme.outlineVariant.copy(alpha = 0.6f))
+                        .height(56.dp)
+                        .background(scheme.outlineVariant.copy(alpha = 0.7f))
                 )
                 RateColumn(
                     label = "上传",
                     rate = totals.txRate,
-                    color = semantic.warning,
+                    color = data.upload,
                     icon = Icons.Rounded.ArrowUpward,
                     modifier = Modifier.weight(1f)
                 )
             }
-            HorizontalDivider(color = scheme.outlineVariant.copy(alpha = 0.45f))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = PrismSpacing.lg, vertical = PrismSpacing.md)
-            ) {
+
+            if (ui.rxHistory.isNotEmpty() || ui.txHistory.isNotEmpty()) {
+                Spacer(Modifier.height(PrismSpacing.md))
+                RateSparkline(
+                    rx = ui.rxHistory,
+                    tx = ui.txHistory,
+                    downloadColor = data.download,
+                    uploadColor = data.upload,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(36.dp)
+                        .semantics {
+                            contentDescription = "最近 ${maxOf(ui.rxHistory.size, ui.txHistory.size)} 次采样的上下行速率趋势"
+                        }
+                )
+            }
+
+            Spacer(Modifier.height(PrismSpacing.md))
+            HorizontalDivider(
+                color = scheme.outlineVariant.copy(alpha = 0.7f),
+                thickness = PrismStroke.hairline
+            )
+            Spacer(Modifier.height(PrismSpacing.md))
+            Row(Modifier.fillMaxWidth()) {
                 HeroMetric(
                     label = "本次下载",
                     value = fmtBytes(totals.rx),
@@ -593,15 +652,15 @@ private fun RateColumn(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
-                    .size(PrismSize.iconLarge)
-                    .background(color.copy(alpha = 0.14f), CircleShape),
+                    .size(32.dp)
+                    .background(color.copy(alpha = 0.12f), CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
                     imageVector = icon,
                     contentDescription = null,
                     tint = color,
-                    modifier = Modifier.size(16.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
             Spacer(Modifier.width(PrismSpacing.sm))
@@ -619,7 +678,7 @@ private fun RateColumn(
                 style = MaterialTheme.typography.headlineSmall
                     .copy(
                         fontSize = size,
-                        lineHeight = size * 1.08f,
+                        lineHeight = size * 1.05f,
                         fontWeight = FontWeight.Bold,
                         letterSpacing = (-0.5).sp
                     )
@@ -646,6 +705,51 @@ private fun RateColumn(
     }
 }
 
+/** 最近采样双线趋势：上传先画、下载后画，蓝线压在青线上方。 */
+@Composable
+private fun RateSparkline(
+    rx: List<Long>,
+    tx: List<Long>,
+    downloadColor: Color,
+    uploadColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Canvas(modifier) {
+        val count = maxOf(rx.size, tx.size)
+        if (count < 2) return@Canvas
+        val maxValue = maxOf(
+            rx.maxOrNull() ?: 0L,
+            tx.maxOrNull() ?: 0L,
+            1L
+        ).toFloat()
+        val stepX = size.width / (count - 1)
+
+        fun drawSeries(values: List<Long>, color: Color) {
+            if (values.size < 2) return
+            val offset = count - values.size
+            var previous: Offset? = null
+            values.forEachIndexed { index, raw ->
+                val x = (offset + index) * stepX
+                val ratio = (raw.coerceAtLeast(0L) / maxValue).coerceIn(0f, 1f)
+                val point = Offset(x, size.height - ratio * size.height)
+                previous?.let { start ->
+                    drawLine(
+                        color = color.copy(alpha = 0.9f),
+                        start = start,
+                        end = point,
+                        strokeWidth = 2.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                }
+                previous = point
+            }
+        }
+
+        drawSeries(tx, uploadColor)
+        drawSeries(rx, downloadColor)
+    }
+}
+
 @Composable
 private fun HeroMetric(label: String, value: String, modifier: Modifier = Modifier) {
     Column(modifier) {
@@ -653,6 +757,67 @@ private fun HeroMetric(label: String, value: String, modifier: Modifier = Modifi
             text = label,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(PrismSpacing.xs))
+        Text(
+            text = value,
+            style = MaterialTheme.typography.titleSmall.tabular(),
+            color = MaterialTheme.colorScheme.onSurface,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+/* ───────────────────────── 今日 / 在线摘要 ───────────────────────── */
+
+/**
+ * 紧凑摘要条：今日流量 / 在线设备 / Clash 连接。
+ *
+ * 今日优先取近 7 天历史里「今天」的汇总；历史尚未拿到时退回面板进程累计，
+ * 并把标签改成「本次累计」，避免把进程累计谎报成今日。
+ * 本月只保留在速率主卡底部，摘要条不再重复，避免同屏两个不同格式的月流量。
+ */
+@Composable
+private fun SummaryStrip(ui: UiState, state: PanelState) {
+    val scheme = MaterialTheme.colorScheme
+    val todayKey = LocalDate.now().toString()
+    val today = ui.history.lastOrNull()?.takeIf { it.day == todayKey }
+    val todayLabel = if (today != null) "今日流量" else "本次累计"
+    val todayValue = fmtBytes(today?.total ?: state.totals.total)
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        color = scheme.surface,
+        contentColor = scheme.onSurface,
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = PrismSpacing.lg, vertical = PrismSpacing.md),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SummaryCell(todayLabel, todayValue, Modifier.weight(1f))
+            SummaryDivider()
+            SummaryCell("在线设备", "${state.onlineCount} 台", Modifier.weight(1f))
+            SummaryDivider()
+            SummaryCell("Clash 连接", "${state.health.clashConnections} 条", Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+private fun SummaryCell(label: String, value: String, modifier: Modifier = Modifier) {
+    Column(modifier) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
         Spacer(Modifier.height(PrismSpacing.xs))
         Text(
@@ -665,66 +830,172 @@ private fun HeroMetric(label: String, value: String, modifier: Modifier = Modifi
     }
 }
 
-/* ───────────────────────── KPI 网格 ───────────────────────── */
+@Composable
+private fun SummaryDivider() {
+    Box(
+        Modifier
+            .padding(horizontal = PrismSpacing.sm)
+            .width(PrismStroke.hairline)
+            .height(32.dp)
+            .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
+    )
+}
+
+/* ───────────────────────── Top 3 活跃设备 ───────────────────────── */
 
 /**
- * 2×2 KPI：今日流量 / 本月累计 / 在线设备 / Clash 连接。
+ * 活跃设备入口：按「实时速率总和」排序取前 3。
  *
- * 今日流量优先取近 7 天历史里「今天」的汇总；历史尚未拿到时退回面板进程累计，
- * 并把标签改成「本次累计」，避免把进程累计谎报成今日。
+ * 行点击优先跳单设备详情（[onOpenDevice] 已接线时）；未接线时保持旧行为跳设备页签。
+ * 「查看全部」始终进设备页签，方便看完整列表。副标题与读屏文案会随接线情况变化，
+ * 不再写成「只能进入设备页」。
  */
 @Composable
-private fun KpiGrid(ui: UiState, state: PanelState) {
-    val totals = state.totals
-    val semantic = LocalPrismSemanticColors.current
-    val todayKey = LocalDate.now().toString()
-    val today = ui.history.lastOrNull()?.takeIf { it.day == todayKey }
-
-    val todayLabel = if (today != null) "今日流量" else "本次累计"
-    val (todayValue, todayUnit) = compactBytes(today?.total ?: totals.total)
-    val (monthValue, monthUnit) = compactBytes(totals.monthTotal)
-
-    Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.md)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(PrismSpacing.md)
-        ) {
-            StatCard(
-                label = todayLabel,
-                value = todayValue,
-                unit = todayUnit,
-                accent = MaterialTheme.colorScheme.primary,
-                icon = Icons.Rounded.DataUsage,
-                modifier = Modifier.weight(1f)
+private fun ActiveDevicesCard(
+    state: PanelState,
+    onOpenDevices: (() -> Unit)?,
+    onOpenDevice: ((Device) -> Unit)?
+) {
+    val devices = remember(state.devices) {
+        state.devices
+            .sortedWith(
+                compareByDescending<Device> { it.rxRate + it.txRate }
+                    .thenByDescending { it.total }
+                    .thenBy { it.name.lowercase(Locale.US) }
             )
-            StatCard(
-                label = "本月累计",
-                value = monthValue,
-                unit = monthUnit,
-                accent = MaterialTheme.colorScheme.tertiary,
-                icon = Icons.Rounded.CalendarMonth,
-                modifier = Modifier.weight(1f)
+            .take(ACTIVE_DEVICE_ROWS)
+    }
+    val openDevices = onOpenDevices
+    val actionSlot: (@Composable () -> Unit)? = if (openDevices != null) {
+        { ViewAllAction(text = "查看全部", onClick = openDevices) }
+    } else {
+        null
+    }
+    val hasDetail = onOpenDevice != null
+    val subtitle = when {
+        hasDetail -> "按实时速率排序 · 点按查看设备详情"
+        openDevices != null -> "按实时速率排序 · 点按进入设备页"
+        else -> "按实时速率排序"
+    }
+
+    SectionCard(
+        title = "活跃设备",
+        subtitle = subtitle,
+        action = actionSlot
+    ) {
+        if (devices.isEmpty()) {
+            Text(
+                text = "路由器还没有上报终端速率，连接 Wi-Fi 后会自动出现。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            return@SectionCard
+        }
+        devices.forEachIndexed { index, device ->
+            /* 没有 MAC 时无法定位详情，回落为设备页签跳转。 */
+            val openDetail = onOpenDevice != null && normalizeMac(device.mac).isNotBlank()
+            val rowClick: (() -> Unit)? = if (openDetail) {
+                { onOpenDevice?.invoke(device) }
+            } else {
+                onOpenDevices
+            }
+            ActiveDeviceRow(
+                device = device,
+                onClick = rowClick,
+                actionHint = if (openDetail) "点按查看设备详情" else "点按进入设备页"
+            )
+            if (index != devices.lastIndex) {
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
+                    thickness = PrismStroke.hairline
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActiveDeviceRow(
+    device: Device,
+    onClick: (() -> Unit)?,
+    actionHint: String = "点按进入设备页"
+) {
+    val data = LocalPrismDataColors.current
+    val scheme = MaterialTheme.colorScheme
+    val name = device.name.ifBlank { "未命名设备" }
+    val shape = MaterialTheme.shapes.small
+    val clickModifier = if (onClick != null) {
+        Modifier
+            .clip(shape)
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics(mergeDescendants = true) {
+                contentDescription = "$name，下载 ${fmtRate(device.rxRate)}，" +
+                    "上传 ${fmtRate(device.txRate)}，累计 ${fmtBytes(device.total)}，$actionHint"
+            }
+    } else {
+        Modifier
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = PrismSize.touchTarget)
+            .then(clickModifier)
+            .padding(vertical = PrismSpacing.xs),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .background(scheme.primary.copy(alpha = 0.12f), CircleShape),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Devices,
+                contentDescription = null,
+                tint = scheme.primary,
+                modifier = Modifier.size(PrismSize.iconSmall)
             )
         }
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(PrismSpacing.md)
-        ) {
-            StatCard(
-                label = "在线设备",
-                value = state.onlineCount.toString(),
-                unit = "台",
-                accent = semantic.success,
-                icon = Icons.Rounded.Devices,
-                modifier = Modifier.weight(1f)
+        Spacer(Modifier.width(PrismSpacing.md))
+        Column(Modifier.weight(1f)) {
+            Text(
+                text = name,
+                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+                color = scheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
-            StatCard(
-                label = "Clash 连接",
-                value = state.health.clashConnections.toString(),
-                unit = "条",
-                accent = semantic.info,
-                icon = Icons.Rounded.Link,
-                modifier = Modifier.weight(1f)
+            Text(
+                text = "累计 ${fmtBytes(device.total)}",
+                style = MaterialTheme.typography.labelSmall.tabular(),
+                color = scheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Spacer(Modifier.width(PrismSpacing.sm))
+        Column(horizontalAlignment = Alignment.End) {
+            Text(
+                text = "↓ ${fmtRate(device.rxRate)}",
+                style = MaterialTheme.typography.labelSmall.tabular(),
+                color = data.download,
+                maxLines = 1
+            )
+            Text(
+                text = "↑ ${fmtRate(device.txRate)}",
+                style = MaterialTheme.typography.labelSmall.tabular(),
+                color = data.upload,
+                maxLines = 1
+            )
+        }
+        if (onClick != null) {
+            Spacer(Modifier.width(PrismSpacing.xs))
+            Icon(
+                imageVector = Icons.Rounded.ChevronRight,
+                contentDescription = null,
+                tint = scheme.onSurfaceVariant,
+                modifier = Modifier.size(PrismSize.iconSmall)
             )
         }
     }
@@ -763,7 +1034,7 @@ private fun TrendCard(ui: UiState) {
             days.isEmpty() && ui.loading -> SkeletonBox(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(132.dp),
+                    .height(124.dp),
                 alpha = 0.7f
             )
 
@@ -793,7 +1064,7 @@ private fun TrendCard(ui: UiState) {
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(132.dp)
+                        .height(124.dp)
                         .semantics { contentDescription = chartDesc }
                 )
                 Spacer(Modifier.height(PrismSpacing.sm))
@@ -802,9 +1073,7 @@ private fun TrendCard(ui: UiState) {
                         val active = day.day == selected?.day
                         Text(
                             text = day.dayLabel,
-                            style = MaterialTheme.typography.labelSmall
-                                .copy(fontSize = 10.sp)
-                                .tabular(),
+                            style = MaterialTheme.typography.labelSmall.tabular(),
                             color = if (active) {
                                 MaterialTheme.colorScheme.primary
                             } else {
@@ -836,8 +1105,8 @@ private fun TrendCard(ui: UiState) {
 /**
  * 柱状图本体：每根柱子 = 当日总量，高度按 7 天峰值归一。
  *
- * 柱体用品牌色竖向渐变（上实下淡），选中柱 100% 不透明，其余 50%；
- * 槽位底色始终绘制，因此「0 流量」的一天也能看出位置。
+ * 柱体用纯色而非渐变（选中 100%、未选中 45%）；槽位底色始终绘制，
+ * 因此「0 流量」的一天也能看出位置。
  */
 @Composable
 private fun DailyBars(
@@ -848,6 +1117,7 @@ private fun DailyBars(
 ) {
     val barColor = MaterialTheme.colorScheme.primary
     val trackColor = MaterialTheme.colorScheme.surfaceVariant
+    val data = LocalPrismDataColors.current
     val maxTotal = maxOf(days.maxOfOrNull { it.total } ?: 0L, 1L).toFloat()
     val hasFlow = days.any { it.total > 0L }
 
@@ -875,7 +1145,7 @@ private fun DailyBars(
                 val left = slot * index + (slot - barWidth) / 2f
                 val selected = day.day == selectedDay
                 drawRoundRect(
-                    color = trackColor.copy(alpha = if (selected) 0.75f else 0.45f),
+                    color = trackColor.copy(alpha = if (selected) 0.85f else 0.55f),
                     topLeft = Offset(left, 0f),
                     size = Size(barWidth, size.height),
                     cornerRadius = radius
@@ -887,14 +1157,10 @@ private fun DailyBars(
                 val alpha = when {
                     selectedDay == null -> 1f
                     selected -> 1f
-                    else -> 0.5f
+                    else -> 0.45f
                 }
                 drawRoundRect(
-                    brush = Brush.verticalGradient(
-                        colors = listOf(barColor, barColor.copy(alpha = 0.55f)),
-                        startY = top,
-                        endY = size.height
-                    ),
+                    color = barColor,
                     topLeft = Offset(left, top),
                     size = Size(barWidth, barHeight),
                     cornerRadius = radius,
@@ -916,9 +1182,10 @@ private fun DailyBars(
 /** 选中当天的明细条：日期 / 下载 / 上传 / 总量。 */
 @Composable
 private fun DayDetail(day: DailyUsage) {
+    val data = LocalPrismDataColors.current
     Surface(
         shape = RoundedCornerShape(PrismRadius.small),
-        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f)
     ) {
         Row(
             modifier = Modifier
@@ -926,15 +1193,20 @@ private fun DayDetail(day: DailyUsage) {
                 .padding(horizontal = PrismSpacing.md, vertical = PrismSpacing.sm)
         ) {
             DetailCell("日期", day.dayLabel, Modifier.weight(1f))
-            DetailCell("下载", fmtBytes(day.rx), Modifier.weight(1.3f))
-            DetailCell("上传", fmtBytes(day.tx), Modifier.weight(1.3f))
+            DetailCell("下载", fmtBytes(day.rx), Modifier.weight(1.3f), color = data.download)
+            DetailCell("上传", fmtBytes(day.tx), Modifier.weight(1.3f), color = data.upload)
             DetailCell("总量", fmtBytes(day.total), Modifier.weight(1.3f))
         }
     }
 }
 
 @Composable
-private fun DetailCell(label: String, value: String, modifier: Modifier = Modifier) {
+private fun DetailCell(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    color: Color = MaterialTheme.colorScheme.onSurface
+) {
     Column(modifier) {
         Text(
             text = label,
@@ -945,8 +1217,8 @@ private fun DetailCell(label: String, value: String, modifier: Modifier = Modifi
         Spacer(Modifier.height(PrismSpacing.xs))
         Text(
             text = value,
-            style = MaterialTheme.typography.bodyMedium.tabular(),
-            color = MaterialTheme.colorScheme.onSurface,
+            style = MaterialTheme.typography.labelSmall.tabular(),
+            color = color,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
@@ -1000,7 +1272,10 @@ private fun AlertsCard(ui: UiState, onOpenDevices: (() -> Unit)?) {
                 onClick = open
             )
             if (index != visible.lastIndex) {
-                HorizontalDivider(color = scheme.outlineVariant.copy(alpha = 0.4f))
+                HorizontalDivider(
+                    color = scheme.outlineVariant.copy(alpha = 0.7f),
+                    thickness = PrismStroke.hairline
+                )
             }
         }
         if (alerts.size > visible.size) {
@@ -1030,7 +1305,7 @@ private fun AllClearRow() {
             Box(
                 modifier = Modifier
                     .size(28.dp)
-                    .background(success.copy(alpha = 0.18f), CircleShape),
+                    .background(success.copy(alpha = 0.16f), CircleShape),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
@@ -1071,11 +1346,12 @@ private fun ExitsCard(state: PanelState, onOpenNetwork: (() -> Unit)?) {
     val subtitle = if (nodes.isEmpty()) "累计流量占比" else "累计流量占比 · 前 ${visible.size} 个"
 
     /* 回调存在才显示「查看全部」；当前导航未接线时按钮不出现。 */
-    if (onOpenNetwork != null) {
+    val openNetwork = onOpenNetwork
+    if (openNetwork != null) {
         SectionCard(
             title = "出口 / 节点",
             subtitle = subtitle,
-            action = { ViewAllAction(onOpenNetwork) }
+            action = { ViewAllAction(text = "查看全部", onClick = openNetwork) }
         ) {
             ExitsBody(nodes, visible, total)
         }
@@ -1088,24 +1364,24 @@ private fun ExitsCard(state: PanelState, onOpenNetwork: (() -> Unit)?) {
 
 @Composable
 private fun ExitsBody(nodes: List<NodeUsage>, visible: List<NodeUsage>, total: Long) {
-    val semantic = LocalPrismSemanticColors.current
     if (visible.isEmpty()) {
         Text(
-            text = "面板尚未下发出口数据，稍后下拉刷新。",
+            text = "路由器尚未下发出口数据，稍后下拉刷新。",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         return
     }
     visible.forEachIndexed { index, node ->
+        val share = (node.total.toFloat() / total).coerceIn(0f, 1f)
         ExitRow(
             name = exitName(node.name),
             total = node.total,
-            share = node.total.toFloat() / total,
+            share = share,
             color = if (node.name.trim().equals("DIRECT", ignoreCase = true)) {
-                semantic.success
+                LocalPrismCategoryColors.current.direct
             } else {
-                MaterialTheme.colorScheme.primary
+                LocalPrismCategoryColors.current.proxy
             }
         )
         if (index != visible.lastIndex) Spacer(Modifier.height(PrismSpacing.md))
@@ -1122,6 +1398,7 @@ private fun ExitsBody(nodes: List<NodeUsage>, visible: List<NodeUsage>, total: L
 
 @Composable
 private fun ExitRow(name: String, total: Long, share: Float, color: Color) {
+    val percent = (share * 100f).roundToInt()
     Column(Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
@@ -1134,7 +1411,7 @@ private fun ExitRow(name: String, total: Long, share: Float, color: Color) {
             )
             Spacer(Modifier.width(PrismSpacing.sm))
             Text(
-                text = "${(share * 100f).roundToInt()}%",
+                text = "$percent%",
                 style = MaterialTheme.typography.labelSmall.tabular(),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1
@@ -1150,25 +1427,22 @@ private fun ExitRow(name: String, total: Long, share: Float, color: Color) {
             )
         }
         Spacer(Modifier.height(PrismSpacing.sm))
-        LinearProgressIndicator(
-            progress = { share.coerceIn(0f, 1f) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(6.dp),
+        PrismProgressBar(
+            progress = share,
             color = color,
-            trackColor = MaterialTheme.colorScheme.surfaceVariant
+            contentDescription = "$name 占比 $percent%"
         )
     }
 }
 
 @Composable
-private fun ViewAllAction(onClick: () -> Unit) {
+private fun ViewAllAction(text: String, onClick: () -> Unit) {
     TextButton(
         onClick = onClick,
         modifier = Modifier.heightIn(min = PrismSize.touchTarget)
     ) {
         Text(
-            text = "查看全部",
+            text = text,
             style = MaterialTheme.typography.labelSmall
         )
     }
@@ -1197,13 +1471,13 @@ private fun HealthCard(state: PanelState) {
         "unavailable" -> Triple(
             scheme.error,
             "记账不可用",
-            "无法获取记账数据，请检查面板与内核模块状态。"
+            "无法获取记账数据，请检查路由器与内核模块状态。"
         )
 
         else -> Triple(
             semantic.neutral,
             "记账未知",
-            "面板尚未返回可信度字段，暂不做记账结论。"
+            "路由器尚未返回可信度字段，暂不做记账结论。"
         )
     }
     val reasons = health.reasons
@@ -1241,7 +1515,8 @@ private fun HealthCard(state: PanelState) {
         }
         HorizontalDivider(
             modifier = Modifier.padding(vertical = PrismSpacing.md),
-            color = scheme.outlineVariant.copy(alpha = 0.45f)
+            color = scheme.outlineVariant.copy(alpha = 0.7f),
+            thickness = PrismStroke.hairline
         )
         Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.md)) {
             InfoCell(
@@ -1303,7 +1578,7 @@ private fun InfoCell(
             Spacer(Modifier.height(PrismSpacing.xs))
             Text(
                 text = caption,
-                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp).tabular(),
+                style = MaterialTheme.typography.labelSmall.tabular(),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -1323,16 +1598,16 @@ private fun OverviewFooter(ui: UiState) {
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
-            text = "数据来自路由器只读面板",
+            text = "数据来自路由器只读接口",
             style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
         )
         Spacer(Modifier.height(PrismSpacing.xs))
         Text(
             text = "每 ${ui.intervalSec} 秒自动刷新 · 下拉可立即更新",
             style = MaterialTheme.typography.labelSmall.tabular(),
-            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
         )
     }
@@ -1340,7 +1615,7 @@ private fun OverviewFooter(ui: UiState) {
 
 /* ───────────────────────── 骨架屏 ───────────────────────── */
 
-/** 首屏骨架：状态条 + 速率大卡 + 2×2 KPI + 趋势，与真实布局一一对应。 */
+/** 首屏骨架：状态行 + 速率主卡 + 摘要 + 活跃设备 + 趋势，与真实布局一一对应。 */
 @Composable
 private fun OverviewSkeleton() {
     val alpha = rememberSkeletonAlpha()
@@ -1354,11 +1629,12 @@ private fun OverviewSkeleton() {
             top = PrismSpacing.sm,
             bottom = PrismSpacing.xl
         ),
-        verticalArrangement = Arrangement.spacedBy(PrismSpacing.lg)
+        verticalArrangement = Arrangement.spacedBy(PrismSpacing.md)
     ) {
-        item { SkeletonBanner(alpha) }
+        item { SkeletonStatus(alpha) }
         item { SkeletonHero(alpha) }
-        item { SkeletonKpi(alpha) }
+        item { SkeletonSummary(alpha) }
+        item { SkeletonDevices(alpha) }
         item { SkeletonTrend(alpha) }
     }
 }
@@ -1378,10 +1654,10 @@ private fun rememberSkeletonAlpha(): Float {
     return alpha
 }
 
-/** 骨架卡片外壳：与 [SectionCard] 相同的圆角 / 描边，内部留白一致。 */
+/** 骨架卡片外壳：与 [SectionCard] 相同的圆角 / 表面，不再加 1dp 描边。 */
 @Composable
 private fun SkeletonSurface(
-    shape: Shape = RoundedCornerShape(PrismRadius.medium),
+    shape: RoundedCornerShape = RoundedCornerShape(PrismRadius.medium),
     content: @Composable ColumnScope.() -> Unit
 ) {
     Surface(
@@ -1389,7 +1665,7 @@ private fun SkeletonSurface(
         shape = shape,
         color = MaterialTheme.colorScheme.surface,
         tonalElevation = 0.dp,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+        shadowElevation = 0.dp
     ) {
         Column(
             modifier = Modifier
@@ -1401,25 +1677,20 @@ private fun SkeletonSurface(
 }
 
 @Composable
-private fun SkeletonBanner(alpha: Float) {
-    SkeletonSurface(shape = RoundedCornerShape(PrismRadius.large)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            SkeletonBox(Modifier.width(72.dp).height(16.dp), alpha)
-            Spacer(Modifier.weight(1f))
-            SkeletonBox(Modifier.width(96.dp).height(12.dp), alpha)
-        }
-        Spacer(Modifier.height(PrismSpacing.lg))
-        Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.sm)) {
-            repeat(3) {
-                SkeletonBox(
-                    modifier = Modifier
-                        .width(78.dp)
-                        .height(24.dp),
-                    alpha = alpha,
-                    shape = RoundedCornerShape(PrismRadius.pill)
-                )
-            }
-        }
+private fun SkeletonStatus(alpha: Float) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 28.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        SkeletonBox(Modifier.size(8.dp), alpha, CircleShape)
+        Spacer(Modifier.width(PrismSpacing.sm))
+        SkeletonBox(Modifier.width(64.dp).height(12.dp), alpha)
+        Spacer(Modifier.width(PrismSpacing.sm))
+        SkeletonBox(Modifier.width(56.dp).height(12.dp), alpha)
+        Spacer(Modifier.weight(1f))
+        SkeletonBox(Modifier.width(88.dp).height(12.dp), alpha)
     }
 }
 
@@ -1430,12 +1701,15 @@ private fun SkeletonHero(alpha: Float) {
             SkeletonRateColumn(alpha, Modifier.weight(1f))
             SkeletonRateColumn(alpha, Modifier.weight(1f))
         }
-        Spacer(Modifier.height(PrismSpacing.lg))
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f))
+        Spacer(Modifier.height(PrismSpacing.md))
+        SkeletonBox(Modifier.fillMaxWidth().height(36.dp), alpha)
+        Spacer(Modifier.height(PrismSpacing.md))
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f))
         Spacer(Modifier.height(PrismSpacing.md))
         Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.lg)) {
-            SkeletonBox(Modifier.width(110.dp).height(14.dp), alpha)
-            SkeletonBox(Modifier.width(110.dp).height(14.dp), alpha)
+            repeat(3) {
+                SkeletonBox(Modifier.weight(1f).height(32.dp), alpha)
+            }
         }
     }
 }
@@ -1447,38 +1721,46 @@ private fun SkeletonRateColumn(alpha: Float, modifier: Modifier = Modifier) {
         Spacer(Modifier.height(PrismSpacing.md))
         SkeletonBox(Modifier.fillMaxWidth(0.72f).height(34.dp), alpha)
         Spacer(Modifier.height(PrismSpacing.sm))
-        SkeletonBox(Modifier.width(72.dp).height(10.dp), alpha)
+        SkeletonBox(Modifier.width(72.dp).height(12.dp), alpha)
     }
 }
 
 @Composable
-private fun SkeletonKpi(alpha: Float) {
-    Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.md)) {
-        repeat(2) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(PrismSpacing.md)
-            ) {
-                repeat(2) {
-                    Surface(
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(96.dp),
-                        shape = RoundedCornerShape(PrismRadius.medium),
-                        color = MaterialTheme.colorScheme.surface,
-                        tonalElevation = 0.dp,
-                        border = BorderStroke(
-                            1.dp,
-                            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.45f)
-                        )
-                    ) {
-                        Column(Modifier.padding(PrismSpacing.lg)) {
-                            SkeletonBox(Modifier.fillMaxWidth(0.6f).height(12.dp), alpha)
-                            Spacer(Modifier.height(PrismSpacing.md))
-                            SkeletonBox(Modifier.fillMaxWidth(0.5f).height(26.dp), alpha)
-                        }
-                    }
+private fun SkeletonSummary(alpha: Float) {
+    SkeletonSurface {
+        Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.lg)) {
+            repeat(3) {
+                Column(Modifier.weight(1f)) {
+                    SkeletonBox(Modifier.width(56.dp).height(12.dp), alpha)
+                    Spacer(Modifier.height(PrismSpacing.sm))
+                    SkeletonBox(Modifier.width(72.dp).height(20.dp), alpha)
                 }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SkeletonDevices(alpha: Float) {
+    SkeletonSurface {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            SkeletonBox(Modifier.width(96.dp).height(14.dp), alpha)
+            Spacer(Modifier.weight(1f))
+            SkeletonBox(Modifier.width(52.dp).height(12.dp), alpha)
+        }
+        Spacer(Modifier.height(PrismSpacing.md))
+        repeat(3) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(48.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SkeletonBox(Modifier.size(32.dp), alpha, CircleShape)
+                Spacer(Modifier.width(PrismSpacing.md))
+                SkeletonBox(Modifier.weight(1f).height(14.dp), alpha)
+                Spacer(Modifier.width(PrismSpacing.md))
+                SkeletonBox(Modifier.width(64.dp).height(12.dp), alpha)
             }
         }
     }
@@ -1492,11 +1774,11 @@ private fun SkeletonTrend(alpha: Float) {
             Spacer(Modifier.weight(1f))
             SkeletonBox(Modifier.width(64.dp).height(12.dp), alpha)
         }
-        Spacer(Modifier.height(PrismSpacing.lg))
+        Spacer(Modifier.height(PrismSpacing.md))
         SkeletonBox(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(132.dp),
+                .height(124.dp),
             alpha = alpha
         )
     }
@@ -1521,31 +1803,12 @@ private fun fmtMbpsValue(bytesPerSec: Long): String {
 private fun fmtKiB(bytesPerSec: Long): String =
     String.format(Locale.US, "%.0f KiB/s", bytesPerSec.coerceAtLeast(0L) / 1024.0)
 
-/** 按数字长度给速率主数字降字号：390dp 宽度下两列并排不换行、不裁切。 */
+/** 按数字长度给速率主数字降字号：360dp 宽度下两列并排不换行、不裁切。 */
 private fun rateValueSize(text: String): TextUnit = when {
-    text.length <= 4 -> 38.sp
-    text.length == 5 -> 33.sp
-    text.length == 6 -> 29.sp
-    else -> 25.sp
-}
-
-/**
- * KPI 用的紧凑体积：拆成「数字 + 单位」两段。
- *
- * StatCard 的数值列在 2×2 网格里只有约 73dp 宽，三位整数带小数（如 102.4 GB）
- * 会把单位挤成省略号；这里在整数部分 ≥3 位时去掉小数（102 GB），
- * 既保住有效数字，又保证单位完整显示。
- */
-private fun compactBytes(bytes: Long): Pair<String, String> {
-    val text = fmtBytes(bytes)
-    val separator = text.lastIndexOf(' ')
-    if (separator <= 0) return text to ""
-    var number = text.substring(0, separator)
-    val unit = text.substring(separator + 1)
-    if (number.contains('.') && number.substringBefore('.').length >= 3) {
-        number = number.substringBefore('.')
-    }
-    return number to unit
+    text.length <= 4 -> 36.sp
+    text.length == 5 -> 32.sp
+    text.length == 6 -> 28.sp
+    else -> 24.sp
 }
 
 /** 出口名：DIRECT 统一显示为「直连」，与其余节点名区分。 */

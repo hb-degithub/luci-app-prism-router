@@ -190,7 +190,7 @@ function update_configured() {
 /* ---------------- 版本 ---------------- */
 
 /* 版本来源（按优先级）：
- *   1. /usr/lib/opkg/info/luci-app-prism-router.control 的 Version: 1.0.0-1（opkg 安装后必有）
+ *   1. /usr/lib/opkg/info/luci-app-prism-router.control 的 Version: 1.0.4-1（opkg 安装后必有）
  *   2. /etc/prism-router/version（可选，由部署方写入，供 APK/App 直接比对）
  * build 是完整版本（含 -release），version 是去掉 release 的短版本。 */
 function version_short() {
@@ -415,7 +415,44 @@ function version_cmp(a, b) {
 	return (x.pre < y.pre) ? -1 : 1;
 }
 
-/* GitHub release JSON → 对外契约；tag 去 v 前缀，notes 截断 2000 字节。 */
+/* 资产名是否带某个版本号，且版本号两侧不能紧邻数字。
+ * 例：latest=1.0.4 时 "prism-router-android-1.0.4.apk" / "x_1.0.4-1_all.ipk" 命中，
+ * 但 "1.0.40" / "11.0.4" 不命中（避免把旧资产或前缀相近的版本当成新版）。 */
+function name_has_version(name, version) {
+	if (type(name) != 'string' || type(version) != 'string') return false;
+	if (version == '' || length(version) > 64) return false;
+	let n = length(name), pos = 0;
+	while (pos <= n) {
+		let i = index(substr(name, pos), version);
+		if (i == null) return false;
+		let at = pos + i;
+		let end = at + length(version);
+		let before = (at > 0) ? substr(name, at - 1, 1) : '';
+		let after = (end < n) ? substr(name, end, 1) : '';
+		if (!match(before, /[0-9]/) && !match(after, /[0-9]/)) return true;
+		pos = at + 1;
+	}
+	return false;
+}
+
+/* GitHub release 资产 URL 里的 tag 段（/releases/download/<tag>/<file>）。
+ * 返回 null 表示不是 GitHub download URL（镜像/其它主机），由文件名版本号兜底；
+ * 返回 '' 表示 URL 形状不合法，调用方应拒绝。 */
+function asset_tag_of(url) {
+	let marker = '/releases/download/';
+	let i = index(url, marker);
+	if (i == null) return null;
+	let rest = substr(url, i + length(marker));
+	let slash = index(rest, '/');
+	if (slash == null || slash == 0) return '';
+	return substr(rest, 0, slash);
+}
+
+/* GitHub release JSON → 对外契约；tag 去 v 前缀，notes 截断 2000 字节。
+ *
+ * 资产筛选：只接受文件名带本次 Release 版本号（或完整 tag）的 .apk/.ipk，
+ * 并交叉校验下载 URL 的 tag 段。找不到匹配资产时 apk/ipk 保持 null，
+ * 客户端会退回 html_url 打开 Release 页面 —— 绝不把旧 tag 的资产冒充新版。 */
 function build_update(repo, body) {
 	let rel = null;
 	try { rel = json(body); } catch (e) { rel = null; }
@@ -444,9 +481,16 @@ function build_update(repo, body) {
 		if (type(a.size) == 'int') size = a.size;
 		else if (type(a.size) == 'double') size = int(a.size);
 		let item = { name: a.name, url: a.browser_download_url, size: size };
+		if (!name_has_version(a.name, latest) && !name_has_version(a.name, tag)) continue;
+		let url_tag = asset_tag_of(a.browser_download_url);
+		if (url_tag != null && url_tag != tag) continue;
 		let low = lc(a.name);
-		if (apk == null && match(low, /\.apk$/)) apk = item;
-		else if (ipk == null && match(low, /\.ipk$/)) ipk = item;
+		if (match(low, /\.apk$/)) {
+			if (apk == null) apk = item;
+		}
+		else if (match(low, /\.ipk$/)) {
+			if (ipk == null) ipk = item;
+		}
 	}
 
 	return {

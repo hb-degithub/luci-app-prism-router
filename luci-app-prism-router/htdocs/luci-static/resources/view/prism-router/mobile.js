@@ -12,8 +12,9 @@
  * 节点 / AP 数据懒加载：首次切到「节点」或「拓扑」时并行补拉
  * get_nodes + get_stations，之后复用缓存，只有停在这两屏时刷新才顺带更新。
  *
- * 结构：.tsm-app 内是顶部分段 tab + 5 屏（概览 / 设备 / 节点 / 拓扑 / 安装）+ 底部固定圆点。
- * 切屏（setPage / 左右滑动）只改 class 与圆点状态；首屏之外的额外 RPC 仅懒加载补拉一次。
+ * 结构：.tsm-app 内是顶部带文字分段 tab + 5 屏（概览 / 设备 / 节点 / 拓扑 / 安装）。
+ * 切屏（setPage / 左右滑动）只改 class；首屏之外的额外 RPC 仅懒加载补拉一次。
+ * 底部无文字圆点导航已移除（可发现性差），导航只保留顶部 tab。
  * 设备屏支持搜索（名称 / MAC / IP），拓扑屏支持出口 / AP 卡片下钻。
  *
  * 离线：每次 get_state 成功都写一份精简快照到 localStorage（见「离线快照」段），
@@ -640,7 +641,7 @@ var CSS = [
 	'.tsm-inst-hint{font-size:11.5px;opacity:.6;margin-top:8px;line-height:1.5}',
 	'.tsm-url-row{display:flex;gap:8px;align-items:center;margin:12px 0 0;padding-top:12px;border-top:1px dashed rgba(127,127,127,.28)}',
 	'.tsm-url{flex:1 1 auto;min-width:0;font-size:11.5px;line-height:1.45;word-break:break-all;text-align:left;font-family:ui-monospace,Menlo,Consolas,monospace}',
-	'.tsm-copy{flex:none;font:inherit;font-size:12.5px;line-height:1.1;padding:8px 12px;min-height:34px;border-radius:8px;border:none;cursor:pointer;color:#fff;background:#1a73e8}',
+	'.tsm-copy{flex:none;font:inherit;font-size:12.5px;line-height:1.1;padding:8px 12px;min-height:44px;border-radius:8px;border:none;cursor:pointer;color:#fff;background:#1a73e8}',
 	'.tsm-copy[disabled]{opacity:.75;cursor:default}',
 	'.tsm-install-note{margin:10px 0 0}',
 	'@media (min-width:600px){.tsm-card-v{font-size:19px}.tsm-card-s{font-size:11.5px}.tsm-dev-name{font-size:15px}.tsm-app,.tsm-approw{font-size:13px}}',
@@ -650,7 +651,7 @@ var CSS = [
 	 * 这里用同一份样式表后置覆盖上面的旧规则（同优先级后者胜），
 	 * 旧规则仍为设备/应用列表保留，第 2 步直接复用。
 	 * ================================================================ */
-	'#ts-mobile{max-width:100%;padding:0 0 72px 0;background:#fff;color:#1b1f24;-webkit-text-size-adjust:100%}',
+	'#ts-mobile{max-width:100%;padding:0 0 24px 0;background:#fff;color:#1b1f24;-webkit-text-size-adjust:100%}',
 	'.tsm-app{display:flex;flex-direction:column;min-height:100%}',
 	/* 顶部标题行 */
 	'.tsm-head{flex-wrap:wrap;align-items:center;gap:8px;padding:12px 16px 2px;margin:0}',
@@ -742,11 +743,7 @@ var CSS = [
 	'.tsm-url-row{border-top:1px dashed rgba(0,0,0,.1)}',
 	'.tsm-url{color:#1b1f24}',
 	'.tsm-copy{background:#ff6f00}',
-	/* 底部圆点分页（固定条） */
-	'.tsm-dots{position:fixed;left:0;right:0;bottom:0;z-index:30;display:flex;align-items:center;justify-content:center;gap:4px;padding:8px 0 calc(8px + env(safe-area-inset-bottom,0px));background:linear-gradient(to top,rgba(255,255,255,.99) 55%,rgba(255,255,255,.86))}',
-	'.tsm-dot-btn{width:30px;height:30px;padding:0;border:none;background:none;cursor:pointer;display:flex;align-items:center;justify-content:center}',
-	'.tsm-dot-i{display:block;width:6px;height:6px;border-radius:50%;background:rgba(0,0,0,.14)}',
-	'.tsm-dot-i.on{width:8px;height:8px;background:#2b2f33}',
+	/* 底部分页已移除：只保留顶部带文字 tab（避免无文字圆点的可发现性问题） */
 	/* 窄屏收紧大号数字；宽屏整页限宽 480 居中 */
 	'@media (max-width:359px){.tsm-big{font-size:34px}}',
 	'@media (min-width:760px){#ts-mobile{max-width:480px;border-left:1px solid rgba(0,0,0,.06);border-right:1px solid rgba(0,0,0,.06);min-height:100vh}.tsm-page{padding:14px 18px 0}}',
@@ -770,7 +767,8 @@ var CSS = [
 	'.tsm-dsearch-i{flex:1 1 auto;min-width:0;width:100%;padding:0;border:none;background:none;font:inherit;font-size:13px;line-height:1.4;color:var(--tsm-text);outline:none;-webkit-appearance:none;appearance:none}',
 	'.tsm-dsearch-i::placeholder{color:var(--tsm-sub)}',
 	'.tsm-dsearch-i::-webkit-search-cancel-button{-webkit-appearance:none;appearance:none;display:none}',
-	'.tsm-dclear{display:flex;align-items:center;justify-content:center;flex:none;width:28px;height:28px;padding:0;border:none;border-radius:50%;background:none;color:var(--tsm-sub);font:inherit;font-size:16px;line-height:1;cursor:pointer}',
+	'.tsm-dclear{position:relative;display:flex;align-items:center;justify-content:center;flex:none;width:32px;height:32px;padding:0;border:none;border-radius:50%;background:none;color:var(--tsm-sub);font:inherit;font-size:16px;line-height:1;cursor:pointer}',
+	'.tsm-dclear::before{content:"";position:absolute;left:50%;top:50%;width:44px;height:44px;transform:translate(-50%,-50%)}',
 	'.tsm-dclear:active{background:var(--tsm-soft)}',
 	'.tsm-filter{display:flex;align-items:center;gap:4px;flex:none;font:inherit;font-size:13px;line-height:1.2;min-height:32px;padding:6px 10px;border:none;border-radius:16px;background:none;color:#ff6f00;cursor:pointer}',
 	'.tsm-filter.on{background:rgba(255,111,0,.1)}',
@@ -780,8 +778,9 @@ var CSS = [
 	'.tsm-flabel{font-size:11.5px;color:#8a8f98;margin:0 0 7px}',
 	'.tsm-fchips{display:flex;flex-wrap:wrap;gap:8px}',
 	'.tsm-fchips+.tsm-flabel{margin-top:12px}',
-	'.tsm-chip{font:inherit;font-size:12.5px;line-height:1.2;min-height:32px;padding:7px 12px;border-radius:999px;border:1px solid rgba(0,0,0,.1);background:#fff;color:#1b1f24;cursor:pointer}',
-	'.tsm-chip.on{color:#ff6f00;border-color:rgba(255,111,0,.5);background:rgba(255,111,0,.08);font-weight:600}',
+	'.tsm-chip{font:inherit;font-size:12.5px;line-height:1.2;min-height:44px;padding:10px 14px;border-radius:999px;border:1px solid var(--tsm-line-strong);background:var(--tsm-card-bg);color:var(--tsm-text);cursor:pointer}',
+	/* 选中态：深色文字 + 橙色描边/浅底。橙字在白底上只有 ~2.8:1，不能当正文色。 */
+	'.tsm-chip.on{color:var(--tsm-text);border-color:rgba(255,111,0,.55);background:rgba(255,111,0,.10);font-weight:600}',
 	/* 设备行：40px 圆形底 + 三行文字 + 右侧速率两行 + 箭头，整行可点（>=44px） */
 	'.tsm-ditem{border-bottom:1px solid rgba(0,0,0,.06)}',
 	'.tsm-drow{display:flex;align-items:center;gap:10px;padding:10px 2px;min-height:44px;cursor:pointer}',
@@ -824,7 +823,6 @@ var CSS = [
 	/* 视觉尺寸不变、可点区域 ≥44px：透明元素撑盒模型 + 负 margin 抵消；
 	   有底色的刷新/筛选按钮改用透明 ::before 覆盖层，避免背景被撑大 */
 	'.tsm-tab{min-height:44px;padding-top:12px;margin:-4px 0 -4px}',
-	'.tsm-dot-btn{width:44px;height:44px;margin:-7px}',
 	'.tsm-nmore{width:44px;height:44px;top:-4px;right:-4px}',
 	'.tsm-refresh{position:relative}',
 	'.tsm-refresh::before{content:"";position:absolute;left:-2px;right:-2px;top:50%;height:44px;margin-top:-22px}',
@@ -839,10 +837,9 @@ var CSS = [
 	 * 第 3 步：网络拓扑屏 + 主题变量
 	 * 卡片/分隔线/次级文字统一走变量，深色主题只改变量，强调色不动。
 	 * ================================================================ */
-	'#ts-mobile{--tsm-card-bg:#fff;--tsm-line:rgba(0,0,0,.06);--tsm-line-strong:rgba(0,0,0,.1);--tsm-wire:rgba(0,0,0,.26);--tsm-text:#1b1f24;--tsm-sub:#8a8f98;--tsm-accent:#ff6f00;--tsm-green:#00b96b;--tsm-blue:#2b7de9;--tsm-soft:rgba(0,0,0,.03);--tsm-dots-bg:linear-gradient(to top,rgba(255,255,255,.99) 55%,rgba(255,255,255,.86))}',
+	'#ts-mobile{--tsm-card-bg:#fff;--tsm-line:rgba(0,0,0,.06);--tsm-line-strong:rgba(0,0,0,.1);--tsm-wire:rgba(0,0,0,.26);--tsm-text:#1b1f24;--tsm-sub:#8a8f98;--tsm-accent:#ff6f00;--tsm-green:#00b96b;--tsm-blue:#2b7de9;--tsm-soft:rgba(0,0,0,.03)}',
 	'.tsm-card,.tsm-rows,.tsm-ncard,.tsm-install-card,.tsm-fpanel,.tsm-pill,.tsm-inet,.tsm-exit,.tsm-router-card,.tsm-ap,.tsm-tgroup{background:var(--tsm-card-bg);border-color:var(--tsm-line)}',
 	'.tsm-tabs,.tsm-dtabs{background:var(--tsm-card-bg);border-color:var(--tsm-line)}',
-	'.tsm-dots{background:var(--tsm-dots-bg)}',
 	'.tsm-meta,.tsm-rate-cap,.tsm-nodesub,.tsm-card-t,.tsm-card-s,.tsm-row-s,.tsm-note,.tsm-sub,.tsm-h3-n,.tsm-dev-sub,.tsm-marker,.tsm-apps-t,.tsm-dmeta,.tsm-drates,.tsm-dcount,.tsm-dnote,.tsm-nhero-t,.tsm-nnote,.tsm-ndetail,.tsm-tab,.tsm-tab-n,.tsm-flabel,.tsm-tl-h,.tsm-tl-empty,.tsm-ap-dev,.tsm-ap-meta,.tsm-exit-bytes,.tsm-ndrow-k,.tsm-empty,.tsm-empty-s{color:var(--tsm-sub)}',
 	'.tsm-row-l,.tsm-row-num,.tsm-ndrow-v,.tsm-url,.tsm-chip,.tsm-tab.on,.tsm-pill,.tsm-health,.tsm-router-name,.tsm-exit-name,.tsm-ap-name{color:var(--tsm-text)}',
 
@@ -938,16 +935,15 @@ var CSS = [
 	'@media (max-width:359px){.tsm-exits{grid-template-columns:1fr 1fr}.tsm-exit{padding:8px}.tsm-exit-name{font-size:12px}.tsm-aps{grid-template-columns:1fr}.tsm-tl-h{margin-bottom:4px}.tsm-conn{height:16px}.tsm-dnode-name{font-size:11px}}',
 	'@media (max-width:320px){.tsm-topo .tsm-exits{grid-template-columns:1fr}.tsm-topo .tsm-exit{padding:7px 8px}.tsm-topo .tsm-exit-name,.tsm-topo .tsm-ap-name,.tsm-topo .tsm-router-name,.tsm-topo .tsm-inet-txt{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-topo .tsm-conn{height:14px}.tsm-topo .tsm-tl-h{margin-bottom:4px}.tsm-topo .tsm-ap{padding:8px}.tsm-topo .tsm-router-card{gap:8px;padding:10px}.tsm-topo .tsm-router-ico{width:38px;height:38px}.tsm-topo .tsm-router-ico svg{width:24px;height:24px}.tsm-topo .tsm-xname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.tsm-trow{grid-template-columns:repeat(2,minmax(0,1fr))}.tsm-dnode-ring{width:40px;height:40px}.tsm-dnode-ico,.tsm-dnode-ico svg{width:20px;height:20px}.tsm-otopo{padding:10px 8px 8px}.tsm-dsearch{padding:0 8px;gap:4px;margin-left:0;margin-right:0}}',
 	/* 深色主题：只改背景/分隔线/次级文字，橙/绿/蓝强调色保持不变；不用纯黑 */
-	'@media (prefers-color-scheme: dark){#ts-mobile{--tsm-card-bg:#1c2026;--tsm-line:rgba(255,255,255,.1);--tsm-line-strong:rgba(255,255,255,.18);--tsm-wire:rgba(255,255,255,.34);--tsm-text:#e7eaee;--tsm-sub:#a4abb5;--tsm-soft:rgba(255,255,255,.06);--tsm-dots-bg:linear-gradient(to top,rgba(20,23,27,.99) 55%,rgba(20,23,27,.86));background:#14171b;color:#e7eaee}#ts-mobile .tsm-tabs,#ts-mobile .tsm-dtabs{background:#1c2026}#ts-mobile .tsm-dot-i{background:rgba(255,255,255,.22)}#ts-mobile .tsm-dot-i.on{background:#e7eaee}#ts-mobile .tsm-nhero{background:linear-gradient(180deg,rgba(255,111,0,.14) 0%,rgba(255,111,0,.05) 60%,rgba(20,23,27,0) 100%)}#ts-mobile .tsm-tab.on{color:#e7eaee}#ts-mobile .tsm-health{background:rgba(255,255,255,.05)}}',
+	'@media (prefers-color-scheme: dark){#ts-mobile{--tsm-card-bg:#1c2026;--tsm-line:rgba(255,255,255,.1);--tsm-line-strong:rgba(255,255,255,.18);--tsm-wire:rgba(255,255,255,.34);--tsm-text:#e7eaee;--tsm-sub:#a4abb5;--tsm-soft:rgba(255,255,255,.06);background:#14171b;color:#e7eaee}#ts-mobile .tsm-tabs,#ts-mobile .tsm-dtabs{background:#1c2026}#ts-mobile .tsm-nhero{background:linear-gradient(180deg,rgba(255,111,0,.14) 0%,rgba(255,111,0,.05) 60%,rgba(20,23,27,0) 100%)}#ts-mobile .tsm-tab.on{color:#e7eaee}#ts-mobile .tsm-health{background:rgba(255,255,255,.05)}}',
 
 	/* ================================================================
 	 * 第 4 步：下拉刷新 / 骨架屏 / 切屏过渡 / 安全区 / 迷你趋势 / Top3
 	 * 全部走颜色变量，深色主题自动跟随。
 	 * ================================================================ */
 	/* ---- 安全区：刘海与底部横条不遮挡内容（viewport-fit=cover 由 injectPwaHead 保证）---- */
-	'#ts-mobile{padding-top:env(safe-area-inset-top,0px);padding-bottom:calc(72px + env(safe-area-inset-bottom,0px))}',
+	'#ts-mobile{padding-top:env(safe-area-inset-top,0px);padding-bottom:calc(12px + env(safe-area-inset-bottom,0px))}',
 	'.tsm-tabs{top:env(safe-area-inset-top,0px)}',
-	'.tsm-dots{padding-bottom:calc(8px + env(safe-area-inset-bottom,0px))}',
 	/* ---- 下拉刷新指示器：绝对定位在 .tsm-pages 顶部，默认藏在 sticky tab 后面 ---- */
 	'.tsm-pages{position:relative}',
 	'.tsm-pull{position:absolute;top:0;left:0;right:0;z-index:5;display:flex;align-items:center;justify-content:center;gap:6px;height:56px;pointer-events:none;opacity:0;transform:translateY(-100%);transition:transform .18s ease-out,opacity .18s ease-out;background:var(--tsm-card-bg);color:var(--tsm-sub);font-size:12px;border-bottom:1px solid var(--tsm-line)}',
@@ -2467,13 +2463,12 @@ return view.extend({
 			this.renderOfflineBar(),
 			this.renderTabs(),
 			this.renderNotice(),
-			this.renderPages(),
-			this.renderDots()
+			this.renderPages()
 		]);
 
 		this.root = root;
 
-		/* 默认停在第 1 屏；setPage 只改 class 与圆点，不发 RPC */
+		/* 默认停在第 1 屏；setPage 只改 class，不发 RPC */
 		this.setPage(0);
 
 		if (this.state != null) {
@@ -2589,27 +2584,6 @@ return view.extend({
 		}));
 	},
 
-	/* 底部圆点分页指示：当前项实心深色 8px，其它 6px 透明灰 */
-	renderDots: function() {
-		var self = this;
-		var labels = [ _('概览'), _('设备'), _('节点'), _('拓扑'), _('安装') ];
-
-		return E('div', { 'class': 'tsm-dots' }, labels.map(function(label, index) {
-			var dot = E('span', { 'class': 'tsm-dot-i' }, '');
-			var btn = E('button', {
-				type: 'button',
-				'class': 'tsm-dot-btn',
-				'aria-label': label,
-				title: label,
-				click: function() { self.setPage(index); }
-			}, dot);
-
-			self.dots.push(dot);
-
-			return btn;
-		}));
-	},
-
 	renderPages: function() {
 		this.pages = [
 			this.renderOverview(),
@@ -2647,7 +2621,6 @@ return view.extend({
 
 			this.toggleClass(this.pages[i], 'on', on);
 			this.toggleClass(this.tabs[i], 'on', on);
-			this.toggleClass(this.dots[i], 'on', on);
 		}
 
 		/* 入场过渡：只加 class 与一次性定时器，仍然是「不发 RPC」的纯本地切屏 */

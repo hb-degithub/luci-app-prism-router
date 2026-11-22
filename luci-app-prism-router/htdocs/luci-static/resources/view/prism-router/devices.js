@@ -3,6 +3,7 @@
 'require dom';
 'require rpc';
 'require ui';
+'require prism-router/theme as theme';
 
 /*
  * 棱镜路由 · 设备
@@ -401,46 +402,55 @@ function clearNode(node) {
 
 /* 这个页面的表格在窄屏隐藏次要列并允许容器内横向滚动；CSS 只作用于本页容器。 */
 var CSS = [
-	'#ts-devices .tsd-tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%}',
-	'#ts-devices table{min-width:1080px}',
-	'#ts-devices .tsd-sub{font-size:11px;opacity:.65;line-height:1.5;white-space:nowrap}',
+	'#ts-devices{max-width:100%;min-width:0;overflow-wrap:anywhere}',
+	'#ts-devices .tsd-tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;max-width:100%;min-width:0}',
+	'#ts-devices table{min-width:1080px;display:block}',
+	'#ts-devices table .tr{display:flex;flex-wrap:nowrap;min-width:1080px;width:100%;box-sizing:border-box}',
+	'#ts-devices table .th,#ts-devices table .td{flex:1 1 0;min-width:0;box-sizing:border-box}',
+	'#ts-devices table .tsd-col-name{flex:0 0 230px}',
+	'#ts-devices table .tsd-col-link{flex:0 0 72px}',
+	'#ts-devices table .tsd-col-bytes{flex:0 0 94px;white-space:nowrap}',
+	'#ts-devices table .tsd-col-rate{flex:0 0 98px;white-space:nowrap}',
+	'#ts-devices table .td{white-space:normal}',
+	'#ts-devices .tsd-scrollhint{display:none;margin:0 0 6px;color:var(--ts-text-3);font-size:12px}',
+	'#ts-devices .tsd-sub{font-size:12px;color:var(--ts-text-3);line-height:1.5;white-space:normal;overflow-wrap:anywhere}',
 	/* 主机名列：类型图标（圆形底 + 24px SVG）+ 名称/厂商/子信息；图标固定宽度，不挤名称。 */
 	'#ts-devices .tsd-host{display:flex;align-items:flex-start;gap:8px;min-width:190px}',
 	'#ts-devices .tsd-host-text{min-width:0;flex:1 1 auto}',
 	'#ts-devices .tsd-kind{display:flex;align-items:center;justify-content:center;flex:0 0 auto;',
 	'width:30px;height:30px;border-radius:50%;box-sizing:border-box}',
-	'#ts-devices .tsd-vendor{font-size:11px;line-height:1.5;opacity:.72;margin-top:1px;',
+	'#ts-devices .tsd-vendor{font-size:12px;line-height:1.5;color:var(--ts-text-3);margin-top:1px;',
 	'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}',
 	'#ts-devices .tsd-alias-name{font-weight:600;word-break:break-word}',
-	'#ts-devices .tsd-edit{padding:1px 7px;font-size:11px;line-height:1.6;margin-left:6px;white-space:nowrap}',
-	'#ts-devices .tsd-new{display:inline-block;margin-left:5px;padding:0 5px;border-radius:6px;font-size:10px;',
-	'line-height:1.6;background:rgba(198,40,40,.14);color:#c62828;vertical-align:middle}',
+	'#ts-devices .tsd-edit{padding:1px 7px;font-size:12px;line-height:1.6;margin-left:6px;white-space:nowrap}',
+	'#ts-devices .tsd-new{display:inline-block;margin-left:5px;padding:0 5px;border-radius:6px;font-size:12px;',
+	'line-height:1.6;background:rgba(59,130,246,.12);color:var(--ts-down-text);vertical-align:middle}',
 	'#ts-devices .tsd-quota{min-width:92px;text-align:right}',
 	'#ts-devices .tsd-seg{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px 0}',
 	'#ts-devices .tsd-seg-btn{font:inherit;font-size:12.5px;line-height:1.5;padding:5px 12px;border-radius:15px;',
 	'cursor:pointer;color:inherit;background:rgba(127,127,127,.08);border:1px solid rgba(127,127,127,.35)}',
-	'#ts-devices .tsd-seg-btn.tsd-on{background:#2b7de9;border-color:#2b7de9;color:#fff}',
+	'#ts-devices .tsd-seg-btn.tsd-on{background:var(--ts-surface-2);border-color:var(--ts-down);color:var(--ts-down-text);font-weight:600}',
 	'#ts-devices .tsd-sum{font-size:12px;opacity:.85;line-height:1.8;margin:0 0 8px 0}',
 	'#ts-devices .tsd-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px 0}',
 	'#ts-devices .tsd-search{font:inherit;font-size:12.5px;padding:4px 8px;min-width:0;flex:1 1 180px;max-width:280px;',
 	'border:1px solid rgba(127,127,127,.4);border-radius:6px;background:transparent;color:inherit}',
 	'#ts-devices .tsd-select{font:inherit;font-size:12.5px;padding:4px 6px;border-radius:6px;',
 	'border:1px solid rgba(127,127,127,.4);background:transparent;color:inherit}',
-	'#ts-devices .tsd-alert{padding:8px 12px;border-radius:8px;background:rgba(198,40,40,.12);color:#c62828;',
+	'#ts-devices .tsd-alert{padding:8px 12px;border-radius:8px;background:rgba(220,38,38,.10);color:var(--ts-bad-text);',
 	'font-size:12.5px;line-height:1.6;margin:0 0 10px 0}',
 	'#ts-devices .tsd-empty{padding:14px 16px;border:1px dashed rgba(127,127,127,.4);border-radius:10px;',
 	'font-size:13px;line-height:1.8;margin:10px 0 0 0}',
 	'#ts-devices .tsd-sort{font:inherit;font-weight:inherit;color:inherit;background:none;border:0;padding:0;',
 	'margin:0;cursor:pointer;white-space:nowrap}',
-	'#ts-devices .tsd-arrow{display:inline-block;min-width:9px;margin-left:3px;font-size:10px;opacity:.55}',
-	'#ts-devices .tsd-arrow.tsd-arrow-on{opacity:1;color:#2b7de9}',
-	'#ts-devices .tsd-appbtn{font:inherit;font-size:11px;line-height:1.6;padding:0 5px;margin-right:4px;',
+	'#ts-devices .tsd-arrow{display:inline-block;min-width:9px;margin-left:3px;font-size:12px;opacity:.55}',
+	'#ts-devices .tsd-arrow.tsd-arrow-on{opacity:1;color:var(--ts-down-text)}',
+	'#ts-devices .tsd-appbtn{font:inherit;font-size:12px;line-height:1.6;padding:0 5px;margin-right:4px;',
 	'border:1px solid rgba(127,127,127,.4);border-radius:5px;background:transparent;color:inherit;cursor:pointer}',
 	'#ts-devices .tsd-detail-btn{white-space:nowrap}',
-	'#ts-devices .tsd-pill{display:inline-block;font-size:11px;line-height:1.7;padding:1px 9px;border-radius:10px;',
+	'#ts-devices .tsd-pill{display:inline-block;font-size:12px;line-height:1.7;padding:1px 9px;border-radius:10px;',
 	'white-space:nowrap;font-weight:600}',
-	'#ts-devices .tsd-pill-on{background:rgba(76,175,80,.18);color:#2e7d32}',
-	'#ts-devices .tsd-pill-off{background:rgba(127,127,127,.2);color:#616161}',
+	'#ts-devices .tsd-pill-on{background:rgba(22,163,74,.14);color:var(--ts-ok-text)}',
+	'#ts-devices .tsd-pill-off{background:var(--ts-surface-2);color:var(--ts-text-2)}',
 	'.tsd-drawer-overlay{position:fixed;inset:0;z-index:10000;display:flex;justify-content:flex-end;',
 	'background:rgba(0,0,0,.42)}',
 	'.tsd-drawer-panel{width:440px;max-width:100%;height:100%;box-sizing:border-box;overflow:auto;',
@@ -462,16 +472,31 @@ var CSS = [
 	'.tsd-drawer-apps{width:100%;border-collapse:collapse;font-size:12px}',
 	'.tsd-drawer-apps td{padding:3px 4px;vertical-align:middle}',
 	'.tsd-drawer-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}',
-	'.tsd-drawer-code{font-size:11px;line-height:1.6;background:rgba(127,127,127,.12);padding:8px;border-radius:6px;',
+	'.tsd-drawer-code{font-size:12px;line-height:1.6;background:rgba(127,127,127,.12);padding:8px;border-radius:6px;',
 	'white-space:pre-wrap;word-break:break-all;margin:6px 0 0 0}',
-	'.tsd-drawer-note{font-size:11.5px;opacity:.7;line-height:1.6;margin:6px 0 0 0}',
+	'.tsd-drawer-note{font-size:12px;color:var(--ts-text-3);line-height:1.6;margin:6px 0 0 0}',
 	'@media (max-width:760px){',
 	'#ts-devices .tsd-opt{display:none}',
-	'#ts-devices table{min-width:620px}',
-	'#ts-devices .tsd-tablewrap{overflow-x:auto}',
-	'#ts-devices .tsd-host{min-width:160px}',
-	'#ts-devices .tsd-vendor{max-width:150px}',
+	'#ts-devices table{min-width:660px}',
+	'#ts-devices table .tr{min-width:660px}',
+	'#ts-devices .tsd-col-meta{display:none}',
+	'#ts-devices table .tsd-col-name{flex-basis:190px}',
+	'#ts-devices table .tsd-col-link{flex-basis:62px}',
+	'#ts-devices table .tsd-col-bytes{flex-basis:82px}',
+	'#ts-devices table .tsd-col-rate{flex-basis:94px}',
+	'#ts-devices .tsd-tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch}',
+	'#ts-devices .tsd-scrollhint{display:block}',
+	'#ts-devices .tsd-host{min-width:0}',
+	'#ts-devices .tsd-vendor{max-width:140px}',
+	'#ts-devices .tsd-toolbar{gap:6px}',
+	'#ts-devices .tsd-search{flex:1 1 100%;max-width:none}',
+	'#ts-devices .tsd-select{flex:1 1 46%;min-width:0;max-width:100%}',
+	'#ts-devices .tsd-seg-btn{min-height:32px}',
 	'.tsd-drawer-panel{width:100%;max-width:100%;padding:14px}',
+	'}',
+	'@media (max-width:420px){',
+	'#ts-devices .tsd-host{min-width:0}',
+	'#ts-devices .tsd-edit{margin-left:4px}',
 	'}'
 ].join('\n');
 
@@ -1345,40 +1370,46 @@ return view.extend({
 
 		var head = E('tr', { 'class': 'tr table-titles' }, [
 			this.sortHead('vendor', _('主机名 / 厂商'),
-				_('设备名称在图标右侧，小字为按 MAC 前 3 字节（OUI）识别的厂商；点击按厂商名排序'), 'left'),
-			E('th', { 'class': 'th' }, _('别名 / 分组')),
+				_('设备名称在图标右侧，小字为按 MAC 前 3 字节（OUI）识别的厂商；点击按厂商名排序'), 'left', 'tsd-col-name'),
+			E('th', { 'class': 'th tsd-col-meta' }, _('别名 / 分组')),
 			E('th', { 'class': 'th tsd-opt', title: _('守护进程首次看到该 MAC 的时间（本地时区）') }, _('首次出现')),
 			E('th', {
-				'class': 'th',
+				'class': 'th tsd-col-link',
 				title: _('接入方式：主路由桥 FDB 里该设备 MAC 学在哪个端口（无线/有线），与代理/直连无关')
 			}, _('接入')),
-			this.sortHead('direct', _('直连'), _('按直连下载 + 上传排序')),
-			this.sortHead('proxy', _('代理'), _('按代理下载 + 上传排序')),
-			this.sortHead('total', _('合计'), _('按直连 + 代理合计排序')),
-			E('th', { 'class': 'th', style: 'text-align:right', title: _('本月 1 号至今的 rx+tx（只读 daily/，跨月自动归零）') }, _('本月')),
-			E('th', { 'class': 'th tsd-quota', title: _('剩余 = 配额 - 本月用量；未配置配额时显示 —') }, _('配额剩余')),
-			this.sortHead('rate', _('速率'), _('按当前下载 + 上传速率排序')),
-			this.sortHead('last_seen', _('上次活跃'), _('按 last_seen 时间排序')),
+			this.sortHead('direct', _('直连'), _('按直连下载 + 上传排序'), 'right', 'tsd-col-bytes'),
+			this.sortHead('proxy', _('代理'), _('按代理下载 + 上传排序'), 'right', 'tsd-col-bytes'),
+			this.sortHead('total', _('合计'), _('按直连 + 代理合计排序'), 'right', 'tsd-col-bytes'),
+			E('th', { 'class': 'th tsd-col-meta', style: 'text-align:right', title: _('本月 1 号至今的 rx+tx（只读 daily/，跨月自动归零）') }, _('本月')),
+			E('th', { 'class': 'th tsd-quota tsd-col-meta', title: _('剩余 = 配额 - 本月用量；未配置配额时显示 —') }, _('配额剩余')),
+			this.sortHead('rate', _('速率'), _('按当前下载 + 上传速率排序'), 'right', 'tsd-col-rate'),
+			this.sortHead('last_seen', _('上次活跃'), _('按 last_seen 时间排序'), 'right', 'tsd-col-meta'),
 			E('th', {
 				'class': 'th tsd-opt',
 				style: 'text-align:right',
 				title: _('来自哑桥 AP 的无线信号（仅元数据，不含流量）')
 			}, _('信号')),
-			E('th', { 'class': 'th', style: 'text-align:right' }, _('操作'))
+			E('th', { 'class': 'th tsd-col-meta', style: 'text-align:right' }, _('操作'))
 		]);
 
 		this.tbody = E('tbody', {}, '');
-		this.tableWrap = E('div', { 'class': 'tsd-tablewrap' },
-			E('table', { 'class': 'table' }, [ head, this.tbody ]));
+		this.tableWrap = E('div', {
+			'class': 'tsd-tablewrap',
+			'role': 'region',
+			'tabindex': '0',
+			'aria-label': _('设备列表，可左右滑动查看更多列')
+		}, E('table', { 'class': 'table' }, [ head, this.tbody ]));
 		this.emptyBox = E('div', { 'class': 'tsd-empty', style: 'display:none' }, '');
 
-		this.root = E('div', { 'id': 'ts-devices' }, [
+		this.root = E('div', { 'id': 'ts-devices', 'class': theme.CLASS }, [
+			theme.style(),
 			E('style', {}, CSS),
-			E('h2', {}, _('棱镜路由 · 设备')),
+			E('h2', { 'class': 'ts-title' }, _('棱镜路由 · 设备')),
 			this.alertBox,
 			segmentBox,
 			this.summaryNode,
 			toolbar,
+			E('p', { 'class': 'tsd-scrollhint' }, _('左右滑动表格查看更多列')),
 			this.tableWrap,
 			this.emptyBox
 		]);
@@ -1392,11 +1423,11 @@ return view.extend({
 		return this.root;
 	},
 
-	sortHead: function(key, label, title, align) {
+	sortHead: function(key, label, title, align, className) {
 		var self = this;
 		var arrow = E('span', { 'class': 'tsd-arrow' }, '');
 		var th = E('th', {
-			'class': 'th',
+			'class': 'th' + (className ? ' ' + className : ''),
 			style: 'text-align:' + (align === 'left' ? 'left' : 'right') + ';cursor:pointer',
 			title: title || _('点击切换排序'),
 			click: function(ev) {
@@ -2347,7 +2378,7 @@ return view.extend({
 
 		var filled = false;
 		var open = false;
-		var aliasCell = E('td', { 'class': 'td' });
+		var aliasCell = E('td', { 'class': 'td tsd-col-meta' });
 
 		if (mac.length) this.aliasCells[mac] = aliasCell;
 
@@ -2382,7 +2413,7 @@ return view.extend({
 			style: 'cursor:pointer',
 			title: _('点击查看设备详情')
 		}, [
-			E('td', { 'class': 'td' }, E('div', { 'class': 'tsd-host' }, [
+			E('td', { 'class': 'td tsd-col-name' }, E('div', { 'class': 'tsd-host' }, [
 				marker,
 				this.renderKindBadge(dev),
 				E('div', { 'class': 'tsd-host-text' }, [
@@ -2403,10 +2434,23 @@ return view.extend({
 			E('td', { 'class': 'td tsd-opt', title: firstSeen > 0 ? fmtDate(firstSeen) : _('后端尚未记录 first_seen') },
 				firstSeen > 0 ? fmtDate(firstSeen) : '—'),
 			this.renderLink(dev),
-			E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(direct)),
-			E('td', { 'class': 'td', style: 'text-align:right' }, fmtBytes(proxy)),
-			E('td', { 'class': 'td', style: 'text-align:right' }, E('strong', {}, fmtBytes(total))),
-			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, monthAvailable(dev)
+			E('td', {
+				'class': 'td tsd-col-bytes',
+				style: 'text-align:right',
+				title: _('直连') + ' ↓ ' + fmtBytes(num(dev.direct_rx)) + ' / ↑ ' + fmtBytes(num(dev.direct_tx))
+			}, fmtBytes(direct)),
+			E('td', {
+				'class': 'td tsd-col-bytes',
+				style: 'text-align:right',
+				title: _('代理') + ' ↓ ' + fmtBytes(num(dev.proxy_rx)) + ' / ↑ ' + fmtBytes(num(dev.proxy_tx))
+			}, fmtBytes(proxy)),
+			E('td', {
+				'class': 'td tsd-col-bytes',
+				style: 'text-align:right',
+				title: _('合计') + ' ↓ ' + fmtBytes(num(dev.direct_rx) + num(dev.proxy_rx)) +
+					' / ↑ ' + fmtBytes(num(dev.direct_tx) + num(dev.proxy_tx))
+			}, E('strong', {}, fmtBytes(total))),
+			E('td', { 'class': 'td tsd-col-meta', style: 'text-align:right;white-space:nowrap' }, monthAvailable(dev)
 				? [
 					fmtBytes(monthTotal(dev)),
 					E('div', { 'class': 'tsd-sub' }, '↓ ' + fmtBytes(num(dev.month_rx)) + ' · ↑ ' + fmtBytes(num(dev.month_tx)))
@@ -2414,16 +2458,16 @@ return view.extend({
 				: E('span', { style: 'opacity:.55' }, '—')),
 			this.renderQuotaCell(dev),
 			E('td', {
-				'class': 'td',
+				'class': 'td tsd-col-rate',
 				style: 'text-align:right;white-space:nowrap',
 				title: '↓ ' + fmtRateBytes(num(dev.rx_rate)) + ' / ↑ ' + fmtRateBytes(num(dev.tx_rate))
 			}, [
 				E('div', {}, '↓ ' + fmtRateBits(num(dev.rx_rate))),
 				E('div', { style: 'font-size:11px;opacity:.7' }, '↑ ' + fmtRateBits(num(dev.tx_rate)))
 			]),
-			E('td', { 'class': 'td', style: 'text-align:right;white-space:nowrap' }, fmtTime(dev.last_seen)),
+			E('td', { 'class': 'td tsd-col-meta', style: 'text-align:right;white-space:nowrap' }, fmtTime(dev.last_seen)),
 			this.renderSignal(dev),
-			E('td', { 'class': 'td', style: 'text-align:right' }, E('button', {
+			E('td', { 'class': 'td tsd-col-meta', style: 'text-align:right' }, E('button', {
 				'class': 'cbi-button tsd-detail-btn',
 				type: 'button',
 				click: function(ev) {
@@ -2484,12 +2528,12 @@ return view.extend({
 		var q = deviceQuota(dev);
 
 		if (q == null)
-			return E('td', { 'class': 'td tsd-quota', style: 'text-align:right;opacity:.55' }, '—');
+			return E('td', { 'class': 'td tsd-quota tsd-col-meta', style: 'text-align:right;opacity:.55' }, '—');
 
 		var over = q.remaining < 0;
 
 		return E('td', {
-			'class': 'td tsd-quota',
+			'class': 'td tsd-quota tsd-col-meta',
 			style: 'text-align:right;white-space:nowrap',
 			title: _('已用') + ' ' + fmtBytes(q.used) + ' / ' + fmtBytes(q.limit) + '（' + q.pct.toFixed(1) + '%）'
 		}, [
@@ -2772,7 +2816,7 @@ return view.extend({
 	},
 
 	renderLink: function(dev) {
-		return E('td', { 'class': 'td' }, this.linkBadge(dev));
+		return E('td', { 'class': 'td tsd-col-link' }, this.linkBadge(dev));
 	},
 
 	/* 信号列：有数据就显示 "-53 dBm" 并分级着色；没有该设备的数据就显示 "-"。
@@ -2782,7 +2826,7 @@ return view.extend({
 		var signal = (st != null && typeof st.signal == 'number' && isFinite(st.signal)) ? st.signal : null;
 
 		if (signal == null)
-			return E('td', { 'class': 'td', style: 'text-align:right' }, '-');
+			return E('td', { 'class': 'td tsd-opt', style: 'text-align:right' }, '-');
 
 		var parts = [];
 
@@ -2794,7 +2838,7 @@ return view.extend({
 		if (parts.length) title += ' · ' + parts.join(' · ');
 
 		return E('td', {
-			'class': 'td',
+			'class': 'td tsd-opt',
 			style: 'text-align:right;white-space:nowrap',
 			title: title
 		}, E('span', {

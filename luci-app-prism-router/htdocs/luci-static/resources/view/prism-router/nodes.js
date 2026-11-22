@@ -3,6 +3,7 @@
 'require dom';
 'require rpc';
 'require ui';
+'require prism-router/theme as theme';
 
 /*
  * 棱镜路由 · 多节点（子母汇总）
@@ -437,20 +438,20 @@ function buildDetails(node, totals, age, devs, apps) {
 // ---------------------------------------------------------------- 样式（内联，不引外部 CSS）
 
 var CSS = [
-	'#ts-nodes{font-size:13px;line-height:1.5;max-width:100%}',
+	'#ts-nodes{font-size:var(--ts-fs-2);line-height:1.55;max-width:100%;min-width:0}',
 	'#ts-nodes *,#ts-nodes *::before,#ts-nodes *::after{box-sizing:border-box}',
 
 	/* 标题 + 最后更新时间 */
 	'#ts-nodes .tsn-head{display:flex;align-items:baseline;gap:8px 12px;flex-wrap:wrap;margin:0 0 3px 0}',
-	'#ts-nodes .tsn-title{margin:0;font-size:16px;font-weight:600;line-height:1.5;white-space:nowrap}',
-	'#ts-nodes .tsn-updated{margin-left:auto;font-size:11px;opacity:.68;white-space:nowrap;',
+	'#ts-nodes .tsn-title{margin:0;font-size:var(--ts-fs-4);font-weight:600;line-height:1.4;white-space:nowrap}',
+	'#ts-nodes .tsn-updated{margin-left:auto;font-size:var(--ts-fs-1);color:var(--ts-text-3);white-space:nowrap;',
 	'font-variant-numeric:tabular-nums}',
-	'#ts-nodes .tsn-sub{margin:0 0 10px 0;font-size:11.5px;line-height:1.65;opacity:.72}',
+	'#ts-nodes .tsn-sub{margin:0 0 10px 0;font-size:var(--ts-fs-1);line-height:1.65;color:var(--ts-text-2)}',
 
 	/* 摘要卡 */
 	'#ts-nodes .tsn-summary{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;',
-	'margin:0 0 10px 0;padding:9px 12px;border-radius:10px;background:rgba(127,127,127,.07);',
-	'border:1px solid rgba(127,127,127,.18);min-width:0}',
+	'margin:0 0 10px 0;padding:9px 12px;border-radius:var(--ts-r);background:var(--ts-surface);',
+	'border:1px solid var(--ts-border);min-width:0}',
 	'#ts-nodes .tsn-sum-main{display:flex;align-items:baseline;gap:2px 5px;flex-wrap:wrap;min-width:0}',
 	'#ts-nodes .tsn-sum-stat{display:inline-flex;align-items:center;gap:5px;font-size:12px;',
 	'font-weight:600;white-space:nowrap}',
@@ -458,20 +459,20 @@ var CSS = [
 	'#ts-nodes .tsn-sum-v{font-size:18px;line-height:1.25;font-variant-numeric:tabular-nums}',
 	'#ts-nodes .tsn-sep{opacity:.35;padding:0 1px}',
 	'#ts-nodes .tsn-sum-unit{font-size:12px;opacity:.72;white-space:nowrap}',
-	'#ts-nodes .tsn-sum-total{margin-left:auto;font-size:11.5px;opacity:.72;white-space:nowrap}',
+	'#ts-nodes .tsn-sum-total{margin-left:auto;font-size:var(--ts-fs-1);color:var(--ts-text-2);white-space:nowrap}',
 
 	/* 状态胶囊 / 圆点 */
 	'#ts-nodes .tsn-pill{display:inline-flex;align-items:center;gap:5px;flex:none;',
-	'font-size:11px;font-weight:600;line-height:1.8;padding:0 8px;border-radius:9px;',
+	'font-size:12px;font-weight:600;line-height:1.8;padding:0 8px;border-radius:var(--ts-r-sm);',
 	'border:1px solid transparent;white-space:nowrap}',
 	'#ts-nodes .tsn-dot{width:7px;height:7px;border-radius:50%;flex:none;display:inline-block;',
 	'background:currentColor}',
-	'#ts-nodes .tsn-pill.tsn-st-online{background:rgba(46,125,50,.12);border-color:rgba(46,125,50,.38);color:#2e7d32}',
-	'#ts-nodes .tsn-pill.tsn-st-offline{background:rgba(249,168,37,.16);border-color:rgba(249,168,37,.45);color:#8a5a00}',
-	'#ts-nodes .tsn-pill.tsn-st-unreported{background:rgba(120,120,120,.14);border-color:rgba(120,120,120,.35);color:#616161}',
-	'#ts-nodes .tsn-sum-stat.tsn-st-online{color:#2e7d32}',
-	'#ts-nodes .tsn-sum-stat.tsn-st-offline{color:#8a5a00}',
-	'#ts-nodes .tsn-sum-stat.tsn-st-unreported{color:#616161}',
+	'#ts-nodes .tsn-pill.tsn-st-online{background:rgba(22,163,74,.10);border-color:rgba(22,163,74,.40);color:var(--ts-ok-text)}',
+	'#ts-nodes .tsn-pill.tsn-st-offline{background:rgba(217,119,6,.10);border-color:rgba(217,119,6,.42);color:var(--ts-warn-text)}',
+	'#ts-nodes .tsn-pill.tsn-st-unreported{background:var(--ts-surface-2);border-color:var(--ts-border);color:var(--ts-text-2)}',
+	'#ts-nodes .tsn-sum-stat.tsn-st-online{color:var(--ts-ok-text)}',
+	'#ts-nodes .tsn-sum-stat.tsn-st-offline{color:var(--ts-warn-text)}',
+	'#ts-nodes .tsn-sum-stat.tsn-st-unreported{color:var(--ts-text-2)}',
 
 	/* 工具栏（纯本地排序 / 筛选） */
 	'#ts-nodes .tsn-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px 0}',
@@ -482,16 +483,16 @@ var CSS = [
 	'#ts-nodes .tsn-seg{display:inline-flex;flex-wrap:wrap;border:1px solid rgba(127,127,127,.28);',
 	'border-radius:9px;overflow:hidden;max-width:100%}',
 	'#ts-nodes .tsn-seg-btn{font:inherit;font-size:12px;line-height:1.9;padding:0 10px;border:0;',
-	'border-right:1px solid rgba(127,127,127,.2);background:transparent;color:inherit;cursor:pointer;white-space:nowrap}',
+	'border-right:1px solid var(--ts-border);background:transparent;color:inherit;cursor:pointer;white-space:nowrap}',
 	'#ts-nodes .tsn-seg-btn:last-child{border-right:0}',
-	'#ts-nodes .tsn-seg-btn.on{background:#1565c0;color:#fff}',
+	'#ts-nodes .tsn-seg-btn.on{background:var(--ts-surface-2);color:var(--ts-down-text);font-weight:600}',
 	'#ts-nodes .tsn-count{font-size:11px;opacity:.62;white-space:nowrap;margin-left:auto}',
 	'#ts-nodes .tsn-toolbar-note{flex:1 1 100%;font-size:10.5px;line-height:1.6;opacity:.62}',
 
 	/* 错误条：保留旧数据 + 重试 */
 	'#ts-nodes .tsn-alert{display:flex;align-items:flex-start;gap:10px;flex-wrap:wrap;',
-	'margin:0 0 10px 0;padding:9px 12px;border-radius:8px;background:rgba(198,40,40,.1);',
-	'border-left:3px solid #c62828;font-size:12px;line-height:1.65}',
+	'margin:0 0 10px 0;padding:9px 12px;border-radius:var(--ts-r-sm);background:rgba(220,38,38,.08);',
+	'border-left:3px solid var(--ts-bad);font-size:12px;line-height:1.65}',
 	'#ts-nodes .tsn-alert-main{flex:1 1 220px;min-width:0}',
 	'#ts-nodes .tsn-alert-text{overflow-wrap:anywhere;word-break:break-word;opacity:.85}',
 	'#ts-nodes .tsn-alert-note{font-size:10.5px;opacity:.68;margin-top:2px}',
@@ -504,11 +505,11 @@ var CSS = [
 	/* 节点卡片 */
 	'#ts-nodes .tsn-list{min-width:0}',
 	'#ts-nodes .tsn-card{max-width:100%;margin:0 0 10px 0;border-radius:10px;overflow:hidden;',
-	'background:rgba(127,127,127,.06);border:1px solid rgba(127,127,127,.18);',
-	'border-left:3px solid rgba(127,127,127,.35);cursor:pointer}',
-	'#ts-nodes .tsn-card-online{border-left-color:#2e7d32}',
-	'#ts-nodes .tsn-card-offline{border-left-color:#f9a825}',
-	'#ts-nodes .tsn-card-unreported{border-left-color:#9e9e9e}',
+	'background:var(--ts-surface);border:1px solid var(--ts-border);',
+	'border-left:3px solid var(--ts-neutral);cursor:pointer}',
+	'#ts-nodes .tsn-card-online{border-left-color:var(--ts-ok)}',
+	'#ts-nodes .tsn-card-offline{border-left-color:var(--ts-warn)}',
+	'#ts-nodes .tsn-card-unreported{border-left-color:var(--ts-neutral)}',
 	'#ts-nodes .tsn-card[aria-expanded="true"]{background:rgba(127,127,127,.09)}',
 	'#ts-nodes .tsn-card-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;',
 	'padding:10px 12px;cursor:pointer;outline:none}',
@@ -617,10 +618,11 @@ return view.extend({
 		this.bannerEl = E('div', { 'class': 'tsn-banner' });
 		this.listEl = E('div', { 'class': 'tsn-list' });
 
-		this.root = E('div', { 'id': 'ts-nodes' }, [
+		this.root = E('div', { 'id': 'ts-nodes', 'class': theme.CLASS }, [
+			theme.style(),
 			E('style', {}, CSS),
 			E('div', { 'class': 'tsn-head' }, [
-				E('h2', { 'class': 'tsn-title' }, _('棱镜路由 · 多节点')),
+				E('h2', { 'class': 'tsn-title ts-title' }, _('棱镜路由 · 网络节点')),
 				this.updatedEl
 			]),
 			E('p', { 'class': 'tsn-sub' },

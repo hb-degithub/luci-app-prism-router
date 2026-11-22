@@ -24,7 +24,13 @@
 	var TOP_DEVICES = 10;
 	var TOP_APPS = 10;
 	var TOP_DEVICE_APPS = 5;
-	var ONLINE_WINDOW = 180;        /* 秒：超过这个时间没有活动就不算在线 */
+	var ONLINE_WINDOW = 600;        /* 秒：近 10 分钟有活动才算在线（用真实时钟，不拿 state.ts 当 now） */
+	var FUTURE_SKEW = 60;           /* 秒：last_seen 最多容忍的未来偏差 */
+	var COMPACT_MQ = '(max-width: 760px)'; /* 与 style.css 的移动断点一致 */
+	var DEVICE_PREVIEW = 3;         /* 手机默认只看 Top 3，其余走「查看全部」 */
+	var APP_PREVIEW = 5;            /* 手机默认只看 Top 5 */
+	var NODE_PREVIEW = 5;           /* 出口节点默认 Top 5（桌面与手机一致） */
+	var LIST_MAX = 50;              /* 「查看全部」的单次渲染上限，避免一次插入上百行 */
 	var HISTORY_DAYS = 7;
 	var HISTORY_REFRESH = 300000;   /* 历史数据 5 分钟刷新一次 */
 	var NODES_REFRESH = 300000;     /* 节点上报状态 5 分钟刷新一次 */
@@ -32,7 +38,6 @@
 
 	/* 告警中心阈值（与 SPEC/需求保持一致） */
 	var ALERT_STALE_SEC = 90;       /* 数据陈旧：now - ts > 90s */
-	var ALERT_OFFLINE_SEC = 600;    /* 设备离线：last_seen <= 0 或 > 600s */
 	var ALERT_NODE_STALE_SEC = 300; /* 节点上报超时：age_sec > 300s */
 	var ALERT_QUOTA_WARN = 0.8;     /* 配额接近：>= 80% */
 	var ALERT_UNKNOWN_ONLINE = 3;   /* 未知接入设备较多：在线 > 3 台 */
@@ -97,10 +102,14 @@
 		settingsAt: 0,
 		settingsBusy: false,
 		settingsError: null,
+		/* 用户主动展开/收起的设置分组；15s 自动刷新不得重置选择和焦点语义。 */
+		settingsOpen: {},
 		samples: [],
 		prevTotals: null,
 		lastSampleTs: 0,
 		expanded: {},
+		/* Top 列表的「查看全部」状态：手机默认折叠，桌面设备/应用仍显示 Top 10 */
+		more: { devices: false, apps: false, nodes: false },
 		manual: false,
 		offlineSeen: false,     /* 是否已经因为断网提示过（用于恢复后只刷新一次） */
 		lastRecoverAt: 0,
@@ -590,11 +599,17 @@
 		return rx + tx;
 	}
 
+	/* 在线口径：一律对真实时钟（不把 state.ts 当 now）。
+	   - 有 last_seen：与 now 相差 ≤ 10 分钟即在线，最多容忍 FUTURE_SKEW 秒未来偏差；
+	   - 没有 last_seen：只有本轮 state 采样仍然新鲜、且设备当前仍有速率时才计入在线。 */
 	function isOnline(dev, state) {
+		if (!dev) return false;
 		var seen = toSec(dev.last_seen);
-		var now = toSec(state && state.ts) || Math.floor(Date.now() / 1000);
-		if (seen > 0 && now - seen <= ONLINE_WINDOW) return true;
-		return (n0(dev.rx_rate) + n0(dev.tx_rate)) > 0;
+		var now = nowSec();
+		if (seen > 0) return seen <= now + FUTURE_SKEW && now - seen <= ONLINE_WINDOW;
+		var ts = toSec(state && state.ts);
+		var fresh = ts > 0 && Math.abs(now - ts) <= ALERT_STALE_SEC;
+		return fresh && (n0(dev.rx_rate) + n0(dev.tx_rate)) > 0;
 	}
 
 	function isRunning(state) {
@@ -807,7 +822,7 @@
 		});
 		setText(dom.cardDevices, devices.length ? String(online) : '—');
 		setText(dom.cardDevicesUnit, devices.length ? ' / ' + devices.length + ' 台' : '');
-		setText(dom.cardDevicesSub, devices.length ? '近 3 分钟有活动设备' : '暂无设备数据');
+		setText(dom.cardDevicesSub, devices.length ? '近 10 分钟有活动的设备' : '暂无设备数据');
 
 		setText(dom.cardClash, String(n0(health.clash_connections)));
 		setText(dom.cardClashSub, 'conntrack 记录 ' + n0(health.conntrack_count));
@@ -824,16 +839,16 @@
 
 		if (dark) {
 			return {
-				grid: '#26304a', axis: '#46536e', text: '#8b9ab4',
-				rx: '#7aa2ff', tx: '#f0a15c',
+				grid: '#26304a', axis: '#46536e', text: '#8595b2',
+				rx: '#7aa2ff', tx: '#35d6e6',
 				rxTop: 'rgba(122, 162, 255, .30)', rxBottom: 'rgba(122, 162, 255, 0)',
 				dot: '#0f1420'
 			};
 		}
 		return {
-			grid: '#e6ecf6', axis: '#b8c4d6', text: '#6b7a90',
-			rx: '#2f6bf4', tx: '#e8792b',
-			rxTop: 'rgba(47, 107, 244, .26)', rxBottom: 'rgba(47, 107, 244, 0)',
+			grid: '#e6ecf6', axis: '#b8c4d6', text: '#5b6b82',
+			rx: '#2563eb', tx: '#0c6a84',
+			rxTop: 'rgba(37, 99, 235, .26)', rxBottom: 'rgba(37, 99, 235, 0)',
 			dot: '#ffffff'
 		};
 	}
@@ -855,7 +870,7 @@
 		if (!canvas || typeof canvas.getContext !== 'function') return;
 
 		var cssW = Math.max(260, Math.round(canvas.clientWidth || 640));
-		var cssH = Math.max(160, Math.round(canvas.clientHeight || 240));
+		var cssH = Math.max(100, Math.round(canvas.clientHeight || 240));
 		var dpr = Math.min(3, Math.max(1, window.devicePixelRatio || 1));
 		var pxW = Math.round(cssW * dpr);
 		var pxH = Math.round(cssH * dpr);
@@ -971,6 +986,9 @@
 		var hasData = samples.length >= 2;
 
 		if (dom.chartEmpty) dom.chartEmpty.hidden = hasData;
+		/* 空图收成一条 120px 以内的占位，避免首屏被空画布占掉半屏（CSS 兜底 :has 同款）。 */
+		var chartBox = dom.canvas && dom.canvas.parentNode;
+		if (chartBox && chartBox.classList) chartBox.classList.toggle('is-empty', !hasData);
 		setText(dom.chartMeta, samples.length ? samples.length + ' 个采样点' : '采样中');
 		setText(dom.chartWindow, String(MAX_SAMPLES));
 
@@ -1104,6 +1122,50 @@
 		}
 	}
 
+	/* 手机默认只看前几项，桌面仍是 Top 10；「查看全部」展开到 LIST_MAX。
+	   断点与 style.css 的 760px 保持一致。 */
+	function isCompactViewport() {
+		try { return !!(window.matchMedia && window.matchMedia(COMPACT_MQ).matches); }
+		catch (e) { return false; }
+	}
+
+	function basePreviewLimit(kind, total) {
+		var count = Math.max(0, n0(total));
+		if (kind === 'devices') return Math.min(count, isCompactViewport() ? DEVICE_PREVIEW : TOP_DEVICES);
+		if (kind === 'apps') return Math.min(count, isCompactViewport() ? APP_PREVIEW : TOP_APPS);
+		return Math.min(count, NODE_PREVIEW);
+	}
+
+	function previewLimit(kind, total) {
+		var count = Math.max(0, n0(total));
+		return app.more[kind] ? Math.min(count, LIST_MAX) : basePreviewLimit(kind, count);
+	}
+
+	function updateMoreButton(btn, kind, total) {
+		if (!btn) return;
+		var count = Math.max(0, n0(total));
+		var base = basePreviewLimit(kind, count);
+		var expanded = !!app.more[kind];
+		/* 是否显示按钮看「默认条数」而不是当前条数：展开后仍要能「收起」。 */
+		var hasOverflow = count > base;
+
+		btn.hidden = !hasOverflow;
+		setText(btn, expanded ? '收起' : '查看全部');
+		btn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+		btn.title = expanded
+			? '收起列表，回到默认的 ' + base + ' 项'
+			: '展开到 ' + Math.min(count, LIST_MAX) + ' 项（最多 ' + LIST_MAX + ' 项）';
+	}
+
+	function bindMore(btn, kind, rerender) {
+		if (!btn) return;
+		btn.addEventListener('click', function () {
+			app.more[kind] = !app.more[kind];
+			rerender();
+			announce(app.more[kind] ? '已展开全部列表。' : '已收起列表。');
+		});
+	}
+
 	function renderDevices() {
 		var body = dom.devicesBody;
 		if (!body) return;
@@ -1111,11 +1173,13 @@
 
 		var state = app.state;
 		var devices = sortedDevices(state);
-		var list = devices.slice(0, TOP_DEVICES);
+		var list = devices.slice(0, previewLimit('devices', devices.length));
 
 		var meta = devices.length ? '共 ' + devices.length + ' 台' : '';
+		if (list.length && list.length < devices.length) meta += ' · 显示 ' + list.length;
 		if (state && state.truncated) meta += meta ? ' · 已截断' : '已截断';
 		setMeta(dom.devicesMeta, meta);
+		updateMoreButton(dom.devicesMore, 'devices', devices.length);
 
 		if (!list.length) {
 			var emptyRow = el('tr');
@@ -1257,12 +1321,15 @@
 		if (meta) setText(meta, guardMetaText());
 	}
 
+	/* 家长控制详细说明：默认收起，summary 上保留当前状态标签；
+	   展开后仍是完整的状态行 + 说明 + 提示（内容不丢失）。 */
 	function guardSettingsGroup() {
 		var status = guardStatus();
 		var metaState = guardStatusMeta();
 
-		var group = el('div', 'settings__group');
-		group.appendChild(el('h3', 'settings__group-title', '家长控制'));
+		var chip = el('span', 'guard__status ' + metaState.cls, metaState.text);
+		chip.title = '家长控制：' + metaState.text;
+		var group = settingsDetails('家长控制', false, chip, true);
 
 		var box = el('div', 'guard');
 
@@ -1286,8 +1353,8 @@
 			box.appendChild(hint);
 		}
 
-		group.appendChild(box);
-		return group;
+		group.body.appendChild(box);
+		return group.details;
 	}
 
 	/* ---- 确认框 ---- */
@@ -1466,11 +1533,13 @@
 		var state = app.state;
 		var apps = (state && Array.isArray(state.apps)) ? state.apps.slice() : [];
 		apps.sort(function (a, b) { return (n0(b.rx) + n0(b.tx)) - (n0(a.rx) + n0(a.tx)); });
-		var list = apps.slice(0, TOP_APPS);
+		var list = apps.slice(0, previewLimit('apps', apps.length));
 
 		var meta = apps.length ? '共 ' + apps.length + ' 个' : '';
+		if (list.length && list.length < apps.length) meta += ' · 显示 ' + list.length;
 		if (state && state.truncated) meta += meta ? ' · 已截断' : '已截断';
 		setMeta(dom.appsMeta, meta);
+		updateMoreButton(dom.appsMore, 'apps', apps.length);
 
 		if (!list.length) {
 			var emptyRow = el('tr');
@@ -1526,6 +1595,7 @@
 		if (!raw || !Object.keys(raw).length) {
 			list.appendChild(el('p', 'node__empty', state ? '暂无出口节点数据' : '正在加载…'));
 			setMeta(dom.nodesMeta, '');
+			updateMoreButton(dom.nodesMore, 'nodes', 0);
 			return;
 		}
 
@@ -1537,9 +1607,13 @@
 
 		var sum = 0;
 		nodes.forEach(function (node) { sum += node.total; });
-		setMeta(dom.nodesMeta, '共 ' + nodes.length + ' 个');
+		var shown = nodes.slice(0, previewLimit('nodes', nodes.length));
+		var nodesMeta = '共 ' + nodes.length + ' 个';
+		if (shown.length < nodes.length) nodesMeta += ' · 显示 ' + shown.length;
+		setMeta(dom.nodesMeta, nodesMeta);
+		updateMoreButton(dom.nodesMore, 'nodes', nodes.length);
 
-		nodes.forEach(function (node, idx) {
+		shown.forEach(function (node, idx) {
 			var box = el('div', 'node');
 			var head = el('div', 'node__head');
 			var nameWrap = el('div', 'node__name');
@@ -1807,11 +1881,14 @@
 			});
 		});
 
-		/* 6) 设备离线 */
+		/* 6) 设备离线：只对「有过 last_seen 且确实超过 10 分钟」的设备报警；
+		   没有 last_seen 或时间戳在未来偏差内的设备不误报。 */
 		var offline = [];
 		devices.forEach(function (dev, idx) {
 			var seen = toSec(dev.last_seen);
-			if (seen > 0 && now - seen <= ALERT_OFFLINE_SEC) return;
+			if (!(seen > 0)) return;
+			if (seen > now + FUTURE_SKEW) return;
+			if (now - seen <= ONLINE_WINDOW) return;
 			offline.push({ name: deviceName(dev), key: deviceKey(dev, idx) });
 		});
 		if (offline.length) {
@@ -1930,10 +2007,24 @@
 
 		if (target.type === 'devices') {
 			var rows = [];
+			var allDevices = sortedDevices(app.state);
+			var missing = false;
 			(target.keys || []).forEach(function (key) {
 				var row = deviceRowByKey(key);
 				if (row) rows.push(row);
+				else missing = true;
 			});
+
+			/* 手机默认 Top 3 可能折叠掉告警设备：先展开再定位，不能假报“已定位”。 */
+			if (missing && allDevices.length > previewLimit('devices', allDevices.length)) {
+				app.more.devices = true;
+				renderDevices();
+				rows = [];
+				(target.keys || []).forEach(function (key) {
+					var row = deviceRowByKey(key);
+					if (row) rows.push(row);
+				});
+			}
 
 			if (rows.length) {
 				scrollToNode(rows[0]);
@@ -1945,7 +2036,7 @@
 			var devicesPanel = panelOf(dom.devicesBody);
 			scrollToNode(devicesPanel || dom.devicesBody, 'start');
 			flashNode(devicesPanel);
-			announce('已定位到设备榜。');
+			announce('设备在当前列表之外，已展开可见列表；请点“查看全部”进一步查找。');
 			return;
 		}
 
@@ -2052,22 +2143,76 @@
 		return { text: s === '' ? '—' : s, cls: '' };
 	}
 
-	function settingsGroup(title, rows) {
-		var group = el('div', 'settings__group');
-		group.appendChild(el('h3', 'settings__group-title', title));
+	function settingsRow(label, value, cls, title) {
+		var item = el('div', 'settings__row');
+		item.appendChild(el('dt', 'settings__k', label));
+		var node = el('dd', 'settings__v' + (cls ? ' ' + cls : ''), value);
+		if (title) node.title = title;
+		item.appendChild(node);
+		return item;
+	}
 
-		var list = el('dl', 'settings__list');
-		rows.forEach(function (row) {
-			var item = el('div', 'settings__row');
-			item.appendChild(el('dt', 'settings__k', row.label));
-			var value = el('dd', 'settings__v' + (row.cls ? ' ' + row.cls : ''), row.value);
-			if (row.title) value.title = row.title;
-			item.appendChild(value);
-			list.appendChild(item);
+	/* 原生 <details> 分组：summary 上放标题 + 可选状态/说明，
+	   内容全部由 renderSettings 动态生成，仍挂在 #settings-body 下。 */
+	function settingsDetails(title, open, summaryExtra, wide) {
+		var details = el('details', wide ? 'settings-group settings-group--wide' : 'settings-group');
+		if (Object.prototype.hasOwnProperty.call(app.settingsOpen, title)) {
+			details.open = app.settingsOpen[title] === true;
+		} else if (open) {
+			details.open = true;
+		}
+		details.addEventListener('toggle', function () {
+			app.settingsOpen[title] = details.open === true;
 		});
 
-		group.appendChild(list);
-		return group;
+		var summary = el('summary', 'settings-group__summary');
+		summary.appendChild(el('span', 'settings-group__title', title));
+		if (summaryExtra) summary.appendChild(summaryExtra);
+		details.appendChild(summary);
+
+		var body = el('div', 'settings-group__body');
+		details.appendChild(body);
+		return { details: details, body: body };
+	}
+
+	function settingsGroup(title, rows, open, wide) {
+		var group = settingsDetails(title, open, null, wide);
+		var list = el('dl', 'settings__list');
+		rows.forEach(function (row) {
+			list.appendChild(settingsRow(row.label, row.value, row.cls, row.title));
+		});
+		group.body.appendChild(list);
+		return group.details;
+	}
+
+	/* 当前状态：写操作是否开放 + 家长控制当前状态，默认展开。 */
+	function settingsStatusGroup(write) {
+		var metaState = guardStatusMeta();
+		var group = settingsDetails('当前状态', true, el('span', 'settings-group__note', '只读'), true);
+
+		if (write.enabled === false) {
+			var writeBox = el('p', 'settings__write');
+			var writeDot = el('span', 'settings__write-dot');
+			writeDot.setAttribute('aria-hidden', 'true');
+			writeBox.appendChild(writeDot);
+			writeBox.appendChild(el('span', '', '写操作未开放'));
+			group.body.appendChild(writeBox);
+		}
+
+		var list = el('dl', 'settings__list');
+		var guardCls = metaState.cls === 'guard__status--on' ? 'settings__v--on'
+			: (metaState.cls === 'guard__status--warn' ? 'settings__v--warn' : 'settings__v--off');
+		list.appendChild(settingsRow('家长控制', metaState.text, guardCls));
+
+		var paused = pausedCount();
+		if (paused > 0) list.appendChild(settingsRow('已暂停设备', paused + ' 台'));
+
+		group.body.appendChild(list);
+
+		if (guardStatus().key === 'on') {
+			group.body.appendChild(el('p', 'settings__hint', guardMetaText()));
+		}
+		return group.details;
 	}
 
 	function settingsErrorBox() {
@@ -2106,27 +2251,21 @@
 
 		setMeta(dom.settingsMeta, guardEnabled() ? '只读 · 家长控制' : '只读');
 
-		if (write.enabled === false) {
-			var writeBox = el('p', 'settings__write');
-			var writeDot = el('span', 'settings__write-dot');
-			writeDot.setAttribute('aria-hidden', 'true');
-			writeBox.appendChild(writeDot);
-			writeBox.appendChild(el('span', '', '写操作未开放'));
-			body.appendChild(writeBox);
-		}
+		/* 核心三组默认展开；功能开关与家长控制详细说明默认折叠。 */
+		body.appendChild(settingsStatusGroup(write));
 
 		body.appendChild(settingsGroup('采集与保留', [
 			{ label: '轮询间隔', value: settingWithUnit(settings.poll_interval, '秒') },
 			{ label: '历史保留天数', value: settingWithUnit(settings.history_days, '天') },
 			{ label: '日文件保留', value: settingWithUnit(settings.retention_daily_days, '天') }
-		]));
+		], true));
 
 		var bind = str(panelCfg.bind).trim();
 		body.appendChild(settingsGroup('面板服务', [
 			{ label: '面板端口', value: settingRaw(panelCfg.port) },
 			{ label: '绑定地址', value: bind === '' ? '全部地址' : bind },
 			{ label: '是否设置令牌', value: panelCfg.has_token ? '是' : '否' }
-		]));
+		], true));
 
 		var feishu = onOffValue(settings.feishu_enabled);
 		var mother = onOffValue(settings.mother_enabled);
@@ -2145,7 +2284,7 @@
 				title: '旧共享密钥：' + (str(settings.legacy_shared_secret) === '1' ? '开' : '关') +
 					' · 旧站点令牌：' + (str(settings.legacy_stations_token) === '1' ? '开' : '关')
 			}
-		]));
+		], false, true));
 
 		body.appendChild(guardSettingsGroup());
 
@@ -2500,6 +2639,20 @@
 			var observer = new window.ResizeObserver(function () { drawChart(); });
 			observer.observe(dom.canvas.parentNode);
 		}
+		/* 跨过 760px 断点时，列表默认条数会变（手机 3/5 条、桌面 10 条），重渲染一次。 */
+		if (window.matchMedia) {
+			try {
+				var compact = window.matchMedia(COMPACT_MQ);
+				var onChange = function () {
+					app.more.devices = false;
+					app.more.apps = false;
+					renderDevices();
+					renderApps();
+				};
+				if (compact.addEventListener) compact.addEventListener('change', onChange);
+				else if (compact.addListener) compact.addListener(onChange);
+			} catch (e) { /* 老浏览器忽略 */ }
+		}
 	}
 
 	function bindEvents() {
@@ -2510,6 +2663,9 @@
 		if (dom.authForm) dom.authForm.addEventListener('submit', onTokenSubmit);
 		if (dom.tokenClear) dom.tokenClear.addEventListener('click', onTokenClear);
 		if (dom.devicesBody) dom.devicesBody.addEventListener('click', onDevicesClick);
+		bindMore(dom.devicesMore, 'devices', renderDevices);
+		bindMore(dom.appsMore, 'apps', renderApps);
+		bindMore(dom.nodesMore, 'nodes', renderNodes);
 		if (dom.guardCancel) dom.guardCancel.addEventListener('click', closeGuardModal);
 		if (dom.guardConfirm) dom.guardConfirm.addEventListener('click', onGuardConfirm);
 		if (dom.guardBackdrop) {
@@ -2787,9 +2943,9 @@
 			'card-devices', 'card-devices-unit', 'card-devices-sub',
 			'card-clash', 'card-clash-sub',
 			'chart-window', 'chart-meta', 'rate-chart', 'chart-empty', 'chart-legend-note',
-			'nodes-meta', 'nodes-list',
-			'devices-meta', 'devices-body',
-			'apps-meta', 'apps-body',
+			'nodes-meta', 'nodes-list', 'nodes-more',
+			'devices-meta', 'devices-body', 'devices-more',
+			'apps-meta', 'apps-body', 'apps-more',
 			'health-meta', 'health-sources', 'health-reasons',
 			'alerts-meta', 'alerts-list',
 			'settings-meta', 'settings-body'

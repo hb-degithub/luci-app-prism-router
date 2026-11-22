@@ -1,4 +1,5 @@
 #!/bin/sh
+. /src/tests/lib/prism-version-inner.sh
 mkdir -p /var/lock /var/run /tmp 2>/dev/null
 # 在隔离容器内运行：安装包 → 断言权限未被破坏 → 跑守护进程离线用例
 PASS=0; FAIL=0
@@ -15,7 +16,7 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www)
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW"
 
 echo "=== 1. 安装 prism-router ==="
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装成功（严格依赖，无 --force-depends）" || { bad "安装失败"; tail -5 /tmp/i1.log; }
+opkg install "$PRISM_IPK" >/tmp/i1.log 2>&1 && ok "安装成功（严格依赖，无 --force-depends）" || { bad "安装失败"; tail -5 /tmp/i1.log; }
 
 echo "=== 2. 关键文件与属主权限 ==="
 for f in /usr/bin/prism-routerd /etc/init.d/prism-routerd /etc/config/prism-router /usr/share/prism-router/feishu.uc; do

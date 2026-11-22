@@ -102,6 +102,7 @@ import io.prism.router.ui.components.EmptyState
 import io.prism.router.ui.components.ErrorState
 import io.prism.router.ui.components.Pill
 import io.prism.router.ui.components.PrismIconAction
+import io.prism.router.ui.components.PrismProgressBar
 import io.prism.router.ui.components.PrismScaffold
 import io.prism.router.ui.components.SectionCard
 import io.prism.router.ui.components.Segmented
@@ -160,7 +161,7 @@ private data class DiagItem(
  * 设置页（统计只读 + 本机配置 + 少量管理操作）。
  *
  * 分组顺序与商用路由器 App 一致：连接 → 管理员 → 系统 → 显示 → 通知 → 刷新 → 诊断 → 关于。
- * - 连接：当前服务器摘要、面板地址 / 令牌编辑、测试连接；「多路由器」内联展开
+ * - 连接：当前服务器摘要、路由器地址 / 令牌编辑、测试连接；「多路由器」内联展开
  *   （增删切换仍调用 ViewModel 的既有方法，不跳子路由）；
  * - 管理员：root 密码登录换取 30 分钟内存令牌，登录后可重启路由器（输入 REBOOT
  *   二次确认）或开关无线射频；密码与令牌都不落盘、不进日志；
@@ -172,7 +173,7 @@ private data class DiagItem(
  * - 诊断：原有 9 项只读自检，折叠展示；
  * - 关于：版本、构建信息、GitHub 更新检查（下载 / Release 入口）、只读说明与开源许可。
  *
- * 底部固定「保存设置」按钮，保存后弹 Snackbar；深色 / 动态色全部走主题令牌。
+ * 只有存在未保存修改时才出现底部「保存设置」栏，保存后弹 Snackbar；深色 / 动态色全部走主题令牌。
  *
  * @param vm Activity 作用域的 MainViewModel（由 NavHost 显式传入，避免按
  *   NavBackStackEntry 新建第二个实例）；仅供多路由器增删切换使用。
@@ -304,12 +305,14 @@ fun SettingsScreen(
 
     val intervalValue = interval.toIntOrNull()
     val intervalInvalid = intervalValue == null || intervalValue !in INTERVAL_MIN..INTERVAL_MAX
+    val baseInvalid = base.trim().isEmpty()
     val dirty = base.trim().trimEnd('/') != ui.baseUrl ||
         token != ui.token ||
-        (intervalValue != null && intervalValue in INTERVAL_MIN..INTERVAL_MAX &&
-            intervalValue != ui.intervalSec)
+        intervalInvalid ||
+        intervalValue != ui.intervalSec
 
     fun submit() {
+        if (intervalInvalid || baseInvalid) return
         val value = (interval.toIntOrNull() ?: ui.intervalSec).coerceIn(INTERVAL_MIN, INTERVAL_MAX)
         interval = value.toString()
         onSave(base, token, value)
@@ -359,7 +362,14 @@ fun SettingsScreen(
             }
         },
         bottomBar = {
-            SettingsSaveBar(dirty = dirty, onSave = { submit() })
+            /* 只读区域（系统 / 关于 / 服务器）不再常驻保存栏：只有真正改过才出现。 */
+            if (dirty) {
+                SettingsSaveBar(
+                    onSave = { submit() },
+                    saveEnabled = !intervalInvalid && !baseInvalid,
+                    invalidMessage = if (baseInvalid) "请先填写路由器地址" else "请先修正无效的刷新间隔"
+                )
+            }
         }
     ) {
         Box(Modifier.fillMaxSize()) {
@@ -378,7 +388,7 @@ fun SettingsScreen(
                 item {
                     SectionCard(
                         title = "连接",
-                        subtitle = "面板地址、访问令牌与多路由器"
+                        subtitle = "路由器地址、访问令牌与多路由器"
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Column(Modifier.weight(1f)) {
@@ -391,7 +401,7 @@ fun SettingsScreen(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = ui.baseUrl.ifBlank { "尚未填写面板地址" },
+                                    text = ui.baseUrl.ifBlank { "尚未填写路由器地址" },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     maxLines = 1,
@@ -409,8 +419,12 @@ fun SettingsScreen(
                         OutlinedTextField(
                             value = base,
                             onValueChange = { base = it },
-                            label = { Text("面板地址") },
+                            label = { Text("路由器地址") },
                             placeholder = { Text("http://192.168.100.1:8099") },
+                            isError = baseInvalid,
+                            supportingText = {
+                                if (baseInvalid) Text("请输入路由器地址")
+                            },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )
@@ -483,7 +497,7 @@ fun SettingsScreen(
                                     fontWeight = FontWeight.SemiBold
                                 )
                                 Text(
-                                    text = "${ui.servers.size} / $MAX_SERVERS 个面板地址 · " +
+                                    text = "${ui.servers.size} / $MAX_SERVERS 个路由器地址 · " +
                                         if (ui.servers.size > 1) "点选即切换" else "可添加备用地址",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -862,7 +876,7 @@ fun SettingsScreen(
                                     text = when {
                                         diagLoading -> "正在读取状态…"
                                         statusAt > 0L -> "状态读取于 ${fmtClockSec(statusAt / 1000L)}"
-                                        else -> "尚未读取面板状态"
+                                        else -> "尚未读取路由器状态"
                                     },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -943,7 +957,7 @@ fun SettingsScreen(
                         Spacer(Modifier.height(PrismSpacing.xs))
                         Text(
                             text = "统计功能只读；管理员操作需登录，且仅限重启路由器、无线开关与网络配置。" +
-                                "面板地址、访问令牌与刷新间隔仅保存在本机 DataStore；" +
+                                "路由器地址、访问令牌与刷新间隔仅保存在本机 DataStore；" +
                                 "管理员令牌只存在于内存，退出应用或切换服务器即失效。",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1025,42 +1039,54 @@ fun SettingsScreen(
 
 /* ───────────────────────── 底部保存栏 ───────────────────────── */
 
-/** 底部固定保存栏：左侧显示是否有未保存修改，右侧保存按钮（≥48dp）。 */
+/**
+ * 底部保存栏：只有存在未保存修改时才由 [SettingsScreen] 挂载。
+ *
+ * 因此这里不再需要「配置已同步」的常驻文案，也不占只读区域的高度；
+ * 顶部用 0.5dp 分隔线与内容区分，按钮保持 ≥48dp。
+ */
 @Composable
-private fun SettingsSaveBar(dirty: Boolean, onSave: () -> Unit) {
+private fun SettingsSaveBar(onSave: () -> Unit, saveEnabled: Boolean, invalidMessage: String = "请先修正无效的刷新间隔") {
     val semantic = LocalPrismSemanticColors.current
     Surface(
-        color = MaterialTheme.colorScheme.surface,
-        tonalElevation = 3.dp,
-        shadowElevation = 8.dp,
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp,
         shape = RoundedCornerShape(topStart = PrismRadius.large, topEnd = PrismRadius.large)
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = PrismSpacing.lg, vertical = PrismSpacing.md),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(PrismSpacing.md)
-        ) {
-            Text(
-                text = if (dirty) "有未保存的修改" else "配置已同步",
-                style = MaterialTheme.typography.labelSmall,
-                color = if (dirty) semantic.warning else MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+        Column {
+            HorizontalDivider(
+                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
+                thickness = 0.5.dp
             )
-            Button(
-                onClick = onSave,
-                modifier = Modifier.heightIn(min = 48.dp)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = PrismSpacing.lg, vertical = PrismSpacing.md),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(PrismSpacing.md)
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.Save,
-                    contentDescription = null,
-                    modifier = Modifier.size(PrismSize.iconSmall)
+                Text(
+                    text = if (saveEnabled) "有未保存的修改" else invalidMessage,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = semantic.warning,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-                Spacer(Modifier.width(PrismSpacing.xs))
-                Text("保存设置")
+                Button(
+                    onClick = onSave,
+                    enabled = saveEnabled,
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Save,
+                        contentDescription = null,
+                        modifier = Modifier.size(PrismSize.iconSmall)
+                    )
+                    Spacer(Modifier.width(PrismSpacing.xs))
+                    Text("保存设置")
+                }
             }
         }
     }
@@ -1158,7 +1184,7 @@ private fun AddServerForm(
         OutlinedTextField(
             value = url,
             onValueChange = onUrl,
-            label = { Text("面板地址") },
+            label = { Text("路由器地址") },
             placeholder = { Text("http://192.168.1.1:8099") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
@@ -2174,14 +2200,11 @@ private fun ProgressRow(label: String, valueText: String, percent: Float) {
             )
         }
         Spacer(Modifier.height(PrismSpacing.xs))
-        LinearProgressIndicator(
-            progress = { percent.coerceIn(0f, 1f) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(6.dp)
-                .clip(RoundedCornerShape(PrismRadius.pill)),
+        PrismProgressBar(
+            progress = percent,
             color = color,
-            trackColor = MaterialTheme.colorScheme.surfaceVariant
+            height = 6.dp,
+            contentDescription = String.format(Locale.US, "%s 已用 %.0f%%", label, percent * 100f)
         )
     }
 }

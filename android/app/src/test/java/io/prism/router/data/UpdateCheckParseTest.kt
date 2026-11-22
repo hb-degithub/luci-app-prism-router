@@ -130,6 +130,39 @@ class UpdateCheckParseTest {
         assertFalse(check.hasAsset)
     }
 
+
+    @Test
+    fun v104ReleaseWithOnlyOldAssetsFallsBackToReleasePage() {
+        /*
+         * v1.0.4 Release 里如果只剩旧版 v1.0.0 的资产，后端筛选后 apk/ipk 必须为 null，
+         * 客户端不得展示旧下载链接，只能打开 html_url 指向的 v1.0.4 Release 页。
+         */
+        val check = client.parseUpdateCheck(
+            """
+            {
+              "configured": true,
+              "repo": "owner/repo",
+              "current": "1.0.3",
+              "latest": "1.0.4",
+              "has_update": true,
+              "published_at": "2026-11-22T10:00:00Z",
+              "html_url": "https://github.com/owner/repo/releases/tag/v1.0.4",
+              "notes": "新 UI 与安装修复",
+              "apk": null,
+              "ipk": null
+            }
+            """.trimIndent()
+        )
+        assertTrue(check.configured)
+        assertTrue(check.hasUpdate)
+        assertEquals("1.0.4", check.latestText)
+        assertFalse(check.hasAsset)
+        assertNull(check.apk)
+        assertNull(check.ipk)
+        assertTrue(check.hasReleasePage)
+        assertEquals("https://github.com/owner/repo/releases/tag/v1.0.4", check.htmlUrl)
+    }
+
     @Test
     fun notesSummaryTruncatesLongText() {
         val check = UpdateCheck(notes = "第一行\n\n第二行" + "很长的说明".repeat(100))

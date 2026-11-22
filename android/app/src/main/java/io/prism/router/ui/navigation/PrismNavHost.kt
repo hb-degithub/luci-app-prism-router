@@ -1,5 +1,6 @@
 package io.prism.router.ui.navigation
 
+import android.os.Build
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -33,18 +34,24 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.navigation
 import androidx.navigation.createGraph
+import androidx.navigation.navArgument
+import io.prism.router.data.Device
 import io.prism.router.data.MAX_SERVERS
 import io.prism.router.data.MainViewModel
 import io.prism.router.data.UiState
+import io.prism.router.data.normalizeMac
 import io.prism.router.ui.AppsScreen
 import io.prism.router.ui.ConfigScreen
+import io.prism.router.ui.DeviceDetailScreen
 import io.prism.router.ui.DevicesScreen
 import io.prism.router.ui.NetworkScreen
 import io.prism.router.ui.OverviewScreen
@@ -57,6 +64,7 @@ import io.prism.router.ui.components.SectionCard
 import io.prism.router.ui.theme.PrismSize
 import io.prism.router.ui.theme.PrismSpacing
 import io.prism.router.ui.theme.ThemeMode
+import io.prism.router.ui.DeviceRouteCodec
 
 /* ───────────────────────── 路由表 ───────────────────────── */
 
@@ -78,6 +86,28 @@ object PrismRoutes {
 
     /** 网络配置（LAN / WAN / DHCP / 系统 / 端口转发），仅管理员登录后可用。 */
     const val SETTINGS_CONFIG = "settings/config"
+
+    /** 设备详情：路径参数是规范化后的 MAC（冒号编码为 %3A）。 */
+    const val DEVICE_DETAIL = "device/{mac}"
+    const val DEVICE_DETAIL_ARG = "mac"
+
+    /**
+     * 设备详情路由占位符：MAC 为空（无法作为路径参数）时使用。
+     * 详情页会把该占位符当成「设备已不在当前列表」展示，而不是崩溃 / 白屏。
+     */
+    const val DEVICE_DETAIL_UNKNOWN = "-"
+
+    /**
+     * 构建设备详情路由（`device/{mac}`）。
+     *
+     * 先按后端 / [io.prism.router.data.normalizeMac] 的规则归一化（大写、冒号分隔），
+     * 再做百分号编码：冒号必须编码成 `%3A`，否则会被 Uri 解析成 scheme 分隔符。
+     * 路由里只放 MAC，绝不放 token / 面板地址等敏感数据。
+     */
+    fun deviceDetailRoute(mac: String): String {
+        /* 严格 MAC 编码；空/非法值进入受控的“设备不可用”空态，不构造歧义路由。 */
+        return "device/" + (DeviceRouteCodec.encode(mac) ?: DEVICE_DETAIL_UNKNOWN)
+    }
 }
 
 /** 底部导航的 5 个一级目的地（Material 指南：≤5 项）。 */
@@ -105,6 +135,28 @@ fun NavHostController.navigateToTab(destination: PrismDestination) {
         launchSingleTop = true
         restoreState = true
     }
+}
+
+/**
+ * 打开设备详情。
+ *
+ * MAC 是唯一路由键：没有 MAC 的设备无法定位到详情，退回设备页签而不是跳非法路由。
+ * 正常路径由设备页 / 概览的点击回调触发，此前已按 [normalizeMac] 判空。
+ */
+private fun NavHostController.openDeviceDetail(device: Device) {
+    if (normalizeMac(device.mac).isBlank()) {
+        navigateToTab(PrismDestination.DEVICES)
+        return
+    }
+    navigate(PrismRoutes.deviceDetailRoute(device.mac)) {
+        /* 慢机/双击不能把同一台设备压栈两次，否则返回时仍停在相同详情页。 */
+        launchSingleTop = true
+    }
+}
+
+/** 详情页返回：优先弹回上一页（设备列表 / 概览），返回栈异常时兜底回设备页签。 */
+private fun NavHostController.backFromDeviceDetail() {
+    if (!popBackStack()) navigateToTab(PrismDestination.DEVICES)
 }
 
 /**
@@ -218,6 +270,11 @@ fun PrismNavHost(
                         onOpenDevices = {
                             navController.navigateToTab(PrismDestination.DEVICES)
                         },
+                        /*
+                         * Top 3 活跃设备行：有该回调时直接进单设备详情；
+                         * 「查看全部」仍走设备页签（见 OverviewScreen 的 action 槽）。
+                         */
+                        onOpenDevice = { device -> navController.openDeviceDetail(device) },
                         onOpenNetwork = {
                             navController.navigateToTab(PrismDestination.NETWORK)
                         }
@@ -226,7 +283,32 @@ fun PrismNavHost(
 
                 composable(PrismRoutes.DEVICES) {
                     /* 设备屏自带 PrismScaffold；vm 只用于下拉刷新（屏幕仍只渲染传入的 ui）。 */
-                    DevicesScreen(ui = vm.ui, vm = vm)
+                    DevicesScreen(
+                        ui = vm.ui,
+                        vm = vm,
+                        /* 正式详情路由；MAC 为空时设备屏自己回退到旧弹层。 */
+                        onOpenDevice = { device -> navController.openDeviceDetail(device) }
+                    )
+                }
+
+                /*
+                 * 设备详情：主图内的二级目的地，因此底部导航自动隐藏、系统返回由
+                 * NavController 弹出。MAC 经路径参数传入（只含归一化 MAC，无敏感数据）。
+                 */
+                composable(
+                    route = PrismRoutes.DEVICE_DETAIL,
+                    arguments = listOf(
+                        navArgument(PrismRoutes.DEVICE_DETAIL_ARG) { type = NavType.StringType }
+                    )
+                ) { entry ->
+                    DeviceDetailScreen(
+                        ui = vm.ui,
+                        mac = entry.arguments
+                            ?.getString(PrismRoutes.DEVICE_DETAIL_ARG)
+                            .orEmpty(),
+                        onRetry = { vm.refresh() },
+                        onBack = { navController.backFromDeviceDetail() }
+                    )
                 }
 
                 composable(PrismRoutes.APPS) {
@@ -394,7 +476,7 @@ private fun ServersRoute(ui: UiState, onBack: () -> Unit) {
 
             SectionCard(title = "编辑入口", subtitle = "为什么这里不能直接改？") {
                 Text(
-                    text = "面板地址、令牌与刷新间隔仍在「设置」页编辑，避免同一份配置出现两个写入入口。" +
+                    text = "路由器地址、令牌与刷新间隔仍在「设置」页编辑，避免同一份配置出现两个写入入口。" +
                         "完整的多路由器管理（重命名 / 排序 / 批量删除）会在后续版本迁到这里。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -429,8 +511,26 @@ private fun AboutRoute(onBack: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(PrismSpacing.md)
         ) {
             SectionCard(title = "关于棱镜路由", subtitle = "Android 原生客户端") {
+                val context = LocalContext.current
+                /* 版本必须来自 PackageManager（Gradle 的 versionName/versionCode），
+                   不能写死：CI 按 Release tag 注入版本，写死会让 About 永远停在旧版本。 */
+                val packageInfo = remember(context) {
+                    runCatching {
+                        context.packageManager.getPackageInfo(context.packageName, 0)
+                    }.getOrNull()
+                }
+                val versionText = if (packageInfo == null) {
+                    "未知"
+                } else {
+                    val code = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        packageInfo.longVersionCode
+                    } else {
+                        @Suppress("DEPRECATION") packageInfo.versionCode.toLong()
+                    }
+                    formatAppVersion(packageInfo.versionName, code)
+                }
                 InfoLine("应用", "棱镜路由")
-                InfoLine("版本", "1.0.0 (1)")
+                InfoLine("版本", versionText)
                 InfoLine("数据来源", "路由器只读面板 /cgi-bin/panel-api")
                 InfoLine("权限", "只读展示，不修改路由器配置")
             }
@@ -445,6 +545,16 @@ private fun AboutRoute(onBack: () -> Unit) {
             }
         }
     }
+}
+
+/**
+ * About 页版本文案：`versionName (versionCode)`。
+ *
+ * 抽成纯函数便于 JVM 单测；真实值由 PackageManager 读取，缺失时退回 `? (0)`。
+ */
+internal fun formatAppVersion(versionName: String?, versionCode: Long): String {
+    val name = versionName?.trim().orEmpty().ifBlank { "?" }
+    return "$name ($versionCode)"
 }
 
 @Composable

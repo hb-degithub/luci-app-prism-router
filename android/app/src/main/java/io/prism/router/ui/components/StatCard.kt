@@ -38,7 +38,8 @@ import io.prism.router.ui.theme.PrismSpacing
  *
  * - [accent] 决定左侧强调条与图标底色；
  * - 可点击时自动具备 48dp 触控高度、Button 语义与整卡内容描述；
- * - 数值使用 HeadlineSmall，单位使用 LabelSmall，避免长数字撑破一行。
+ * - 数值使用 HeadlineSmall + tabular figures，单位使用 LabelSmall，
+ *   避免长数字撑破一行或在轮询时抖动。
  */
 @Composable
 fun StatCard(
@@ -67,16 +68,13 @@ fun StatCard(
     Surface(
         modifier = modifier
             .fillMaxWidth()
-            .heightIn(min = 96.dp)
+            .heightIn(min = 88.dp)
             .then(clickModifier),
         shape = shape,
         color = MaterialTheme.colorScheme.surface,
         contentColor = MaterialTheme.colorScheme.onSurface,
         tonalElevation = 0.dp,
-        border = androidx.compose.foundation.BorderStroke(
-            1.dp,
-            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
-        )
+        shadowElevation = 0.dp
     ) {
         Row(
             modifier = Modifier
@@ -86,8 +84,8 @@ fun StatCard(
         ) {
             Box(
                 Modifier
-                    .width(4.dp)
-                    .height(PrismSize.touchTarget)
+                    .width(3.dp)
+                    .height(40.dp)
                     .background(accent, RoundedCornerShape(2.dp))
             )
             Spacer(Modifier.width(PrismSpacing.md))
@@ -103,7 +101,9 @@ fun StatCard(
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
                         text = value,
-                        style = MaterialTheme.typography.headlineSmall,
+                        style = MaterialTheme.typography.headlineSmall.copy(
+                            fontFeatureSettings = "tnum"
+                        ),
                         color = MaterialTheme.colorScheme.onSurface,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis

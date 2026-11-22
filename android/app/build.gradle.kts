@@ -5,6 +5,18 @@ plugins {
 }
 
 /*
+ * 版本单一来源：
+ * - 默认 1.0.4 / 4，与 Makefile（1.0.4）、tools/build-ipk.sh 默认值一致；
+ * - CI 按 Release tag 注入 -PPRISM_VERSION_NAME=1.0.4 -PPRISM_VERSION_CODE=10004，
+ *   保证 About 页、APK 文件名与 GitHub Release 资产版本一致。
+ */
+val prismVersionName: String =
+    (project.findProperty("PRISM_VERSION_NAME") as String?)?.trim()?.takeIf { it.isNotEmpty() }
+        ?: "1.0.4"
+val prismVersionCode: Int =
+    (project.findProperty("PRISM_VERSION_CODE") as String?)?.toIntOrNull() ?: 4
+
+/*
  * release 签名（仅本地内测）：
  * - keystore 在 android/keystore/prism-router.jks，由 keytool 自签名生成；
  * - 口令只放在 android/gradle.properties（PRISM_STORE_PASSWORD / PRISM_KEY_PASSWORD），
@@ -21,8 +33,8 @@ android {
         applicationId = "io.prism.router"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = prismVersionCode
+        versionName = prismVersionName
     }
 
     signingConfigs {
@@ -74,4 +86,9 @@ dependencies {
     /* 单元测试：JVM 里跑纯逻辑；org.json 在 JVM 下由真实实现提供（android.jar 里只是桩）。 */
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+}
+
+/* CI 用：打印本次构建实际生效的 versionName，避免资产文件名与 APK 内版本不一致。 */
+tasks.register("printVersionName") {
+    doLast { println(prismVersionName) }
 }

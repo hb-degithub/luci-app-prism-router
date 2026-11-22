@@ -7,7 +7,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -150,10 +149,7 @@ private fun PrismBottomBar(
     onSelect: (PrismDestination) -> Unit
 ) {
     Column(Modifier.navigationBarsPadding()) {
-        /* 1dp 分隔线替代阴影：深浅色下都不会在内容区投出脏边。 */
-        HorizontalDivider(
-            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-        )
+        /* 不画 1dp 分隔线：底部栏用 surface 与背景形成层级，避免多一条苍白横线。 */
         NavigationBar(
             modifier = Modifier.fillMaxWidth(),
             windowInsets = WindowInsets(0, 0, 0, 0),

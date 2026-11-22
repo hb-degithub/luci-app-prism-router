@@ -1,4 +1,5 @@
 #!/bin/sh
+. /src/tests/lib/prism-version-inner.sh
 # 设备别名/分组 · 月配额 · 导出（CSV/JSON + Prometheus）· 陌生设备标记 —— 容器内用例
 # 由 tests/container-validate-features.sh 调用（隔离容器，--network none）。
 #
@@ -128,7 +129,7 @@ echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 echo "=== 1. 安装两个包 ==="
 # 严格依赖安装：不使用 --force-depends。前端已改用内置 SVG，不再依赖
 # luci-lib-chartjs；其余依赖 deps 镜像都有，所以不需要任何占位包。
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 && ok "安装 prism-router（严格依赖）" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
+opkg install "$PRISM_IPK" >/tmp/i1.log 2>&1 && ok "安装 prism-router（严格依赖）" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
 true >/tmp/i2.log 2>&1 && ok "安装 luci-app-prism-router（严格依赖）" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }
 
 echo "=== 2. 新配置项 / 文件落位 / 权限 / 语法 ==="

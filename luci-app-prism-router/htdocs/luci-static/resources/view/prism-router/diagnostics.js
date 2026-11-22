@@ -1,6 +1,7 @@
 'use strict';
 'require view';
 'require rpc';
+'require prism-router/theme as theme';
 
 /*
  * 棱镜路由 · 诊断中心（只读自检页）
@@ -80,54 +81,54 @@ var callStations = rpc.declare({
 // ---------------------------------------------------------------- 样式
 
 var CSS = [
-	'#ts-diagnostics{max-width:980px;margin:0 auto;padding:4px 2px 24px}',
-	'.tsd-head{margin:0 0 10px}',
-	'.tsd-title-main{margin:0 0 4px;font-size:20px;line-height:1.3}',
-	'.tsd-sub{margin:0;color:#666;font-size:12.5px;line-height:1.5}',
-	'.tsd-panel-link{margin-left:10px;color:#ff6f00;text-decoration:none;white-space:nowrap}',
-	'.tsd-panel-link:hover{text-decoration:underline}',
-	'.tsd-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;',
-	'padding:10px 12px;margin:0 0 14px;background:#f4f6f8;',
-	'border:1px solid #e0e4e8;border-radius:6px}',
-	'.tsd-sum{margin:0;font-size:13.5px;color:#333}',
-	'.tsd-sum strong{font-size:15px}',
-	'.tsd-n-ok{color:#2e7d32}',
-	'.tsd-n-warn{color:#ef6c00}',
-	'.tsd-n-fail{color:#c62828}',
-	'.tsd-sep{color:#bbb;margin:0 6px}',
-	'.tsd-time{margin:0 0 0 auto;color:#777;font-size:12px}',
-	'.tsd-btn{flex:0 0 auto}',
-	'.tsd-list{display:block}',
-	'.tsd-item{margin:0 0 10px;padding:10px 12px;background:#fff;',
-	'border:1px solid #e0e4e8;border-left:4px solid #9e9e9e;border-radius:6px}',
-	'.tsd-item.tsd-ok{border-left-color:#2e7d32}',
-	'.tsd-item.tsd-warn{border-left-color:#ef6c00}',
-	'.tsd-item.tsd-fail{border-left-color:#c62828}',
-	'.tsd-row{display:flex;align-items:flex-start;gap:8px}',
-	'.tsd-dot{flex:0 0 auto;width:10px;height:10px;margin-top:5px;border-radius:50%;',
-	'background:#9e9e9e}',
-	'.tsd-ok .tsd-dot{background:#2e7d32}',
-	'.tsd-warn .tsd-dot{background:#ef6c00}',
-	'.tsd-fail .tsd-dot{background:#c62828}',
-	'.tsd-body{flex:1 1 auto;min-width:0}',
-	'.tsd-name{margin:0 0 2px;font-size:14px;font-weight:600;line-height:1.4}',
-	'.tsd-badge{display:inline-block;margin-left:6px;padding:0 6px;border-radius:9px;',
-	'font-size:11px;font-weight:500;line-height:16px;color:#fff;background:#2e7d32;',
+	'#ts-diagnostics{max-width:980px;margin:0 auto;padding:4px 2px 24px;min-width:0}',
+	'#ts-diagnostics .tsd-head{margin:0 0 10px}',
+	'#ts-diagnostics .tsd-title-main{margin:0 0 4px;font-size:var(--ts-fs-4);line-height:1.3}',
+	'#ts-diagnostics .tsd-sub{margin:0;color:var(--ts-text-2);font-size:12px;line-height:1.6;overflow-wrap:anywhere}',
+	'#ts-diagnostics .tsd-panel-link{margin-left:10px;color:var(--ts-down-text);text-decoration:none;white-space:nowrap}',
+	'#ts-diagnostics .tsd-panel-link:hover{text-decoration:underline}',
+	'#ts-diagnostics .tsd-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;',
+	'padding:10px 12px;margin:0 0 14px;background:var(--ts-surface);',
+	'border:1px solid var(--ts-border);border-radius:var(--ts-r-sm)}',
+	'#ts-diagnostics .tsd-sum{margin:0;font-size:13.5px;color:var(--ts-text)}',
+	'#ts-diagnostics .tsd-sum strong{font-size:15px}',
+	'#ts-diagnostics .tsd-n-ok{color:var(--ts-ok-text)}',
+	'#ts-diagnostics .tsd-n-warn{color:var(--ts-warn-text)}',
+	'#ts-diagnostics .tsd-n-fail{color:var(--ts-bad-text)}',
+	'#ts-diagnostics .tsd-sep{color:var(--ts-text-3);margin:0 6px}',
+	'#ts-diagnostics .tsd-time{margin:0 0 0 auto;color:var(--ts-text-3);font-size:12px}',
+	'#ts-diagnostics .tsd-btn{flex:0 0 auto}',
+	'#ts-diagnostics .tsd-list{display:block}',
+	'#ts-diagnostics .tsd-item{margin:0 0 10px;padding:10px 12px;background:var(--ts-surface);',
+	'border:1px solid var(--ts-border);border-left:4px solid var(--ts-neutral);border-radius:var(--ts-r-sm)}',
+	'#ts-diagnostics .tsd-item.tsd-ok{border-left-color:var(--ts-ok)}',
+	'#ts-diagnostics .tsd-item.tsd-warn{border-left-color:var(--ts-warn)}',
+	'#ts-diagnostics .tsd-item.tsd-fail{border-left-color:var(--ts-bad)}',
+	'#ts-diagnostics .tsd-row{display:flex;align-items:flex-start;gap:8px}',
+	'#ts-diagnostics .tsd-dot{flex:0 0 auto;width:10px;height:10px;margin-top:5px;border-radius:50%;',
+	'background:var(--ts-neutral)}',
+	'#ts-diagnostics .tsd-ok .tsd-dot{background:var(--ts-ok)}',
+	'#ts-diagnostics .tsd-warn .tsd-dot{background:var(--ts-warn)}',
+	'#ts-diagnostics .tsd-fail .tsd-dot{background:var(--ts-bad)}',
+	'#ts-diagnostics .tsd-body{flex:1 1 auto;min-width:0}',
+	'#ts-diagnostics .tsd-name{margin:0 0 2px;font-size:14px;font-weight:600;line-height:1.4}',
+	'#ts-diagnostics .tsd-badge{display:inline-block;margin-left:6px;padding:0 6px;border-radius:9px;',
+	'font-size:12px;font-weight:600;line-height:17px;color:var(--ts-ok-text);background:rgba(22,163,74,.14);',
 	'vertical-align:1px}',
-	'.tsd-warn .tsd-badge{background:#ef6c00}',
-	'.tsd-fail .tsd-badge{background:#c62828}',
-	'.tsd-detail{margin:0;color:#444;font-size:12.5px;line-height:1.55;word-break:break-word}',
-	'.tsd-advice{margin:8px 0 0 18px;font-size:12.5px}',
-	'.tsd-advice>summary{cursor:pointer;color:#1565c0}',
-	'.tsd-tips{margin:6px 0 0;padding-left:18px;color:#555;line-height:1.6}',
-	'.tsd-tips>li{margin:2px 0;word-break:break-word}',
-	'.tsd-foot{margin:14px 0 0;color:#888;font-size:11.5px;line-height:1.5}',
+	'#ts-diagnostics .tsd-warn .tsd-badge{background:rgba(217,119,6,.14);color:var(--ts-warn-text)}',
+	'#ts-diagnostics .tsd-fail .tsd-badge{background:rgba(220,38,38,.14);color:var(--ts-bad-text)}',
+	'#ts-diagnostics .tsd-detail{margin:0;color:var(--ts-text-2);font-size:12px;line-height:1.6;word-break:break-word}',
+	'#ts-diagnostics .tsd-advice{margin:8px 0 0 18px;font-size:12.5px}',
+	'#ts-diagnostics .tsd-advice>summary{cursor:pointer;color:var(--ts-down-text)}',
+	'#ts-diagnostics .tsd-tips{margin:6px 0 0;padding-left:18px;color:var(--ts-text-2);line-height:1.6}',
+	'#ts-diagnostics .tsd-tips>li{margin:2px 0;word-break:break-word}',
+	'#ts-diagnostics .tsd-foot{margin:14px 0 0;color:var(--ts-text-3);font-size:12px;line-height:1.6}',
 	'@media (max-width:600px){',
-	'.tsd-title-main{font-size:18px}',
-	'.tsd-toolbar{gap:8px}',
-	'.tsd-time{margin-left:0}',
-	'.tsd-name{font-size:13.5px}',
-	'.tsd-item{padding:9px 10px}',
+	'#ts-diagnostics .tsd-title-main{font-size:var(--ts-fs-3)}',
+	'#ts-diagnostics .tsd-toolbar{gap:8px}',
+	'#ts-diagnostics .tsd-time{margin-left:0}',
+	'#ts-diagnostics .tsd-name{font-size:13.5px}',
+	'#ts-diagnostics .tsd-item{padding:9px 10px}',
 	'}'
 ].join('');
 
@@ -807,10 +808,11 @@ return view.extend({
 		}, _('重新检查'));
 		this.listEl = E('div', { 'class': 'tsd-list' });
 
-		this.root = E('div', { 'id': 'ts-diagnostics' }, [
+		this.root = E('div', { 'id': 'ts-diagnostics', 'class': theme.CLASS }, [
+			theme.style(),
 			E('style', {}, CSS),
 			E('div', { 'class': 'tsd-head' }, [
-				E('h2', { 'class': 'tsd-title-main' }, _('棱镜路由 · 诊断')),
+				E('h2', { 'class': 'tsd-title-main ts-title' }, _('棱镜路由 · 诊断')),
 				E('p', { 'class': 'tsd-sub' }, [
 					_('只读检查，不会修改任何配置。'),
 					E('a', {

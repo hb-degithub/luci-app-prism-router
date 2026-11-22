@@ -20,11 +20,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-prism-router
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.0.4
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=prism-router
+PKG_CONF_SHA:=$(shell sha256sum $(CURDIR)/root/etc/config/prism-router | cut -d' ' -f1)
 
 LUCI_TITLE:=LuCI 棱镜路由（代理/直连 · 设备 · 域名 · 飞书报表）
 LUCI_DESCRIPTION:=单包插件：按设备/域名统计代理与直连流量，含实时速率、记账健康度、拓扑、诊断与飞书日报；另带可选独立面板服务。
@@ -45,6 +46,7 @@ endef
 define Package/luci-app-prism-router/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./root/usr/bin/prism-routerd $(1)/usr/bin/prism-routerd
+	$(SED) "s/^\(const[[:space:]]\+DAEMON_VERSION[[:space:]]*=[[:space:]]*\)'[^']*';/\1'$(PKG_VERSION)';/" $(1)/usr/bin/prism-routerd
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./root/etc/init.d/prism-routerd $(1)/etc/init.d/prism-routerd
@@ -59,6 +61,7 @@ define Package/luci-app-prism-router/install
 
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/ucode
 	$(INSTALL_DATA) ./root/usr/share/rpcd/ucode/prism-router.uc $(1)/usr/share/rpcd/ucode/prism-router.uc
+	$(SED) "s/^\(const[[:space:]]\+VERSION[[:space:]]*=[[:space:]]*\)'[^']*';/\1'$(PKG_VERSION)';/" $(1)/usr/share/rpcd/ucode/prism-router.uc
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-prism-router.json $(1)/usr/share/rpcd/acl.d/luci-app-prism-router.json
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
@@ -68,17 +71,19 @@ define Package/luci-app-prism-router/install
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-ingest $(1)/www/cgi-bin/prism-router-ingest
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-stations $(1)/www/cgi-bin/prism-router-stations
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-metrics $(1)/www/cgi-bin/prism-router-metrics
+	$(SED) "s/^\(const[[:space:]]\+VERSION[[:space:]]*=[[:space:]]*\)'[^']*';/\1'$(PKG_VERSION)';/" $(1)/www/cgi-bin/prism-router-metrics
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-feishu $(1)/www/cgi-bin/prism-router-feishu
+	$(SED) "s/^\(const[[:space:]]\+VERSION[[:space:]]*=[[:space:]]*\)'[^']*';/\1'$(PKG_VERSION)';/" $(1)/www/cgi-bin/prism-router-feishu
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-control $(1)/www/cgi-bin/prism-router-control
 	# 只读系统信息（无登录）+ 管理员 API（token）；两个都必须 755。
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-system $(1)/www/cgi-bin/prism-router-system
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-admin $(1)/www/cgi-bin/prism-router-admin
+	$(INSTALL_DIR) $(1)/www/prism-router-panel/cgi-bin
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-control $(1)/www/prism-router-panel/cgi-bin/prism-router-control
 	# 面板服务（8099）也要能访问 system/admin：同一份 CGI 再装一份到面板目录。
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-system $(1)/www/prism-router-panel/cgi-bin/prism-router-system
 	$(INSTALL_BIN) ./root/www/cgi-bin/prism-router-admin $(1)/www/prism-router-panel/cgi-bin/prism-router-admin
 
-	$(INSTALL_DIR) $(1)/www/prism-router-panel/cgi-bin
 	$(INSTALL_DATA) ./root/www/prism-router-panel/index.html $(1)/www/prism-router-panel/index.html
 	$(INSTALL_DATA) ./root/www/prism-router-panel/app.js $(1)/www/prism-router-panel/app.js
 	$(INSTALL_DATA) ./root/www/prism-router-panel/style.css $(1)/www/prism-router-panel/style.css
@@ -93,9 +98,10 @@ endef
 define Package/luci-app-prism-router/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] || {
-	# 从旧包 traffic-stats / luci-app-traffic-stats 迁移：旧配置优先并补 panel 段；
-	# 旧数据目录整份复制；旧服务停用，避免新旧守护进程双跑。
-	if [ -f /etc/config/traffic-stats ]; then
+	# 仅首次安装且当前仍为包内默认配置时迁移；升级或已有用户配置绝不覆盖。
+	if [ -f /etc/config/traffic-stats ] \
+		&& ! grep -q '^Package: luci-app-prism-router$$' /usr/lib/opkg/status 2>/dev/null \
+		&& { [ ! -e /etc/config/prism-router ] || [ "$$(sha256sum /etc/config/prism-router 2>/dev/null | awk '{print $$1}')" = '$(PKG_CONF_SHA)' ]; }; then
 		cp -p /etc/config/traffic-stats /etc/config/prism-router 2>/dev/null
 		if ! uci -q get prism-router.panel.enabled >/dev/null 2>&1; then
 			uci -q set prism-router.panel=panel
@@ -117,7 +123,7 @@ define Package/luci-app-prism-router/postinst
 	fi
 	if [ -d /etc/traffic-stats ]; then
 		mkdir -p /etc/prism-router
-		cp -a /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null || cp -r /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null
+		cp -a -n /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null || cp -rn /etc/traffic-stats/. /etc/prism-router/ 2>/dev/null
 	fi
 	if [ -x /etc/init.d/traffic-statsd ]; then
 		/etc/init.d/traffic-statsd stop >/dev/null 2>&1

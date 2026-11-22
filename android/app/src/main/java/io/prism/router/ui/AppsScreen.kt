@@ -1,7 +1,6 @@
 package io.prism.router.ui
 
 import androidx.activity.ComponentActivity
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -44,7 +43,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -64,6 +62,8 @@ import io.prism.router.ui.components.PrismIconAction
 import io.prism.router.ui.components.PrismScaffold
 import io.prism.router.ui.components.Segmented
 import io.prism.router.ui.components.SkeletonList
+import io.prism.router.ui.theme.LocalPrismCategoryColors
+import io.prism.router.ui.theme.LocalPrismDataColors
 import io.prism.router.ui.theme.LocalPrismSemanticColors
 import io.prism.router.ui.theme.PrismRadius
 import io.prism.router.ui.theme.PrismSize
@@ -89,11 +89,11 @@ private val AppRanges = listOf(RANGE_TODAY, RANGE_7D)
 /** 下拉刷新看门狗：请求异常卡住时最多转 8 秒，避免指示器永久停在顶部。 */
 private const val REFRESH_WATCHDOG_MS = 8_000L
 
-/** 域名 / 速率等机器可读串的等宽样式（域名长，字号比设备页略大）。 */
+/** 域名 / 速率等机器可读串的等宽样式（最小 12sp，保证说明文字可读）。 */
 private val MonoCaption = TextStyle(
     fontFamily = FontFamily.Monospace,
-    fontSize = 11.sp,
-    lineHeight = 15.sp,
+    fontSize = 12.sp,
+    lineHeight = 16.sp,
     letterSpacing = 0.sp
 )
 
@@ -140,20 +140,6 @@ private fun categoryOf(host: String): AppCategory {
     return CategoryRules.firstOrNull { (category, keywords) ->
         category != AppCategory.OTHER && keywords.any { h.contains(it) }
     }?.first ?: AppCategory.OTHER
-}
-
-/** 类别配色：全部取主题色，深浅色自适应，不写死十六进制。 */
-@Composable
-private fun categoryColor(category: AppCategory): Color {
-    val semantic = LocalPrismSemanticColors.current
-    return when (category) {
-        AppCategory.VIDEO -> MaterialTheme.colorScheme.error
-        AppCategory.SOCIAL -> MaterialTheme.colorScheme.primary
-        AppCategory.DOWNLOAD -> MaterialTheme.colorScheme.secondary
-        AppCategory.SHOPPING -> semantic.warning
-        AppCategory.GAME -> MaterialTheme.colorScheme.tertiary
-        AppCategory.OTHER -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
 }
 
 /**
@@ -237,8 +223,15 @@ fun AppsScreen(
     val counts = remember(rows) {
         categories.associateWith { category -> rows.count { it.category == category } }
     }
-    val selectedCategory =
-        if (categoryIndex in 1..categories.size) categories[categoryIndex - 1] else null
+    /* 只允许选中「当前有数据」的类别；0 计数的类别不渲染，也不保留选中态。 */
+    val selectedCategory = if (categoryIndex in 1..categories.size) {
+        categories[categoryIndex - 1].takeIf { (counts[it] ?: 0) > 0 }
+    } else {
+        null
+    }
+    LaunchedEffect(selectedCategory) {
+        if (categoryIndex != 0 && selectedCategory == null) categoryIndex = 0
+    }
     val shown = if (selectedCategory == null) {
         rows
     } else {
@@ -273,7 +266,7 @@ fun AppsScreen(
     }
 
     PrismScaffold(
-        title = "应用",
+        title = "应用 / 域名",
         subtitle = appsSubtitle(count = rows.size, sevenDay = sevenDay),
         actions = {
             PrismIconAction(
@@ -454,7 +447,7 @@ private fun Top50Notice(updatedAt: Long) {
     }
 }
 
-/** 类别筛选：全部 + 6 类，带当前时间范围内的条目数；横向滚动避免 390dp 下挤压。 */
+/** 类别筛选：全部 + 有数据的类别（0 计数不渲染），横向滚动避免 360dp 下挤压。 */
 @Composable
 private fun CategoryChips(
     rows: List<AppRow>,
@@ -462,6 +455,7 @@ private fun CategoryChips(
     selected: AppCategory?,
     onSelect: (AppCategory?) -> Unit
 ) {
+    val available = AppCategory.entries.filter { (counts[it] ?: 0) > 0 }
     LazyRow(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.sm)) {
         item {
             CategoryChip(
@@ -470,7 +464,7 @@ private fun CategoryChips(
                 onClick = { onSelect(null) }
             )
         }
-        items(AppCategory.entries) { category ->
+        items(available) { category ->
             CategoryChip(
                 label = "${category.label} ${counts[category] ?: 0}",
                 selected = selected == category,
@@ -499,14 +493,14 @@ private fun CategoryChip(label: String, selected: Boolean, onClick: () -> Unit) 
 /* ───────────────────────── 应用卡片 ───────────────────────── */
 
 /**
- * 商用风格应用行：
- * - 第一行：类别徽章 + 域名（等宽、过长省略）+ 今日合计；
- * - 第二行：链路 Pill（DIRECT 绿）+ 下行 / 上行 + 设备数（今日）或出现天数（7 天）；
+ * 驾驶舱风格应用行：
+ * - 第一行：类别徽章（中性色，不占用状态色）+ 域名（等宽、过长省略）+ 今日合计；
+ * - 第二行：链路 Pill（直连次要青 / 代理品牌蓝）+ 下行蓝 / 上行青 + 设备数（今日）；
  * - 第三行（仅近 7 天）：合计 / 日均 / 出现天数。
  */
 @Composable
 private fun AppCard(row: AppRow, sevenDay: Boolean) {
-    val categoryAccent = categoryColor(row.category)
+    val data = LocalPrismDataColors.current
     val shape = MaterialTheme.shapes.medium
 
     Surface(
@@ -515,7 +509,7 @@ private fun AppCard(row: AppRow, sevenDay: Boolean) {
         color = MaterialTheme.colorScheme.surface,
         contentColor = MaterialTheme.colorScheme.onSurface,
         tonalElevation = 0.dp,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f))
+        shadowElevation = 0.dp
     ) {
         Column(
             Modifier
@@ -525,7 +519,7 @@ private fun AppCard(row: AppRow, sevenDay: Boolean) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Pill(
                     text = row.category.label,
-                    color = categoryAccent,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     leadingDot = false
                 )
                 Spacer(Modifier.width(PrismSpacing.sm))
@@ -533,8 +527,7 @@ private fun AppCard(row: AppRow, sevenDay: Boolean) {
                     text = row.host,
                     style = MaterialTheme.typography.bodyMedium.copy(
                         fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 13.sp
+                        fontWeight = FontWeight.Medium
                     ),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -547,7 +540,7 @@ private fun AppCard(row: AppRow, sevenDay: Boolean) {
                         style = MaterialTheme.typography.bodyMedium.copy(
                             fontFamily = FontFamily.Monospace,
                             fontWeight = FontWeight.SemiBold,
-                            fontSize = 13.sp
+                            fontFeatureSettings = "tnum"
                         ),
                         maxLines = 1
                     )
@@ -561,14 +554,14 @@ private fun AppCard(row: AppRow, sevenDay: Boolean) {
                 Text(
                     text = "↓ ${fmtBytes(row.rx)}",
                     style = MonoCaption,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = data.download,
                     maxLines = 1
                 )
                 Spacer(Modifier.width(PrismSpacing.sm))
                 Text(
                     text = "↑ ${fmtBytes(row.tx)}",
                     style = MonoCaption,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = data.upload,
                     maxLines = 1
                 )
                 Spacer(Modifier.weight(1f))
@@ -587,21 +580,21 @@ private fun AppCard(row: AppRow, sevenDay: Boolean) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = "合计 ${fmtBytes(row.total)}",
-                        style = MaterialTheme.typography.labelSmall,
+                        style = MaterialTheme.typography.labelSmall.tabular(),
                         color = MaterialTheme.colorScheme.onSurface,
                         maxLines = 1
                     )
                     SeparatorDot()
                     Text(
                         text = "日均 ${fmtBytes(row.daily)}",
-                        style = MaterialTheme.typography.labelSmall,
+                        style = MaterialTheme.typography.labelSmall.tabular(),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1
                     )
                     SeparatorDot()
                     Text(
                         text = "出现 ${row.days} 天",
-                        style = MaterialTheme.typography.labelSmall,
+                        style = MaterialTheme.typography.labelSmall.tabular(),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1
                     )
@@ -616,23 +609,22 @@ private fun SeparatorDot() {
     Text(
         text = "·",
         style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(horizontal = PrismSpacing.xs)
     )
 }
 
 /**
- * 出口链路 Pill：`DIRECT` 用 success 绿（显示「直连」），其余非空链路用 primary 蓝。
- * 缺失显示「—」并置灰——不冒充代理。
+ * 出口链路 Pill：直连/代理使用固定类别色，不复用上下行方向色。
+ * 缺失显示「—」并置灰——不冒充代理，也不占用绿 / 橙 / 红状态色。
  */
 @Composable
 private fun ChainPill(chain: String) {
     val normalized = chain.trim()
-    val semantic = LocalPrismSemanticColors.current
     val color = when {
-        normalized.isEmpty() -> MaterialTheme.colorScheme.onSurfaceVariant
-        normalized.equals("DIRECT", ignoreCase = true) -> semantic.success
-        else -> MaterialTheme.colorScheme.primary
+        normalized.isEmpty() -> LocalPrismCategoryColors.current.neutral
+        normalized.equals("DIRECT", ignoreCase = true) -> LocalPrismCategoryColors.current.direct
+        else -> LocalPrismCategoryColors.current.proxy
     }
     Pill(
         text = when {
@@ -653,11 +645,11 @@ private fun ChainPill(chain: String) {
 private fun EmptyApps(sevenDay: Boolean) {
     EmptyState(
         icon = Icons.Rounded.Apps,
-        title = if (sevenDay) "近 7 天暂无应用数据" else "暂无应用数据",
+        title = if (sevenDay) "近 7 天暂无应用 / 域名数据" else "暂无应用 / 域名数据",
         desc = if (sevenDay) {
             "路由器可能还未生成每日摘要；产生流量后汇总会自动出现。"
         } else {
-            "路由器还没有统计到域名用量，产生流量后会自动出现。"
+            "路由器还没有统计到应用 / 域名用量，产生流量后会自动出现。"
         }
     )
 }
@@ -670,11 +662,11 @@ private fun EmptyCategory(
 ) {
     EmptyState(
         icon = Icons.Rounded.Search,
-        title = "「${category?.label ?: "该类别"}」暂无应用",
+        title = "「${category?.label ?: "该类别"}」暂无应用 / 域名",
         desc = if (sevenDay) {
-            "近 7 天没有该类别流量，切回「全部」看看其他域名。"
+            "近 7 天没有该类别流量，切回「全部」看看其他应用 / 域名。"
         } else {
-            "今日没有该类别流量，切回「全部」看看其他域名。"
+            "今日没有该类别流量，切回「全部」看看其他应用 / 域名。"
         },
         action = {
             TextButton(onClick = onShowAll) { Text("查看全部") }
@@ -749,10 +741,13 @@ private fun OfflineBanner(at: Long, onRetry: () -> Unit) {
 /* ───────────────────────── 文案 / 工具 ───────────────────────── */
 
 private fun appsSubtitle(count: Int, sevenDay: Boolean): String = if (sevenDay) {
-    "$count 个域名 · 近 7 天按每日 Top 50 汇总"
+    "$count 个应用 / 域名 · 近 7 天按每日 Top 50 汇总"
 } else {
-    "$count 个域名 · 今日按域名统计"
+    "$count 个应用 / 域名 · 今日按域名统计"
 }
+
+/** 等宽数字：刷新时数值宽度不跳动。 */
+private fun TextStyle.tabular(): TextStyle = copy(fontFeatureSettings = "tnum")
 
 /** 口径提示用的时:分格式（与「更新于 HH:mm」的中文习惯一致）。 */
 private fun fmtHm(ts: Long): String {

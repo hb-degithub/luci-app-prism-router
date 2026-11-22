@@ -1,4 +1,5 @@
 #!/bin/sh
+. /src/tests/lib/prism-version-inner.sh
 # 核心修复容器内用例（由 tests/container-validate-core-fixes.sh 调用）。
 # 覆盖：
 #   1. 跨软重启：daily 恢复、baseline 恢复、截断 baseline（含 >8192 条）、
@@ -47,7 +48,7 @@ ROOT=/tmp/cf
 mkdir -p "$ROOT"
 
 echo "=== 0. 安装两个包 ==="
-opkg install /src/dist/luci-app-prism-router_1.0.0-1_all.ipk >/tmp/i1.log 2>&1 \
+opkg install "$PRISM_IPK" >/tmp/i1.log 2>&1 \
   && ok "安装 prism-router" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
 true >/tmp/i2.log 2>&1 \
   && ok "安装 luci-app-prism-router" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }

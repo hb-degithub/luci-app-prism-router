@@ -1,6 +1,5 @@
 package io.prism.router.ui.components
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
@@ -23,8 +22,9 @@ import io.prism.router.ui.theme.PrismSpacing
 /**
  * 通用内容卡片：标题 + 可选副标题 / 右上角操作 + 自定义内容。
  *
- * 使用 16dp 圆角与 1dp outlineVariant 描边，深色下描边自动降为低对比，
- * 不依赖阴影，因此在纯色背景与图片背景上都稳定。
+ * 不再使用 1dp 苍白描边：浅色下白色卡片直接压在 #F3F6FB 背景上，
+ * 深色下 surface(#111827) 压在 #0A0F18 背景上，靠表面层级与留白区分；
+ * 卡片内部的分隔线用 0.5dp + 0.7 alpha 的轻量线，而不是把每块内容都框起来。
  */
 @Composable
 fun SectionCard(
@@ -42,7 +42,7 @@ fun SectionCard(
         color = containerColor,
         contentColor = MaterialTheme.colorScheme.onSurface,
         tonalElevation = 0.dp,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f))
+        shadowElevation = 0.dp
     ) {
         Column(
             modifier = Modifier
@@ -60,7 +60,7 @@ fun SectionCard(
                         if (subtitle != null) {
                             Text(
                                 text = subtitle,
-                                style = MaterialTheme.typography.bodySmall,
+                                style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(top = 2.dp)
                             )
@@ -71,7 +71,7 @@ fun SectionCard(
                         action()
                     }
                 }
-                Spacer(Modifier.height(PrismSpacing.md))
+                Spacer(Modifier.height(PrismSpacing.sm))
             }
             content()
         }
