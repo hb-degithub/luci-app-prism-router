@@ -34,6 +34,123 @@ var callNodes = rpc.declare({
 	reject: true
 });
 
+// ---------------------------------------------------------------- AP 管理（顶部区块）
+//
+// 只调 rpcd 的 ap_* 方法：ap_list 只读（read ACL），绑定/重命名/删除/命令都要 root 会话
+// （admin ACL）。列表数据完全来自 rpcd，前端不算"在线"（online 由 rpcd 按 180 秒判定），
+// 避免两端口径漂移。
+
+var callApList = rpc.declare({
+	object: 'prism-router',
+	method: 'ap_list',
+	expect: { aps: [] },
+	reject: true
+});
+
+var callApBindStart = rpc.declare({
+	object: 'prism-router',
+	method: 'ap_bind_start',
+	params: [ 'name', 'node_id', 'host' ],
+	reject: true
+});
+
+var callApRename = rpc.declare({
+	object: 'prism-router',
+	method: 'ap_rename',
+	params: [ 'node_id', 'name' ],
+	reject: true
+});
+
+var callApDelete = rpc.declare({
+	object: 'prism-router',
+	method: 'ap_delete',
+	params: [ 'node_id' ],
+	reject: true
+});
+
+var callApCmd = rpc.declare({
+	object: 'prism-router',
+	method: 'ap_cmd',
+	params: [ 'node_id', 'cmd' ],
+	reject: true
+});
+
+function apIsOnline(ap) {
+	return ap != null && ap.online === true;
+}
+
+function apAgeText(ap) {
+	if (ap == null || ap.age_sec == null || ap.age_sec < 0) return _('未上报');
+
+	return fmtAge(ap.age_sec);
+}
+
+function apMetric(label, value) {
+	var t = '' + value;
+
+	return E('div', { 'class': 'tsn-ap-metric' }, [
+		E('div', { 'class': 'tsn-ap-metric-k' }, label),
+		E('div', { 'class': 'tsn-ap-metric-v', 'title': t }, t)
+	]);
+}
+
+function apCopyFallback(text) {
+	try {
+		var ta = document.createElement('textarea');
+
+		ta.value = text;
+		ta.setAttribute('readonly', 'readonly');
+		ta.style.position = 'fixed';
+		ta.style.top = '-1000px';
+		ta.style.left = '0';
+		document.body.appendChild(ta);
+		ta.select();
+		document.execCommand('copy');
+		document.body.removeChild(ta);
+	}
+	catch (e) {
+		/* 复制失败不弹错：文本本身可选，用户可手动复制 */
+	}
+}
+
+function apCopy(text, btn) {
+	var done = function() {
+		if (btn == null) return;
+
+		var old = btn.textContent;
+
+		btn.textContent = _('已复制');
+
+		if (typeof window != 'undefined' && typeof window.setTimeout == 'function')
+			window.setTimeout(function() { btn.textContent = old; }, 1200);
+	};
+
+	var nav = (typeof navigator != 'undefined') ? navigator : null;
+
+	if (nav != null && nav.clipboard != null && typeof nav.clipboard.writeText == 'function') {
+		nav.clipboard.writeText(text).then(done, function() {
+			apCopyFallback(text);
+			done();
+		});
+		return;
+	}
+
+	apCopyFallback(text);
+	done();
+}
+
+function apCodeRow(label, value) {
+	var btn = E('button', { 'type': 'button', 'class': 'tsn-btn' }, _('复制'));
+
+	btn.addEventListener('click', function() { apCopy(value, btn); });
+
+	return E('div', { 'class': 'tsn-bind-row' }, [
+		E('div', { 'class': 'tsn-bind-k' }, label),
+		E('pre', { 'class': 'tsn-code tsn-copyable', 'tabindex': '0' }, value),
+		btn
+	]);
+}
+
 function num(value) {
 	var n = (typeof value == 'number') ? value : parseInt(value, 10);
 
@@ -588,14 +705,63 @@ var CSS = [
 	'#ts-nodes .tsn-chev{order:2}',
 	'#ts-nodes .tsn-metrics{padding:0 11px 10px 11px}',
 	'#ts-nodes .tsn-details{padding:8px 11px 10px 11px}',
-	'}'
+	'}',
+
+	/* AP 管理区块（顶部）：离线整行标红；窄屏指标 2 列，绝不横向溢出 */
+	'#ts-nodes .tsn-aps{max-width:100%;margin:0 0 14px 0;padding:11px 12px;border-radius:var(--ts-r);',
+	'background:var(--ts-surface);border:1px solid var(--ts-border);min-width:0}',
+	'#ts-nodes .tsn-aps-head{display:flex;align-items:center;gap:8px 10px;flex-wrap:wrap;margin:0 0 5px 0}',
+	'#ts-nodes .tsn-aps-title{margin:0;font-size:var(--ts-fs-4);font-weight:600;line-height:1.4}',
+	'#ts-nodes .tsn-aps-note{font-size:var(--ts-fs-1);color:var(--ts-text-3);white-space:nowrap}',
+	'#ts-nodes .tsn-aps-spacer{flex:1 1 auto}',
+	'#ts-nodes .tsn-btn-primary{background:rgba(21,101,192,.16);border-color:rgba(21,101,192,.45);font-weight:600}',
+	'#ts-nodes .tsn-btn-danger{color:var(--ts-bad-text);border-color:rgba(220,38,38,.45)}',
+	'#ts-nodes .tsn-aps-hint{font-size:10.5px;line-height:1.6;opacity:.66;margin:0 0 8px 0}',
+	'#ts-nodes .tsn-ap{max-width:100%;margin:0 0 8px 0;padding:9px 11px;border-radius:9px;',
+	'background:var(--ts-surface-2);border:1px solid var(--ts-border);border-left:3px solid var(--ts-ok)}',
+	'#ts-nodes .tsn-ap:last-child{margin-bottom:0}',
+	'#ts-nodes .tsn-ap.tsn-ap-off{border-left-color:var(--ts-bad);background:rgba(220,38,38,.05)}',
+	'#ts-nodes .tsn-ap.tsn-ap-off .tsn-name{color:var(--ts-bad-text)}',
+	'#ts-nodes .tsn-ap-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}',
+	'#ts-nodes .tsn-ap-main{flex:1 1 140px;min-width:0}',
+	'#ts-nodes .tsn-ap-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));',
+	'gap:4px 10px;margin:6px 0 0 0;min-width:0}',
+	'#ts-nodes .tsn-ap-metric{min-width:0}',
+	'#ts-nodes .tsn-ap-metric-k{font-size:10px;line-height:1.5;opacity:.6;white-space:nowrap}',
+	'#ts-nodes .tsn-ap-metric-v{font-size:12px;font-weight:600;line-height:1.4;white-space:nowrap;',
+	'overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}',
+	'#ts-nodes .tsn-ap-btns{display:flex;gap:6px;flex-wrap:wrap;margin:7px 0 0 0}',
+	'#ts-nodes .tsn-modal{min-width:0;max-width:100%;padding:2px 0}',
+	'#ts-nodes .tsn-field-form label{display:block;font-size:10.5px;opacity:.66;margin:4px 0 0 0}',
+	'#ts-nodes .tsn-modal .cbi-input-text{width:100%;margin:2px 0 8px 0;box-sizing:border-box}',
+	'#ts-nodes .tsn-modal-status{font-size:12px;line-height:1.6;color:var(--ts-warn-text);margin:2px 0}',
+	'#ts-nodes .tsn-modal .right{margin:9px 0 0 0;text-align:right}',
+	'#ts-nodes .tsn-bind-result{margin:10px 0 0 0;min-width:0}',
+	'#ts-nodes .tsn-bind-warn{font-size:11.5px;line-height:1.65;padding:8px 10px;border-radius:8px;',
+	'margin:0 0 8px 0;background:rgba(217,119,6,.10);border-left:3px solid var(--ts-warn)}',
+	'#ts-nodes .tsn-bind-row{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;margin:0 0 8px 0;min-width:0}',
+	'#ts-nodes .tsn-bind-k{flex:0 0 100%;font-size:10.5px;opacity:.66}',
+	'#ts-nodes .tsn-copyable{flex:1 1 220px;min-width:0;margin:0}',
+	'@media (max-width:900px){#ts-nodes .tsn-ap-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}',
+	'@media (max-width:640px){#ts-nodes .tsn-ap-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}',
+
 ].join('\n');
 
 // ---------------------------------------------------------------- 视图
 
 return view.extend({
 	load: function() {
-		return this.reload();
+		this.aps = [];
+		this.apLoaded = false;
+		this.apLoading = false;
+		this.apError = null;
+		this.apUpdated = null;
+		this.offlineMin = 10;
+
+		/* 两个 RPC 并行；任一失败都不影响另一个（reload/reloadAps 各自吞异常） */
+		return Promise.all([ this.reload(), this.reloadAps() ]).then(function() {
+			return true;
+		});
 	},
 
 	render: function() {
@@ -607,6 +773,12 @@ return view.extend({
 		if (this.loading == null) this.loading = false;
 		if (this.error == null) this.error = null;
 		if (this.lastUpdated == null) this.lastUpdated = null;
+		if (!Array.isArray(this.aps)) this.aps = [];
+		if (this.apLoaded == null) this.apLoaded = false;
+		if (this.apLoading == null) this.apLoading = false;
+		if (this.apError === undefined) this.apError = null;
+		if (this.apUpdated === undefined) this.apUpdated = null;
+		if (this.offlineMin == null) this.offlineMin = 10;
 
 		this.updatedEl = E('span', { 'class': 'tsn-updated' }, '');
 		this.summaryEl = E('div', {
@@ -617,10 +789,12 @@ return view.extend({
 		this.toolbarEl = E('div', { 'class': 'tsn-toolbar' });
 		this.bannerEl = E('div', { 'class': 'tsn-banner' });
 		this.listEl = E('div', { 'class': 'tsn-list' });
+		this.apEl = E('div', { 'class': 'tsn-aps', 'id': 'tsn-aps' });
 
 		this.root = E('div', { 'id': 'ts-nodes', 'class': theme.CLASS }, [
 			theme.style(),
 			E('style', {}, CSS),
+			this.apEl,
 			E('div', { 'class': 'tsn-head' }, [
 				E('h2', { 'class': 'tsn-title ts-title' }, _('棱镜路由 · 网络节点')),
 				this.updatedEl
@@ -650,6 +824,7 @@ return view.extend({
 		this.renderSummary(counts, nodes.length);
 		this.renderToolbar(counts, nodes.length, filtered.length);
 		this.renderBanner();
+		this.renderAps();
 		this.renderList();
 	},
 
@@ -1039,6 +1214,7 @@ return view.extend({
 			if (typeof document != 'undefined' && document.hidden === true) return;
 
 			self.reload();
+			self.reloadAps();
 		}, REFRESH_MS);
 
 		if (typeof win.addEventListener == 'function' && this.unloadFn == null) {
@@ -1063,6 +1239,373 @@ return view.extend({
 
 			this.unloadFn = null;
 		}
+	},
+
+
+	/* ---- AP 管理：列表 / 绑定 / 重命名 / 删除 / 重启 ---- */
+
+	reloadAps: function() {
+		var self = this;
+
+		if (this.apLoading === true) return Promise.resolve(false);
+
+		this.apLoading = true;
+
+		if (this.apEl != null) this.renderAps();
+
+		return callApList().then(function(result) {
+			var aps = (result != null && Array.isArray(result.aps)) ? result.aps : [];
+
+			self.aps = aps.slice();
+			self.apLoaded = true;
+			self.apUpdated = new Date();
+			self.apLoading = false;
+			self.apError = null;
+
+			if (result != null && result.offline_min != null)
+				self.offlineMin = num(result.offline_min);
+
+			self.renderAps();
+
+			return true;
+		}, function(err) {
+			/* 保留上一次成功数据：只显示错误条 */
+			self.apError = errText(err);
+			self.apLoading = false;
+			self.renderAps();
+
+			return false;
+		});
+	},
+
+	renderAps: function() {
+		var self = this;
+
+		if (this.apEl == null) return;
+
+		clear(this.apEl);
+
+		var refreshBtn = E('button', { 'type': 'button', 'class': 'tsn-btn' },
+			this.apLoading === true ? _('刷新中…') : _('刷新数据'));
+
+		if (this.apLoading === true) refreshBtn.disabled = 'disabled';
+
+		refreshBtn.addEventListener('click', function() { self.reloadAps(); });
+
+		var bindBtn = E('button', { 'type': 'button', 'class': 'tsn-btn tsn-btn-primary' }, _('生成绑定命令'));
+
+		bindBtn.addEventListener('click', function() { self.showBindDialog(); });
+
+		this.apEl.appendChild(E('div', { 'class': 'tsn-aps-head' }, [
+			E('h3', { 'class': 'tsn-aps-title' }, _('AP 管理')),
+			E('span', { 'class': 'tsn-aps-note' },
+				this.apUpdated != null ? _('更新于') + ' ' + clockText(this.apUpdated) : ''),
+			E('span', { 'class': 'tsn-aps-spacer' }),
+			refreshBtn,
+			bindBtn
+		]));
+
+		this.apEl.appendChild(E('div', { 'class': 'tsn-aps-hint' },
+			_('在线 = 最近上报 < 180 秒；离线告警阈值在设置页配置（当前') + ' ' +
+			(this.offlineMin || 10) + ' ' + _('分钟）。绑定后 AP 每分钟上报，可下发 refresh / reboot。')));
+
+		if (this.apError != null) {
+			var retry = E('button', { 'type': 'button', 'class': 'tsn-btn' }, _('重试'));
+
+			retry.addEventListener('click', function() { self.reloadAps(); });
+
+			this.apEl.appendChild(E('div', { 'class': 'tsn-alert', 'role': 'alert' }, [
+				E('div', { 'class': 'tsn-alert-main' }, [
+					E('strong', {}, _('读取 AP 列表失败')),
+					E('div', { 'class': 'tsn-alert-text' }, this.apError)
+				]),
+				retry
+			]));
+		}
+
+		var aps = Array.isArray(this.aps) ? this.aps : [];
+
+		if (aps.length == 0) {
+			if (this.apLoaded !== true && this.apError == null)
+				this.apEl.appendChild(E('div', { 'class': 'tsn-empty tsn-empty-sm' }, [
+					E('div', { 'class': 'tsn-empty-title' }, _('正在读取 AP…'))
+				]));
+			else
+				this.apEl.appendChild(this.renderApEmpty());
+
+			return;
+		}
+
+		var list = E('div', { 'class': 'tsn-ap-list' });
+
+		for (var i = 0; i < aps.length; i++)
+			list.appendChild(this.renderApRow(aps[i]));
+
+		this.apEl.appendChild(list);
+	},
+
+	renderApEmpty: function() {
+		var self = this;
+		var bind = E('button', { 'type': 'button', 'class': 'tsn-btn tsn-btn-primary' }, _('生成绑定命令'));
+
+		bind.addEventListener('click', function() { self.showBindDialog(); });
+
+		return E('div', { 'class': 'tsn-empty tsn-empty-sm' }, [
+			E('div', { 'class': 'tsn-empty-title' }, _('还没有绑定 AP')),
+			E('p', { 'class': 'tsn-empty-text' },
+				_('点「生成绑定命令」得到一条可在 AP 上直接执行的安装命令；10 分钟内有效，令牌只显示一次。')),
+			bind
+		]);
+	},
+
+	renderApRow: function(ap) {
+		var self = this;
+		var online = apIsOnline(ap);
+		var id = (ap != null && ap.node_id != null) ? ('' + ap.node_id) : '';
+		var name = (ap != null && ap.name != null && ('' + ap.name).length) ? ('' + ap.name) : id;
+		var managed = (ap != null && ap.managed === true);
+		var result = (ap != null && ap.last_cmd_result != null) ? ('' + ap.last_cmd_result) : '';
+		var cmd = (ap != null && ap.last_cmd != null) ? ('' + ap.last_cmd) : '';
+
+		var renameBtn = E('button', { 'type': 'button', 'class': 'tsn-btn' }, _('重命名'));
+		var rebootBtn = E('button', { 'type': 'button', 'class': 'tsn-btn' }, _('重启 AP'));
+		var delBtn = E('button', { 'type': 'button', 'class': 'tsn-btn tsn-btn-danger' }, _('删除'));
+
+		renameBtn.addEventListener('click', function() { self.showRenameDialog(ap); });
+		rebootBtn.addEventListener('click', function() { self.showRebootDialog(ap); });
+		delBtn.addEventListener('click', function() { self.showDeleteDialog(ap); });
+
+		/* 未绑定的只有站点快照：没有通道可控制，只能看/删除 */
+		if (!managed) {
+			renameBtn.disabled = 'disabled';
+			rebootBtn.disabled = 'disabled';
+		}
+		else if (ap != null && ap.controllable === false) {
+			rebootBtn.disabled = 'disabled';
+		}
+
+		var cmdText = '—';
+
+		if (cmd.length)
+			cmdText = cmd + (result.length ? ' · ' + result : '');
+
+		return E('div', { 'class': 'tsn-ap' + (online ? '' : ' tsn-ap-off') }, [
+			E('div', { 'class': 'tsn-ap-top' }, [
+				E('span', { 'class': 'tsn-pill ' + (online ? 'tsn-st-online' : 'tsn-st-offline') }, [
+					E('i', { 'class': 'tsn-dot' }),
+					online ? _('在线') : _('离线')
+				]),
+				E('div', { 'class': 'tsn-ap-main' }, [
+					E('div', { 'class': 'tsn-name' }, name),
+					E('div', { 'class': 'tsn-id' },
+						id + (managed ? '' : ' · ' + _('未绑定（只有站点快照）')))
+				])
+			]),
+			E('div', { 'class': 'tsn-ap-metrics' }, [
+				apMetric(_('最后上报'), apAgeText(ap)),
+				apMetric(_('终端'), (ap != null ? num(ap.stations) : 0) + ' ' + _('台')),
+				apMetric(_('平均信号'),
+					(ap != null && ap.avg_signal != null) ? (num(ap.avg_signal) + ' dBm') : '—'),
+				apMetric(_('最近命令'), cmdText)
+			]),
+			E('div', { 'class': 'tsn-ap-btns' }, [ renameBtn, rebootBtn, delBtn ])
+		]);
+	},
+
+	showBindDialog: function() {
+		var nameIn = E('input', {
+			'type': 'text',
+			'class': 'cbi-input-text',
+			'maxlength': '32',
+			'placeholder': _('例如：客厅 AP（可留空）')
+		});
+		var nodeIn = E('input', {
+			'type': 'text',
+			'class': 'cbi-input-text',
+			'maxlength': '64',
+			'placeholder': _('留空 = 用 AP 主机名；接管旧 AP 可填 ap-1')
+		});
+		var status = E('div', { 'class': 'tsn-modal-status' }, '');
+		var result = E('div', { 'class': 'tsn-bind-result' });
+		var okBtn = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-apply' }, _('生成'));
+		var cancelBtn = E('button', { 'type': 'button', 'class': 'btn cbi-button' }, _('关闭'));
+
+		cancelBtn.addEventListener('click', function() { ui.hideModal(); });
+
+		okBtn.addEventListener('click', function() {
+			var name = nameIn.value.replace(/^\s+|\s+$/g, '');
+			var nodeId = nodeIn.value.replace(/^\s+|\s+$/g, '');
+
+			okBtn.disabled = 'disabled';
+			status.textContent = _('正在生成…');
+
+			callApBindStart(name, nodeId, '').then(function(res) {
+				okBtn.disabled = false;
+
+				if (res == null || res.ok !== true) {
+					status.textContent = _('生成失败：') + errText(res != null ? (res.error || res) : null);
+					return;
+				}
+
+				status.textContent = '';
+				clear(result);
+
+				result.appendChild(E('div', { 'class': 'tsn-bind-warn' }, [
+					E('strong', {}, _('令牌只显示这一次。')),
+					' ' + _('把它贴到 AP 上执行下面的命令；AP 首次上报即完成绑定，令牌随即作废。')
+				]));
+				result.appendChild(apCodeRow(_('上报地址'), '' + res.url));
+				result.appendChild(apCodeRow(_('绑定令牌'), '' + res.token));
+				result.appendChild(apCodeRow(_('安装命令'), '' + res.cmd));
+				result.appendChild(E('div', { 'class': 'tsn-guide-n' },
+					_('10 分钟内有效（最多 8 个待用令牌）。命令需要 AP 能访问母节点地址；自签 HTTPS 时会带 --insecure（HMAC 仍然校验请求）。')));
+			}, function(err) {
+				okBtn.disabled = false;
+				status.textContent = _('生成失败：') + errText(err);
+			});
+		});
+
+		ui.showModal(_('生成 AP 绑定命令'), [
+			E('div', { 'class': 'tsn-modal' }, [
+				E('p', { 'class': 'tsn-guide-n' },
+					_('生成一个一次性绑定令牌，并给出可直接在 AP 上执行的安装命令。令牌只存 sha256，明文只在这里出现一次。')),
+				E('div', { 'class': 'tsn-field-form' }, [
+					E('label', {}, _('备注名')),
+					nameIn,
+					E('label', {}, _('节点 ID（可选）')),
+					nodeIn
+				]),
+				status,
+				E('div', { 'class': 'right' }, [ okBtn, ' ', cancelBtn ]),
+				result
+			])
+		]);
+	},
+
+	showRenameDialog: function(ap) {
+		var self = this;
+		var id = '' + ap.node_id;
+		var input = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'maxlength': '32' });
+		var status = E('div', { 'class': 'tsn-modal-status' }, '');
+		var okBtn = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-apply' }, _('保存'));
+		var cancelBtn = E('button', { 'type': 'button', 'class': 'btn cbi-button' }, _('取消'));
+
+		input.value = (ap.name != null && ('' + ap.name).length) ? ('' + ap.name) : id;
+
+		cancelBtn.addEventListener('click', function() { ui.hideModal(); });
+
+		okBtn.addEventListener('click', function() {
+			var name = input.value.replace(/^\s+|\s+$/g, '');
+
+			if (name.length == 0) {
+				status.textContent = _('名字不能为空（最多 32 字）');
+				return;
+			}
+
+			okBtn.disabled = 'disabled';
+
+			callApRename(id, name).then(function(res) {
+				okBtn.disabled = false;
+
+				if (res == null || res.ok !== true) {
+					status.textContent = _('重命名失败：') + errText(res != null ? (res.error || res) : null);
+					return;
+				}
+
+				ui.hideModal();
+				ui.addNotification(null, E('p', {}, _('已重命名：') + id + ' → ' + name), 'info');
+				self.reloadAps();
+			}, function(err) {
+				okBtn.disabled = false;
+				status.textContent = _('重命名失败：') + errText(err);
+			});
+		});
+
+		ui.showModal(_('重命名 AP') + ' · ' + id, [
+			E('div', { 'class': 'tsn-modal' }, [
+				E('label', {}, _('展示名（最多 32 字）')),
+				input,
+				status,
+				E('div', { 'class': 'right' }, [ okBtn, ' ', cancelBtn ])
+			])
+		]);
+	},
+
+	showDeleteDialog: function(ap) {
+		var self = this;
+		var id = '' + ap.node_id;
+		var status = E('div', { 'class': 'tsn-modal-status' }, '');
+		var okBtn = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-remove' }, _('删除'));
+		var cancelBtn = E('button', { 'type': 'button', 'class': 'btn cbi-button' }, _('取消'));
+
+		cancelBtn.addEventListener('click', function() { ui.hideModal(); });
+
+		okBtn.addEventListener('click', function() {
+			okBtn.disabled = 'disabled';
+
+			callApDelete(id).then(function(res) {
+				okBtn.disabled = false;
+
+				if (res == null || res.ok !== true) {
+					status.textContent = _('删除失败：') + errText(res != null ? (res.error || res) : null);
+					return;
+				}
+
+				ui.hideModal();
+				ui.addNotification(null, E('p', {}, _('已删除 AP：') + id), 'info');
+				self.reloadAps();
+			}, function(err) {
+				okBtn.disabled = false;
+				status.textContent = _('删除失败：') + errText(err);
+			});
+		});
+
+		ui.showModal(_('删除 AP') + ' · ' + id, [
+			E('div', { 'class': 'tsn-modal' }, [
+				E('p', {}, _('会删除该 AP 的绑定信息、站点快照与命令队列。AP 若还在运行，下一轮上报会因为未绑定被拒绝，需要重新生成绑定命令。')),
+				status,
+				E('div', { 'class': 'right' }, [ okBtn, ' ', cancelBtn ])
+			])
+		]);
+	},
+
+	showRebootDialog: function(ap) {
+		var self = this;
+		var id = '' + ap.node_id;
+		var status = E('div', { 'class': 'tsn-modal-status' }, '');
+		var okBtn = E('button', { 'type': 'button', 'class': 'btn cbi-button cbi-button-negative' }, _('确认重启'));
+		var cancelBtn = E('button', { 'type': 'button', 'class': 'btn cbi-button' }, _('取消'));
+
+		cancelBtn.addEventListener('click', function() { ui.hideModal(); });
+
+		okBtn.addEventListener('click', function() {
+			okBtn.disabled = 'disabled';
+
+			callApCmd(id, 'reboot').then(function(res) {
+				okBtn.disabled = false;
+
+				if (res == null || res.ok !== true) {
+					status.textContent = _('下发失败：') + errText(res != null ? (res.error || res) : null);
+					return;
+				}
+
+				ui.hideModal();
+				ui.addNotification(null, E('p', {},
+					_('已下发 reboot，等待 AP 下一次轮询（约 1 分钟内）。')), 'warning');
+				self.reloadAps();
+			}, function(err) {
+				okBtn.disabled = false;
+				status.textContent = _('下发失败：') + errText(err);
+			});
+		});
+
+		ui.showModal(_('重启 AP') + ' · ' + id, [
+			E('div', { 'class': 'tsn-modal' }, [
+				E('p', {}, _('重启会断开该 AP 上所有无线客户端，约 1–2 分钟恢复。命令在 AP 下一次上报后执行。')),
+				status,
+				E('div', { 'class': 'right' }, [ okBtn, ' ', cancelBtn ])
+			])
+		]);
 	},
 
 	handleSave: null,

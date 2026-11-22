@@ -84,3 +84,59 @@ WiFi：3 个 BSS 正常
 **干扰数据如何避免**：AP 侧只采集 `iw station dump` 的 6 个字段（mac/iface/signal/rx_rate/tx_rate/connected_sec），
 母节点再按白名单过滤一次；即使 AP 端被改坏、塞入 `rx_bytes`，也不会落盘（门禁 93 项含此用例）。
 因此主路由的字节统计仍是唯一权威来源，不会出现双计。
+
+---
+
+## 七、AP 绑定 + 上报 + 控制（1.0.32 起）
+
+方案 B 的「哑桥元数据」通道（token + nonce，不签名）继续保留；从 1.0.32 起多了一条
+**可绑定、可控制**的签名通道，供 `ap-agent.sh` 使用：
+
+```
+主路由（生成一次性命令）                       AP（每分钟一轮）
+  ap_bind_start ── 32 hex token（10 分钟，只存 sha256）
+        │
+        ├─ url  : https://192.168.100.1/cgi-bin/prism-router-ingest
+        └─ cmd  : curl -fsSLk -o /usr/share/prism-router/ap-agent.sh … && ap-agent.sh --url … --token … --install
+                                                    │
+                                                 ap_report ── 首次自动绑定并消费 token（HMAC 校验）
+                                                    │
+                                                 ap_poll  ── 取 refresh|reboot（队列 0600，最多 8 条）
+                                                    │
+                                                 ap_result ── 结果写回 registry.last_cmd_result
+```
+
+- 协议、签名原文、落盘路径与错误码见 `docs/SPEC.md` §5.2。
+- `ap-agent.sh` 是 POSIX sh，**纯 shell HMAC-SHA256**（busybox `printf '%b'` + `sha256sum`），
+  不需要 openssl；token 不进 argv/环境/日志。单实例锁 + 256 KB 日志轮转 + 同类失败 5 分钟节流。
+- 网络页顶部新增「AP 管理」：列表（名称/在线/最后上报/终端数/平均信号，离线标红）、
+  生成绑定命令（弹窗含 url+token+cmd，可复制，10 分钟有效）、重命名、删除、重启 AP（二次确认）。
+- 设置页新增 `settings.ap_offline_min`（默认 10 分钟，`ap_list` 原样返回给页面显示阈值）。
+
+### 7.1 部署与迁移（真机步骤）
+
+```sh
+# 母节点（192.168.100.1）安装 1.0.32 包后，在网络页「AP 管理 → 生成绑定命令」复制命令；
+# 或命令行（root）：
+ubus call prism-router ap_bind_start '{"name":"客厅 AP","node_id":"ap-1"}'
+
+# 在 AP 上执行返回的 cmd；--install 会写 /etc/prism-router-ap/agent.conf(0600)
+# 并装一条 crontab：* * * * * /usr/share/prism-router/ap-agent.sh >/dev/null 2>&1
+# 如果 AP 上还跑着旧的 stations.uc cron，装完本 agent 后把那一行删掉（同一个 node_id 会写同一份快照）。
+```
+
+### 7.2 2026-11-23 真机验证（iStoreOS 24.10.7，模拟 AP）
+
+```
+ap_bind_start → token 32 hex；url=https://192.168.100.1/cgi-bin/prism-router-ingest；insecure=true（自签）
+ap-agent.sh --once（假 iw，node-id=ap-1）→ "绑定成功（node_id=ap-1），已上报 3 个站点" exit 0
+/etc/prism-router/ap-bind/  空（令牌已消费，目录 0700）
+/etc/prism-router/ap-registry.json  0600，只有 sha256(token)
+/etc/prism-router/stations/ap-1.json  0644，3 站（-41/-48/-57 dBm，rx/tx 速率，连接时长），无 bytes
+ap_list → count=1 online=true stations=3 avg_signal=-48 controllable=true
+ap_cmd refresh → 队列 0600；第二轮 agent：poll → refresh → result
+ap_list → last_cmd=refresh, last_cmd_result="ok: refreshed 3 stations"
+```
+
+旧 `ap-1` 快照（11-17）被这次首报直接接管；`/etc/config/prism-router` 未被覆盖（opkg 提示
+新 conffile 在 `/etc/config/prism-router-opkg`），`ap_offline_min` 缺省时 rpcd 按 10 处理。

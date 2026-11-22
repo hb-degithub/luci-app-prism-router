@@ -307,11 +307,16 @@ config update 'update'
 | `set_device_meta` | `{mac, alias, group}` | `{ok, mac, alias, group, devices}`；写 `/etc/prism-router/devices.json`（§10.1） |
 | `export_csv` | `{what}` | `{ok, what, filename, rows, csv}`；what = devices\|apps\|daily（§10.3） |
 | `test_feishu` | 无 | `{ok, code, msg}` |
-| `set_config` | `{section, options}` | `{ok}`；`settings` 白名单含 `lan_bridge/wireless_ports/ap_macs/link_refresh/system_enabled/wan_iface/quota_mode/quota_monthly_gb/quota_total_gb/metrics_enabled/metrics_token` |
+| `set_config` | `{section, options}` | `{ok}`；`settings` 白名单含 `lan_bridge/wireless_ports/ap_macs/link_refresh/ap_offline_min/system_enabled/wan_iface/quota_mode/quota_monthly_gb/quota_total_gb/metrics_enabled/metrics_token` |
+| `ap_bind_start` | `{name?, node_id?, host?}` | `{ok, token, url, cmd, name, node_id, scheme, insecure, host, port, expires_in:600, pending, ts}`；生成一次性 AP 绑定令牌（32 hex，10 分钟），**明文 token 只在这里返回一次**，文件只存 sha256（§5.2） |
+| `ap_list` | 无 | `{ok, count, online_sec:180, offline_min, aps:[{node_id, name, managed, controllable, online, age_sec, last_seen, stations, avg_signal, bound_ts, last_cmd, last_cmd_ts, last_cmd_result, last_ip}]}`；只读，**不含 token / token_hash** |
+| `ap_rename` | `{node_id, name}` | `{ok, node_id, name, managed}`；名字 ≤32 字；未绑定快照也可改名（写回快照） |
+| `ap_delete` | `{node_id}` | `{ok, node_id, removed[]}`；删 registry + 快照 + 命令队列 + 该 node 未用令牌（幂等） |
+| `ap_cmd` | `{node_id, cmd}` | `{ok, node_id, cmd, queued, max:8, ts}`；cmd 仅 refresh\|reboot；未绑定返回 `{ok:false,error}` |
 | `restart` | 无 | `{ok}` |
 
-ACL：`read.ubus.prism-router` 给 status/get_state/get_history/get_daily/get_nodes/get_stations/**export_csv**；
-`write.ubus.prism-router` 给 test_feishu/feishu_chats/set_config/restart/**set_device_meta**。
+ACL：`read.ubus.prism-router` 给 status/get_state/get_history/get_daily/get_nodes/get_stations/**export_csv**/**ap_list**；
+`write.ubus.prism-router` 给 test_feishu/feishu_chats/set_config/restart/**set_device_meta**/**ap_bind_start/ap_rename/ap_delete/ap_cmd**。
 
 ### 5.1 节点 / AP 认证协议（v2）
 
@@ -321,6 +326,40 @@ ACL：`read.ubus.prism-router` 给 status/get_state/get_history/get_daily/get_no
 - HMAC 在 ucode 内组装，sha256sum/openssl 只接收数据，不把密钥放入 argv、环境或临时磁盘。
 - HTTPS 默认验证系统 CA 与主机名，不使用 `-k`；支持显式 CA/公钥 pin。禁止跨源和降级重定向。
 - `legacy_shared_secret=1` / `legacy_stations_token=1` 仅用于短期迁移旧全局凭证，默认均为 0；不得作为长期多节点方案。
+
+### 5.2 AP 绑定 / 上报 / 命令通道（v1，签名）
+
+哑桥 AP 的元数据通道（`/cgi-bin/prism-router-stations`）是「token + nonce」不签名；
+本通道用 HMAC 真正校验「请求方持有 token」，供 `ap-agent.sh` 使用。
+
+**协议**（母节点 `/cgi-bin/prism-router-ingest`，`action=` 走 AP 分支）：
+
+```
+POST ?action=ap_report   body {"v":1,"node_id","name","ts","stations":[{mac,iface,signal,rx_rate,tx_rate,connected_sec}]}
+GET  ?action=ap_poll&node_id=..
+POST ?action=ap_result   body {"v":1,"node_id","ts","results":[{id,cmd,ok,code,detail}]}
+
+Authorization: PrismAP token=<32hex>;ts=<epoch>;sign=<64hex>
+X-Prism-Token / X-Prism-Ts / X-Prism-Sign（标准 CGI 兜底；uhttpd 会丢弃，无妨）
+sign = HMAC-SHA256(key = token 文本,
+                   msg = "PRISM-AP1\n<action>\n<node_id>\n<ts>\n<sha256hex(body)>")
+```
+
+- GET 无 body：`sha256hex("")` 参与签名；时间戳 ±300 秒；每 IP 每分钟 120 次（超出 429 + `Retry-After`）。
+- 未知 node / 令牌已消费或过期 / 签名不符一律 **HTTP 401**；非法 node_id 400；非 POST（report/result）405。
+- AP 侧 `ap-agent.sh` 用**纯 shell** 算 HMAC（busybox `printf '%b'` + `sha256sum`），不依赖 openssl；
+  token 不进 argv / 环境变量 / 日志。已与 openssl 对拍。
+- 落盘（rpcd 与 ingest 共用）：
+  - `/etc/prism-router/ap-bind/<sha256(token)>.json`（目录 0700 / 文件 0600）一次性令牌，10 分钟；
+  - `/etc/prism-router/ap-registry.json`（0600）`{v,aps:{<node_id>:{node_id,name,token_hash,bound_ts,last_seen,last_ip,last_poll,last_cmd,last_cmd_ts,last_cmd_result}}}`；
+  - `/etc/prism-router/ap-cmd/<node_id>.json`（目录 0700 / 文件 0600）`{v,cmds:[{id,cmd,ts}]}`，最多 8 条，`ap_poll` 取走即清空；
+  - `/etc/prism-router/stations/<node_id>.json`（0644）与哑桥通道同格式（`get_stations` 直接可读），字段白名单，绝不接受字节。
+- 首次 `ap_report` 携带待用令牌时自动创建 registry 条目并**消费**令牌（写快照失败时不消费，可重试）；
+  已绑定的 node 走 token_hash 校验，不再重新绑定。`ap_delete` 后旧 token 立即失效（401）。
+- 母节点生成绑定命令时会探测 `uhttpd.main.redirect_https` 与 `/etc/uhttpd.crt`：
+  自签证书时 url 用 `https://`，命令与 agent 带 `-k/--insecure`（HMAC 仍然校验请求）。
+- 迁移提示：AP 上若仍保留旧的 `stations.uc` cron，请替换成本 agent 的 cron（同一 `node_id` 会写同一份快照，
+  两边同时跑只是重复写，不会双计字节，但没必要）。
 
 ---
 

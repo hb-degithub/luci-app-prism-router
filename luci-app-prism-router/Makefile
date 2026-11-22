@@ -23,7 +23,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-prism-router
-PKG_VERSION:=1.0.31
+PKG_VERSION:=1.0.32
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-2.0-only
@@ -76,6 +76,8 @@ define Package/luci-app-prism-router/install
 	$(INSTALL_DIR) $(1)/usr/share/prism-router
 	$(INSTALL_DATA) ./root/usr/share/prism-router/*.uc $(1)/usr/share/prism-router/
 	$(INSTALL_BIN) ./root/usr/share/prism-router/feishu-test.sh $(1)/usr/share/prism-router/feishu-test.sh
+	# AP 侧代理（POSIX sh，纯 shell HMAC）：AP 上用 curl 从母节点 /prism-router/ap-agent.sh 取
+	$(INSTALL_BIN) ./root/usr/share/prism-router/ap-agent.sh $(1)/usr/share/prism-router/ap-agent.sh
 	# 官方 lark-oapi 长连接服务（默认关闭；只有 ws_enabled=1 才由 procd 拉起）
 	$(INSTALL_BIN) ./root/usr/share/prism-router/feishu-ws.py $(1)/usr/share/prism-router/feishu-ws.py
 	$(INSTALL_BIN) ./root/etc/init.d/prism-router-feishu-ws $(1)/etc/init.d/prism-router-feishu-ws
@@ -116,6 +118,10 @@ define Package/luci-app-prism-router/install
 	$(INSTALL_DATA) ./root/www/prism-router-panel/app.js $(1)/www/prism-router-panel/app.js
 	$(INSTALL_DATA) ./root/www/prism-router-panel/style.css $(1)/www/prism-router-panel/style.css
 	$(INSTALL_BIN) ./root/www/prism-router-panel/cgi-bin/panel-api $(1)/www/prism-router-panel/cgi-bin/panel-api
+
+	# 同目录再放一份可下载的脚本：绑定命令里的 curl 直接取这个（不需要 token，脚本本身不保密）
+	$(INSTALL_DIR) $(1)/www/prism-router
+	$(INSTALL_DATA) ./root/usr/share/prism-router/ap-agent.sh $(1)/www/prism-router/ap-agent.sh
 
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/prism-router
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/prism-router/*.js $(1)/www/luci-static/resources/view/prism-router/

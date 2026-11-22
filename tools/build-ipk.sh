@@ -28,7 +28,7 @@ OUT="$ROOT/dist"; LEGACY=0
 # 版本可用环境变量覆盖（CI 按 Release tag 注入）；源码默认 1.0.22，
 # 与 Makefile / Android 默认版本保持一致。包名、opkg Version 与包内版本常量
 # 全部由同一个 VER 派生，避免出现“新 UI 却打包成旧版本”的漂移。
-VER="${PRISM_VER:-1.0.31}"; REL="${PRISM_REL:-1}"
+VER="${PRISM_VER:-1.0.32}"; REL="${PRISM_REL:-1}"
 # 随包 SDK 的 .so 是 musl x86_64；Architecture 必须与之一致，不能是 all。
 # PRISM_NO_PYLIB=1 生成不带 SDK 的 all 架构包：Webhook / 应用 API 仍可用，
 # 仅长连接不随包，供 ARM 等非 x86_64 设备安装。
@@ -93,6 +93,7 @@ pack() { # $1=dir $2=basename（不带扩展名）
   # / 独立面板的 init 与只读 CGI（静态页面仍是 644）
   chmod 755 "$d/data/usr/bin/prism-routerd" "$d/data/etc/init.d/prism-routerd" \
     "$d/data/usr/share/prism-router/feishu-test.sh" \
+    "$d/data/usr/share/prism-router/ap-agent.sh" \
     "$d/data/usr/share/prism-router/feishu-ws.py" \
     "$d/data/etc/init.d/prism-router-feishu-ws" \
     "$d/data/www/cgi-bin/prism-router-ingest" \
@@ -159,7 +160,7 @@ mkdir -p "$D/data/usr/bin" "$D/data/usr/share/prism-router" \
   "$D/data/usr/share/rpcd/ucode" "$D/data/usr/share/rpcd/acl.d" \
   "$D/data/usr/share/luci/menu.d" \
   "$D/data/etc/init.d" "$D/data/etc/config" "$D/data/etc/prism-router/daily" \
-  "$D/data/www/cgi-bin" "$D/data/www/prism-router-panel/cgi-bin" \
+  "$D/data/www/cgi-bin" "$D/data/www/prism-router" "$D/data/www/prism-router-panel/cgi-bin" \
   "$D/data/www/luci-static/resources/view/prism-router" \
   "$D/data/www/luci-static/resources/prism-router" \
   "$D/data/usr/lib/prism-router" "$D/control"
@@ -169,7 +170,7 @@ chmod 755 "$D" "$D/control" "$D/data" \
   "$D/data/usr/share/luci" "$D/data/usr/share/luci/menu.d" \
   "$D/data/etc" "$D/data/etc/init.d" "$D/data/etc/config" \
   "$D/data/etc/prism-router" "$D/data/etc/prism-router/daily" \
-  "$D/data/www" "$D/data/www/cgi-bin" \
+  "$D/data/www" "$D/data/www/cgi-bin" "$D/data/www/prism-router" \
   "$D/data/www/prism-router-panel" "$D/data/www/prism-router-panel/cgi-bin" \
   "$D/data/www/luci-static" "$D/data/www/luci-static/resources" \
   "$D/data/www/luci-static/resources/view" "$D/data/www/luci-static/resources/view/prism-router" \
@@ -191,6 +192,13 @@ done
 [ -f "$ROOT/luci-app-prism-router/root/usr/share/prism-router/feishu-test.sh" ] && \
   install -m 755 "$ROOT/luci-app-prism-router/root/usr/share/prism-router/feishu-test.sh" \
     "$D/data/usr/share/prism-router/feishu-test.sh"
+
+# AP 侧代理：母节点随包分发（/usr/share 是本机可直接跑的副本；
+# /www/prism-router 是给 AP 用 curl 下载的那一份，脚本本身不含密钥）。
+install -m 755 "$ROOT/luci-app-prism-router/root/usr/share/prism-router/ap-agent.sh" \
+  "$D/data/usr/share/prism-router/ap-agent.sh"
+install -m 644 "$ROOT/luci-app-prism-router/root/usr/share/prism-router/ap-agent.sh" \
+  "$D/data/www/prism-router/ap-agent.sh"
 
 # 官方 lark-oapi 长连接服务 + 随包 SDK（musl x86_64）
 # 先校验 vendor 树没漂移（MANIFEST.json 的 totals.sha256 / 体积 / 静态 import 图），

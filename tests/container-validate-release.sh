@@ -213,6 +213,7 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
       return p == "./usr/bin/prism-routerd" ||
              p == "./etc/init.d/prism-routerd" ||
              p == "./usr/share/prism-router/feishu-test.sh" ||
+             p == "./usr/share/prism-router/ap-agent.sh" ||
              p == "./usr/share/prism-router/feishu-ws.py" ||
              p == "./etc/init.d/prism-router-feishu-ws" ||
              p == "./www/cgi-bin/prism-router-ingest" ||

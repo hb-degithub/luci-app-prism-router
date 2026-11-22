@@ -3,7 +3,7 @@
 		"description": "棱镜路由 —— 只读面板（不包含配置密钥）",
 		"read": {
 			"ubus": {
-				"prism-router": [ "status", "get_state", "get_history", "get_apps_history", "get_daily", "get_nodes", "get_stations", "export_csv", "feishu_ws_status" ]
+				"prism-router": [ "status", "get_state", "get_history", "get_apps_history", "get_daily", "get_nodes", "get_stations", "export_csv", "feishu_ws_status", "ap_list" ]
 			}
 		}
 	},
@@ -11,7 +11,7 @@
 		"description": "棱镜路由 —— 管理配置（可读写节点与推送密钥）",
 		"read": {
 			"ubus": {
-				"prism-router": [ "status", "get_state", "get_history", "get_apps_history", "get_daily", "get_nodes", "get_stations", "export_csv", "feishu_ws_status" ]
+				"prism-router": [ "status", "get_state", "get_history", "get_apps_history", "get_daily", "get_nodes", "get_stations", "export_csv", "feishu_ws_status", "ap_list" ]
 			},
 			"uci": [ "prism-router" ],
 			"file": {
@@ -20,7 +20,8 @@
 		},
 		"write": {
 			"ubus": {
-				"prism-router": [ "test_feishu", "feishu_chats", "set_config", "restart", "set_device_meta" ]
+				"prism-router": [ "test_feishu", "feishu_chats", "set_config", "restart", "set_device_meta",
+								"ap_bind_start", "ap_rename", "ap_delete", "ap_cmd" ]
 			},
 			"uci": [ "prism-router" ],
 			"file": {

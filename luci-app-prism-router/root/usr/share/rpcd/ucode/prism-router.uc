@@ -28,7 +28,7 @@
 //
 'use strict';
 
-import { readfile, access, glob, popen, basename, writefile, rename, chmod, chown, unlink, mkdir, rmdir, stat } from 'fs';
+import { readfile, access, glob, popen, basename, writefile, rename, chmod, chown, unlink, mkdir, rmdir, stat, open, lsdir } from 'fs';
 import { cursor } from 'uci';
 
 /* 测试钩子（生产环境不要设置）：把读/写的固定路径换成 fixture 目录，
@@ -56,7 +56,26 @@ const STATIONS_DIR = '/etc/prism-router/stations';
 /* 设备别名/分组/首次出现（prism-routerd 与 rpcd 共用的唯一权威文件，SPEC §10.1） */
 const DEVICES_FILE = env_or('PRISM_ROUTER_DEVICES_FILE', '/etc/prism-router/devices.json');
 const INIT_SCRIPT  = '/etc/init.d/prism-routerd';
-const VERSION      = '1.0.31';
+const VERSION      = '1.0.32';
+
+/* AP 绑定 / 命令（与 /www/cgi-bin/prism-router-ingest 的 AP 通道共用同一批文件）：
+   ap-bind/<sha256(token)>.json   一次性绑定令牌（0600，10 分钟，最多 8 个待用）
+   ap-registry.json               已绑定 AP（0600，只存 token 的 sha256）
+   ap-cmd/<node_id>.json          待执行命令队列（0600，refresh|reboot，最多 8 条）
+   stations/<node_id>.json        AP 上报的站点快照（0644，与哑桥通道同格式）
+   明文 token 只在 ap_bind_start 的一次响应里返回，绝不落盘 / 进日志。 */
+const AP_BIND_DIR   = '/etc/prism-router/ap-bind';
+const AP_CMD_DIR    = '/etc/prism-router/ap-cmd';
+const AP_REGISTRY   = '/etc/prism-router/ap-registry.json';
+const AP_TMP_DIR    = '/tmp/prism-router';
+const AP_BIND_TTL   = 600;          // 令牌有效期（秒）
+const AP_BIND_MAX   = 8;            // 同时待用的令牌上限
+const AP_CMD_MAX    = 8;            // 单 AP 命令队列上限
+const AP_ONLINE_SEC = 180;          // online = 最近上报 < 180 秒
+const AP_NAME_CHARS = 32;           // AP 展示名最多 32 字
+const AP_LIST_MAX   = 64;           // 列表条目上限（防脏 registry 撑爆 ubus）
+const AP_LOCK_STALE = 20;           // registry 锁陈旧阈值（秒）
+const AP_LOCK_TRIES = 60;
 
 /* 别名/分组单字段字节上限（与守护进程 DEVICE_META_TEXT_MAX 一致） */
 const DEVICE_TEXT_MAX = 128;
@@ -136,7 +155,9 @@ const UCI_FIELDS = {
 		/* 月配额（SPEC §10.2）：get_state 只给字节数，剩余量/百分比由前端算 */
 		'quota_mode', 'quota_monthly_gb', 'quota_total_gb',
 		/* Prometheus 指标导出（SPEC §10.3）：/cgi-bin/prism-router-metrics */
-		'metrics_enabled', 'metrics_token'
+		'metrics_enabled', 'metrics_token',
+		/* AP 离线告警阈值（分钟）；网络页 / ap_list 读取 */
+		'ap_offline_min'
 	],
 	/* 数据/日志保留策略（retention.uc 消费） */
 	retention: [ 'enabled', 'run_time', 'daily_days', 'nodes_days', 'stations_days',
@@ -1639,12 +1660,14 @@ function norm_mac(value) {
 }
 
 /* 原子写 + 0644 root:root；同名临时文件带「秒 + clock 纳秒 + 进程内序号」，
-   两个并发写者（守护进程 / 另一次 rpcd 调用）不会撞在同一个临时文件上。 */
+   两个并发写者（守护进程 / 另一次 rpcd 调用）不会撞在同一个临时文件上。
+   mode 省略 → 0644；AP 的 registry / 命令队列 / 绑定令牌传 0600（384）。 */
 let write_seq = 0;
 
-function write_atomic(path, content) {
+function write_atomic(path, content, mode) {
 	write_seq++;
 	const tmp = sprintf('%s.tmp.%d.%d.%d', path, time(), clock()[1], write_seq);
+	const perm = (mode == null) ? 420 : mode;
 
 	try {
 		const n = writefile(tmp, content);
@@ -1659,7 +1682,7 @@ function write_atomic(path, content) {
 		return false;
 	}
 
-	try { chmod(tmp, 420); } catch (e) { }
+	try { chmod(tmp, perm); } catch (e) { }
 	try { chown(tmp, 0, 0); } catch (e) { }
 
 	if (rename(tmp, path))
@@ -2485,6 +2508,826 @@ function set_device_meta(request) {
 }
 
 
+// ---------------------------------------------------------------- AP 绑定 / 上报 / 控制
+//
+// 协议与安全边界见 /www/cgi-bin/prism-router-ingest 的 AP 通道注释（母节点是权威说明）。
+// 这里只做「生成绑定令牌 / 列表 / 重命名 / 删除 / 命令入队」，不采集、不常驻：
+//   * ap_bind_start 生成 32 位 hex 一次性令牌（10 分钟），只把 sha256 落盘（0600），
+//     明文只在这次响应里返回一次，给用户复制到 AP；
+//   * ap_list 只读今 registry + stations 快照，绝不返回 token / hash；
+//   * ap_cmd 只认 refresh|reboot，写队列 0600，AP 的 ap_poll 取走即清空。
+//
+// ucode 的函数声明不做提升，本段所有 helper 必须在 methods 表之前，且按依赖顺序排列。
+
+/* ucode 的 %J 默认带缩进（"a": 1），落盘文件要紧凑版：/etc 在 overlay flash 上，
+   而且 ingest 侧读的是紧凑 JSON（同一份 registry 两边都要能直接 sed/grep）。
+   与 ingest 的 jminify 同义，别各自漂移。 */
+function jminify(s) {
+	let out = '', instr = false, esc = false;
+
+	for (let i = 0; i < length(s); i++) {
+		const c = substr(s, i, 1);
+
+		if (instr) {
+			out += c;
+
+			if (esc)
+				esc = false;
+			else if (c == '\\')
+				esc = true;
+			else if (c == '"')
+				instr = false;
+		}
+		else if (c == '"') {
+			instr = true;
+			out += c;
+		}
+		else if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+			/* drop */
+		}
+		else {
+			out += c;
+		}
+	}
+
+	return out;
+}
+
+function jstr(o) {
+	return jminify(sprintf('%J', o));
+}
+
+function ap_valid_id(id) {
+	return match(`${id}`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/) != null;
+}
+
+/* n 字节随机数 -> 2n 位小写 hex。优先 /dev/urandom；容器/裁剪系统退回 uuid。 */
+function ap_random_hex(nbytes) {
+	let raw = '';
+
+	try {
+		const fd = open('/dev/urandom', 'r');
+
+		if (fd != null) {
+			raw = fd.read(nbytes) ?? '';
+			fd.close();
+		}
+	}
+	catch (e) {
+		raw = '';
+	}
+
+	if (length(raw) < nbytes) {
+		try {
+			raw = replace(trim(text(readfile('/proc/sys/kernel/random/uuid'), '')), '-', '');
+		}
+		catch (e) {
+			raw = '';
+		}
+	}
+
+	if (length(raw) < nbytes)
+		return '';
+
+	let out = '';
+
+	for (let i = 0; i < nbytes; i++)
+		out += sprintf('%02x', ord(substr(raw, i, 1)));
+
+	return out;
+}
+
+/* sha256(字符串) -> 64 位十六进制。数据走 stdin，argv 里只有 0600 输出文件路径，
+   所以 token 不会出现在 /proc/<pid>/cmdline。输出文件只含摘要，读回即删。 */
+let ap_hash_seq = 0;
+
+function ap_sha256_hex(data) {
+	try { mkdir(AP_TMP_DIR, 493); } catch (e) { }
+
+	const out = sprintf('%s/ap-hash-%d-%d-%d', AP_TMP_DIR, time(), clock()[1], ap_hash_seq++);
+	let fd = null;
+
+	try {
+		fd = open(out, 'wx', 384);
+
+		if (fd == null)
+			return '';
+
+		fd.close();
+	}
+	catch (e) {
+		try { if (fd != null) fd.close(); } catch (e2) { }
+		try { unlink(out); } catch (e2) { }
+		return '';
+	}
+
+	let p = null;
+
+	try {
+		p = popen(sprintf('sha256sum > %s', shellquote(out)), 'w');
+	}
+	catch (e) {
+		p = null;
+	}
+
+	if (p == null) {
+		try { unlink(out); } catch (e) { }
+		return '';
+	}
+
+	try { p.write(`${data}`); } catch (e) { }
+	p.close();
+
+	let raw = '';
+
+	try { raw = text(readfile(out), ''); } catch (e) { raw = ''; }
+	try { unlink(out); } catch (e) { }
+
+	const m = match(trim(raw), /^([0-9a-fA-F]{64})/);
+
+	return m ? lc(m[1]) : '';
+}
+
+/* 通用 UCI 读取（本文件的 uci_get 固定读 prism-router，这里要看 network/uhttpd）。 */
+function uci_get_cfg(cfg, section, option, fallback) {
+	let c = null;
+
+	try {
+		c = cursor();
+	}
+	catch (e) {
+		return fallback;
+	}
+
+	if (c == null)
+		return fallback;
+
+	const value = c.get(cfg, section, option);
+
+	return (value == null) ? fallback : value;
+}
+
+function uci_list_cfg(cfg, section, option) {
+	let c = null;
+
+	try {
+		c = cursor();
+	}
+	catch (e) {
+		return [];
+	}
+
+	if (c == null)
+		return [];
+
+	const value = c.get(cfg, section, option);
+
+	if (value == null)
+		return [];
+
+	if (type(value) == 'array')
+		return value;
+
+	return split(`${value}`, ' ');
+}
+
+function ap_run(cmd) {
+	let p = null;
+
+	try { p = popen(cmd); } catch (e) { return ''; }
+
+	if (p == null)
+		return '';
+
+	let out = '', buf = '';
+
+	try {
+		while (length(buf = p.read(4096)))
+			out += buf;
+	}
+	catch (e) {
+		/* 读失败也要把子进程收掉 */
+	}
+
+	try { p.close(); } catch (e) { }
+
+	return out;
+}
+
+function ap_registry_read() {
+	const raw = read_json(AP_REGISTRY);
+
+	if (raw != null && type(raw) == 'object' && type(raw.aps) == 'object')
+		return raw;
+
+	return { v: 1, aps: {} };
+}
+
+function ap_registry_write(reg) {
+	return write_atomic(AP_REGISTRY, sprintf('%s\n', jstr(reg)), 384);
+}
+
+/* 与 ingest 完全相同的锁协议：mkdir 0000? 不 —— 0700 目录，忙等有限次。
+   （ingest 也是同样 60 次、20 秒陈旧回收，两边必须一致。） */
+function ap_lock_acquire() {
+	const lock = '/etc/prism-router/.ap-registry.lock';
+
+	for (let i = 0; i < AP_LOCK_TRIES; i++) {
+		if (mkdir(lock, 448))
+			return lock;
+
+		let st = null;
+
+		try { st = stat(lock); } catch (e) { st = null; }
+
+		if (st != null && (time() - integer(st.mtime, 0)) >= AP_LOCK_STALE) {
+			try { rmdir(lock); } catch (e) { }
+			continue;
+		}
+	}
+
+	return null;
+}
+
+function ap_lock_release(lock) {
+	if (lock != null) {
+		try { rmdir(lock); } catch (e) { }
+	}
+}
+
+function ap_dir_ensure(path) {
+	try { mkdir(path, 448); } catch (e) { }
+
+	let st = null;
+
+	try { st = stat(path); } catch (e) { st = null; }
+
+	if (st == null || st.type != 'directory')
+		return false;
+
+	try { chmod(path, 448); } catch (e) { }
+
+	return true;
+}
+
+/* 删除过期待用令牌，返回存活数量。 */
+function ap_bind_prune() {
+	let alive = 0;
+	const now = time();
+	let files = [];
+
+	try { files = lsdir(AP_BIND_DIR) ?? []; } catch (e) { files = []; }
+
+	for (let name in files) {
+		if (match(name, /^[0-9a-f]{64}\.json$/) == null)
+			continue;
+
+		const path = sprintf('%s/%s', AP_BIND_DIR, name);
+		const data = read_json(path);
+		const created = integer(data?.created, 0);
+
+		if (data == null || created <= 0 || (now - created) > AP_BIND_TTL) {
+			try { unlink(path); } catch (e) { }
+			continue;
+		}
+
+		alive++;
+	}
+
+	return alive;
+}
+
+/* 展示名：去控制字符、按 UTF-8 字符截断到 32 字（不切断码点）。 */
+function ap_clean_name(value) {
+	const s = trim(replace(text(value, ''), /[\r\n\t]+/g, ' '));
+
+	if (length(s) == 0)
+		return '';
+
+	let out = '', chars = 0, i = 0;
+
+	while (i < length(s) && chars < AP_NAME_CHARS) {
+		const b = ord(substr(s, i, 1));
+		let n = 1;
+
+		if (b >= 0xf0)
+			n = 4;
+		else if (b >= 0xe0)
+			n = 3;
+		else if (b >= 0xc0)
+			n = 2;
+
+		out += substr(s, i, n);
+		i += n;
+		chars++;
+	}
+
+	return trim(out);
+}
+
+/* 一台 AP 的站点摘要（快照缺失 / 坏文件 → 0 条、age=-1）。 */
+function ap_station_stats(node_id) {
+	const out = { count: 0, avg_signal: null, ts: 0, age_sec: -1, name: '' };
+	const data = read_json(sprintf('%s/%s.json', STATIONS_DIR, node_id));
+
+	if (data == null || type(data) != 'object')
+		return out;
+
+	out.name = text(data.name, '');
+	out.ts = integer(data.ts, 0);
+	out.age_sec = (out.ts > 0) ? max(0, time() - out.ts) : -1;
+
+	const list = (type(data.stations) == 'array') ? data.stations : [];
+	let sum = 0, n = 0;
+
+	for (let st in list) {
+		if (type(st) != 'object')
+			continue;
+
+		const sig = integer(st.signal, null);
+
+		if (sig != null && sig >= -120 && sig <= 0) {
+			sum += sig;
+			n++;
+		}
+	}
+
+	out.count = length(list);
+
+	if (n > 0)
+		out.avg_signal = int(sum / n);
+
+	return out;
+}
+
+/* 列表：registry 里的（可控制）+ 只有站点快照没有绑定的（不可控制，便于删除/接管）。
+   绝不返回 token / token_hash / 任何密钥材料。 */
+function ap_build_list() {
+	const reg = ap_registry_read();
+	let out = [];
+	const seen = {};
+
+	for (let id in keys(reg.aps)) {
+		const e = reg.aps[id];
+
+		if (!ap_valid_id(id) || type(e) != 'object')
+			continue;
+
+		seen[id] = true;
+
+		const st = ap_station_stats(id);
+		const now = time();
+
+		/* 「最后上报」以母节点收包时间（registry.last_seen）为准：
+		   AP 时钟可能没对时，用快照里的 ts 会把在线状态算错。 */
+		const seen = integer(e.last_seen, st.ts);
+		const age = (seen > 0) ? max(0, now - seen) : st.age_sec;
+
+		push(out, {
+			node_id: id,
+			name: cut_text(text(e.name, id), 128) || id,
+			managed: true,
+			controllable: true,
+			online: (age >= 0 && age < AP_ONLINE_SEC),
+			age_sec: age,
+			last_seen: seen,
+			stations: st.count,
+			avg_signal: st.avg_signal,
+			bound_ts: integer(e.bound_ts, 0),
+			last_cmd: text(e.last_cmd, ''),
+			last_cmd_ts: integer(e.last_cmd_ts, 0),
+			last_cmd_result: cut_text(text(e.last_cmd_result, ''), 200),
+			last_ip: text(e.last_ip, '')
+		});
+	}
+
+	let files = glob(`${STATIONS_DIR}/*.json`) ?? [];
+
+	for (let f in files) {
+		const id = replace(basename(f), /\.json$/, '');
+
+		if (!ap_valid_id(id) || seen[id] == true)
+			continue;
+
+		const st = ap_station_stats(id);
+
+		if (st.ts <= 0 && st.count == 0)
+			continue;
+
+		push(out, {
+			node_id: id,
+			name: cut_text(st.name, 128) || id,
+			managed: false,
+			controllable: false,
+			online: (st.age_sec >= 0 && st.age_sec < AP_ONLINE_SEC),
+			age_sec: st.age_sec,
+			last_seen: st.ts,
+			stations: st.count,
+			avg_signal: st.avg_signal,
+			bound_ts: 0,
+			last_cmd: '',
+			last_cmd_ts: 0,
+			last_cmd_result: '',
+			last_ip: ''
+		});
+	}
+
+	sort(out, (a, b) => {
+		if (a.online != b.online)
+			return a.online ? -1 : 1;
+
+		return (a.name > b.name) ? 1 : ((a.name < b.name) ? -1 : 0);
+	});
+
+	if (length(out) > AP_LIST_MAX)
+		out = slice(out, 0, AP_LIST_MAX);
+
+	return {
+		ok: true,
+		count: length(out),
+		online_sec: AP_ONLINE_SEC,
+		offline_min: clamp(integer(uci_get('settings', 'ap_offline_min', 10), 10), 1, 10080),
+		aps: out
+	};
+}
+
+function ap_listen_entries(option) {
+	const out = [];
+
+	for (let item in uci_list_cfg('uhttpd', 'main', option)) {
+		const t = trim(`${item}`);
+		const m = match(t, /^(\[[0-9A-Fa-f:.]+\]|[0-9A-Fa-f.:]+):([0-9]{1,5})$/);
+
+		if (m == null)
+			continue;
+
+		const port = integer(m[2], 0);
+
+		if (port <= 0 || port > 65535)
+			continue;
+
+		push(out, {
+			addr: m[1],
+			bare: replace(m[1], /^\[|\]$/g, ''),
+			port: port
+		});
+	}
+
+	return out;
+}
+
+function ap_pick_port(entries, host, fallback) {
+	for (let e in entries)
+		if (e.bare == host)
+			return e.port;
+
+	return fallback;
+}
+
+/* 生成 AP 要访问的 origin（http(s)://host[:port]）。
+   优先级：host 参数 > network.lan.ipaddr > uhttpd 监听地址里第一个非通配地址 > 127.0.0.1。
+   uhttpd.main.redirect_https=1 且存在 listen_https 时用 https —— 真机 iStoreOS 就是
+   这样，用 http 会先吃一个 307；自签证书再让 AP 侧带 --insecure（HMAC 仍然校验请求）。 */
+function ap_endpoint(request) {
+	const override = trim(text(request?.args?.host, ''));
+	let host = '', port = 0;
+
+	if (length(override)) {
+		const m = match(override, /^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._-]+)(:([0-9]{1,5}))?$/);
+
+		if (m == null)
+			return null;
+
+		host = m[1];
+		port = integer(m[3], 0);
+	}
+
+	const http_l = ap_listen_entries('listen_http');
+	const https_l = ap_listen_entries('listen_https');
+	const redirect = int(trim(text(uci_get_cfg('uhttpd', 'main', 'redirect_https', '0'), '0'))) != 0;
+	const use_https = redirect && length(https_l) > 0;
+
+	let lan = trim(text(uci_get_cfg('network', 'lan', 'ipaddr', ''), ''));
+
+	lan = replace(lan, /\/[0-9]+$/, '');
+
+	if (match(lan, /^[0-9A-Fa-f:.]+$/) == null)
+		lan = '';
+
+	const pool = use_https ? https_l : http_l;
+
+	if (length(host) == 0) {
+		if (length(lan)) {
+			host = lan;
+		}
+		else {
+			for (let e in pool) {
+				if (e.bare == '0.0.0.0' || e.bare == '::' || length(e.bare) == 0)
+					continue;
+
+				host = e.addr;
+				port = e.port;
+				break;
+			}
+		}
+	}
+
+	if (length(host) == 0)
+		host = '127.0.0.1';
+
+	const bare = replace(host, /^\[|\]$/g, '');
+	const dflt = use_https ? 443 : 80;
+
+	if (port <= 0)
+		port = ap_pick_port(pool, bare, dflt);
+
+	/* 自签证书：uhttpd.crt 的 issuer == subject（或根本没有证书）→ 需要 -k/--insecure */
+	let insecure = false;
+
+	if (use_https) {
+		if (!access('/etc/uhttpd.crt')) {
+			insecure = true;
+		}
+		else {
+			/* 按行解析：ucode 的 . 会跨行匹配（[\s\S] 反而不支持），
+			   所以不用 [\s\S]* 这种写法，逐行取 issuer= / subject= 再比较。 */
+			const info = ap_run(sprintf('%s x509 -in %s -noout -issuer -subject 2>/dev/null',
+				OPENSSL_BIN, shellquote('/etc/uhttpd.crt')));
+			let issuer = '', subject = '';
+
+			for (let line in split(info, '\n')) {
+				const t = trim(line);
+				const im = match(t, /^issuer=(.+)$/);
+				const sm = match(t, /^subject=(.+)$/);
+
+				if (im != null)
+					issuer = trim(im[1]);
+
+				if (sm != null)
+					subject = trim(sm[1]);
+			}
+
+			if (length(issuer) > 0 && issuer == subject)
+				insecure = true;
+		}
+	}
+
+	const hostpart = (index(bare, ':') >= 0) ? sprintf('[%s]', bare) : bare;
+	const portpart = (port == dflt) ? '' : sprintf(':%d', port);
+
+	return {
+		scheme: use_https ? 'https' : 'http',
+		host: bare,
+		port: port,
+		origin: sprintf('%s://%s%s', use_https ? 'https' : 'http', hostpart, portpart),
+		insecure: insecure
+	};
+}
+
+/* 生成一次性绑定令牌。返回 {ok, token, url, cmd, name, node_id, expires_in, insecure, ts}。
+   token 只在这里出现一次；文件里只有 sha256。 */
+function ap_bind_start(request) {
+	if (!ap_dir_ensure(AP_BIND_DIR))
+		return { ok: false, error: `无法创建 ${AP_BIND_DIR}` };
+
+	const ep = ap_endpoint(request);
+
+	if (ep == null)
+		return { ok: false, error: 'host 参数非法（形如 192.168.100.1 或 192.168.100.1:8080）' };
+
+	const token = ap_random_hex(16);
+
+	if (match(token, /^[0-9a-f]{32}$/) == null)
+		return { ok: false, error: '/dev/urandom 不可用，无法生成绑定令牌' };
+
+	const hash = ap_sha256_hex(token);
+
+	if (length(hash) != 64)
+		return { ok: false, error: '无法计算 token 的 sha256（缺少 sha256sum / 临时目录不可写？）' };
+
+	const alive = ap_bind_prune();
+
+	if (alive >= AP_BIND_MAX)
+		return { ok: false, error: `待用绑定令牌已有 ${alive} 个（上限 ${AP_BIND_MAX}），请等待过期或先完成一次绑定` };
+
+	let node_id = trim(text(request?.args?.node_id, ''));
+
+	if (length(node_id) && !ap_valid_id(node_id))
+		return { ok: false, error: 'node_id 只能包含字母/数字/._-，以字母或数字开头，最长 64' };
+
+	const reg = ap_registry_read();
+	let name = ap_clean_name(request?.args?.name);
+
+	if (length(name) == 0)
+		name = sprintf('AP-%d', length(keys(reg.aps)) + alive + 1);
+
+	const now = time();
+	const rec = {
+		v: 1,
+		token_hash: hash,
+		created: now,
+		expires: now + AP_BIND_TTL,
+		name: name,
+		node_id: node_id
+	};
+
+	if (!write_atomic(sprintf('%s/%s.json', AP_BIND_DIR, hash), sprintf('%s\n', jstr(rec)), 384))
+		return { ok: false, error: '写入绑定令牌失败' };
+
+	const agent_url = sprintf('%s/prism-router/ap-agent.sh', ep.origin);
+	const ingest_url = sprintf('%s/cgi-bin/prism-router-ingest', ep.origin);
+	const agent_args = [
+		'/usr/share/prism-router/ap-agent.sh',
+		sprintf('--url %s', shellquote(ingest_url)),
+		sprintf('--token %s', token)
+	];
+
+	if (length(node_id))
+		push(agent_args, sprintf('--node-id %s', shellquote(node_id)));
+
+	if (ep.insecure)
+		push(agent_args, '--insecure');
+
+	push(agent_args, '--install');
+
+	/* 三步用 && 串起来；agent 的参数用空格连成一条（不能混进 && 里） */
+	const parts = [
+		'mkdir -p /usr/share/prism-router',
+		sprintf('%s -o /usr/share/prism-router/ap-agent.sh %s',
+		        ep.insecure ? 'curl -fsSLk' : 'curl -fsSL', shellquote(agent_url)),
+		'chmod 755 /usr/share/prism-router/ap-agent.sh',
+		join(' ', agent_args)
+	];
+
+	return {
+		ok: true,
+		token: token,
+		url: ingest_url,
+		cmd: join(' && ', parts),
+		name: name,
+		node_id: node_id,
+		scheme: ep.scheme,
+		insecure: ep.insecure,
+		host: ep.host,
+		port: ep.port,
+		expires_in: AP_BIND_TTL,
+		pending: alive + 1,
+		ts: now
+	};
+}
+
+function ap_rename(request) {
+	const id = trim(text(request?.args?.node_id, ''));
+	const name = ap_clean_name(request?.args?.name);
+
+	if (!ap_valid_id(id))
+		return { ok: false, error: 'node_id 非法' };
+
+	if (length(name) == 0)
+		return { ok: false, error: '名字不能为空（最多 32 字）' };
+
+	const reg = ap_registry_read();
+
+	if (type(reg.aps[id]) == 'object') {
+		reg.aps[id].name = name;
+
+		if (!ap_registry_write(reg))
+			return { ok: false, error: '写入 AP registry 失败（磁盘只读？）' };
+
+		return { ok: true, node_id: id, name: name, managed: true };
+	}
+
+	/* 未绑定：直接改站点快照里的 name（AP 已离线时也生效） */
+	const file = sprintf('%s/%s.json', STATIONS_DIR, id);
+	const snap = read_json(file);
+
+	if (snap == null || type(snap) != 'object')
+		return { ok: false, error: '未找到该 AP（既未绑定，也没有站点快照）' };
+
+	snap.name = name;
+
+	if (!write_atomic(file, sprintf('%s\n', jstr(snap))))
+		return { ok: false, error: '写入站点快照失败' };
+
+	return { ok: true, node_id: id, name: name, managed: false };
+}
+
+/* 删除：registry 条目 + 站点快照 + 命令队列 + 该 node_id 名下未用的绑定令牌。
+   未知 node_id 也返回 ok（幂等），removed 为空数组，UI 不会因为重复点击报错。 */
+function ap_delete(request) {
+	const id = trim(text(request?.args?.node_id, ''));
+
+	if (!ap_valid_id(id))
+		return { ok: false, error: 'node_id 非法' };
+
+	const removed = [];
+	const reg = ap_registry_read();
+
+	if (type(reg.aps[id]) == 'object') {
+		delete reg.aps[id];
+
+		if (ap_registry_write(reg))
+			push(removed, 'registry');
+	}
+
+	for (let p in [ sprintf('%s/%s.json', STATIONS_DIR, id), sprintf('%s/%s.json', AP_CMD_DIR, id) ]) {
+		if (!access(p))
+			continue;
+
+		try {
+			unlink(p);
+			push(removed, p);
+		}
+		catch (e) {
+			/* 删不掉就留在 removed 外面，UI 会显示"已解绑但文件残留" */
+		}
+	}
+
+	let bind_files = [];
+
+	try { bind_files = lsdir(AP_BIND_DIR) ?? []; } catch (e) { bind_files = []; }
+
+	for (let f in bind_files) {
+		if (match(f, /^[0-9a-f]{64}\.json$/) == null)
+			continue;
+
+		const p = sprintf('%s/%s', AP_BIND_DIR, f);
+		const rec = read_json(p);
+
+		if (rec == null || trim(text(rec.node_id, '')) != id)
+			continue;
+
+		try {
+			unlink(p);
+			push(removed, 'bind');
+		}
+		catch (e) { }
+	}
+
+	return { ok: true, node_id: id, removed: removed };
+}
+
+function ap_cmd(request) {
+	const id = trim(text(request?.args?.node_id, ''));
+	const cmd = trim(text(request?.args?.cmd, ''));
+
+	if (!ap_valid_id(id))
+		return { ok: false, error: 'node_id 非法' };
+
+	if (cmd != 'refresh' && cmd != 'reboot')
+		return { ok: false, error: '只支持 refresh / reboot' };
+
+	const reg = ap_registry_read();
+
+	if (type(reg.aps[id]) != 'object')
+		return { ok: false, error: '该 AP 尚未绑定，无法下发命令（先点「生成绑定命令」完成绑定）' };
+
+	if (!ap_dir_ensure(AP_CMD_DIR))
+		return { ok: false, error: `无法创建 ${AP_CMD_DIR}` };
+
+	const path = sprintf('%s/%s.json', AP_CMD_DIR, id);
+	const data = read_json(path);
+	const list = (data != null && type(data) == 'object' && type(data.cmds) == 'array')
+		? data.cmds : [];
+	const now = time();
+
+	push(list, {
+		id: sprintf('%d-%d', now, length(list) + 1),
+		cmd: cmd,
+		ts: now
+	});
+
+	let keep = list;
+
+	if (length(keep) > AP_CMD_MAX) {
+		const out = [];
+
+		for (let i = length(keep) - AP_CMD_MAX; i < length(keep); i++)
+			push(out, keep[i]);
+
+		keep = out;
+	}
+
+	if (!write_atomic(path, sprintf('%s\n', jstr({ v: 1, cmds: keep })), 384))
+		return { ok: false, error: '写入命令队列失败' };
+
+	/* registry 先记「已下发」；AP 执行完 ap_result 会覆盖成 ok / failed */
+	reg.aps[id].last_cmd = cmd;
+	reg.aps[id].last_cmd_ts = now;
+	reg.aps[id].last_cmd_result = 'queued';
+	ap_registry_write(reg);
+
+	return {
+		ok: true,
+		node_id: id,
+		cmd: cmd,
+		queued: length(keep),
+		max: AP_CMD_MAX,
+		ts: now
+	};
+}
+
+
 // ---------------------------------------------------------------- ubus 方法表
 
 /* get_history 的桶瘦身：前端趋势图只需要时间戳与四个方向的字节数；
@@ -2856,6 +3699,81 @@ const methods = {
 		call: function(request) {
 			try {
 				return set_config(request);
+			}
+			catch (e) {
+				return { ok: false, error: `${e}` };
+			}
+		}
+	},
+
+	/* ── AP 绑定 / 管理 / 控制（网络页「AP 管理」区块）─────────────────────────
+	   读取 ap_list 走 ACL 的 read 组；其余四个是写操作，必须 root 会话。
+	   ap_bind_start 是唯一返回明文 token 的方法（只返回一次，10 分钟有效）。 */
+	ap_bind_start: {
+		args: { name: '', node_id: '', host: '' },
+		call: function(request) {
+			if (!is_root(request))
+				return { ok: false, error: 'permission denied' };
+
+			try {
+				return ap_bind_start(request);
+			}
+			catch (e) {
+				return { ok: false, error: `${e}` };
+			}
+		}
+	},
+
+	ap_list: {
+		call: function(request) {
+			try {
+				return ap_build_list();
+			}
+			catch (e) {
+				/* 页面挂了也不能影响拓扑/概览：异常退回空结构 */
+				return { ok: false, error: `${e}`, count: 0, aps: [] };
+			}
+		}
+	},
+
+	ap_rename: {
+		args: { node_id: '', name: '' },
+		call: function(request) {
+			if (!is_root(request))
+				return { ok: false, error: 'permission denied' };
+
+			try {
+				return ap_rename(request);
+			}
+			catch (e) {
+				return { ok: false, error: `${e}` };
+			}
+		}
+	},
+
+	ap_delete: {
+		args: { node_id: '' },
+		call: function(request) {
+			if (!is_root(request))
+				return { ok: false, error: 'permission denied' };
+
+			try {
+				return ap_delete(request);
+			}
+			catch (e) {
+				return { ok: false, error: `${e}` };
+			}
+		}
+	},
+
+	ap_cmd: {
+		args: { node_id: '', cmd: '' },
+		call: function(request) {
+			if (!is_root(request))
+				return { ok: false, error: 'permission denied' };
+
+			try {
+				return ap_cmd(request);
 			}
 			catch (e) {
 				return { ok: false, error: `${e}` };

@@ -1,5 +1,5 @@
 # 由容器门禁 wrapper 通过 -e 传入；单独运行 inner 时退回源码默认版本。
-PRISM_VER="${PRISM_VER:-1.0.31}"
+PRISM_VER="${PRISM_VER:-1.0.32}"
 PRISM_ARCH="${PRISM_ARCH:-x86_64}"
 PRISM_IPK_NAME="${PRISM_IPK_NAME:-luci-app-prism-router_${PRISM_VER}-1_${PRISM_ARCH}.ipk}"
 PRISM_IPK="/src/dist/$PRISM_IPK_NAME"

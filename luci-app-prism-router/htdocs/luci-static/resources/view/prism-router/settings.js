@@ -150,6 +150,8 @@ var DEFAULTS = {
 		wireless_ports: '',
 		ap_macs: '',
 		link_refresh: '30',
+		/* AP 绑定 / 离线告警：网络页「AP 管理」读取（ap_list 也返回同一个值） */
+		ap_offline_min: '10',
 		system_enabled: '1',
 		wan_iface: '',
 		/* 月配额（SPEC §10.2）：mode=none 时后两项不生效 */
@@ -949,6 +951,12 @@ return view.extend({
 			return self.field(def[0], def[1], def[2], def[3], def[4], def[5]);
 		});
 
+		/* ---- AP 绑定 / 离线告警（网络页「AP 管理」区块用同一个阈值）---- */
+		fields.push(this.subhead(_('AP 绑定 / 离线告警'), false));
+		fields.push(this.field('settings', 'ap_offline_min', _('AP 离线告警阈值（分钟）'),
+			_('AP 最后一次上报超过 N 分钟视为离线（1–10080，默认 10）。网络页「AP 管理」显示该阈值；绑定与命令下发在主路由侧完成。'),
+			'number', { min: 1, max: 10080, placeholder: '10' }));
+
 		fields.push(this.subhead(_('系统指标（软路由自身，与棱镜路由隔离）'), false));
 		fields.push(this.field('settings', 'system_enabled', _('采集系统指标'),
 			_('CPU / 内存 / 负载 / 磁盘 / 温度 / WAN 速率，写入 state.json 的 system 段；关闭后整段不出现。'),
@@ -1630,6 +1638,7 @@ return view.extend({
 		settings.wireless_ports = this.inputValue('settings', 'wireless_ports');
 		settings.ap_macs = this.inputValue('settings', 'ap_macs');
 		settings.link_refresh = this.inputValue('settings', 'link_refresh');
+		settings.ap_offline_min = this.inputValue('settings', 'ap_offline_min') || '10';
 		settings.system_enabled = this.inputChecked('settings', 'system_enabled') ? '1' : '0';
 		this.setOptional(settings, 'settings', 'wan_iface', this.inputValue('settings', 'wan_iface'));
 
@@ -1766,6 +1775,9 @@ return view.extend({
 
 		if (!isIntegerInRange(settings.link_refresh, 1, 3600))
 			return _('接入方式刷新间隔必须是 1–3600 之间的整数');
+
+		if (!isIntegerInRange(settings.ap_offline_min, 1, 10080))
+			return _('AP 离线告警阈值必须是 1–10080 之间的整数（分钟）');
 
 		if (settings.lan_bridge.length > 0 && !/^[A-Za-z0-9._-]{1,15}$/.test(settings.lan_bridge))
 			return _('LAN 网桥名不合法（1–15 个字母/数字/._-，例如 br-lan）');

@@ -115,6 +115,13 @@ config settings 'settings'
 	# 生成：hexdump -n 24 -e '24/1 "%02x"' /dev/urandom
 	# 注意：这是仅限局域网的明文接口，别把 web 端口暴露到 WAN。
 	option metrics_token ''
+	# ── AP 绑定 / 控制（网络页「AP 管理」区块）────────────────────────────
+	# 主路由生成一次性绑定命令（ap_bind_start，10 分钟有效，令牌只存 sha256），
+	# AP 装 /usr/share/prism-router/ap-agent.sh 后每分钟上报站点并轮询 refresh/reboot。
+	# 待用令牌 / 已绑定清单 / 命令队列都在 /etc/prism-router/{ap-bind,ap-registry.json,ap-cmd}，
+	# 权限 0600/0700，只存 token 的 sha256，明文只在生成时返回一次。
+	# AP 离线多少分钟算告警（1..10080）；网络页用它显示阈值文案。
+	option ap_offline_min '10'
 
 # ── 独立面板 HTTP 服务（SPEC「独立面板服务」）──────────────────────────
 # 与 LuCI 解耦的**只读**面板：procd 管理一个独立 uhttpd 实例，静态根

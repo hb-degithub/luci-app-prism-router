@@ -68,6 +68,29 @@ const MAX_DEVICES  = 20;
 const MAX_APPS     = 20;
 const LOG_GAP      = 60;          // 失败日志节流（秒）
 
+/* ── AP 绑定 / 上报 / 命令通道（与 rpcd 的 ap_* 方法共用同一批文件）──────────
+   /etc/prism-router/ap-bind/<sha256(token)>.json   一次性绑定令牌（0600），10 分钟
+   /etc/prism-router/ap-registry.json              已绑定 AP（0600，含 token 的 sha256）
+   /etc/prism-router/ap-cmd/<node_id>.json         待执行命令队列（0600，最多 8 条）
+   /etc/prism-router/stations/<node_id>.json       AP 上报的站点快照（0644，与哑桥通道同格式）
+
+   令牌明文只出现在 ap_bind_start 的一次响应里（给用户复制到 AP），文件和日志
+   里只有 sha256 —— 因此本文件的日志/错误消息里绝不出现 token。 */
+const AP_BIND_DIR      = '/etc/prism-router/ap-bind';
+const AP_CMD_DIR       = '/etc/prism-router/ap-cmd';
+const AP_REGISTRY      = '/etc/prism-router/ap-registry.json';
+const STATIONS_DIR     = '/etc/prism-router/stations';
+const AP_BIND_TTL      = 600;          // 绑定令牌有效期（秒）
+const AP_RATE_LIMIT    = 120;          // 每个 IP 每分钟请求数上限
+const AP_RATE_WINDOW   = 60;
+const AP_MAX_STATIONS  = 128;          // 单次上报站点数上限
+const AP_MAX_APS       = 64;           // registry 条目上限（防脏文件撑爆 ubus）
+const AP_MAX_CMDS      = 8;            // 命令队列上限
+const AP_LOCK_STALE    = 20;           // 注册表锁陈旧阈值（秒）
+const AP_LOCK_TRIES    = 60;           // 锁忙等次数（每次只 mkdir，极快）
+
+const MODE_600     = 384;         // 0o600（文件）
+const MODE_700     = 448;         // 0o700（目录）
 const MODE_644     = 420;         // 0o644
 const MODE_755     = 493;         // 0o755
 
@@ -202,13 +225,25 @@ function ensure_nodes_dir() {
     return true;
 }
 
-/* 临时文件 + rename 原子写，权限 0644 root（先落盘再改名，读端永远看不到半截文件）。 */
-function write_atomic(path, content) {
+function ensure_stations_dir() {
+    if (!ensure_dir(STATIONS_DIR))
+        return false;
+
+    try { chmod(STATIONS_DIR, MODE_755); } catch (e) { }
+    try { chown(STATIONS_DIR, 0, 0); } catch (e) { }
+
+    return true;
+}
+
+/* 临时文件 + rename 原子写（先落盘再改名，读端永远看不到半截文件）。
+   权限默认 0644；AP 的 registry / 命令队列 / 绑定令牌传 0600。 */
+function write_atomic(path, content, mode) {
     const tmp = sprintf('%s.tmp.%d.%d.%d', path, ucode_pid(), _seq++, time());
+    const perm = (mode == null) ? MODE_644 : mode;
 
     try {
         writefile(tmp, content);
-        try { chmod(tmp, MODE_644); } catch (e) { }
+        try { chmod(tmp, perm); } catch (e) { }
         try { chown(tmp, 0, 0); } catch (e) { }
 
         if (rename(tmp, path))
@@ -545,7 +580,10 @@ function auth_b64(bin) {
     return out;
 }
 
-function auth_hmac_b64(secret, message) {
+/* HMAC-SHA256 的最终十六进制结果（AP 通道用十六进制签名，与纯 shell 的
+   ap-agent.sh 对齐；子节点 push 通道再用它转 base64，保持不变）。
+   注意：ucode 的函数声明**不做提升**，所以本函数必须在 auth_hmac_b64 之前。 */
+function auth_hmac_outer_hex(secret, message) {
     const msg = `${message}`;
     let key = `${secret}`;
 
@@ -572,7 +610,15 @@ function auth_hmac_b64(secret, message) {
     if (length(inner_hex) == 0)
         return '';
 
-    const outer_hex = auth_sha256_hex(opad + auth_hex_bin(inner_hex));
+    return auth_sha256_hex(opad + auth_hex_bin(inner_hex));
+}
+
+function auth_hmac_hex(secret, message) {
+    return auth_hmac_outer_hex(secret, message);
+}
+
+function auth_hmac_b64(secret, message) {
+    const outer_hex = auth_hmac_outer_hex(secret, message);
 
     if (length(outer_hex) == 0)
         return '';
@@ -1163,16 +1209,857 @@ function store(snap) {
     return true;
 }
 
-// ───────────────────────────── 主流程 ─────────────────────────────
+// ───────────────────── AP 绑定 / 上报 / 命令通道（v1）─────────────────────
+//
+// AP 侧脚本：/usr/share/prism-router/ap-agent.sh（POSIX sh，纯 shell 算 HMAC-SHA256）。
+//
+//   POST ?action=ap_report   body {"v":1,"node_id","name","ts","stations":[{...}]}
+//   GET  ?action=ap_poll&node_id=..
+//   POST ?action=ap_result   body {"v":1,"node_id","ts","results":[{id,cmd,ok,code,detail}]}
+//
+//   Authorization: PrismAP token=<32hex>;ts=<epoch>;sign=<64hex>
+//   sign = HMAC-SHA256(key = token 文本,
+//                      msg = "PRISM-AP1\n<action>\n<node_id>\n<ts>\n<sha256hex(body)>")
+//   同时接受 X-Prism-Token / X-Prism-Ts / X-Prism-Sign（标准 CGI；uhttpd 会丢，无妨）。
+//   GET 无 body；body 为空串时 sha256hex("") = e3b0c442...b855。
+//
+// 与哑桥 stations 通道的区别：这条通道是**签名**的，母节点能证明请求方持有 token，
+// 而不只是"知道 token"。时间戳 ±300 秒 + 每 IP 120 次/分钟；未知 node_id、
+// 令牌已消费 / 过期、签名不符一律 401（HTTP 状态码与返回体 code 一致）。
+//
+// 落盘（与 rpcd 的 ap_* 方法共用）：
+//   ap-bind/<sha256(token)>.json   一次性绑定令牌（0600），10 分钟，首报成功才消费
+//   ap-registry.json               已绑定 AP（0600）：node_id/name/token_hash/bound_ts/
+//                                  last_seen/last_ip/last_cmd/last_cmd_ts/last_cmd_result
+//   ap-cmd/<node_id>.json          待执行命令队列（0600，最多 8 条），ap_poll 取走即清空
+//   stations/<node_id>.json        站点快照（0644，与哑桥通道同格式，字段白名单）
+//
+// 令牌明文只出现在 ap_bind_start 的一次响应里（给用户复制到 AP）；本文件从不记录它。
 
-function status_text(status) {
+const AP_ACTION_REPORT = 'ap_report';
+const AP_ACTION_POLL   = 'ap_poll';
+const AP_ACTION_RESULT = 'ap_result';
+
+/* ucode 的函数声明**不做提升**（在声明之前调用会 Reference error），
+   所以响应工具与读 JSON 必须放在本段最前面。 */
+function http_reason(status) {
+    if (status == 400)
+        return 'Bad Request';
+
+    if (status == 401)
+        return 'Unauthorized';
+
+    if (status == 403)
+        return 'Forbidden';
+
     if (status == 405)
         return 'Method Not Allowed';
 
     if (status == 413)
         return 'Payload Too Large';
 
+    if (status == 429)
+        return 'Too Many Requests';
+
+    if (status == 500)
+        return 'Internal Server Error';
+
     return 'Error';
+}
+
+function ap_reply(http, body) {
+    if (http != 200)
+        print(sprintf('Status: %d %s\r\n', http, http_reason(http)));
+
+    print('Content-Type: application/json\r\n');
+    print('Cache-Control: no-store\r\n');
+
+    if (http == 429)
+        print(sprintf('Retry-After: %d\r\n', AP_RATE_WINDOW));
+
+    print('\r\n');
+    print(sprintf('%s\n', body));
+}
+
+function ap_err(http, msg) {
+    ap_reply(http, jstr({ ok: false, code: http, msg: text(msg, '') }));
+}
+
+/* 读 JSON 文件：缺失 / 半截 / 类型不对一律 null（与 rpcd 的 read_json 同义）。 */
+function read_json_file(path) {
+    let raw = null;
+
+    try { raw = readfile(path); } catch (e) { return null; }
+
+    if (type(raw) != 'string' || length(raw) == 0)
+        return null;
+
+    try {
+        const parsed = json(raw);
+        return (type(parsed) == 'object' || type(parsed) == 'array') ? parsed : null;
+    }
+    catch (e) {
+        return null;
+    }
+}
+
+function ap_is_token(t) {
+    return match(`${t}`, /^[0-9a-f]{32}$/) != null;
+}
+
+function ap_is_id(id) {
+    return match(`${id}`, /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/) != null;
+}
+
+function ap_is_mac(s) {
+    return match(`${s}`, /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/) != null;
+}
+
+/* 子目录必须 0700 root（存放令牌 hash / 命令队列）。 */
+function ap_secure_subdir(path) {
+    let st = null;
+
+    try { st = lstat(path); } catch (e) { st = null; }
+
+    if (st == null) {
+        try { mkdir(path, MODE_700); } catch (e) { }
+        st = null;
+        try { st = lstat(path); } catch (e) { st = null; }
+    }
+
+    if (st == null || st.type != 'directory' || st.uid != 0 || st.gid != 0)
+        return false;
+
+    try { chmod(path, MODE_700); } catch (e) { }
+
+    return true;
+}
+
+function ap_registry_load() {
+    const raw = read_json_file(AP_REGISTRY);
+
+    if (raw != null && type(raw) == 'object' && type(raw.aps) == 'object')
+        return raw;
+
+    return { v: 1, aps: {} };
+}
+
+function ap_registry_save(reg) {
+    return write_atomic(AP_REGISTRY, sprintf('%s\n', jstr(reg)), MODE_600);
+}
+
+/* 跨进程互斥：rpcd 的 ap_* 方法与本 CGI 都会读改写 registry。
+   ucode 没有 flock，用 mkdir 的原子性；不睡眠，只忙等有限次（mkdir 在 tmpfs/ext4
+   上极快，真实冲突只有"用户点按钮的同时 AP 正好上报"这一瞬间）。 */
+function ap_lock_acquire() {
+    const lock = '/etc/prism-router/.ap-registry.lock';
+
+    for (let i = 0; i < AP_LOCK_TRIES; i++) {
+        if (mkdir(lock, MODE_700))
+            return lock;
+
+        let st = null;
+
+        try { st = stat(lock); } catch (e) { st = null; }
+
+        if (st != null && (time() - integer(st.mtime, 0)) >= AP_LOCK_STALE) {
+            try { rmdir(lock); } catch (e) { }
+            continue;
+        }
+    }
+
+    return null;
+}
+
+function ap_lock_release(lock) {
+    if (lock != null) {
+        try { rmdir(lock); } catch (e) { }
+    }
+}
+
+/* 只改一个 registry 条目（不存在则不动）；返回 true = 条目存在且已落盘。 */
+function ap_patch_entry(node_id, patch) {
+    const lock = ap_lock_acquire();
+    const reg = ap_registry_load();
+    const entry = reg.aps[node_id];
+    let ok = false;
+
+    if (type(entry) == 'object') {
+        for (let k in keys(patch))
+            entry[k] = patch[k];
+
+        ok = ap_registry_save(reg);
+    }
+
+    ap_lock_release(lock);
+
+    return ok;
+}
+
+function ap_bind_path(hash) {
+    return sprintf('%s/%s.json', AP_BIND_DIR, hash);
+}
+
+/* 读一个待用绑定令牌；过期/坏文件顺手删掉并返回 null。 */
+function ap_bind_read(hash) {
+    const path = ap_bind_path(hash);
+    const data = read_json_file(path);
+
+    if (data == null || type(data) != 'object')
+        return null;
+
+    if (`${data.token_hash}` != hash) {
+        try { unlink(path); } catch (e) { }
+        return null;
+    }
+
+    const created = integer(data.created, 0);
+
+    if (created <= 0 || (time() - created) > AP_BIND_TTL) {
+        try { unlink(path); } catch (e) { }
+        return null;
+    }
+
+    return data;
+}
+
+function ap_bind_consume(hash) {
+    try { unlink(ap_bind_path(hash)); } catch (e) { }
+}
+
+function ap_remote_ip() {
+    const ip = trim(text(getenv('REMOTE_ADDR'), ''));
+
+    if (match(ip, /^[0-9A-Fa-f:.]{3,64}$/) == null)
+        return '';
+
+    return ip;
+}
+
+/* 每 IP 每自然分钟 120 次；计数落 /tmp（tmpfs，不磨 flash）。
+   拿不到 REMOTE_ADDR（直接喂 stdin 调试）时不限速。 */
+function ap_rate_allow(ip) {
+    if (length(ip) == 0)
+        return true;
+
+    const dir = sprintf('%s/ap-rl', TMP_DIR);
+
+    if (!ensure_dir(dir))
+        return true;
+
+    const path = sprintf('%s/%s.json', dir, ip);
+    const now = time();
+    const minute = int(now / AP_RATE_WINDOW);
+    const rec = read_json_file(path);
+    let count = 0;
+
+    if (rec != null && type(rec) == 'object' && integer(rec.m, -1) == minute)
+        count = integer(rec.c, 0);
+
+    count++;
+    write_atomic(path, jstr({ m: minute, c: count }), MODE_600);
+
+    return count <= AP_RATE_LIMIT;
+}
+
+function ap_params() {
+    const out = {};
+    const auth = env_header('AUTHORIZATION');
+    const m = match(auth, /^PrismAP[ \t]+(.+)$/i);
+
+    if (m != null) {
+        for (let part in split(m[1], ';')) {
+            const eq = index(part, '=');
+
+            if (eq <= 0)
+                continue;
+
+            out[trim(substr(part, 0, eq))] = trim(substr(part, eq + 1));
+        }
+    }
+
+    if (!length(text(out.token, '')))
+        out.token = env_header('X_PRISM_TOKEN');
+
+    if (!length(text(out.ts, '')))
+        out.ts = env_header('X_PRISM_TS');
+
+    if (!length(text(out.sign, '')))
+        out.sign = env_header('X_PRISM_SIGN');
+
+    return out;
+}
+
+function ap_station_signal(value) {
+    const n = integer(value, null);
+
+    if (n == null || n < -120 || n > 0)
+        return null;
+
+    return n;
+}
+
+function ap_station_rate(value) {
+    const n = integer(value, null);
+
+    if (n == null)
+        return null;
+
+    if (n < 0)
+        return 0;
+
+    return (n > 100000000) ? 100000000 : n;
+}
+
+function ap_station_secs(value) {
+    const n = integer(value, null);
+
+    if (n == null || n < 0)
+        return null;
+
+    return (n > 40000000) ? 40000000 : n;
+}
+
+/* 字段白名单：AP 就算发了 rx_bytes 之类也进不了落盘文件。 */
+function ap_norm_station(src) {
+    if (type(src) != 'object')
+        return null;
+
+    const mac = lc(trim(text(src.mac, '')));
+
+    if (!ap_is_mac(mac))
+        return null;
+
+    const out = { mac: mac };
+    const iface = cut(one_line(text(src.iface, '')), 32);
+
+    if (length(iface))
+        out.iface = iface;
+
+    const sig = ap_station_signal(src.signal);
+
+    if (sig != null)
+        out.signal = sig;
+
+    const rx = ap_station_rate(src.rx_rate);
+
+    if (rx != null)
+        out.rx_rate = rx;
+
+    const tx = ap_station_rate(src.tx_rate);
+
+    if (tx != null)
+        out.tx_rate = tx;
+
+    const ct = ap_station_secs(src.connected_sec);
+
+    if (ct != null)
+        out.connected_sec = ct;
+
+    return out;
+}
+
+function ap_norm_stations(src) {
+    const list = [];
+    const seen = {};
+    let dropped = 0;
+
+    if (type(src) != 'array')
+        return { list: list, dropped: 0 };
+
+    for (let item in src) {
+        const st = ap_norm_station(item);
+
+        if (st == null || seen[st.mac] == true) {
+            dropped++;
+            continue;
+        }
+
+        seen[st.mac] = true;
+
+        if (length(list) >= AP_MAX_STATIONS) {
+            dropped++;
+            continue;
+        }
+
+        push(list, st);
+    }
+
+    return { list: list, dropped: dropped };
+}
+
+/* 与哑桥 stations 通道完全同格式，rpcd get_stations / 网络页无需改动即可读到。 */
+function ap_store_snapshot(node_id, name, ts, now, stations, dropped) {
+    if (!ensure_stations_dir())
+        return false;
+
+    const snap = {
+        v: 1,
+        node_id: node_id,
+        name: name,
+        ts: ts,
+        received_ts: now,
+        count: length(stations),
+        dropped: dropped,
+        stations: stations
+    };
+
+    return write_atomic(sprintf('%s/%s.json', STATIONS_DIR, node_id), sprintf('%s\n', jstr(snap)));
+}
+
+function ap_read_body() {
+    const cl_raw = text(getenv('CONTENT_LENGTH'), '');
+    const has_declared = length(cl_raw) > 0;
+    let declared = 0;
+
+    if (has_declared) {
+        if (match(cl_raw, /^[0-9]+$/) == null)
+            return { status: 400, error: 'invalid Content-Length' };
+
+        let digits = cl_raw;
+
+        while (length(digits) > 1 && substr(digits, 0, 1) == '0')
+            digits = substr(digits, 1);
+
+        const max_text = `${MAX_BODY}`;
+
+        if (length(digits) > length(max_text)
+            || (length(digits) == length(max_text) && digits > max_text))
+            return { status: 413, error: 'request body too large' };
+
+        declared = integer(digits, -1);
+
+        if (declared < 0 || declared > MAX_BODY)
+            return { status: 400, error: 'invalid Content-Length' };
+    }
+
+    const body = read_body(declared, has_declared);
+
+    if (length(body) == 0)
+        return { status: 400, error: 'empty request body' };
+
+    if (length(body) > MAX_BODY)
+        return { status: 413, error: 'request body too large' };
+
+    if (has_declared && length(body) != declared)
+        return { status: 400, error: 'Content-Length mismatch' };
+
+    return { status: 200, body: body };
+}
+
+function ap_hmac_message(action, node_id, ts_text, digest) {
+    return sprintf('PRISM-AP1\n%s\n%s\n%s\n%s', action, node_id, ts_text, digest);
+}
+
+/* 先验 HMAC（证明请求方持有 token），再查 registry / 待用绑定令牌。
+   返回 {ok:true, token_hash, now, ts, bound?, bind_name?} 或 {ok:false, msg}。 */
+function ap_auth(action, node_id, body) {
+    const params = ap_params();
+    const token = trim(text(params.token, ''));
+    const ts_text = trim(text(params.ts, ''));
+    const sign = lc(trim(text(params.sign, '')));
+
+    if (!ap_is_token(token))
+        return { ok: false, msg: 'missing or invalid token' };
+
+    if (match(sign, /^[0-9a-f]{64}$/) == null)
+        return { ok: false, msg: 'missing or invalid signature' };
+
+    if (match(ts_text, /^[0-9]{1,12}$/) == null)
+        return { ok: false, msg: 'invalid timestamp' };
+
+    const ts = integer(ts_text, 0);
+    const now = time();
+
+    if (ts <= 0)
+        return { ok: false, msg: 'invalid timestamp' };
+
+    if (abs_int(now - ts) > MAX_SKEW)
+        return { ok: false, msg: 'timestamp out of tolerance' };
+
+    const token_hash = auth_sha256_hex(token);
+
+    if (length(token_hash) == 0)
+        return { ok: false, msg: 'signature verification unavailable' };
+
+    const digest = auth_sha256_hex(body);
+
+    if (length(digest) == 0)
+        return { ok: false, msg: 'signature verification unavailable' };
+
+    const expect = auth_hmac_hex(token, ap_hmac_message(action, node_id, ts_text, digest));
+
+    if (length(expect) == 0)
+        return { ok: false, msg: 'signature verification unavailable' };
+
+    if (!auth_same(sign, lc(expect)))
+        return { ok: false, msg: 'signature mismatch' };
+
+    const reg = ap_registry_load();
+    const entry = reg.aps[node_id];
+
+    if (type(entry) == 'object') {
+        if (`${entry.token_hash}` == token_hash)
+            return { ok: true, token_hash: token_hash, now: now, ts: ts, entry: entry };
+
+        /* 已绑定但 token 不同：只有当这是管理员刚生成的一次性绑定令牌时才允许
+           「重新绑定 / 接管」（AP 重装、换凭证）。绑定令牌 10 分钟内有效、只用一次、
+           且没指定别的 node_id 才算数；其余情况仍然 401。
+           这样 UI 里重新点「生成绑定命令」就能直接接管，不需要先删除。 */
+        if (action != AP_ACTION_REPORT)
+            return { ok: false, msg: 'token does not match node' };
+
+        const rebind = ap_bind_read(token_hash);
+
+        if (rebind == null)
+            return { ok: false, msg: 'token does not match node' };
+
+        const rebind_claim = trim(text(rebind.node_id, ''));
+
+        if (length(rebind_claim) && rebind_claim != node_id)
+            return { ok: false, msg: 'binding token is for another node' };
+
+        return {
+            ok: true,
+            token_hash: token_hash,
+            now: now,
+            ts: ts,
+            bound: true,
+            rebind: true,
+            bind_name: trim(text(rebind.name, ''))
+        };
+    }
+
+    if (action != AP_ACTION_REPORT)
+        return { ok: false, msg: 'node is not bound' };
+
+    const bind = ap_bind_read(token_hash);
+
+    if (bind == null)
+        return { ok: false, msg: 'node is not bound (binding token expired or unknown)' };
+
+    const claim = trim(text(bind.node_id, ''));
+
+    if (length(claim) && claim != node_id)
+        return { ok: false, msg: 'binding token is for another node' };
+
+    return {
+        ok: true,
+        token_hash: token_hash,
+        now: now,
+        ts: ts,
+        bound: true,
+        bind_name: trim(text(bind.name, ''))
+    };
+}
+
+function ap_do_report(payload, node_id, auth) {
+    const now = auth.now;
+    let ts = integer(payload?.ts, 0);
+
+    if (ts <= 0)
+        ts = now;
+
+    if (ts > now + MAX_SKEW)
+        ts = now;
+
+    let name = trim(one_line(text(payload?.name, '')));
+
+    if (length(auth.bind_name ?? ''))
+        name = auth.bind_name;
+
+    if (length(name) == 0)
+        name = node_id;
+
+    name = cut(name, 64);
+
+    const norm = ap_norm_stations(payload?.stations);
+    const ip = ap_remote_ip();
+
+    const lock = ap_lock_acquire();
+    const reg = ap_registry_load();
+    let entry = reg.aps[node_id];
+    let bound = false;
+
+    if (type(entry) != 'object') {
+        if (!auth.bound) {
+            ap_lock_release(lock);
+            ap_err(401, 'node is not bound');
+            return 0;
+        }
+
+        if (length(keys(reg.aps)) >= AP_MAX_APS) {
+            ap_lock_release(lock);
+            ap_err(400, 'too many APs');
+            return 0;
+        }
+
+        entry = {
+            node_id: node_id,
+            name: name,
+            token_hash: auth.token_hash,
+            bound_ts: now,
+            last_seen: now,
+            last_ip: ip
+        };
+        reg.aps[node_id] = entry;
+        bound = true;
+    }
+    else if (auth.rebind) {
+        /* 用新的一次性令牌接管这个 node：替换凭证，保留命令历史 */
+        entry.token_hash = auth.token_hash;
+        entry.bound_ts = now;
+        entry.last_seen = now;
+        entry.last_ip = ip;
+
+        if (length(auth.bind_name ?? ''))
+            entry.name = auth.bind_name;
+
+        if (!length(text(entry.name, '')))
+            entry.name = name;
+
+        bound = true;
+        note(sprintf('AP 重新绑定 node=%s（使用新的绑定令牌）', node_id));
+    }
+    else {
+        entry.last_seen = now;
+
+        if (length(ip))
+            entry.last_ip = ip;
+
+        if (!length(text(entry.name, '')))
+            entry.name = name;
+    }
+
+    const saved = ap_registry_save(reg);
+    ap_lock_release(lock);
+
+    if (!saved)
+        note(sprintf('AP registry 写入失败 node=%s', node_id));
+
+    if (!ap_store_snapshot(node_id, text(entry.name, node_id), ts, now, norm.list, norm.dropped)) {
+        note(sprintf('AP 站点快照写入失败 node=%s', node_id));
+        ap_err(500, 'failed to store snapshot');
+        return 0;
+    }
+
+    /* 首报成功才消费一次性令牌：写盘失败时不消费，AP 下一轮还能重试。 */
+    if (auth.bound)
+        ap_bind_consume(auth.token_hash);
+
+    ap_reply(200, jstr({
+        ok: true,
+        code: 0,
+        node_id: node_id,
+        name: text(entry.name, node_id),
+        ts: ts,
+        bound: bound,
+        count: length(norm.list),
+        server_ts: now
+    }));
+
+    return 0;
+}
+
+function ap_do_poll(node_id, auth) {
+    const path = sprintf('%s/%s.json', AP_CMD_DIR, node_id);
+    const data = read_json_file(path);
+    const cmds = [];
+
+    if (data != null && type(data) == 'object' && type(data.cmds) == 'array') {
+        for (let item in data.cmds) {
+            if (type(item) != 'object')
+                continue;
+
+            const cmd = trim(text(item.cmd, ''));
+
+            if (cmd != 'refresh' && cmd != 'reboot')
+                continue;
+
+            let id = trim(text(item.id, ''));
+
+            if (match(id, /^[A-Za-z0-9._:-]{1,64}$/) == null)
+                id = sprintf('%d-%d', time(), length(cmds));
+
+            push(cmds, { id: id, cmd: cmd });
+
+            if (length(cmds) >= AP_MAX_CMDS)
+                break;
+        }
+    }
+
+    /* 取走即消费：命令只有 refresh（幂等）和 reboot（重启一次），
+       重复投递比丢一条更糟，所以投递后清空队列。 */
+    if (length(cmds) > 0 && access(path)) {
+        try { unlink(path); } catch (e) { }
+    }
+
+    if (length(cmds) > 0)
+        ap_patch_entry(node_id, {
+            last_cmd: cmds[length(cmds) - 1].cmd,
+            last_cmd_ts: time(),
+            last_cmd_result: 'delivered',
+            last_poll: time()
+        });
+    else
+        ap_patch_entry(node_id, { last_poll: time() });
+
+    const lines = [];
+
+    for (let c in cmds)
+        push(lines, sprintf('{"id":"%s","cmd":"%s"}', c.id, c.cmd));
+
+    let body = '';
+
+    if (length(lines) == 0) {
+        body = sprintf('{"ok":true,"code":0,"node_id":"%s","ts":%d,"cmds":[]}', node_id, time());
+    }
+    else {
+        body = sprintf('{"ok":true,"code":0,"node_id":"%s","ts":%d,"cmds":[\n%s\n]}',
+                       node_id, time(), join(',\n', lines));
+    }
+
+    ap_reply(200, body);
+    return 0;
+}
+
+function ap_do_result(payload, node_id, auth) {
+    const results = (type(payload?.results) == 'array') ? payload.results : [];
+    let last = null;
+    let applied = 0;
+
+    for (let item in results) {
+        if (type(item) != 'object')
+            continue;
+
+        const cmd = trim(text(item.cmd, ''));
+
+        if (cmd != 'refresh' && cmd != 'reboot')
+            continue;
+
+        last = {
+            cmd: cmd,
+            ok: (item.ok == true),
+            detail: cut(one_line(text(item.detail, '')), 120)
+        };
+
+        if (++applied >= AP_MAX_CMDS)
+            break;
+    }
+
+    if (last != null) {
+        const detail = (length(last.detail) > 0) ? sprintf(': %s', last.detail) : '';
+
+        ap_patch_entry(node_id, {
+            last_cmd: last.cmd,
+            last_cmd_ts: auth.now,
+            last_cmd_result: cut(sprintf('%s%s', last.ok ? 'ok' : 'failed', detail), 200),
+            last_result_ts: auth.now
+        });
+    }
+
+    ap_reply(200, jstr({
+        ok: true,
+        code: 0,
+        node_id: node_id,
+        ts: auth.now,
+        applied: applied
+    }));
+
+    return 0;
+}
+
+function ap_main(action) {
+    const ip = ap_remote_ip();
+
+    if (!ap_rate_allow(ip)) {
+        ap_err(429, 'rate limit exceeded');
+        return 0;
+    }
+
+    const method = trim(text(getenv('REQUEST_METHOD'), ''));
+
+    if (action == AP_ACTION_POLL) {
+        if (method != 'GET' && method != 'POST') {
+            ap_err(405, 'only GET or POST is accepted');
+            return 0;
+        }
+    }
+    else if (method != 'POST') {
+        ap_err(405, 'only POST is accepted');
+        return 0;
+    }
+
+    const query = query_params();
+    let body = '';
+
+    if (action != AP_ACTION_POLL) {
+        const info = ap_read_body();
+
+        if (info.error != null) {
+            ap_err(info.status, info.error);
+            return 0;
+        }
+
+        body = info.body;
+    }
+
+    let payload = null;
+
+    if (length(body) > 0) {
+        try {
+            payload = json(body);
+        }
+        catch (e) {
+            payload = null;
+        }
+
+        if (type(payload) != 'object') {
+            ap_err(400, 'body is not a JSON object');
+            return 0;
+        }
+    }
+
+    let node_id = trim(text(query.node_id, ''));
+
+    if (length(node_id) == 0 && payload != null)
+        node_id = trim(text(payload.node_id, ''));
+
+    if (!ap_is_id(node_id)) {
+        ap_err(400, 'invalid node_id');
+        return 0;
+    }
+
+    if (payload != null) {
+        const body_id = trim(text(payload.node_id, ''));
+
+        if (length(body_id) > 0 && body_id != node_id) {
+            ap_err(400, 'body.node_id does not match node_id');
+            return 0;
+        }
+    }
+
+    const auth = ap_auth(action, node_id, body);
+
+    if (!auth.ok) {
+        note(sprintf('AP 请求被拒 action=%s node=%s reason=%s', action, node_id, auth.msg));
+        ap_err(401, auth.msg);
+        return 0;
+    }
+
+    if (action == AP_ACTION_REPORT)
+        return ap_do_report(payload, node_id, auth);
+
+    if (action == AP_ACTION_POLL)
+        return ap_do_poll(node_id, auth);
+
+    return ap_do_result(payload, node_id, auth);
+}
+
+// ───────────────────────────── 主流程 ─────────────────────────────
+
+function status_text(status) {
+    return http_reason(status);
 }
 
 function respond(code, msg, status) {
@@ -1194,6 +2081,14 @@ function respond(code, msg, status) {
 // ───────────────────────────── 主流程 ─────────────────────────────
 
 function main() {
+    /* AP 通道（ap_report / ap_poll / ap_result）走独立分支：
+       鉴权用 PrismAP + HMAC，失败返回 401/429（而不是旧通道的 HTTP 200 + code）；
+       其它请求（子节点 push、哑桥 stations）完全保持原有行为。 */
+    const ap_action = trim(text(query_params().action, ''));
+
+    if (ap_action == AP_ACTION_REPORT || ap_action == AP_ACTION_POLL || ap_action == AP_ACTION_RESULT)
+        return ap_main(ap_action);
+
     if (trim(text(getenv('REQUEST_METHOD'), '')) != 'POST') {
         respond(405, 'only POST is accepted', 405);
         return 0;
