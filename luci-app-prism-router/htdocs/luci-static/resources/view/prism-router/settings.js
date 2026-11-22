@@ -992,8 +992,7 @@ return view.extend({
 			[ 'feishu', 'receive_id', _('接收人 user_id（个人通知，无需群）'), _('飞书管理后台 → 成员与部门 → 成员详情可复制 user_id。不需要回调、不需要扫码。应用可用范围必须包含该账号。'), 'text', { wide: true, placeholder: '飞书 user_id' } ],
 		];
 
-		/* 只保留“应用凭证 + 个人通知”这一种方式，不再有发送方式/扫码绑定。 */
-		var fields = [];
+		var fields = [ this.feishuModeField() ];
 
 		channelFields.forEach(function(def) {
 			fields.push(self.field(def[0], def[1], def[2], def[3], def[4], def[5]));
@@ -1103,10 +1102,9 @@ return view.extend({
 
 	/* 发送方式切换：webhook（自定义机器人，保持原样）/ app（自建应用机器人，扫码绑定）。 */
 	feishuModeField: function() {
-		/* 只保留“应用凭证”一种接入方式：要么绑定群，要么直接发个人；
-		   不再提供 webhook（群自定义机器人）。 */
-		var choices = [ [ FEISHU_MODE_APP, _('绑定群（扫码）') ],
-		                [ FEISHU_MODE_USER, _('发给个人（无需群）') ] ];
+		var choices = [ [ FEISHU_MODE_WEBHOOK, _('群自定义机器人（Webhook）') ],
+		                [ FEISHU_MODE_APP, _('应用机器人 · 群（扫码）') ],
+		                [ FEISHU_MODE_USER, _('应用机器人 · 个人') ] ];
 
 		/* mode 未设置时后端沿用旧行为：app_id/app_secret/chat_id 齐全走应用。
 		   这里把 app 放到首位，让界面选中项与真实发送路线一致，避免误导。 */
@@ -1514,8 +1512,7 @@ return view.extend({
 		   后端 UCI_FIELDS 白名单里暂时没有 mode 时会静默忽略这个键，不影响其它字段落盘。 */
 		feishu.webhook = this.inputValue('feishu', 'webhook').trim();
 		feishu.secret = this.inputValue('feishu', 'secret');
-		/* 填了 webhook 就走自定义机器人；否则走应用凭证。 */
-		feishu.mode = (feishu.webhook !== '') ? FEISHU_MODE_WEBHOOK : FEISHU_MODE_USER;
+		feishu.mode = this.radioValue('feishu', 'mode', FEISHU_MODE_WEBHOOK);
 		feishu.app_id = this.inputValue('feishu', 'app_id');
 		feishu.app_secret = this.inputValue('feishu', 'app_secret');
 		var chatId = this.inputValue('feishu', 'chat_id').trim();
@@ -1672,7 +1669,9 @@ return view.extend({
 		}
 
 		/* 应用机器人没有 App ID/Secret 连 token 都换不到：保存前就拦住并说清楚，别等到发送时静默失败 */
-		if (str(feishu.webhook).length > 0) {
+		if (feishu.mode === FEISHU_MODE_WEBHOOK) {
+			if (str(feishu.webhook).length === 0)
+				return _('群自定义机器人需要填写 Webhook 地址');
 			if (!/^https?:\/\/[^\s]+$/.test(str(feishu.webhook)))
 				return _('Webhook 地址必须是 http(s) 链接');
 		}
@@ -2177,6 +2176,7 @@ return view.extend({
 		var mode = this.feishuMode();
 		var app = (mode === FEISHU_MODE_APP);
 		var user = (mode === FEISHU_MODE_USER);
+		var webhook = (mode === FEISHU_MODE_WEBHOOK);
 		var self = this;
 
 		/* 只显示当前方式真正需要的字段：webhook/secret 只在 webhook；app 凭据在 app/user；
@@ -2186,6 +2186,8 @@ return view.extend({
 			if (row != null) row.style.display = on ? '' : 'none';
 		}
 
+		show('webhook', webhook);
+		show('secret', webhook);
 		show('app_id', app || user);
 		show('app_secret', app || user);
 		show('receive_id', true);
