@@ -172,3 +172,41 @@ VmRSS: 42960 kB
   旧版不依赖 `pylib`，`/usr/lib/prism-router/` 会作为遗留目录留空，可手工删除。
 * 卸载：`opkg remove luci-app-prism-router` 会先 stop+disable 长连接
   （见 prerm），`/etc/prism-router/feishu-ws.json` 与其它数据文件保留。
+
+## 非 x86_64（ARM / 其他架构）
+
+随包的长连接 SDK 是 `musl x86_64 + Python 3.11` 的二进制（`pylib` 里有 9 个 `.so`），
+所以默认 IPK 的 `Architecture` 是 `x86_64`，ARM 路由器装不上。
+
+ARM 请使用 **无 SDK 版（Architecture: all）**，它包含除长连接外的全部功能：
+
+```sh
+PRISM_NO_PYLIB=1 bash tools/build-ipk.sh --out /tmp/prism-all
+# 产物：luci-app-prism-router_<ver>-1_all.ipk
+- 该命令仅用于本地/CI 交叉构建；不要用 PRISM_ARCH=all 绕过默认构建
+```
+
+这个包：
+
+- 不含 `/usr/lib/prism-router/pylib`、`feishu-ws.py`、`/etc/init.d/prism-router-feishu-ws`
+- `Depends` 不含 `python3-*`
+- 安装后设置页不显示「启用长连接」（`feishu_ws_status.sdk_available=false`）
+
+### ARM 上可用的飞书发送方式
+
+| 方式 | 需要什么 | 是否需要权限/发布 |
+|---|---|---|
+| 群自定义机器人（Webhook） | 群设置 → 群机器人 → 自定义机器人 → Webhook 地址 | 不需要 |
+| 应用机器人 · 群 | App ID/Secret；扫码把机器人加进群；「列出机器人所在的群」选 chat_id | 需要 `im:message:send_as_bot`、`im:chat:readonly` 并发布 |
+| 应用机器人 · 个人 | App ID/Secret；接收人 open_id / user_id / 邮箱 | 需要 `im:message:send_as_bot`；user_id 还需通讯录字段权限 |
+
+没有长连接时：
+
+- **不需要**事件订阅/长连接，告警和报表照常发送
+- 群 `chat_id` 用「列出机器人所在的群」获取（tenant_access_token，纯 ucode）
+- 个人 `open_id` 可手工填写，或在 x86_64 设备上启用长连接自动发现后复制过来
+
+### 需要长连接怎么办
+
+长连接只随 x86_64 包提供；ARM 若要自动接收入群/消息事件，需要自行在设备上准备
+Python 3.11 + 官方 `lark-oapi`，或使用 x86_64 软路由。其余发送方式不受影响。

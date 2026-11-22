@@ -1168,6 +1168,15 @@ return view.extend({
 				_('用户：') + ((st.users || []).length));
 
 			node.textContent = lines.join('\n');
+
+			/* 无 SDK 包（ARM/all）：本架构不支持长连接，隐藏开关避免误开 */
+			if (st.sdk_available === false) {
+				var wsRow = self.rows['feishu.ws_enabled'];
+
+				if (wsRow != null)
+					wsRow.style.display = 'none';
+			}
+
 			self.renderFeishuWsLists(st);
 		}).catch(function(e) {
 			node.textContent = _('长连接状态：查询失败（') + ((e != null && e.message) ? e.message : e) + '）';

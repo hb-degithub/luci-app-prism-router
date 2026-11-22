@@ -60,7 +60,9 @@ jobs:
           fi
           chmod +x tools/build-ipk.sh
           PRISM_VER="$VERSION" PRISM_REL=1 bash tools/build-ipk.sh
-          ls -lh dist
+          # ARM/非 x86_64 用无 SDK 的 all 包（Webhook / 应用 API 可用，长连接不随包）
+          PRISM_NO_PYLIB=1 PRISM_VER="$VERSION" PRISM_REL=1 bash tools/build-ipk.sh --out dist-all
+          ls -lh dist dist-all
 
       - uses: actions/setup-java@v4
         with:
@@ -140,6 +142,7 @@ jobs:
       - name: Collect artifacts
         run: |
           cp dist/*.ipk out/
+          cp dist-all/*.ipk out/
           ls -lh out
 
       - name: Publish release

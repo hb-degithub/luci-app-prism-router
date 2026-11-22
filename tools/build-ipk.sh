@@ -28,9 +28,13 @@ OUT="$ROOT/dist"; LEGACY=0
 # 版本可用环境变量覆盖（CI 按 Release tag 注入）；源码默认 1.0.22，
 # 与 Makefile / Android 默认版本保持一致。包名、opkg Version 与包内版本常量
 # 全部由同一个 VER 派生，避免出现“新 UI 却打包成旧版本”的漂移。
-VER="${PRISM_VER:-1.0.27}"; REL="${PRISM_REL:-1}"
+VER="${PRISM_VER:-1.0.28}"; REL="${PRISM_REL:-1}"
 # 随包 SDK 的 .so 是 musl x86_64；Architecture 必须与之一致，不能是 all。
+# PRISM_NO_PYLIB=1 生成不带 SDK 的 all 架构包：Webhook / 应用 API 仍可用，
+# 仅长连接不随包，供 ARM 等非 x86_64 设备安装。
+NO_PYLIB="${PRISM_NO_PYLIB:-0}"
 ARCH="${PRISM_ARCH:-x86_64}"
+[ "$NO_PYLIB" = "1" ] && ARCH=all
 
 usage() {
   sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
@@ -56,7 +60,7 @@ case "$REL" in
   ''|*[!0-9]*) echo "build-ipk: 非法 release [$REL]" >&2; exit 2 ;;
 esac
 case "$ARCH" in
-  all) echo "build-ipk: 拒绝 Architecture=all：随包的 pycryptodome/websockets .so 是 musl x86_64" >&2; exit 2 ;;
+  all) [ "$NO_PYLIB" = "1" ] || { echo "build-ipk: 拒绝 Architecture=all：随包的 pycryptodome/websockets .so 是 musl x86_64" >&2; exit 2; } ;;
   ''|*[!a-z0-9_]*) echo "build-ipk: 非法架构 [$ARCH]" >&2; exit 2 ;;
 esac
 
@@ -191,6 +195,7 @@ done
 # 官方 lark-oapi 长连接服务 + 随包 SDK（musl x86_64）
 # 先校验 vendor 树没漂移（MANIFEST.json 的 totals.sha256 / 体积 / 静态 import 图），
 # 再整树拷进 data/usr/lib/prism-router/pylib。SDK 不写系统 site-packages。
+if [ "$NO_PYLIB" != "1" ]; then
 PYLIB_SRC="$ROOT/luci-app-prism-router/pylib"
 [ -d "$PYLIB_SRC" ] || { echo "build-ipk: 缺少 $PYLIB_SRC（先跑 tools/vendor-pylib.sh）" >&2; exit 1; }
 if command -v python3 >/dev/null 2>&1; then
@@ -220,6 +225,7 @@ install -m 755 "$ROOT/luci-app-prism-router/root/usr/share/prism-router/feishu-w
   "$D/data/usr/share/prism-router/feishu-ws.py"
 install -m 755 "$ROOT/luci-app-prism-router/root/etc/init.d/prism-router-feishu-ws" \
   "$D/data/etc/init.d/prism-router-feishu-ws"
+fi
 
 # rpcd 插件 / ACL / 菜单
 versioned "$ROOT/luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc" "$W/prism-router.uc" VERSION
@@ -270,9 +276,18 @@ for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/prism-router
   install -m 644 "$f" "$D/data/www/luci-static/resources/prism-router/$(basename "$f")"
 done
 
+BASE_DEPS="luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util, uhttpd"
+if [ "$NO_PYLIB" = "1" ]; then
+  DEPENDS="$BASE_DEPS"
+  DESC_SUFFIX=" This build omits the bundled Feishu long-connection SDK (x86_64 only); Webhook and app-API sending still work."
+else
+  DEPENDS="$BASE_DEPS, python3-light, python3-asyncio, python3-codecs, python3-ctypes, python3-decimal, python3-email, python3-logging, python3-openssl, python3-urllib, python3-uuid, python3-xml"
+  DESC_SUFFIX=""
+fi
+
 ctl "$D" luci-app-prism-router luci \
-  "luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util, uhttpd, python3-light, python3-asyncio, python3-codecs, python3-ctypes, python3-decimal, python3-email, python3-logging, python3-openssl, python3-urllib, python3-uuid, python3-xml" \
-  "PRISM Router single-package plugin: usage accounting daemon, LuCI pages, Feishu long-connection service (bundled lark-oapi), diagnostics and optional standalone panel." \
+  "$DEPENDS" \
+  "PRISM Router single-package plugin: usage accounting daemon, LuCI pages, Feishu sending (Webhook / app API), diagnostics and optional standalone panel.${DESC_SUFFIX}" \
   "$ARCH"
 printf '/etc/config/prism-router\n' > "$D/control/conffiles"; chmod 644 "$D/control/conffiles"
 # postinst 的迁移判定要用到包内 conffile 的 sha256（构建时算好写进脚本）：
@@ -339,12 +354,14 @@ else
 	/etc/init.d/prism-router-panel disable >/dev/null 2>&1
 fi
 # 飞书长连接默认关闭：只跟随 ws_enabled，绝不强制启动。
-if [ "$(uci -q get prism-router.feishu.ws_enabled)" = "1" ]; then
-	/etc/init.d/prism-router-feishu-ws enable >/dev/null 2>&1
-	/etc/init.d/prism-router-feishu-ws restart >/dev/null 2>&1
-else
-	/etc/init.d/prism-router-feishu-ws stop >/dev/null 2>&1
-	/etc/init.d/prism-router-feishu-ws disable >/dev/null 2>&1
+if [ -x /etc/init.d/prism-router-feishu-ws ]; then
+	if [ "$(uci -q get prism-router.feishu.ws_enabled)" = "1" ]; then
+		/etc/init.d/prism-router-feishu-ws enable >/dev/null 2>&1
+		/etc/init.d/prism-router-feishu-ws restart >/dev/null 2>&1
+	else
+		/etc/init.d/prism-router-feishu-ws stop >/dev/null 2>&1
+		/etc/init.d/prism-router-feishu-ws disable >/dev/null 2>&1
+	fi
 fi
 rm -f /tmp/luci-indexcache* 2>/dev/null
 # 新装的 rpcd ucode 脚本不会随 reload 生效，必须 restart 才能注册 feishu_ws_status 等方法
@@ -361,6 +378,8 @@ hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
   '/etc/init.d/prism-routerd stop >/dev/null 2>&1' \
   '/etc/init.d/prism-routerd disable >/dev/null 2>&1' \
   'exit 0'
+# 无 SDK 包没有该 init 脚本，prerm 引用会报错：加存在性判断
+sed -i "s#^\(/etc/init.d/prism-router-feishu-ws \)#[ -x /etc/init.d/prism-router-feishu-ws ] \&\& \1#" "$W/_h"
 install -m 755 "$W/_h" "$D/control/prerm"
 pack "$D" "luci-app-prism-router_${VER}-${REL}_${ARCH}"
 

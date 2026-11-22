@@ -56,7 +56,7 @@ const STATIONS_DIR = '/etc/prism-router/stations';
 /* 设备别名/分组/首次出现（prism-routerd 与 rpcd 共用的唯一权威文件，SPEC §10.1） */
 const DEVICES_FILE = env_or('PRISM_ROUTER_DEVICES_FILE', '/etc/prism-router/devices.json');
 const INIT_SCRIPT  = '/etc/init.d/prism-routerd';
-const VERSION      = '1.0.27';
+const VERSION      = '1.0.28';
 
 /* 别名/分组单字段字节上限（与守护进程 DEVICE_META_TEXT_MAX 一致） */
 const DEVICE_TEXT_MAX = 128;
@@ -1253,6 +1253,12 @@ function feishu_ws_status() {
 
 	/* 不启动的具体原因，按「用户下一步要做什么」排序。 */
 	const reasons = [];
+	const sdk_available = access(WS_INIT_SCRIPT)
+		&& access('/usr/share/prism-router/feishu-ws.py')
+		&& access('/usr/lib/prism-router/pylib/lark_oapi');
+
+	if (!sdk_available)
+		push(reasons, '本架构的安装包不含长连接 SDK（ARM/无 SDK 版）；请改用 Webhook 或应用 API 发送，或安装 x86_64 版本');
 
 	if (!ws_enabled)
 		push(reasons, 'ws_enabled=0：长连接默认关闭，勾选「启用长连接」并保存后才会启动');
@@ -1262,11 +1268,12 @@ function feishu_ws_status() {
 		push(reasons, '缺少 /etc/init.d/prism-router-feishu-ws（请重装插件）');
 	if (!access('/usr/bin/python3'))
 		push(reasons, '未安装 python3（opkg install python3-light python3-openssl python3-asyncio python3-ctypes python3-logging）');
-	if (!access('/usr/lib/prism-router/pylib/lark_oapi'))
+	if (!access('/usr/lib/prism-router/pylib/lark_oapi') && sdk_available)
 		push(reasons, '缺少随包分发的 lark-oapi（/usr/lib/prism-router/pylib）');
 
 	return {
 		ok: true,
+		sdk_available: sdk_available,
 		ws_enabled: ws_enabled,
 		has_credentials: length(app_id) > 0 && has_secret,
 		running: running,
