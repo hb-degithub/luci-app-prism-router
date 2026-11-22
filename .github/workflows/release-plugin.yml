@@ -1,0 +1,118 @@
+name: release-plugin
+
+# 路由器插件独立发版（与 Android App 解耦）。
+#
+# 触发：tag `v<plugin-version>`（如 v1.0.32）或 Actions 手动 Run。
+# 产物：luci-app-prism-router_<ver>-1_<arch>.ipk + SHA256SUMS。
+#
+# 重要：本流程的 release **不附带 APK**。Android App 的更新客户端按「含 .apk 的
+# release 的 tag」选版；如果插件 release 也带 APK，插件版本会被误判成 App 版本。
+# App 发版走 release.yml（app-v<app-version>）。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Plugin Release tag（例如 v1.0.32）'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve plugin version
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          case "$TAG" in
+            v*) ;;
+            *) echo "非法插件 tag：[$TAG]（应为 v<plugin-version>）" >&2; exit 1 ;;
+          esac
+          PLUGIN_VERSION="${TAG#v}"
+          case "$PLUGIN_VERSION" in
+            ''|*[!0-9A-Za-z.+_-]*) echo "非法插件版本号：[$PLUGIN_VERSION]" >&2; exit 1 ;;
+          esac
+          {
+            echo "TAG=$TAG"
+            echo "PLUGIN_VERSION=$PLUGIN_VERSION"
+          } >> "$GITHUB_ENV"
+          echo "plugin=$PLUGIN_VERSION tag=$TAG"
+
+      - name: Build ipk
+        run: |
+          set -euo pipefail
+          # SDK 元数据与手搓包使用同一个插件 tag 版本；build-ipk.sh 还会把版本注入
+          # 包内 daemon/rpcd/metrics/feishu 常量，产物文件名与 control 均由 VERSION 派生。
+          sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$PLUGIN_VERSION/" luci-app-prism-router/Makefile
+          sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" luci-app-prism-router/Makefile
+          chmod +x tools/build-ipk.sh
+          PRISM_VER="$PLUGIN_VERSION" PRISM_REL=1 bash tools/build-ipk.sh
+
+          # ARM/非 x86_64 用无 SDK 的 all 包（Webhook / 应用 API 可用，长连接不随包）。
+          # build-ipk.sh 只允许 --out 指向 dist 或 /tmp 下的专用目录，不能用仓库根 dist-all。
+          DIST_ALL=/tmp/prism-dist-all
+          PRISM_NO_PYLIB=1 PRISM_VER="$PLUGIN_VERSION" PRISM_REL=1 bash tools/build-ipk.sh --out "$DIST_ALL"
+          ls -lh dist "$DIST_ALL"
+
+          # 防止 Makefile / 打包脚本版本漂移：逐个 ipk 校验 control 的 Version。
+          for f in dist/*.ipk "$DIST_ALL"/*.ipk; do
+            [ -f "$f" ] || continue
+            CTL=$(tar -xzOf "$f" ./control.tar.gz | tar -xzO ./control)
+            GOT=$(printf '%s\n' "$CTL" | sed -n 's/^Version:[[:space:]]*//p' | head -n 1)
+            [ "$GOT" = "${PLUGIN_VERSION}-1" ] || {
+              echo "ipk control 版本不一致：期望 ${PLUGIN_VERSION}-1，实际 [$GOT]（$f）" >&2
+              exit 1
+            }
+          done
+
+          echo "DIST_ALL=$DIST_ALL" >> "$GITHUB_ENV"
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp dist/*.ipk out/
+          cp "$DIST_ALL"/*.ipk out/
+          [ -n "$(ls -A out)" ] || { echo "没有可发布的 ipk" >&2; exit 1; }
+          # 防御：插件 release 绝不能带 APK，否则 App 更新会误判版本。
+          if ls out/*.apk >/dev/null 2>&1; then
+            echo "插件 release 不允许包含 APK" >&2
+            exit 1
+          fi
+          ls -lh out
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: 棱镜路由 v${{ env.PLUGIN_VERSION }}
+          body: |
+            路由器插件独立发版（不含 APK，避免 App 更新把插件版本误判为 App 版本）。
+            Android 客户端请从 app-v* release 获取。
+          files: out/*.ipk
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          prerelease: false
+
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          echo "release $TAG assets:"
+          printf '%s\n' "$ASSETS"
+          APK_COUNT=$(printf '%s\n' "$ASSETS" | grep -c '\.apk$' || true)
+          IPK_COUNT=$(printf '%s\n' "$ASSETS" | grep -c '\.ipk$' || true)
+          [ "$IPK_COUNT" -ge 1 ] || {
+            echo "Plugin release $TAG 没有 IPK 资产" >&2; exit 1; }
+          [ "$APK_COUNT" -eq 0 ] || {
+            echo "Plugin release $TAG 不应包含 APK（会被 App 更新误判为 App 版本）" >&2; exit 1; }

@@ -1,9 +1,15 @@
 name: release
 
-# 用法：
-#   1) 打标签推送：git tag v1.0.1 && git push origin v1.0.1
-#   2) 或在 Actions 页手动 Run（输入 tag）
-# 产物：luci-app-prism-router_*.ipk + prism-router-android-<version>.apk
+# Android App 独立发版（与路由器插件解耦）。
+#
+# 触发：tag `app-v<versionName>`（如 app-v1.0.10）或 Actions 手动 Run。
+# 说明：
+# - App 版本唯一来源是 android/version.properties；tag 必须与它一致，versionCode
+#   必须满足 major*10000+minor*100+patch（minor/patch < 100）；
+# - 只构建 Android APK；release 里必须至少有一个 `.apk` 资产，否则任务失败；
+# - 用 `aapt dump badging` 校验 APK 内 versionName / versionCode 与 tag 一致；
+# - APK 资产名固定为 prism-router-<versionName>.apk；下载交给系统浏览器 / 下载器。
+# - 插件发版走 release-plugin.yml（v<plugin-version>），不会出现在本流程里。
 #
 # 正式签名：仓库 Secret 配好下面三项后，CI 产出 release 签名 APK；
 # 未配置时自动退回 debug 签名（保证能构建，但安装前需卸载同包名旧版）。
@@ -14,11 +20,11 @@ name: release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['app-v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag（例如 v1.0.1）'
+        description: 'App Release tag（例如 app-v1.0.10）'
         required: true
 
 permissions:
@@ -30,39 +36,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version
+      - name: Resolve App version
         run: |
-          VERSION="${{ inputs.tag }}"
-          if [ -z "$VERSION" ]; then VERSION="${{ github.ref_name }}"; fi
-          VERSION="${VERSION#[vV]}"
-          case "$VERSION" in
-            ''|*[!0-9A-Za-z.+_-]*) echo "非法版本号：[$VERSION]" >&2; exit 1 ;;
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME}"; fi
+          case "$TAG" in
+            app-v*) ;;
+            *) echo "非法 App tag：[$TAG]（应为 app-v<app-version>）" >&2; exit 1 ;;
           esac
-          # 单调 versionCode：major*10000 + minor*100 + patch（1.0.3=10003，1.0.4=10004，1.0.5=10005，1.0.6=10006）。
-          BASE="${VERSION%%-*}"
-          CODE=$(printf '%s' "$BASE" | awk -F. '
-            NF < 3 { print 0; exit }
-            { printf "%d", ($1 * 10000 + $2 * 100 + $3) }')
-          [ "$CODE" -gt 0 ] || { echo "无法从 $VERSION 生成 versionCode" >&2; exit 1; }
-          {
-            echo "VERSION=$VERSION"
-            echo "PRISM_VERSION_NAME=$VERSION"
-            echo "PRISM_VERSION_CODE=$CODE"
-          } >> "$GITHUB_ENV"
+          APP_TAG_VERSION="${TAG#app-v}"
 
-      - name: Build ipk
-        run: |
-          # SDK 元数据与手搓包使用同一个 tag 版本；build-ipk.sh 还会把版本注入
-          # 包内 daemon/rpcd/metrics/feishu 常量，产物文件名与 control 均由 VERSION 派生。
-          if [ -n "$VERSION" ]; then
-            sed -i "s/^PKG_VERSION:=.*/PKG_VERSION:=$VERSION/" luci-app-prism-router/Makefile
-            sed -i "s/^PKG_RELEASE:=.*/PKG_RELEASE:=1/" luci-app-prism-router/Makefile
+          # App 版本唯一来源：android/version.properties。
+          APP_FILE_VERSION=$(awk -F= '$1=="versionName" {v=$2; gsub(/[ \t\r]/, "", v); print v; exit}' android/version.properties)
+          APP_FILE_CODE=$(awk -F= '$1=="versionCode" {v=$2; gsub(/[ \t\r]/, "", v); print v; exit}' android/version.properties)
+          [ -n "$APP_FILE_VERSION" ] || { echo "android/version.properties 缺少 versionName" >&2; exit 1; }
+          [ -n "$APP_FILE_CODE" ] || { echo "android/version.properties 缺少 versionCode" >&2; exit 1; }
+
+          if [[ ! "$APP_FILE_VERSION" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "App versionName 必须为 major.minor.patch：[$APP_FILE_VERSION]" >&2
+            exit 1
           fi
-          chmod +x tools/build-ipk.sh
-          PRISM_VER="$VERSION" PRISM_REL=1 bash tools/build-ipk.sh
-          # ARM/非 x86_64 用无 SDK 的 all 包（Webhook / 应用 API 可用，长连接不随包）
-          PRISM_NO_PYLIB=1 PRISM_VER="$VERSION" PRISM_REL=1 bash tools/build-ipk.sh --out dist-all
-          ls -lh dist dist-all
+          MAJOR=$((10#${BASH_REMATCH[1]}))
+          MINOR=$((10#${BASH_REMATCH[2]}))
+          PATCH=$((10#${BASH_REMATCH[3]}))
+          if [ "$MINOR" -ge 100 ] || [ "$PATCH" -ge 100 ]; then
+            echo "App versionName [$APP_FILE_VERSION] 的 minor/patch 必须 < 100" >&2
+            exit 1
+          fi
+          EXPECTED_CODE=$((MAJOR * 10000 + MINOR * 100 + PATCH))
+          if [ "$APP_FILE_CODE" != "$EXPECTED_CODE" ]; then
+            echo "android/version.properties 版本不自洽：versionName=$APP_FILE_VERSION 应对应 versionCode=$EXPECTED_CODE，实际=$APP_FILE_CODE" >&2
+            exit 1
+          fi
+          if [ "$APP_TAG_VERSION" != "$APP_FILE_VERSION" ]; then
+            echo "App tag 与 android/version.properties 不一致：tag=$APP_TAG_VERSION，文件=$APP_FILE_VERSION" >&2
+            exit 1
+          fi
+
+          {
+            echo "TAG=$TAG"
+            echo "APP_VERSION=$APP_FILE_VERSION"
+            echo "APP_VERSION_CODE=$EXPECTED_CODE"
+            echo "PRISM_VERSION_NAME=$APP_FILE_VERSION"
+            echo "PRISM_VERSION_CODE=$EXPECTED_CODE"
+          } >> "$GITHUB_ENV"
+          echo "app=$APP_FILE_VERSION ($EXPECTED_CODE) tag=$TAG"
 
       - uses: actions/setup-java@v4
         with:
@@ -83,8 +102,11 @@ jobs:
           KEYSTORE_B64: ${{ secrets.PRISM_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.PRISM_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.PRISM_KEY_PASSWORD }}
-        if: env.KEYSTORE_B64 != ''
         run: |
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "未配置 PRISM_KEYSTORE_BASE64，跳过 release 签名（将退回 debug 签名）"
+            exit 0
+          fi
           mkdir -p android/keystore
           printf '%s' "$KEYSTORE_B64" | base64 -d > android/keystore/prism-router.jks
           {
@@ -96,6 +118,7 @@ jobs:
 
       - name: Android unit tests
         run: |
+          set -euo pipefail
           cd android
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           ./gradlew testDebugUnitTest --no-daemon --console=plain \
@@ -104,6 +127,7 @@ jobs:
 
       - name: Build Android APK
         run: |
+          set -euo pipefail
           cd android
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           mkdir -p ../out
@@ -120,36 +144,71 @@ jobs:
             ./gradlew assembleDebug --no-daemon --console=plain "${GRADLE_VERSION_ARGS[@]}"
             SRC=app/build/outputs/apk/debug/app-debug.apk
           fi
-          # 文件名取 Gradle 实际生效的 versionName，而不是另写一份变量。
+
+          # 校验 Gradle 实际生效版本与 version.properties 一致。
           ACTUAL_NAME=$(./gradlew -q :app:printVersionName "${GRADLE_VERSION_ARGS[@]}" | tail -n 1)
-          [ "$ACTUAL_NAME" = "$PRISM_VERSION_NAME" ] || {
-            echo "versionName 不一致：期望 $PRISM_VERSION_NAME，实际 $ACTUAL_NAME" >&2; exit 1; }
-          cp "$SRC" "../out/prism-router-android-${ACTUAL_NAME}.apk"
-          # 再用 aapt 读 APK 内 versionName/versionCode，防止资产名与包内版本漂移。
+          ACTUAL_CODE=$(./gradlew -q :app:printVersionCode "${GRADLE_VERSION_ARGS[@]}" | tail -n 1)
+          [ "$ACTUAL_NAME" = "$APP_VERSION" ] || {
+            echo "versionName 不一致：期望 $APP_VERSION，实际 $ACTUAL_NAME" >&2; exit 1; }
+          [ "$ACTUAL_CODE" = "$APP_VERSION_CODE" ] || {
+            echo "versionCode 不一致：期望 $APP_VERSION_CODE，实际 $ACTUAL_CODE" >&2; exit 1; }
+
+          cp "$SRC" "../out/prism-router-${APP_VERSION}.apk"
+
+          # 用 aapt 读 APK 内 versionName/versionCode，防止资产名与包内版本漂移。
           AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
-          if [ -x "$AAPT" ]; then
-            BADGING=$("$AAPT" dump badging "$SRC" | head -n 1)
-            GOT=$(printf '%s\n' "$BADGING" | sed -n "s/.*versionCode='\([0-9]*\)' versionName='\([^']*\)'.*/\1 \2/p")
-            [ "$GOT" = "$PRISM_VERSION_CODE $ACTUAL_NAME" ] || {
-              echo "APK 内版本不一致：期望 $PRISM_VERSION_CODE $ACTUAL_NAME，实际 [$GOT]" >&2
-              printf '%s\n' "$BADGING" >&2
-              exit 1
-            }
-          else
-            echo "WARNING: 未找到 $AAPT，跳过 APK badging 校验" >&2
+          if [ ! -x "$AAPT" ]; then
+            AAPT=$(find "$ANDROID_HOME/build-tools" -type f -name aapt | sort -V | tail -n 1)
           fi
+          [ -n "$AAPT" ] && [ -x "$AAPT" ] || {
+            echo "未找到 aapt，无法校验 APK 内版本" >&2; exit 1; }
+          BADGING=$("$AAPT" dump badging "$SRC" | head -n 1)
+          GOT_NAME=$(printf '%s\n' "$BADGING" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+          GOT_CODE=$(printf '%s\n' "$BADGING" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")
+          [ "$GOT_NAME" = "$APP_VERSION" ] || {
+            echo "APK 内 versionName 与 tag 不一致：期望 $APP_VERSION，实际 [$GOT_NAME]" >&2
+            printf '%s\n' "$BADGING" >&2
+            exit 1
+          }
+          [ "$GOT_CODE" = "$APP_VERSION_CODE" ] || {
+            echo "APK 内 versionCode 不一致：期望 $APP_VERSION_CODE，实际 [$GOT_CODE]" >&2
+            printf '%s\n' "$BADGING" >&2
+            exit 1
+          }
+
+          shopt -s nullglob
+          APKS=(../out/*.apk)
+          [ "${#APKS[@]}" -ge 1 ] || {
+            echo "App release 没有生成任何 APK 资产" >&2; exit 1; }
 
       - name: Collect artifacts
         run: |
-          cp dist/*.ipk out/
-          cp dist-all/*.ipk out/
+          set -euo pipefail
+          [ -n "$(ls -A out)" ] || { echo "没有可发布的 APK" >&2; exit 1; }
           ls -lh out
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          name: 棱镜路由 ${{ inputs.tag || github.ref_name }}
-          files: out/*
+          tag_name: ${{ env.TAG }}
+          name: 棱镜路由 Android v${{ env.APP_VERSION }}
+          body: |
+            Android 客户端独立发版。App 更新只依赖 GitHub Releases，与路由器插件版本解耦。
+          files: out/*.apk
           fail_on_unmatched_files: true
           generate_release_notes: true
+          prerelease: false
+
+      - name: Verify release has APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          echo "release $TAG assets:"
+          printf '%s\n' "$ASSETS"
+          APK_COUNT=$(printf '%s\n' "$ASSETS" | grep -c '\.apk$' || true)
+          [ "$APK_COUNT" -ge 1 ] || {
+            echo "App release $TAG 没有 APK 资产；不能静默发布" >&2
+            exit 1
+          }

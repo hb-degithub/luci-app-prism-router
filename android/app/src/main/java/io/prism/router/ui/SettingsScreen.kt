@@ -85,6 +85,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.prism.router.data.MAX_SERVERS
+import io.prism.router.data.GithubRelease
+import io.prism.router.data.GithubReleaseClient
 import io.prism.router.data.MainViewModel
 import io.prism.router.data.PanelClient
 import io.prism.router.data.ProcessInfo
@@ -92,7 +94,6 @@ import io.prism.router.data.ServerProfile
 import io.prism.router.data.ServiceInfo
 import io.prism.router.data.SystemInfo
 import io.prism.router.data.UiState
-import io.prism.router.data.UpdateCheck
 import io.prism.router.data.UpdateStatus
 import io.prism.router.data.WifiDevice
 import io.prism.router.data.formatPublishedAt
@@ -323,12 +324,14 @@ fun SettingsScreen(
     val packageInfo = remember(context) {
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0) }.getOrNull()
     }
-    val versionName = packageInfo?.versionName?.takeIf { it.isNotBlank() } ?: "1.0.0"
+    val versionName = packageInfo?.versionName?.takeIf { it.isNotBlank() } ?: "未知"
     val versionCode = when {
-        packageInfo == null -> 1L
+        packageInfo == null -> 0L
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.P -> packageInfo.longVersionCode
         else -> @Suppress("DEPRECATION") packageInfo.versionCode.toLong()
     }
+    /* 路由器插件版本：来自只读系统信息（?what=system 的 version），与 App 版本分开展示。 */
+    val routerPluginVersion = ui.system?.version?.trim().orEmpty()
     val buildType = if ((context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
         "debug"
     } else {
@@ -911,7 +914,20 @@ fun SettingsScreen(
                 /* ───────── 关于 ───────── */
                 item {
                     SectionCard(title = "关于", subtitle = "棱镜路由 · Android 原生客户端") {
-                        InfoRow("版本", "$versionName ($versionCode)")
+                        /*
+                         * App 版本与路由器插件版本是两个独立的版本来源：
+                         * - App 版本由 android/version.properties 单一维护，CI 可覆盖；
+                         * - 插件版本由路由器上安装的 ipk 决定，不参与 App 更新比较。
+                         */
+                        InfoRow("App 版本", "$versionName ($versionCode)")
+                        InfoRow(
+                            "路由器插件版本",
+                            if (routerPluginVersion.isNotBlank()) {
+                                "v$routerPluginVersion"
+                            } else {
+                                "未连接路由器 / 读取中"
+                            }
+                        )
                         InfoRow(
                             "构建",
                             "$buildType · Android ${Build.VERSION.RELEASE}（API ${Build.VERSION.SDK_INT}）"
@@ -921,7 +937,7 @@ fun SettingsScreen(
                         UpdateBlock(
                             ui = ui,
                             appVersionFallback = versionName,
-                            onCheck = { vm.checkUpdate(force = true) },
+                            onCheck = { vm.checkUpdate() },
                             onOpenUrl = { url -> openExternal(url) }
                         )
                         Spacer(Modifier.height(PrismSpacing.xs))
@@ -2336,16 +2352,15 @@ private fun RowScope.ProcessCell(text: String, style: TextStyle, width: Dp?) {
 /* ───────────────────────── 检查更新（关于分组内） ───────────────────────── */
 
 /**
- * 检查更新（路由器的 GitHub 更新源：`?what=update_check`）。
+ * 检查更新：直接查询 GitHub Releases 上的 **App** 新版本（不再经过路由器）。
  *
  * 结果与界面一一对应：
- * - 未配置：提示在路由器 uci 设置 `github_repo`（不提供 App 内修改入口）；
- * - 有更新：插件版本对比（当前 → 最新）、发布时间、notes 摘要，并按后端产物渲染
- *   「下载 APK / 下载 IPK」（交给系统浏览器）与「打开 Release 页」；
- * - 已是最新：显示「已是最新（vX）」；
- * - 失败：`github_unavailable` / `github_not_found` / `github_unauthorized` 的中文提示。
+ * - 有更新：App 版本对比（本机 → 最新）、发布时间、notes 摘要，并提供
+ *   「下载 APK」（交给系统浏览器 / 下载器）与「打开 Release 页」；
+ * - 已是最新：显示「已是最新」与本机 / GitHub 最新 App 版本；
+ * - 失败：网络 / 限流 / 仓库 / 无 APK 的中文提示，**不提示「请先连接路由器」**。
  *
- * App 版本（PackageManager.versionName）始终显示，检查前也可见；
+ * 路由器插件版本在「关于」卡片单独展示；这里的比较只用 App versionName。
  * [onOpenUrl] 由调用方用系统浏览器 Intent 打开，本组件不内置下载 / 安装逻辑。
  */
 @Composable
@@ -2357,7 +2372,7 @@ private fun UpdateBlock(
 ) {
     val semantic = LocalPrismSemanticColors.current
     val update = ui.update
-    val check = update.check
+    val release = update.release
     /* 还没检查过时 UpdateState 里没有版本号：退回 PackageManager 的 versionName。 */
     val appVersion = update.appVersion.ifBlank { appVersionFallback }
     val checking = update.status == UpdateStatus.CHECKING
@@ -2367,9 +2382,7 @@ private fun UpdateBlock(
     Spacer(Modifier.height(PrismSpacing.sm))
 
     InfoRow("本机 App", "v" + appVersion.ifBlank { "未知" })
-    if (check != null && check.configured && check.repo.isNotBlank()) {
-        InfoRow("更新源", check.repo)
-    }
+    InfoRow("更新源", "GitHub Releases · ${GithubReleaseClient.REPO}")
 
     Spacer(Modifier.height(PrismSpacing.sm))
     OutlinedButton(
@@ -2385,46 +2398,26 @@ private fun UpdateBlock(
 
     when (update.status) {
         UpdateStatus.IDLE -> Text(
-            text = "从路由器配置的 GitHub 更新源检查插件新版本；有新版本只提示，不自动安装。",
+            text = "从 GitHub Releases 检查 App 新版本；无需连接路由器。有新版本只提示，不自动安装。",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
         UpdateStatus.CHECKING -> LinearProgressIndicator(Modifier.fillMaxWidth())
 
-        UpdateStatus.NOT_CONFIGURED -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
-            Text(
-                text = "未配置更新源（可在路由器 uci 设置 github_repo）",
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = semantic.warning
-            )
-            /*
-             * 后端会把准确的 uci 命令放在 message 里（prism-router.update.github_repo），
-             * 有就直接展示；没有时用同样的路径兜底，避免引导到错误的配置段。
-             */
-            Text(
-                text = update.message.orEmpty().trim().ifBlank {
-                    "uci set prism-router.update.github_repo='owner/repo' && uci commit prism-router"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-
-        UpdateStatus.UPDATE_AVAILABLE -> UpdateAvailableBlock(check, onOpenUrl)
+        UpdateStatus.UPDATE_AVAILABLE -> UpdateAvailableBlock(release, appVersion, onOpenUrl)
 
         UpdateStatus.UP_TO_DATE -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
             Text(
-                text = "已是最新（v${check?.latestText ?: appVersion.ifBlank { "?" }}）",
+                text = "已是最新（本机 v${appVersion.ifBlank { "?" }}）",
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = semantic.success
             )
-            val published = formatPublishedAt(check?.publishedAt.orEmpty())
+            val published = formatPublishedAt(release?.publishedAt.orEmpty())
             Text(
                 text = buildString {
-                    append("本机 v").append(appVersion.ifBlank { "未知" })
+                    append("GitHub 最新 App 版本 v").append(release?.displayVersion ?: "?")
                     if (published.isNotBlank()) append(" · 最新发布 ").append(published)
                 },
                 style = MaterialTheme.typography.labelSmall,
@@ -2440,15 +2433,16 @@ private fun UpdateBlock(
                 color = semantic.warning
             )
             Text(
-                text = update.message ?: "更新源返回的数据不完整，请稍后重试。",
+                text = update.message ?: "GitHub 返回的版本号无法与本机 App 版本比较，请稍后重试。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
         UpdateStatus.ERROR -> Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
+            val networkFailure = update.message?.startsWith("检查更新失败（网络）") == true
             Text(
-                text = "检查更新失败",
+                text = if (networkFailure) "网络不可用" else "检查更新失败",
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.error
@@ -2463,30 +2457,37 @@ private fun UpdateBlock(
 }
 
 /**
- * 有新版本时的详情：版本对比、发布时间、notes 摘要、安装包下载与 Release 页。
+ * 有新版本时的详情：App 版本对比、发布时间、notes 摘要、APK 下载与 Release 页。
  *
- * 下载按钮按后端下发的 `apk` / `ipk` 是否存在决定（缺哪个就不渲染哪个），
- * 打开动作由 [onOpenUrl] 交给系统浏览器，App 不请求存储或安装权限。
+ * 只展示 GitHub release 里的 APK（不再展示 IPK —— 插件包由插件自己的发布渠道提供）。
+ * 打开动作由 [onOpenUrl] 交给系统浏览器 / DownloadManager，App 不请求存储或安装权限。
  */
 @Composable
-private fun UpdateAvailableBlock(check: UpdateCheck?, onOpenUrl: (String) -> Unit) {
-    if (check == null) return
-    val assets = buildList {
-        check.apk?.takeIf { it.available }?.let { add("APK" to it) }
-        check.ipk?.takeIf { it.available }?.let { add("IPK" to it) }
+private fun UpdateAvailableBlock(
+    release: GithubRelease?,
+    appVersion: String,
+    onOpenUrl: (String) -> Unit
+) {
+    if (release == null) {
+        Text(
+            text = "GitHub 返回的数据缺少 App 发版信息，请稍后重试。",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        return
     }
-    val published = formatPublishedAt(check.publishedAt)
-    val summary = check.notesSummary()
+    val published = formatPublishedAt(release.publishedAt)
+    val summary = release.notesSummary()
 
     Column(verticalArrangement = Arrangement.spacedBy(PrismSpacing.xs)) {
         Text(
-            text = "发现新版本 v${check.latestText}",
+            text = "发现新版本 App v${release.displayVersion}",
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.primary
         )
         Text(
-            text = "插件版本 v${check.currentText} → v${check.latestText}",
+            text = "App 版本 v${appVersion.ifBlank { "未知" }} → v${release.displayVersion}",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -2508,31 +2509,22 @@ private fun UpdateAvailableBlock(check: UpdateCheck?, onOpenUrl: (String) -> Uni
             )
         }
 
-        if (assets.isNotEmpty()) {
+        if (release.hasApk) {
             Spacer(Modifier.height(PrismSpacing.sm))
-            Row(horizontalArrangement = Arrangement.spacedBy(PrismSpacing.sm)) {
-                assets.forEach { (label, asset) ->
-                    OutlinedButton(
-                        onClick = { onOpenUrl(asset.url) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .heightIn(min = PrismSize.touchTarget)
-                    ) {
-                        Text(
-                            text = "下载 $label",
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
+            OutlinedButton(
+                onClick = { onOpenUrl(release.apkUrl) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = PrismSize.touchTarget)
+            ) {
+                Text(
+                    text = "下载 APK",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
             Text(
-                text = assets.joinToString(" · ") { (label, asset) ->
-                    buildString {
-                        append(label).append(" ").append(asset.displayName)
-                        if (asset.sizeText.isNotBlank()) append("（").append(asset.sizeText).append("）")
-                    }
-                },
+                text = "APK ${release.apkName}",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 2,
@@ -2540,10 +2532,10 @@ private fun UpdateAvailableBlock(check: UpdateCheck?, onOpenUrl: (String) -> Uni
             )
         }
 
-        if (check.hasReleasePage) {
+        if (release.hasReleasePage) {
             Spacer(Modifier.height(PrismSpacing.sm))
             OutlinedButton(
-                onClick = { onOpenUrl(check.htmlUrl) },
+                onClick = { onOpenUrl(release.htmlUrl) },
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = PrismSize.touchTarget)
@@ -2552,9 +2544,9 @@ private fun UpdateAvailableBlock(check: UpdateCheck?, onOpenUrl: (String) -> Uni
             }
         }
 
-        if (assets.isEmpty() && !check.hasReleasePage) {
+        if (!release.hasApk && !release.hasReleasePage) {
             Text(
-                text = "更新源没有提供安装包或 Release 链接，请到仓库页面手动获取。",
+                text = "该 Release 没有提供 APK 或发布页链接，请到仓库页面手动获取。",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

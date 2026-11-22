@@ -93,7 +93,7 @@ data class UiState(
     val config: ConfigUiState = ConfigUiState(),
     /** 重启 / 无线开关等管理写操作是否在进行中（禁用按钮、防重复提交）。 */
     val adminBusy: Boolean = false,
-    /** 检查更新：App 版本、GitHub `update_check` 结果与结论。 */
+    /** 检查更新：本机 App 版本、GitHub Releases 上选中的 App 发版与结论（与路由器无关）。 */
     val update: UpdateState = UpdateState(),
     /** 多路由器：地址列表与当前选中项（下标）。空列表时退回默认地址。 */
     val servers: List<ServerProfile> = listOf(DEFAULT_SERVER),
@@ -185,6 +185,14 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         /* 网络配置：进屏读一次；1 分钟内重复进屏复用结果（写成功后强制重读）。 */
         const val CONFIG_CACHE_MS = 60 * 1000L
 
+        /*
+         * App 更新：启动时自动查一次 GitHub Releases，失败/成功后 6 小时内不重复自动查；
+         * 手动点「检查更新」不受节流限制。GitHub 未认证接口限流 60 次/小时，节流可避免
+         * 频繁冷启动把额度用光。更新与路由器无关，不需要 DataStore 配置就绪。
+         */
+        const val AUTO_UPDATE_CHECK_MS = 6 * 60 * 60 * 1000L
+        const val PREF_UPDATE_CHECK_AT = "updateCheckAt"
+
         /* 告警阈值与规则见 data/AlertRules.kt（纯函数，便于单测）。 */
     }
 
@@ -203,6 +211,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val adminClient = AdminClient()
     /* 路由器配置（LAN / WAN / DHCP / 系统 / 端口转发）：独立 CGI 段的轻量客户端。 */
     private val configClient = ConfigClient()
+    /*
+     * App 自动更新：直接查询 GitHub Releases，不经过路由器，也不依赖 DataStore 里的
+     * 面板地址。无 token 的公开接口，调用方（checkUpdate）负责切到 IO 线程。
+     */
+    private val githubReleaseClient = GithubReleaseClient()
 
     /**
      * 仅保留离线快照的 SharedPreferences（`stateCache` / `stateCacheAt`）；
@@ -258,6 +271,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         observeSettings()
+        /* App 更新不依赖路由器：进程启动即可查 GitHub；内部按 6 小时节流。 */
+        maybeAutoCheckUpdate()
     }
 
     /* ───────────────────────── 设置状态流 ───────────────────────── */
@@ -1096,66 +1111,94 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         ui = ui.copy(config = ui.config.copy(notice = null))
     }
 
-    /* ───────────────────────── 检查更新（GitHub） ───────────────────────── */
+    /* ───────────────────────── 检查更新（GitHub Releases，App 自身） ───────────────────────── */
 
     /**
-     * 检查路由器配置的 GitHub 更新源：`GET ?what=update_check[&force=1]`。
+     * 检查 **App 自身的**新版本：直接请求 GitHub Releases，不依赖路由器。
      *
-     * 结论只有四种：未配置更新源 / 有新版本 / 已是最新 / 失败（GitHub 不可达、
-     * 仓库不存在、拒绝访问）。默认 [force]=true，即用户点按钮时跳过后端短期缓存。
-     * 不自动下载任何安装包：只展示版本对比、发布时间、notes 摘要与下载 / Release 入口。
-     * App 版本读自 PackageManager（当前构建未开启 BuildConfig）。
+     * 与旧实现的区别：
+     * - 不再调用 `SystemClient.fetchUpdateCheck`（那是插件 / IPK 版本，且要路由器在线）；
+     * - 不需要面板地址 / 访问令牌 / DataStore 就绪，启动自动检查与手动检查都可以直接查；
+     * - 只把 GitHub 上带 APK 的正式 release 与本机 versionName 比较，**不比较插件版本**；
+     * - 失败时展示可读错误（网络 / 限流 / 仓库 / 无 APK），绝不回退到路由器接口。
+     * - 不自动下载或安装：只保留版本提示，APK 下载交给系统浏览器 / 下载器。
+     *
+     * 每次调用（自动 / 手动）都会刷新节流时间戳；手动检查不会被节流拦截。
      */
-    fun checkUpdate(force: Boolean = true) {
+    fun checkUpdate() {
         if (ui.update.status == UpdateStatus.CHECKING) return
-        if (!settingsReady) return
-        val base = ui.baseUrl
         val appVersion = appVersionName()
-        ui = ui.copy(update = UpdateState(UpdateStatus.CHECKING, appVersion, ui.update.check))
+        prefs.edit().putLong(PREF_UPDATE_CHECK_AT, System.currentTimeMillis()).apply()
+        ui = ui.copy(
+            update = UpdateState(
+                status = UpdateStatus.CHECKING,
+                appVersion = appVersion,
+                release = ui.update.release
+            )
+        )
         viewModelScope.launch {
             try {
-                val check = withContext(Dispatchers.IO) {
-                    systemClient.fetchUpdateCheck(base, force)
+                val release = withContext(Dispatchers.IO) {
+                    githubReleaseClient.fetchLatestRelease()
                 }
-                if (ui.baseUrl != base) return@launch
+                val comparison = compareVersions(release.versionName, appVersion)
                 val status = when {
-                    !check.configured -> UpdateStatus.NOT_CONFIGURED
-                    check.latest.isBlank() -> UpdateStatus.UNKNOWN
-                    check.hasUpdate -> UpdateStatus.UPDATE_AVAILABLE
+                    comparison == null -> UpdateStatus.UNKNOWN
+                    comparison > 0 -> UpdateStatus.UPDATE_AVAILABLE
                     else -> UpdateStatus.UP_TO_DATE
                 }
-                val message = when (status) {
-                    UpdateStatus.NOT_CONFIGURED -> check.message.ifBlank {
-                        "未配置更新源（可在路由器 uci 设置 github_repo）"
-                    }
-
-                    UpdateStatus.UNKNOWN -> "没有拿到最新版本号，请稍后重试"
-                    else -> null
+                val message = if (status == UpdateStatus.UNKNOWN) {
+                    "无法比较版本：本机 App 为 v${appVersion.ifBlank { "未知" }}，" +
+                        "GitHub 最新为 v${release.displayVersion}"
+                } else {
+                    null
                 }
-                ui = ui.copy(update = UpdateState(status, appVersion, check, message))
+                ui = ui.copy(update = UpdateState(status, appVersion, release, message))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (ui.baseUrl != base) return@launch
                 ui = ui.copy(
                     update = UpdateState(
                         status = UpdateStatus.ERROR,
                         appVersion = appVersion,
-                        check = ui.update.check,
-                        message = systemErrorMessage(e)
+                        release = ui.update.release,
+                        message = updateErrorMessage(e)
                     )
                 )
             }
         }
     }
 
-    /** 本机 App 版本号（等价 BuildConfig.VERSION_NAME；构建未开启 buildConfig，改读系统包信息）。 */
+    /**
+     * 启动时的自动检查：0 次或距上次尝试超过 [AUTO_UPDATE_CHECK_MS] 才发起。
+     *
+     * 只说「尝试」：失败也会写时间戳，避免 6 小时内反复请求 GitHub 触发匿名限流；
+     * 用户点「检查更新」不受此限制。
+     */
+    private fun maybeAutoCheckUpdate() {
+        val now = System.currentTimeMillis()
+        val last = prefs.getLong(PREF_UPDATE_CHECK_AT, 0L)
+        if (last > 0L && now >= last && now - last < AUTO_UPDATE_CHECK_MS) return
+        checkUpdate()
+    }
+
+    /** 本机 App 版本号（读取 Gradle 写入 APK 的 versionName；不依赖 BuildConfig）。 */
     private fun appVersionName(): String = try {
         val app = getApplication<Application>()
         @Suppress("DEPRECATION")
         app.packageManager.getPackageInfo(app.packageName, 0).versionName.orEmpty()
     } catch (e: Exception) {
         ""
+    }
+
+    /** 更新检查错误 → 可展示文案；网络类错误明确标注「网络」，不混入路由器提示。 */
+    private fun updateErrorMessage(error: Throwable): String = when (error) {
+        is GithubReleaseException -> when (error.code) {
+            "network", "timeout" -> "检查更新失败（网络）：${error.message}"
+            else -> error.message
+        }
+
+        else -> error.message ?: "检查更新失败，请稍后重试"
     }
 
     /** 系统接口错误 → 可展示文案（SystemException 已带中文）。 */
@@ -1338,9 +1381,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 清空与「某台路由器」绑定的数据：AP 快照 / 系统信息 / 管理员会话 / 更新结果。
+     * 清空与「某台路由器」绑定的数据：AP 快照 / 系统信息 / 管理员会话。
      *
-     * 切换或保存地址时调用，避免把旧路由器的管理令牌、系统信息、更新结论带到新面板上。
+     * 切换或保存地址时调用，避免把旧路由器的管理令牌、系统信息带到新面板上。
+     * 更新检查结果与路由器无关（GitHub 上的 App 发版），所以**不重置** [update]；
+     * 只有「本机版本 + GitHub 结果」两个输入，换路由器不会改变结论。
      * 同时丢弃内存里的管理令牌（令牌只对签发它的那台路由器有效）。
      */
     private fun UiState.withoutRouterScopedData(): UiState {
@@ -1356,7 +1401,6 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             systemError = null,
             systemAt = 0,
             systemLoading = false,
-            update = UpdateState(),
             adminUser = "",
             adminLoggedIn = false,
             adminExpiresAt = 0,

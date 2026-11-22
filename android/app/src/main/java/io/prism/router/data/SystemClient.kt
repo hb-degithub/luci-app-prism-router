@@ -24,9 +24,10 @@ class SystemException(val code: String, override val message: String) : Exceptio
  * - `what=system`    → [SystemInfo]（主机名 / 型号 / 内核 / 运行时间 / 负载 / 内存 / 根分区）；
  * - `what=services`  → [ServiceInfo] 列表（系统服务运行状态）；
  * - `what=processes` → [ProcessInfo] 列表（Top 进程）；
- * - `what=version`   → [ServerVersion]（面板 / 固件版本，只用于展示）；
- * - `what=update_check`（可加 `&force=1`）→ [UpdateCheck]（GitHub 更新源，
- *   未配置 / 有更新 / 已是最新 / 失败四种结果）。
+ * - `what=version`   → [ServerVersion]（路由器插件版本，只用于「关于」页并列展示）；
+ * - `what=update_check`（可加 `&force=1`）→ [UpdateCheck]（**旧版**：由路由器代查
+ *   GitHub 并返回插件 / IPK 版本）。App 更新已改为直接调用
+ *   [GithubReleaseClient]，本方法仅为兼容旧面板契约保留，客户端不再调用。
  *
  * 老面板没有该接口时返回 404，这里映射成「请升级面板」的中文提示，而不是让设置页白屏。
  * 方法都是阻塞式的（与 [PanelClient] 一致），调用方负责放到 IO 线程。
@@ -97,11 +98,16 @@ class SystemClient {
     /**
      * `what=update_check`（[force]=true 时带 `&force=1`，跳过后端的短期缓存）。
      *
+     * **已废弃，App 不再调用**：该接口由路由器代查 GitHub，返回的是插件 / IPK 版本，
+     * 且路由器离线时不可用。App 自动更新改走 [GithubReleaseClient]（直连 GitHub
+     * Releases，只比较 App versionName）。保留仅为兼容旧面板契约 / 历史单测。
+     *
      * 返回三种形态之一（见 [UpdateCheck]）；业务失败（GitHub 不可达 / 仓库不存在 /
      * 拒绝访问）在这里统一抛 [SystemException]，[SystemException.message] 已是对用户
      * 可读的中文，调用方无需再翻译。未配置更新源**不是**异常，而是
-     * `configured=false` 的正常结果（界面据此显示 uci 配置提示）。
+     * `configured=false` 的正常结果。
      */
+    @Deprecated("App 更新改由 GithubReleaseClient 直连 GitHub Releases，不再使用路由器 update_check")
     fun fetchUpdateCheck(baseUrl: String, force: Boolean = false): UpdateCheck = wrap("检查更新") {
         val query = if (force) "what=update_check&force=1" else "what=update_check"
         val result = execute(baseUrl, query)

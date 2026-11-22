@@ -412,18 +412,18 @@ data class ProcessInfo(
 }
 
 /**
- * `?what=version`：服务端版本。
+ * `?what=version`：路由器插件版本。
  *
- * [version] 是面板 / 固件版本（检查更新时与 App 的 versionName 比较）；
- * [apkVersion] 是服务端记录的 Android 包版本，仅在 [version] 缺失时兜底；
- * [build] 是构建标识，只用于展示。
+ * [version] 是面板 / 插件版本（仅用于在「关于」页与 App 版本并列展示，
+ * **不参与 App 更新比较**）；[apkVersion] 是服务端记录的 Android 包版本，
+ * 仅在 [version] 缺失时兜底；[build] 是构建标识，只用于展示。
  */
 data class ServerVersion(
     val version: String = "",
     val build: String = "",
     val apkVersion: String = ""
 ) {
-    /** 参与比较的有效版本：优先 `version`，缺失时退回 `apk_version`。 */
+    /** 展示用有效版本：优先 `version`，缺失时退回 `apk_version`。 */
     val effectiveVersion: String get() = version.trim().ifBlank { apkVersion.trim() }
 
     val displayVersion: String get() = effectiveVersion.ifBlank { "未知" }
@@ -453,20 +453,21 @@ data class WifiInfo(
     val devices: List<WifiDevice> = emptyList()
 )
 
-/* ───────────────────────── 检查更新（GitHub 更新源） ───────────────────────── */
+/* ───────────────────────── 检查更新（GitHub Releases，App 自身） ───────────────────────── */
 
 /**
- * 检查更新的确定结果：
+ * App 更新检查的确定结果：
  * - [IDLE]        还没检查过；
  * - [CHECKING]    请求进行中；
- * - [NOT_CONFIGURED] 路由器没配更新源（uci 的 github_repo 为空）；
- * - [UP_TO_DATE]  已是最新；
- * - [UPDATE_AVAILABLE] 有新版本；
- * - [UNKNOWN]     后端返回了不完整的结果（没有 latest，也没给错误码）；
- * - [ERROR]       请求失败（GitHub 不可达 / 仓库不存在 / 拒绝访问等）。
+ * - [UP_TO_DATE]  当前 App 已是最新；
+ * - [UPDATE_AVAILABLE] GitHub 上有比本机更新的 App 版本；
+ * - [UNKNOWN]     GitHub 返回的版本号无法与 App 版本比较（不是网络错误）；
+ * - [ERROR]       请求失败（GitHub 不可达 / 限流 / 仓库不存在 / 没有带 APK 的 release）。
+ *
+ * 更新比较只看 App 的 versionName，**与路由器插件版本无关**。
  */
 enum class UpdateStatus {
-    IDLE, CHECKING, NOT_CONFIGURED, UP_TO_DATE, UPDATE_AVAILABLE, UNKNOWN, ERROR
+    IDLE, CHECKING, UP_TO_DATE, UPDATE_AVAILABLE, UNKNOWN, ERROR
 }
 
 /**
@@ -491,7 +492,11 @@ data class UpdateAsset(
 }
 
 /**
- * `GET /cgi-bin/prism-router-system?what=update_check[&force=1]` 的结果。
+ * **旧版**路由器代理更新接口 `GET /cgi-bin/prism-router-system?what=update_check` 的结果。
+ *
+ * 已不再用于 App 更新：该接口返回的是插件 / IPK 版本，且依赖路由器可达。
+ * 保留模型与 [SystemClient.parseUpdateCheck] 只是为了兼容旧面板契约与历史单测；
+ * App 更新统一走 [GithubReleaseClient]。
  *
  * 三种形态（与后端契约一致，缺字段一律取安全默认值）：
  * - 未配置：`configured=false`，[message] 是后端说明；
@@ -545,13 +550,67 @@ data class UpdateCheck(
     }
 }
 
-/** 检查更新的 UI 状态：App 版本、最近一次 GitHub 结果与错误文案。 */
+/**
+ * GitHub Releases 上选中的一条 **App 发版**。
+ *
+ * 只由 [GithubReleaseClient] 产出：release 必须是正式版（非 draft / prerelease），
+ * assets 里至少有一个可直链下载的 `.apk`。字段与 GitHub API 的对应关系：
+ * - [tag]：原始 tag（如 `app-v1.0.10` / `v1.0.10`）；
+ * - [versionName]：tag 去掉 `app-v` / `android-v` / `v` 前缀后的版本号，用于与
+ *   App 的 versionName 比较（**不比较插件版本**）；
+ * - [versionCode]：按 `major*10000+minor*100+patch` 从 [versionName] 推导；
+ *   版本号不符合三条数字段时留空，不猜；
+ * - [apkUrl] / [apkName]：选中的 APK 直链与文件名（https，交给系统浏览器 / 下载器）；
+ * - [body] / [publishedAt] / [htmlUrl]：Release 说明、发布时间与发布页。
+ */
+data class GithubRelease(
+    val tag: String = "",
+    val versionName: String = "",
+    val versionCode: Int? = null,
+    val apkUrl: String = "",
+    val apkName: String = "",
+    val body: String = "",
+    val publishedAt: String = "",
+    val htmlUrl: String = ""
+) {
+    /** 是否有可用的 APK 下载地址（只认 https 直链）。 */
+    val hasApk: Boolean
+        get() = apkUrl.startsWith("https://", ignoreCase = true) &&
+            apkName.endsWith(".apk", ignoreCase = true)
+
+    /** 版本展示文案：正常来自 [versionName]，缺失时退回 tag。 */
+    val displayVersion: String get() = versionName.trim().ifBlank { tag.trim().ifBlank { "?" } }
+
+    /** Release 页是否可打开。 */
+    val hasReleasePage: Boolean get() = htmlUrl.isNotBlank()
+
+    /** Release notes 摘要：去空行、去列表符号，用「·」连成一段并截断到 [maxChars]。 */
+    fun notesSummary(maxChars: Int = 220): String {
+        val lines = body
+            .replace("\r\n", "\n")
+            .replace('\r', '\n')
+            .split('\n')
+            .map { line -> line.trim().trimStart('-', '*', '•').trim() }
+            .filter { line -> line.isNotEmpty() && !line.startsWith("<!--") }
+        if (lines.isEmpty()) return ""
+        val joined = lines.joinToString(" · ")
+        if (joined.length <= maxChars) return joined
+        return joined.take(maxChars.coerceAtLeast(1)).trimEnd() + "…"
+    }
+}
+
+/** 检查更新的 UI 状态：本机 App 版本、GitHub 上选中的 App 发版与错误文案。 */
 data class UpdateState(
     val status: UpdateStatus = UpdateStatus.IDLE,
+    /** 本机 App 的 versionName（PackageManager 读取，仅用于展示与比较）。 */
     val appVersion: String = "",
-    val check: UpdateCheck? = null,
+    /** GitHub 上版本最高且带 APK 的正式 release；失败时保留上一次成功结果。 */
+    val release: GithubRelease? = null,
     val message: String? = null
-)
+) {
+    /** 最新 App 版本展示文案（失败 / 未检查时为「?」）。 */
+    val latestVersion: String get() = release?.displayVersion.orEmpty().ifBlank { "?" }
+}
 
 /**
  * 提取版本号里的数字段：`"v1.2.3-beta"` → `[1, 2, 3]`、`"1.10"` → `[1, 10]`。

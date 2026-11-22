@@ -81,10 +81,11 @@ opkg install luci-app-prism-router_1.0.23-1_x86_64.ipk
 
 ### Android
 
-下载 Release 中的 `prism-router-android-*.apk` 安装，打开后填写面板地址：
+下载 Release 中的 `prism-router-<版本>.apk` 安装，打开后填写面板地址：
 
 - 默认 `http://192.168.100.1:8099`
 - 访问令牌可留空（面板未开启 token 时）
+- App 版本独立维护在 `android/version.properties`，与路由器插件版本无关
 
 ## 独立面板（可选）
 
@@ -115,16 +116,31 @@ uci commit prism-router
 - 修改 LAN / WAN / DHCP / 系统 / 端口转发（改前自动备份，支持回滚）
 - 重启路由器、无线开关
 
-## 自动更新
+## 更新
 
-支持通过 GitHub Releases 检测新版本：
+### 路由器插件
+
+插件仍支持在 uci 配置 GitHub 更新源（LuCI 行为不变）：
 
 ```sh
 uci set prism-router.update.github_repo='hb-degithub/luci-app-prism-router'
 uci commit prism-router
 ```
 
-App「设置 → 关于 → 检查更新」会显示新版本、发布时间与 APK / IPK 下载链接。
+### Android App
+
+App「设置 → 关于 → 检查更新」**直接请求 GitHub Releases**，不经过路由器，也不会
+回退到路由器的 `update_check` 接口：
+
+- 路由器离线 / 未连接时仍能检查 App 更新；
+- 只比较 **App 版本**（`versionName`），不拿路由器插件版本比较；
+- 只认 assets 里带 `.apk` 的正式 release，忽略 draft / prerelease；
+- 使用 GitHub 公开 API（无 token；未认证限流约 60 次/小时）；App 启动检查有 6 小时
+  节流，手动检查不受限；
+- 发现新版本只提示，APK 下载交给系统浏览器 / 下载器，App 不内置安装器；
+- GitHub 不可达、403 限流、仓库不存在或没有带 APK 的 release 都会显示明确错误。
+
+「关于」页同时显示 **App 版本** 与 **路由器插件版本**，两者来源独立。
 
 ## 构建
 
@@ -142,18 +158,35 @@ echo "sdk.dir=$ANDROID_HOME" > local.properties
 ./gradlew assembleDebug          # 或 assembleRelease（需 keystore）
 ```
 
+App 版本唯一来源是 `android/version.properties`（`versionName` / `versionCode`）；
+`versionCode` 固定为 `major*10000+minor*100+patch`，且 minor / patch 必须 < 100，越界
+会直接构建失败。CI 仍可用 `-PPRISM_VERSION_NAME` / `-PPRISM_VERSION_CODE` 覆盖，但必须
+与 tag 自洽。可用 `./gradlew :app:verifyVersion` 本地自检。
+
 正式签名需要 `android/keystore/prism-router.jks`（不入库）与 `android/gradle.properties` 中的 `PRISM_STORE_PASSWORD` / `PRISM_KEY_PASSWORD`。
 
-## 自动发版
+## 自动发版（App 与插件独立）
 
-推 tag 即自动构建并发布（GitHub Actions，正式签名）：
+App 与插件使用不同的 tag，互不覆盖版本：
 
 ```sh
-git tag v1.0.2
-git push origin v1.0.2
+# 1) 路由器插件发版：只构建 ipk，不带 APK
+git tag v1.0.32 && git push origin v1.0.32
+
+# 2) Android App 发版：先改 android/version.properties，再打 app-v 前缀的 tag
+#    CI 只构建 APK，并校验 versionName / versionCode 与 tag、APK badging 一致
+git tag app-v1.0.10 && git push origin app-v1.0.10
 ```
 
-CI 会构建 `ipk` 与正式签名 `apk`，自动创建 Release 并上传附件。签名密钥通过仓库 Secrets 注入（`PRISM_KEYSTORE_BASE64` / `PRISM_STORE_PASSWORD` / `PRISM_KEY_PASSWORD`）。
+- `v*` release：包含 `luci-app-prism-router_*.ipk`，**不含 APK**（避免 App 更新把插件
+  版本误判成 App 版本）；对应 `.github/workflows/release-plugin.yml`。
+- `app-v*` release：包含 `prism-router-<versionName>.apk`；没有 APK 资产时 CI 直接失败，
+  不会静默发布；对应 `.github/workflows/release.yml`。
+- 签名密钥通过仓库 Secrets 注入（`PRISM_KEYSTORE_BASE64` / `PRISM_STORE_PASSWORD` /
+  `PRISM_KEY_PASSWORD`）。
+
+旧版本曾用同一个 `v*` tag 同时发布 ipk 与 apk；新流程下两者可以分别发版，App 更新只
+依赖 GitHub Releases 上的 App release。
 
 ## 架构
 

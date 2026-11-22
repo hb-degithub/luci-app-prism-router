@@ -358,7 +358,10 @@ fun PrismNavHost(
 
                 /* 设置子页：关于 + 外观（主题模式 / 动态取色开关）。 */
                 composable(PrismRoutes.SETTINGS_ABOUT) {
-                    AboutRoute(onBack = { navController.popBackStack() })
+                    AboutRoute(
+                        routerPluginVersion = vm.ui.system?.version.orEmpty(),
+                        onBack = { navController.popBackStack() }
+                    )
                 }
 
                 /*
@@ -496,7 +499,7 @@ private fun ServersRoute(ui: UiState, onBack: () -> Unit) {
 }
 
 @Composable
-private fun AboutRoute(onBack: () -> Unit) {
+private fun AboutRoute(routerPluginVersion: String, onBack: () -> Unit) {
     PrismScaffold(
         title = "关于",
         subtitle = "外观、版本与数据来源",
@@ -512,8 +515,8 @@ private fun AboutRoute(onBack: () -> Unit) {
         ) {
             SectionCard(title = "关于棱镜路由", subtitle = "Android 原生客户端") {
                 val context = LocalContext.current
-                /* 版本必须来自 PackageManager（Gradle 的 versionName/versionCode），
-                   不能写死：CI 按 Release tag 注入版本，写死会让 About 永远停在旧版本。 */
+                /* App 版本必须来自 PackageManager（Gradle 从 android/version.properties 注入），
+                   不能写死；路由器插件版本单独展示，不参与 App 更新比较。 */
                 val packageInfo = remember(context) {
                     runCatching {
                         context.packageManager.getPackageInfo(context.packageName, 0)
@@ -530,7 +533,12 @@ private fun AboutRoute(onBack: () -> Unit) {
                     formatAppVersion(packageInfo.versionName, code)
                 }
                 InfoLine("应用", "棱镜路由")
-                InfoLine("版本", versionText)
+                InfoLine("App 版本", versionText)
+                InfoLine(
+                    "路由器插件版本",
+                    routerPluginVersion.trim().takeIf { it.isNotBlank() }?.let { "v$it" }
+                        ?: "未连接路由器 / 读取中"
+                )
                 InfoLine("数据来源", "路由器只读面板 /cgi-bin/panel-api")
                 InfoLine("权限", "只读展示，不修改路由器配置")
             }
