@@ -56,7 +56,7 @@ const STATIONS_DIR = '/etc/prism-router/stations';
 /* 设备别名/分组/首次出现（prism-routerd 与 rpcd 共用的唯一权威文件，SPEC §10.1） */
 const DEVICES_FILE = env_or('PRISM_ROUTER_DEVICES_FILE', '/etc/prism-router/devices.json');
 const INIT_SCRIPT  = '/etc/init.d/prism-routerd';
-const VERSION      = '1.0.10';
+const VERSION      = '1.0.11';
 
 /* 别名/分组单字段字节上限（与守护进程 DEVICE_META_TEXT_MAX 一致） */
 const DEVICE_TEXT_MAX = 128;
@@ -1039,62 +1039,41 @@ function feishu_chats() {
 }
 
 function test_feishu() {
-	const webhook = trim(text(uci_get('feishu', 'webhook', ''), ''));
-	const secret = trim(text(uci_get('feishu', 'secret', ''), ''));
+	/* 复用 feishu.uc test：webhook / 群 / 个人三种路线与真实发送完全一致，
+	   避免 rpcd 自己实现一套只在 webhook 下工作的测试逻辑。 */
+	const script = '/usr/share/prism-router/feishu.uc';
 
-	if (length(webhook) == 0)
-		return { ok: false, code: -1, msg: '未配置飞书 webhook（设置 → 飞书）' };
-
-	if (!match(webhook, /^https?:\/\/[^\s]+$/))
-		return { ok: false, code: -1, msg: 'webhook 不是合法的 http(s) 地址' };
-
-	if (length(secret) && !access(OPENSSL_BIN) && !access('/usr/sbin/openssl'))
-		return { ok: false, code: -1, msg: '缺少 openssl，无法生成签名' };
-
-	const curl = curl_binary();
-
-	if (curl == null)
-		return { ok: false, code: -1, msg: '缺少 curl，无法发送（opkg install curl）' };
-
-	const payload = feishu_payload(secret);
-	const cmd = sprintf('%s -sS -m 15 -H %s -d %s %s',
-		curl,
-		shellquote('Content-Type: application/json'),
-		shellquote(sprintf('%J', payload)),
-		shellquote(webhook));
+	if (!access(script))
+		return { ok: false, code: -1, msg: 'feishu.uc 未安装（重装 prism-router 包）' };
 
 	let fd = null;
 
 	try {
-		fd = popen(cmd);
+		fd = popen(sprintf('/usr/bin/ucode %s test 2>&1', shellquote(script)));
 	}
 	catch (e) {
-		return { ok: false, code: -1, msg: `执行 curl 失败：${e}` };
+		return { ok: false, code: -1, msg: `执行失败：${e}` };
 	}
 
 	if (fd == null)
-		return { ok: false, code: -1, msg: '执行 curl 失败' };
+		return { ok: false, code: -1, msg: '执行失败' };
 
-	const body = fd.read('all');
-	fd.close();
+	const out = trim(text(fd.read('all'), ''));
+	const rc = fd.close();
+	const lines = [];
 
-	let res = null;
+	for (let line in split(out, '\n')) {
+		let l = trim(line);
 
-	try {
-		res = json(body);
+		if (length(l))
+			push(lines, l);
 	}
-	catch (e) {
-		res = null;
-	}
 
-	if (type(res) != 'object')
-		return { ok: false, code: -1, msg: `飞书返回非 JSON：${substr(trim(text(body, '')), 0, 200)}` };
-
-	/* 自定义机器人：v2 返回 {code,msg}，旧版返回 {StatusCode,StatusMessage}。 */
-	const code = integer(res.code ?? res.StatusCode, -1);
-	const msg = text(res.msg ?? res.StatusMessage, '');
-
-	return { ok: (code == 0), code: code, msg: msg };
+	return {
+		ok: rc == 0,
+		code: (rc == 0) ? 0 : -1,
+		msg: length(lines) ? join('\n', lines) : '未返回内容'
+	};
 }
 
 function uci_run(args) {

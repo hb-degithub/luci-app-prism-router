@@ -1763,6 +1763,8 @@ code_help = function(code) {
     if (code == 230001 || code == 230002) return "机器人不在该群，或群里没有发言权限（先把机器人拉进群）";
     if (code == 230013) return "机器人没有发消息权限（开放平台检查 im:message:send_as_bot）";
     if (code == 230027) return "缺少 im:message:send_as_bot 权限（改权限后要发布版本）";
+    if (code == 99991672) return "应用未开通发消息权限：开放平台 → 权限管理 → 添加 im:message:send_as_bot（或 im:message），再创建版本并发布";
+    if (code == 99991679) return "user_access_token 缺少所需权限：重新授权或开通对应 scope";
     if (code == 99991663) return "tenant_access_token 无效或已过期（重试会自动刷新）";
     if (code == 10014) return "app_id / app_secret 不正确（开放平台核对后重填）";
     if (code == -5) return "tenant_access_token 获取失败（检查 app_id/app_secret）";
