@@ -1447,8 +1447,8 @@ async function testOverviewRender() {
 
 	check('概览不渲染默认 8099 控制台死链',
 		containsText(root, '独立控制台') === false);
-	check('概览仍渲染手机版快捷入口',
-		containsText(root, '手机版') === true);
+	check('桌面概览不再渲染手机版入口',
+		containsText(root, '手机版') === false);
 
 	const degradedCtx = makeCtx(false);
 	degradedCtx.state.health.accounting_confidence = 'degraded';
@@ -1509,7 +1509,8 @@ async function testCockpit() {
 		!/readPanelEnabled\(\)/.test(overview));
 	check('概览不渲染无条件 8099 死链',
 		!/href: consoleUrl\(\)/.test(overview));
-	check('概览保留手机版入口', /admin\/services\/prism-router\/mobile/.test(overview));
+	check('概览不再链接手机版路由（桌面不混入手机 UI）',
+		!/admin\/services\/prism-router\/mobile/.test(overview));
 	check('30s 周期同时更新今日桶/昨日对比与日历',
 		/loadTrendHistory: function\(\)/.test(overview) &&
 		/callHistory\(2\)\.then/.test(overview) &&
@@ -1614,6 +1615,11 @@ async function testMenu() {
 		 * 它不会读取 menu.d 的 hidden 字段。这里复刻真实可见性，避免用自创
 		 * hidden 断言把八项菜单误报成五项，或牺牲 mobile/diagnostics 旧路由。
 		 */
+		/*
+		 * 桌面侧栏只放六个真实入口；mobile / panel 去掉 title 后成为
+		 * 「隐藏但可访问」的兼容路由（LuCI 的 getChildren 只渲染带 title 的节点），
+		 * 供手机书签、PWA 与概览「详情」按钮继续使用，不再污染桌面菜单。
+		 */
 		const visible = leafKeys.filter(function(key) {
 			const node = menu[key];
 			return node && Object.prototype.hasOwnProperty.call(node, 'title') && node.satisfied !== false;
@@ -1622,8 +1628,13 @@ async function testMenu() {
 		});
 		const visibleNames = visible.map(function(key) { return key.split('/').pop(); });
 
-		sameList('LuCI 实际可见入口保持八个且路由完整', visibleNames,
-			[ 'overview', 'devices', 'apps', 'nodes', 'settings', 'mobile', 'diagnostics', 'panel' ]);
+		sameList('桌面侧栏只显示六个入口（手机版/详细面板不出现）', visibleNames,
+			[ 'overview', 'devices', 'apps', 'nodes', 'settings', 'diagnostics' ]);
+		[ 'mobile', 'panel' ].forEach(function(name) {
+			const node = menu['admin/services/prism-router/' + name];
+			check(name + ' 不写 title（桌面菜单隐藏）',
+				node && !Object.prototype.hasOwnProperty.call(node, 'title'));
+		});
 		check('不使用 LuCI 不支持的 hidden 菜单字段',
 			leafKeys.every(function(key) { return !Object.prototype.hasOwnProperty.call(menu[key], 'hidden'); }));
 		check('主入口标题为 概览/设备/应用/网络/设置',
@@ -1635,7 +1646,8 @@ async function testMenu() {
 			menu['admin/services/prism-router/nodes'].action.type === 'view' &&
 			menu['admin/services/prism-router/nodes'].action.path === 'prism-router/nodes');
 
-		/* 旧路由仍是真实 view action，设置/概览另有快捷入口，不能成为孤立页面。 */
+		/* 隐藏路由仍必须是真实 view action：设置页给手机版/诊断入口，
+		   概览「详情」按钮打开 panel；三者都不能变成 404。 */
 		[ 'mobile', 'diagnostics', 'panel' ].forEach(function(name) {
 			const node = menu['admin/services/prism-router/' + name];
 			check(name + ' 旧 URL 对应 view 路由保留',

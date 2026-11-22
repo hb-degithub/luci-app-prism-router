@@ -1810,13 +1810,6 @@ return view.extend({
 		   待只读 RPC 提供无敏感信息的 panel_enabled 后再恢复条件入口。 */
 		var panelBtn = '';
 
-		/* 手机版保留原有菜单与路由，这里另给一个显式快捷入口。 */
-		var mobileBtn = E('a', {
-			'class': 'tso-btn',
-			href: L.url('admin/services/prism-router/mobile'),
-			title: _('打开手机版单页视图（保留原有菜单与路由）')
-		}, _('手机版'));
-
 		this.syncAutoLook();
 
 		return E('div', { 'class': 'tso-pills' }, [
@@ -1830,7 +1823,6 @@ return view.extend({
 			this.autoBox,
 			this.btnRefresh,
 			more,
-			mobileBtn,
 			panelBtn
 		]);
 	},

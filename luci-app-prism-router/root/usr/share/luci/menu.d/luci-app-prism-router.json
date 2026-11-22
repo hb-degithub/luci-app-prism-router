@@ -57,7 +57,6 @@
 		}
 	},
 	"admin/services/prism-router/mobile": {
-		"title": "手机版",
 		"order": 60,
 		"action": {
 			"type": "view",
@@ -73,7 +72,6 @@
 		}
 	},
 	"admin/services/prism-router/panel": {
-		"title": "详细面板",
 		"order": 80,
 		"action": {
 			"type": "view",

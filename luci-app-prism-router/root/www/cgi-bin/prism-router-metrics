@@ -57,7 +57,7 @@ function env_or(name, fallback) {
 }
 
 const UCI_CONFIG   = 'prism-router';
-const VERSION      = '1.0.4';
+const VERSION      = '1.0.5';
 const STATE_FILE   = env_or('PRISM_ROUTER_STATE_FILE', '/tmp/prism-router/state.json');
 const DEVICES_FILE = env_or('PRISM_ROUTER_DEVICES_FILE', '/etc/prism-router/devices.json');
 

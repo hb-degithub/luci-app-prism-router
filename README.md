@@ -30,7 +30,7 @@
 
 | 界面 | 说明 |
 |---|---|
-| LuCI 插件页 | 概览 / 设备 / 应用 / 节点 / 设置 / 手机版 / 诊断 |
+| LuCI 插件页 | 概览 / 设备 / 应用 / 网络 / 设置 / 诊断（手机版与详细面板保留为隐藏兼容路由） |
 | 独立面板 | 单独端口（默认 8099）的只读仪表盘，可脱离 LuCI 使用 |
 | Android 原生客户端 | Kotlin + Compose，概览 / 设备 / 应用 / 网络（拓扑·节点·AP）/ 设置 |
 
@@ -67,7 +67,7 @@
 从 [Releases](https://github.com/hb-degithub/luci-app-prism-router/releases) 下载 `luci-app-prism-router_*_all.ipk`：
 
 ```sh
-opkg install luci-app-prism-router_1.0.4-1_all.ipk
+opkg install luci-app-prism-router_1.0.5-1_all.ipk
 /etc/init.d/prism-routerd enable
 /etc/init.d/prism-routerd restart
 ```
