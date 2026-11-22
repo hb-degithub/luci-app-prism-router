@@ -987,6 +987,7 @@ return view.extend({
 			[ 'feishu', 'enabled', _('启用飞书报表'), _('开启后按下面的「时间」推送日报/周报；测试发送不受这里影响。'), 'bool', null ],
 			[ 'feishu', 'app_id', _('App ID（扫码加群的自建应用）'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。填了 App ID/Secret 就优先走应用 API，不再用 webhook。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
 			[ 'feishu', 'app_secret', _('App Secret'), _('与 App ID 配套；仅保存在本机 /etc/config/prism-router。'), 'password', null ],
+			[ 'feishu', 'redirect_base', _('回调地址（可选）'), _('留空自动使用当前访问地址。若通过反代/隧道访问，或开放平台报 20029，这里填 https://你的域名[:端口]（与飞书「安全设置 → 重定向 URL」完全一致）。'), 'text', { wide: true, placeholder: 'https://192.168.100.1' } ],
 			[ 'feishu', 'chat_id', _('群 chat_id'), _('点下方「列出机器人所在的群」自动获取；形如 oc_xxxxx。'), 'text', { wide: true, placeholder: 'oc_xxxxx' } ],
 			[ 'feishu', 'receive_id', _('接收人（个人通知，无需群）'), _('填你的飞书登录邮箱最省事；也可以填 ou_ 开头的 open_id。应用可用范围必须包含这个账号。'), 'text', { wide: true, placeholder: 'you@company.com 或 ou_xxxxx' } ],
 			[ 'feishu', 'report_chat_enabled', _('群聊报表'), _('关掉后只推送给私聊/其它通道（按后端实现）。'), 'bool', null ]
@@ -1129,7 +1130,10 @@ return view.extend({
 		var redirect = '';
 
 		try {
-			redirect = window.location.protocol + '//' + window.location.host +
+			var forced = str(rawValue('feishu', 'redirect_base')).trim();
+
+			redirect = (forced !== '' ? forced.replace(/\/+$/, '')
+				: (window.location.protocol + '//' + window.location.host)) +
 				'/cgi-bin/prism-router-feishu?action=callback';
 		}
 		catch (e) { redirect = ''; }
@@ -1149,9 +1153,11 @@ return view.extend({
 				E('li', {}, _('开放平台创建「自建应用」，并开启「机器人」能力。')),
 				E('li', {}, _('「权限管理」添加 im:chat:readonly，然后创建版本并发布（企业自建应用还需管理员审批）。')),
 				E('li', {}, [
-					_('「安全设置 → 重定向 URL」原样添加：'),
+					_('「安全设置 → 重定向 URL」原样添加（含 ?action=callback）：'),
 					E('br'),
-					E('code', { 'style': codeStyle }, redirect || _('（无法读取当前地址，请用浏览器访问本页）'))
+					E('code', { 'style': codeStyle }, redirect || _('（无法读取当前地址，请用浏览器访问本页）')),
+					E('br'),
+					E('span', { style: 'opacity:.8' }, _('若飞书报 20029：这里显示的值必须与后台一条不差（协议、域名、端口、查询串）。'))
 				]),
 				E('li', {}, _('在本页填写 App ID / App Secret；点「生成绑定二维码」时会自动保存到本机。')),
 				E('li', {}, _('先在飞书群里添加这个机器人，再生成二维码；群列表只显示机器人已加入的群。'))
@@ -1531,6 +1537,7 @@ return view.extend({
 		feishu.app_id = this.inputValue('feishu', 'app_id');
 		feishu.app_secret = this.inputValue('feishu', 'app_secret');
 		feishu.chat_id = this.inputValue('feishu', 'chat_id');
+		feishu.redirect_base = this.inputValue('feishu', 'redirect_base').trim();
 		/* 接收目标统一成 receive_id + receive_id_type：webhook 不用，app 用群，user 用个人。 */
 		if (feishu.mode === FEISHU_MODE_USER) {
 			var target = this.inputValue('feishu', 'receive_id').trim();
@@ -1680,6 +1687,10 @@ return view.extend({
 			return _('飞书发送方式只能是绑定群或发给个人（都使用应用凭证）');
 
 		/* 应用机器人没有 App ID/Secret 连 token 都换不到：保存前就拦住并说清楚，别等到发送时静默失败 */
+		if (str(feishu.redirect_base).length > 0 &&
+		    !/^https?:\/\/[A-Za-z0-9.\-\[\]:]+$/.test(str(feishu.redirect_base)))
+			return _('回调地址要形如 https://192.168.100.1 或 https://example.com:8443（不要带路径）');
+
 		if ((feishu.mode === FEISHU_MODE_APP || feishu.mode === FEISHU_MODE_USER) && str(feishu.app_id) === '')
 			return _('请先填写 App ID（应用凭证里的 App ID，形如 cli_xxxxx）');
 
@@ -2189,6 +2200,7 @@ return view.extend({
 
 		show('app_id', app || user);
 		show('app_secret', app || user);
+		show('redirect_base', app || user);
 		show('chat_id', app);
 		show('receive_id', user);
 

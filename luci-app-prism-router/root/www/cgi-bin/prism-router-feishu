@@ -41,7 +41,7 @@
 import { readfile, open, lsdir, stat, lstat, mkdir, chmod, rename, unlink, popen } from 'fs';
 import { cursor } from 'uci';
 
-const VERSION       = '1.0.12';
+const VERSION       = '1.0.13';
 const PROD_BASE     = 'https://open.feishu.cn';
 /* 新版授权页与 v3 token 端点都在 accounts.feishu.cn（官方文档 2025 起）。 */
 const AUTH_BASE      = 'https://accounts.feishu.cn';
@@ -324,13 +324,27 @@ function request_scheme() {
 /* 回调地址：必须与开放平台「重定向 URL」完全一致。
    Host 来自请求头（客户端可控），只接受 IP/域名[:端口] 形状，否则回落到 127.0.0.1。 */
 function redirect_uri() {
+	const scheme = request_scheme();
+
+	/* 手动指定回调基址：开放平台里填的就是它，避免反代/隧道/端口差异导致 20029。 */
+	const forced = trim(text(uci_value('redirect_base'), ''));
+
+	if (length(forced) > 0 && match(forced, /^https?:\/\/[A-Za-z0-9.\-\[\]:]+$/) != null)
+		return replace(forced, /\/+$/, '') + '/cgi-bin/prism-router-feishu?action=callback';
+
 	let host = trim(text(getenv('HTTP_HOST'), ''));
 
 	if (match(host, /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?$/) == null
 	    && match(host, /^\[[0-9A-Fa-f:]+\](:[0-9]{1,5})?$/) == null)
 		host = '127.0.0.1';
 
-	return `${request_scheme()}://${host}/cgi-bin/prism-router-feishu?action=callback`;
+	/* 去掉默认端口：https://h:443 与 https://h 必须被视为同一个回调地址。 */
+	if (scheme == 'https' && match(host, /:443$/) != null)
+		host = substr(host, 0, length(host) - 4);
+	else if (scheme == 'http' && match(host, /:80$/) != null)
+		host = substr(host, 0, length(host) - 3);
+
+	return `${scheme}://${host}/cgi-bin/prism-router-feishu?action=callback`;
 }
 
 // ───────────────────────────── 脱敏 ─────────────────────────────

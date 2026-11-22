@@ -20,10 +20,10 @@ set -euo pipefail
 umask 022
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/dist"; LEGACY=0
-# 版本可用环境变量覆盖（CI 按 Release tag 注入）；源码默认 1.0.12，
+# 版本可用环境变量覆盖（CI 按 Release tag 注入）；源码默认 1.0.13，
 # 与 Makefile / Android 默认版本保持一致。包名、opkg Version 与包内版本常量
 # 全部由同一个 VER 派生，避免出现“新 UI 却打包成旧版本”的漂移。
-VER="${PRISM_VER:-1.0.12}"; REL="${PRISM_REL:-1}"
+VER="${PRISM_VER:-1.0.13}"; REL="${PRISM_REL:-1}"
 
 usage() {
   sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
