@@ -6,15 +6,15 @@ plugins {
 
 /*
  * 版本单一来源：
- * - 默认 1.0.6 / 6，与 Makefile（1.0.6）、tools/build-ipk.sh 默认值一致；
- * - CI 按 Release tag 注入 -PPRISM_VERSION_NAME=1.0.6 -PPRISM_VERSION_CODE=10006，
+ * - 默认 1.0.7 / 7，与 Makefile（1.0.7）、tools/build-ipk.sh 默认值一致；
+ * - CI 按 Release tag 注入 -PPRISM_VERSION_NAME=1.0.7 -PPRISM_VERSION_CODE=10007，
  *   保证 About 页、APK 文件名与 GitHub Release 资产版本一致。
  */
 val prismVersionName: String =
     (project.findProperty("PRISM_VERSION_NAME") as String?)?.trim()?.takeIf { it.isNotEmpty() }
-        ?: "1.0.6"
+        ?: "1.0.7"
 val prismVersionCode: Int =
-    (project.findProperty("PRISM_VERSION_CODE") as String?)?.toIntOrNull() ?: 6
+    (project.findProperty("PRISM_VERSION_CODE") as String?)?.toIntOrNull() ?: 7
 
 /*
  * release 签名（仅本地内测）：

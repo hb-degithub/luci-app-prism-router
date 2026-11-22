@@ -870,6 +870,7 @@ default_cfg = function() {
     return {
         enabled: true,
         webhook: "", app_id: "", app_secret: "", chat_id: "",
+        receive_id: "", receive_id_type: "",
         // 发送路线：mode 为空 = 未配置（沿用旧的三件套自动判定）
         mode: "", mode_explicit: false, use_app: false, fallback_webhook: false,
         card_wrapper: "card", secret: "", daily_time: "08:30",
@@ -898,6 +899,8 @@ load_cfg = function(opts) {
     c.app_id = trim(uci_get("prism-router.feishu.app_id"));
     c.app_secret = trim(uci_get("prism-router.feishu.app_secret"));
     c.chat_id = trim(uci_get("prism-router.feishu.chat_id"));
+    c.receive_id = trim(uci_get("prism-router.feishu.receive_id"));
+    c.receive_id_type = lc(trim(uci_get("prism-router.feishu.receive_id_type")));
     c.card_wrapper = trim(uci_get("prism-router.feishu.card_wrapper"));
     c.secret = trim(uci_get("prism-router.feishu.secret"));
     c.daily_time = trim(uci_get("prism-router.feishu.daily_time"));
@@ -911,13 +914,15 @@ load_cfg = function(opts) {
        应用路线失败后是否回退 webhook：要求 webhook 本身可用（合法 URL + 有签名密钥）。 */
     c.mode_explicit = uci_present("prism-router.feishu.mode");
     let mraw = lc(trim(uci_get("prism-router.feishu.mode")));
-    c.mode = (mraw == "app" || mraw == "webhook") ? mraw : "";
+    c.mode = (mraw == "app" || mraw == "webhook" || mraw == "user") ? mraw : "";
     let app_creds = length(c.app_id) && length(c.app_secret);
     let app_triple = app_creds && length(c.chat_id);
+    /* user = 应用机器人直接发给个人 open_id，不需要群。 */
+    let app_target = app_creds && (length(c.chat_id) || length(c.receive_id));
     if (!length(c.mode))
-        c.use_app = app_triple;
+        c.use_app = app_target;
     else
-        c.use_app = (c.mode == "app") ? app_creds : false;
+        c.use_app = ((c.mode == "app" || c.mode == "user") ? app_creds : false);
     c.fallback_webhook = webhook_ok(c.webhook) && length(c.secret) > 0;
 
     if (!length(c.daily_time))
@@ -1987,8 +1992,13 @@ app_token = function(cfg, force) {
 deliver_app = function(cfg, req, force_token) {
     if (!length(cfg.app_id) || !length(cfg.app_secret))
         return { ok: false, retryable: false, code: -6, http: 0, msg: "未配置 app_id/app_secret", bytes: 0, route: "app" };
-    if (!length(cfg.chat_id))
-        return { ok: false, retryable: false, code: -7, http: 0, msg: "未配置 chat_id（先跑 feishu.uc chats 列群）", bytes: 0, route: "app" };
+    /* 接收目标：receive_id 优先；老配置回落到 chat_id。类型默认 chat_id。 */
+    let rtype = length(cfg.receive_id_type) ? cfg.receive_id_type : "chat_id";
+    if (rtype != "chat_id" && rtype != "open_id" && rtype != "user_id" && rtype != "email")
+        rtype = "chat_id";
+    let rid = length(cfg.receive_id) ? cfg.receive_id : ((rtype == "chat_id") ? cfg.chat_id : "");
+    if (!length(rid))
+        return { ok: false, retryable: false, code: -7, http: 0, msg: "未配置接收目标（群 chat_id 或个人 open_id）", bytes: 0, route: "app" };
     let tok = app_token(cfg, force_token ? true : false);
     if (!length(tok))
         return { ok: false, retryable: true, code: -5, http: 0, msg: "tenant_access_token 获取失败", bytes: 0, route: "app" };
@@ -1998,7 +2008,7 @@ deliver_app = function(cfg, req, force_token) {
     else
         content = req.content;
     let body = sprintf('%J', {
-        receive_id: cfg.chat_id,
+        receive_id: rid,
         msg_type: req.msg_type,
         content: sprintf('%J', content)
     });
@@ -2006,7 +2016,7 @@ deliver_app = function(cfg, req, force_token) {
     if (bytes >= LIMIT)
         return { ok: false, retryable: false, code: -4, http: 0, msg: sprintf("请求体 %d 字节超过 %d 上限", bytes, LIMIT), bytes: bytes, route: "app" };
     let res = parse_result(app_http("POST",
-        "/open-apis/im/v1/messages?receive_id_type=chat_id", tok, body));
+        "/open-apis/im/v1/messages?receive_id_type=" + rtype, tok, body));
     res.bytes = bytes;
     res.route = "app";
     return res;

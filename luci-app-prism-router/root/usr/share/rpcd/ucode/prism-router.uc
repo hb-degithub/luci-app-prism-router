@@ -56,7 +56,7 @@ const STATIONS_DIR = '/etc/prism-router/stations';
 /* 设备别名/分组/首次出现（prism-routerd 与 rpcd 共用的唯一权威文件，SPEC §10.1） */
 const DEVICES_FILE = env_or('PRISM_ROUTER_DEVICES_FILE', '/etc/prism-router/devices.json');
 const INIT_SCRIPT  = '/etc/init.d/prism-routerd';
-const VERSION      = '1.0.6';
+const VERSION      = '1.0.7';
 
 /* 别名/分组单字段字节上限（与守护进程 DEVICE_META_TEXT_MAX 一致） */
 const DEVICE_TEXT_MAX = 128;
@@ -142,7 +142,7 @@ const UCI_FIELDS = {
 	retention: [ 'enabled', 'daily_days', 'nodes_days', 'stations_days',
 	             'log_days', 'log_max_kb', 'spool_max_kb', 'dry_run' ],
 	feishu:   [ 'enabled', 'mode', 'webhook', 'secret', 'daily_time', 'report_chat_enabled',
-	             'app_id', 'app_secret', 'chat_id', 'card_wrapper',
+	             'app_id', 'app_secret', 'chat_id', 'receive_id', 'receive_id_type', 'card_wrapper',
 	             /* 内容 / 时间 / 条件可配（feishu.uc 1.1.0） */
 	             'report_items', 'report_mode', 'report_time', 'report_weekday',
 	             'alert_app_daily_limit', 'alert_spike_ratio', 'alert_offline_min',
