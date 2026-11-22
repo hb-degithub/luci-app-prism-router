@@ -1343,7 +1343,7 @@ return view.extend({
 
 		if (!this.retentionExists) {
 			notes.push(E('div', { 'class': 'cbi-value-description', style: 'color:#ef6c00;margin-top:4px' },
-				_('当前 UCI 里还没有 retention 段：改动任意一项再保存才会创建它；创建后 daily 的清理由 retention.uc 接管（别忘了加 cron）。')));
+				_('提示（不影响保存）：当前还没有 retention 段；改动任意一项再保存会创建它，之后 daily 清理由 retention.uc 接管（记得加 cron）。')));
 		}
 
 		return E('div', { 'class': 'cbi-section', style: 'margin-bottom:18px' }, [
@@ -1680,17 +1680,25 @@ return view.extend({
 			return _('飞书发送方式只能是绑定群或发给个人（都使用应用凭证）');
 
 		/* 应用机器人没有 App ID/Secret 连 token 都换不到：保存前就拦住并说清楚，别等到发送时静默失败 */
+		if ((feishu.mode === FEISHU_MODE_APP || feishu.mode === FEISHU_MODE_USER) && str(feishu.app_id) === '')
+			return _('请先填写 App ID（应用凭证里的 App ID，形如 cli_xxxxx）');
+
+		/* 允许先保存 App ID、Secret 稍后填；但如果本机已经存过 Secret，不允许被清空。 */
 		if ((feishu.mode === FEISHU_MODE_APP || feishu.mode === FEISHU_MODE_USER) &&
-		    (str(feishu.app_id) === '' || str(feishu.app_secret) === ''))
-			return _('应用机器人模式需要填写 App ID 和 App Secret：请补全后保存，或把发送方式切回自定义机器人');
+		    str(feishu.app_secret) === '' && str(rawValue('feishu', 'app_secret') || '') !== '')
+			return _('App Secret 不能清空：请在输入框重新粘贴后再保存');
 
 		if (feishu.mode === FEISHU_MODE_USER) {
 			var rcpt = str(feishu.receive_id).trim();
-			var okEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rcpt);
-			var okOpen = /^ou_[A-Za-z0-9_-]{8,}$/.test(rcpt);
 
-			if (!okEmail && !okOpen)
-				return _('个人通知需要填写飞书登录邮箱，或 ou_ 开头的 open_id');
+			/* 允许先保存 App 凭证、稍后再填接收人；只有填了才校验格式。 */
+			if (rcpt.length > 0) {
+				var okEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rcpt);
+				var okOpen = /^ou_[A-Za-z0-9_-]{8,}$/.test(rcpt);
+
+				if (!okEmail && !okOpen)
+					return _('接收人要填飞书登录邮箱，或 ou_ 开头的 open_id');
+			}
 		}
 
 		if (feishu.daily_time.length > 0 && normHHMM(feishu.daily_time) == null)
