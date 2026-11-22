@@ -986,6 +986,7 @@ return view.extend({
 			[ 'feishu', 'enabled', _('启用飞书报表'), _('开启后按下面的「时间」推送日报/周报；测试发送不受这里影响。'), 'bool', null ],
 			[ 'feishu', 'app_id', _('App ID'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
 			[ 'feishu', 'app_secret', _('App Secret'), _('与 App ID 配套；仅保存在本机 /etc/config/prism-router。'), 'password', null ],
+			[ 'feishu', 'chat_id', _('群 chat_id（可选）'), _('扫码把机器人加进群后，点下方「列出机器人所在的群」自动填入；留空则发给个人。'), 'text', { wide: true, placeholder: 'oc_xxxxx' } ],
 			[ 'feishu', 'receive_id', _('接收人 user_id（个人通知，无需群）'), _('飞书管理后台 → 成员与部门 → 成员详情可复制 user_id。不需要回调、不需要扫码。应用可用范围必须包含该账号。'), 'text', { wide: true, placeholder: '飞书 user_id' } ],
 		];
 
@@ -995,6 +996,9 @@ return view.extend({
 		channelFields.forEach(function(def) {
 			fields.push(self.field(def[0], def[1], def[2], def[3], def[4], def[5]));
 		});
+
+		/* ---- 机器人二维码（扫码加群）---- */
+		fields.push(this.feishuScanField(writeDisabled));
 
 		/* ---- 内容（report_items）---- */
 		fields.push(this.subhead(_('内容'), false));
@@ -1076,6 +1080,11 @@ return view.extend({
 					'click': ui.createHandlerFn(this, this.testFeishu),
 					'disabled': writeDisabled
 				}, _('测试发送')),
+				E('button', {
+					'class': 'cbi-button',
+					'click': ui.createHandlerFn(this, this.listFeishuChats),
+					'disabled': writeDisabled
+				}, _('列出机器人所在的群')),
 				this.testNode
 			]),
 			this.chatNode
@@ -1504,17 +1513,25 @@ return view.extend({
 		feishu.mode = FEISHU_MODE_USER;
 		feishu.app_id = this.inputValue('feishu', 'app_id');
 		feishu.app_secret = this.inputValue('feishu', 'app_secret');
+		var chatId = this.inputValue('feishu', 'chat_id').trim();
 		var target = this.inputValue('feishu', 'receive_id').trim();
 
-		/* 兼容三种个人 ID：邮箱 / open_id / user_id。 */
-		if (target.indexOf('@') > 0)
+		if (chatId !== '') {
+			feishu.receive_id_type = 'chat_id';
+			feishu.receive_id = chatId;
+		}
+		else if (target.indexOf('@') > 0) {
 			feishu.receive_id_type = 'email';
-		else if (/^ou_/.test(target))
+			feishu.receive_id = target;
+		}
+		else if (/^ou_/.test(target)) {
 			feishu.receive_id_type = 'open_id';
-		else
+			feishu.receive_id = target;
+		}
+		else {
 			feishu.receive_id_type = 'user_id';
-
-		feishu.receive_id = target;
+			feishu.receive_id = target;
+		}
 		feishu.daily_time = this.inputValue('feishu', 'daily_time');
 
 		/* 内容：永远写非空值（全不勾 -> none），绝不写 '' */
@@ -1656,6 +1673,11 @@ return view.extend({
 		/* 允许先保存 App ID、Secret 稍后填；但如果本机已经存过 Secret，不允许被清空。 */
 		if (str(feishu.app_secret) === '' && str(rawValue('feishu', 'app_secret') || '') !== '')
 			return _('App Secret 不能清空：请在输入框重新粘贴后再保存');
+
+		var chatId = str(feishu.chat_id).trim();
+
+		if (chatId !== '' && !/^oc_[A-Za-z0-9_-]{4,}$/.test(chatId))
+			return _('群 chat_id 形如 oc_xxxxx');
 
 		var rcpt = str(feishu.receive_id).trim();
 
@@ -2156,7 +2178,7 @@ return view.extend({
 
 		show('app_id', app || user);
 		show('app_secret', app || user);
-		show('receive_id', user);
+		show('receive_id', true);
 
 		if (this.feishuScanBlock != null)
 			this.feishuScanBlock.style.display = app ? '' : 'none';
