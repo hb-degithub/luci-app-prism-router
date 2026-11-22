@@ -988,7 +988,7 @@ return view.extend({
 			[ 'feishu', 'app_id', _('App ID（扫码加群的自建应用）'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。填了 App ID/Secret 就优先走应用 API，不再用 webhook。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
 			[ 'feishu', 'app_secret', _('App Secret'), _('与 App ID 配套；仅保存在本机 /etc/config/prism-router。'), 'password', null ],
 			[ 'feishu', 'chat_id', _('群 chat_id'), _('点下方「列出机器人所在的群」自动获取；形如 oc_xxxxx。'), 'text', { wide: true, placeholder: 'oc_xxxxx' } ],
-			[ 'feishu', 'receive_id', _('接收人（个人通知，无需群）'), _('填你的飞书登录邮箱最省事；也可以填 ou_ 开头的 open_id。应用可用范围必须包含这个账号。'), 'text', { wide: true, placeholder: 'you@company.com 或 ou_xxxxx' } ],
+			[ 'feishu', 'receive_id', _('接收人（个人通知，无需群）'), _('推荐填飞书 user_id（管理后台 → 成员详情可复制），也可填 ou_ 开头的 open_id 或邮箱；都不需要回调地址。应用可用范围必须包含这个账号。'), 'text', { wide: true, placeholder: 'user_id / ou_xxxxx / 邮箱' } ],
 			[ 'feishu', 'report_chat_enabled', _('群聊报表'), _('关掉后只推送给私聊/其它通道（按后端实现）。'), 'bool', null ]
 		];
 
@@ -1549,8 +1549,15 @@ return view.extend({
 		/* 接收目标统一成 receive_id + receive_id_type：webhook 不用，app 用群，user 用个人。 */
 		if (feishu.mode === FEISHU_MODE_USER) {
 			var target = this.inputValue('feishu', 'receive_id').trim();
-			/* 邮箱最直观；ou_ 开头按 open_id。 */
-			feishu.receive_id_type = (target.indexOf('@') > 0) ? 'email' : 'open_id';
+
+			/* 自动识别：邮箱 → email；ou_ → open_id；其余按 user_id（无需回调，最省事）。 */
+			if (target.indexOf('@') > 0)
+				feishu.receive_id_type = 'email';
+			else if (/^ou_/.test(target))
+				feishu.receive_id_type = 'open_id';
+			else
+				feishu.receive_id_type = 'user_id';
+
 			feishu.receive_id = target;
 		} else {
 			feishu.receive_id_type = 'chat_id';
@@ -1710,9 +1717,10 @@ return view.extend({
 			if (rcpt.length > 0) {
 				var okEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rcpt);
 				var okOpen = /^ou_[A-Za-z0-9_-]{8,}$/.test(rcpt);
+				var okUser = /^[A-Za-z0-9_-]{1,64}$/.test(rcpt);
 
-				if (!okEmail && !okOpen)
-					return _('接收人要填飞书登录邮箱，或 ou_ 开头的 open_id');
+				if (!okEmail && !okOpen && !okUser)
+					return _('接收人要填飞书 user_id、ou_ 开头的 open_id 或邮箱');
 			}
 		}
 
