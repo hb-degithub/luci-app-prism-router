@@ -153,9 +153,8 @@ var DEFAULTS = {
 	},
 	feishu: {
 		enabled: '0',
-		/* 渠道模式：webhook = 群自定义机器人；app = 自建应用机器人（扫码绑定群） */
-		mode: 'webhook',
-		webhook: '',
+		/* 渠道模式：app = 应用凭证（绑定群或发个人） */
+		mode: 'app',
 		secret: '',
 		app_id: '',
 		app_secret: '',
@@ -985,10 +984,10 @@ return view.extend({
 
 		var channelFields = [
 			[ 'feishu', 'enabled', _('启用飞书报表'), _('开启后按下面的「时间」推送日报/周报；测试发送不受这里影响。'), 'bool', null ],
-			[ 'feishu', 'app_id', _('App ID（扫码加群的自建应用）'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。填了 App ID/Secret 就优先走应用 API，不再用 webhook。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
+			[ 'feishu', 'app_id', _('App ID（扫码加群的自建应用）'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
 			[ 'feishu', 'app_secret', _('App Secret'), _('与 App ID 配套；仅保存在本机 /etc/config/prism-router。'), 'password', null ],
 			[ 'feishu', 'chat_id', _('群 chat_id'), _('点下方「列出机器人所在的群」自动获取；形如 oc_xxxxx。'), 'text', { wide: true, placeholder: 'oc_xxxxx' } ],
-			[ 'feishu', 'receive_id', _('接收人（个人通知，无需群）'), _('推荐填飞书 user_id（管理后台 → 成员详情可复制），也可填 ou_ 开头的 open_id 或邮箱；都不需要回调地址。应用可用范围必须包含这个账号。'), 'text', { wide: true, placeholder: 'user_id / ou_xxxxx / 邮箱' } ],
+			[ 'feishu', 'receive_id', _('接收人 user_id（个人通知，无需群）'), _('飞书管理后台 → 成员与部门 → 成员详情可复制 user_id。不需要回调、不需要扫码。应用可用范围必须包含该账号。'), 'text', { wide: true, placeholder: '飞书 user_id' } ],
 			[ 'feishu', 'report_chat_enabled', _('群聊报表'), _('关掉后只推送给私聊/其它通道（按后端实现）。'), 'bool', null ]
 		];
 
@@ -1115,7 +1114,7 @@ return view.extend({
 			choices = [ choices[1], choices[0] ];
 
 		var row = this.radioField('feishu', 'mode', _('发送方式'),
-			_('两种都只需要飞书自建应用的 App ID / App Secret。绑定群 = 扫码把机器人所在的群选出来；发给个人 = 直接填你的飞书邮箱，不需要建群。'),
+			_('两种都只需要应用凭证。绑定群 = 扫机器人二维码加群，再选群；发给个人 = 填飞书 user_id，不需要建群。'),
 			choices);
 
 		row.setAttribute('id', 'ts-feishu-mode-row');
@@ -1145,7 +1144,7 @@ return view.extend({
 				? _('已保存 App ID：') + savedId
 				: _('当前还没有保存 App ID / App Secret。')),
 			E('div', { 'style': 'margin-top:4px;opacity:.8' },
-				_('二维码是飞书官方 Applink（applink.feishu.cn/client/bot/open），不需要配置重定向 URL。'))
+				_('二维码是飞书官方 Applink；群通知直接查机器人所在群，个人通知只填 user_id，不需要重定向或事件订阅。'))
 		]);
 	},
 
@@ -1519,17 +1518,8 @@ return view.extend({
 		feishu.chat_id = this.inputValue('feishu', 'chat_id');
 		/* 接收目标统一成 receive_id + receive_id_type：webhook 不用，app 用群，user 用个人。 */
 		if (feishu.mode === FEISHU_MODE_USER) {
-			var target = this.inputValue('feishu', 'receive_id').trim();
-
-			/* 自动识别：邮箱 → email；ou_ → open_id；其余按 user_id（无需回调，最省事）。 */
-			if (target.indexOf('@') > 0)
-				feishu.receive_id_type = 'email';
-			else if (/^ou_/.test(target))
-				feishu.receive_id_type = 'open_id';
-			else
-				feishu.receive_id_type = 'user_id';
-
-			feishu.receive_id = target;
+			feishu.receive_id_type = 'user_id';
+			feishu.receive_id = this.inputValue('feishu', 'receive_id').trim();
 		} else {
 			feishu.receive_id_type = 'chat_id';
 			feishu.receive_id = feishu.chat_id;
@@ -1685,14 +1675,8 @@ return view.extend({
 			var rcpt = str(feishu.receive_id).trim();
 
 			/* 允许先保存 App 凭证、稍后再填接收人；只有填了才校验格式。 */
-			if (rcpt.length > 0) {
-				var okEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rcpt);
-				var okOpen = /^ou_[A-Za-z0-9_-]{8,}$/.test(rcpt);
-				var okUser = /^[A-Za-z0-9_-]{1,64}$/.test(rcpt);
-
-				if (!okEmail && !okOpen && !okUser)
-					return _('接收人要填飞书 user_id、ou_ 开头的 open_id 或邮箱');
-			}
+			if (rcpt.length > 0 && !/^[A-Za-z0-9_-]{1,64}$/.test(rcpt))
+				return _('接收人只填飞书 user_id（管理后台成员详情可复制）');
 		}
 
 		if (feishu.daily_time.length > 0 && normHHMM(feishu.daily_time) == null)
