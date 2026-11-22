@@ -41,8 +41,12 @@
 import { readfile, open, lsdir, stat, lstat, mkdir, chmod, rename, unlink, popen } from 'fs';
 import { cursor } from 'uci';
 
-const VERSION       = '1.0.5';
+const VERSION       = '1.0.6';
 const PROD_BASE     = 'https://open.feishu.cn';
+/* 新版授权页与 v3 token 端点都在 accounts.feishu.cn（官方文档 2025 起）。 */
+const AUTH_BASE      = 'https://accounts.feishu.cn';
+/* 拉群列表（im/v1/chats）需要该 scope；授权页必须显式申请，否则 20027。 */
+const SCOPE          = 'im:chat:readonly';
 const TMP_ROOT      = '/tmp/prism-router';
 const STATE_DIR     = `${TMP_ROOT}/feishu-oauth`;
 const CURL_TMP      = `${TMP_ROOT}/.feishu-oauth`;
@@ -278,6 +282,11 @@ function is_loopback_base(raw) {
 	return match(raw, /^http:\/\/(127\.0\.0\.1|\[::1\]|localhost)(:[0-9]{1,5})?$/) != null;
 }
 
+/* 完整 URL 版本：容器门禁的 mock 是 http://127.0.0.1:PORT/path，必须允许路径。 */
+function is_loopback_url(raw) {
+	return match(raw, /^http:\/\/(127\.0\.0\.1|\[::1\]|localhost)(:[0-9]{1,5})?(\/.*)?$/) != null;
+}
+
 function feishu_base() {
 	const raw = trim(text(getenv('PRISM_ROUTER_FEISHU_BASE'), ''));
 
@@ -285,6 +294,16 @@ function feishu_base() {
 		return raw;
 
 	return PROD_BASE;
+}
+
+/* 授权页 / v3 token 的 base。测试钩子同样只接受 loopback。 */
+function auth_base() {
+	const raw = trim(text(getenv('PRISM_ROUTER_FEISHU_AUTH_BASE'), ''));
+
+	if (length(raw) > 0 && is_loopback_base(raw))
+		return raw;
+
+	return AUTH_BASE;
 }
 
 /* 回调地址的 scheme：uhttpd 在 TLS 监听上会给 CGI 设 HTTPS=on；纯 HTTP 时没有。
@@ -336,13 +355,46 @@ function sanitize(message, secret) {
 function upstream_reason(j, fallback) {
 	if (is_object(j)) {
 		const code = (j.code != null) ? `${j.code}` : '';
-		const msg = trim(text(j.msg ?? j.message, ''));
+		const msg = trim(text(j.msg ?? j.message ?? j.error_description ?? j.error, ''));
 
 		if (length(msg) > 0)
 			return length(code) > 0 ? `code=${code} ${msg}` : msg;
 	}
 
 	return fallback;
+}
+
+/* 飞书 OAuth 常见错误码 → 可直接照做的中文提示。
+   原始 msg 只用于未知错误，且会被 sanitize 截断/脱敏。 */
+const FEISHU_ERRORS = {
+	'20001': '请求缺少必要参数（检查 App ID / App Secret 是否保存）',
+	'20002': 'App Secret 不正确：请到开发者后台「凭证与基础信息」重新复制',
+	'20003': '授权码无效（可能已被使用）：请重新生成二维码',
+	'20004': '授权码已过期（5 分钟）：请重新生成二维码',
+	'20009': '企业未安装该应用：请先在管理后台安装/启用自建应用',
+	'20010': '当前飞书账号没有该应用的使用权限：请在管理后台放开可用范围',
+	'20024': '授权码与 App ID 不匹配：确认 App ID/Secret 属于同一个应用',
+	'20027': '应用未开通 im:chat:readonly 权限：请在「权限管理」开通并发布版本，再重新授权',
+	'20048': '应用不存在：检查 App ID 是否复制完整',
+	'20065': '授权码已被使用：请重新生成二维码',
+	'20069': '应用未启用：请在开发者后台启用应用',
+	'20071': 'redirect_uri 与发起授权时不一致：必须与「安全设置」里的重定向 URL 完全相同',
+	'99991679': 'user_access_token 缺少 im:chat:readonly 权限：开通权限后重新授权'
+};
+
+function feishu_error(j) {
+	if (!is_object(j))
+		return '飞书授权失败（响应格式不认识）';
+
+	const code = (j.code != null) ? int(j.code) : 0;
+	const hint = FEISHU_ERRORS[`${code}`];
+
+	if (hint != null)
+		return `飞书错误 ${code}：${hint}`;
+
+	const msg = trim(text(j.error_description ?? j.msg ?? j.message ?? j.error, ''));
+
+	return (length(msg) > 0) ? `飞书错误 ${code}：${msg}` : `飞书错误 ${code}`;
 }
 
 // ───────────────────────────── 授权状态文件 ─────────────────────────────
@@ -536,10 +588,12 @@ function api_call(method, path, bearer, body_obj) {
 	const bf = `${CURL_TMP}/body-${tag}`;
 	const rf = `${CURL_TMP}/resp-${tag}`;
 	const cf = `${CURL_TMP}/curl-${tag}`;
-	const loop = is_loopback_base(feishu_base());
+	/* path 可以是相对路径（拼 feishu_base），也可以是完整 URL（v3 token 在 accounts 域）。 */
+	const url = (match(path, /^https?:\/\//) != null) ? path : (feishu_base() + path);
+	const loop = is_loopback_url(url);
 
 	const lines = [
-		`url = "${feishu_base()}${path}"`,
+		`url = "${url}"`,
 		`request = "${method}"`,
 		'silent',
 		'show-error',
@@ -691,6 +745,27 @@ function normalize_chats(items) {
 	return out;
 }
 
+/* 应用 tenant_access_token：列“机器人所在的群”必须用它（user token 列的是用户群，
+   机器人不在群里时虽然能绑定成功、发送却会 230002）。 */
+function tenant_access_token(app_id, app_secret) {
+	const r = api_call('POST', '/open-apis/auth/v3/tenant_access_token/internal', '', {
+		app_id: app_id,
+		app_secret: app_secret
+	});
+
+	if (r.http != 200)
+		return '';
+
+	const j = json_parse(r.body);
+
+	if (!is_object(j) || (j.code != null && int(j.code) != 0))
+		return '';
+
+	const data = is_object(j.data) ? j.data : {};
+
+	return trim(text(j.tenant_access_token ?? data.tenant_access_token, ''));
+}
+
 function pick_token(j) {
 	if (!is_object(j))
 		return '';
@@ -802,8 +877,11 @@ function action_start() {
 	}))
 		return json_error(500, '写入授权状态失败');
 
-	const url = sprintf('%s/open-apis/authen/v1/index?app_id=%s&redirect_uri=%s&state=%s',
-		feishu_base(), url_encode(app_id), url_encode(redirect_uri()), state);
+	/* 官方当前授权页：accounts.feishu.cn/authen/v1/authorize。
+	   必须带 response_type=code；scope 必须显式申请 im:chat:readonly，
+	   否则拿到的 user_access_token 没有列群权限（授权页会直接报 20027）。 */
+	const url = sprintf('%s/open-apis/authen/v1/authorize?client_id=%s&response_type=code&redirect_uri=%s&scope=%s&state=%s',
+		auth_base(), url_encode(app_id), url_encode(redirect_uri()), url_encode(SCOPE), state);
 
 	return json_out(200, { state: state, url: url });
 }
@@ -856,6 +934,12 @@ function action_callback(query) {
 	if (rec.status == 'ready')
 		return respond(200, 'text/html; charset=utf-8', HTML_OK);
 
+	/* 用户在授权页点了拒绝：飞书回跳 ?error=access_denied（没有 code）。 */
+	if (trim(text(query.error, '')) == 'access_denied') {
+		write_record(state, { ts: rec.ts, status: 'error', error: '用户拒绝了授权' });
+		return json_error(400, '你已在飞书授权页拒绝授权。请重新生成二维码，并在授权页点「授权」。');
+	}
+
 	if (length(code) == 0)
 		return json_error(400, '缺少 code 参数（请从棱镜路由设置页重新发起扫码）');
 
@@ -873,16 +957,34 @@ function action_callback(query) {
 
 	const redirect = length(text(rec.redirect, '')) > 0 ? text(rec.redirect, '') : redirect_uri();
 
-	/* code -> user_access_token（OIDC v1）。app_secret 在 0600 请求体文件里，不在 argv。 */
-	const token_res = api_call('POST', '/open-apis/authen/v1/oidc/access_token', '', {
+	/* code -> user_access_token：官方当前端点是 accounts.feishu.cn/oauth/v3/token；
+	   v1 OIDC 已被官方标注为历史版本，v2 仅在 v3 不可用时兜底（同一请求体）。
+	   app_secret 只出现在 0600 请求体文件里，不进 argv。 */
+	const token_body = {
 		grant_type: 'authorization_code',
-		code: code,
-		redirect_uri: redirect,
 		client_id: app_id,
-		client_secret: app_secret
-	});
+		client_secret: app_secret,
+		code: code,
+		redirect_uri: redirect
+	};
 
+	let token_res = api_call('POST', `${auth_base()}/oauth/v3/token`, '', token_body);
+
+	if (token_res.http == 404 || token_res.http == 405)
+		token_res = api_call('POST', `${PROD_BASE}/open-apis/authen/v2/oauth/token`, '', token_body);
+
+	const token_json = json_parse(token_res.body);
+
+	/* v3/v2 失败时 HTTP 可能是 400，但 body 里仍是 {code,error,error_description}：
+	   先看业务错误码，才能给出「未开通 im:chat:readonly」这类可操作提示。 */
 	if (token_res.http != 200) {
+		if (is_object(token_json) && token_json.code != null && int(token_json.code) != 0) {
+			const reason = sanitize(feishu_error(token_json), app_secret);
+
+			write_record(state, { ts: rec.ts, status: 'error', error: reason });
+			return json_error(502, reason);
+		}
+
 		const reason = sanitize(length(token_res.error) > 0
 			? token_res.error
 			: `换取用户授权失败（HTTP ${token_res.http}）`, app_secret);
@@ -891,7 +993,25 @@ function action_callback(query) {
 		return json_error(502, reason);
 	}
 
-	const token_json = json_parse(token_res.body);
+	const token_code = (is_object(token_json) && token_json.code != null) ? int(token_json.code) : 0;
+
+	if (token_code != 0) {
+		const reason = sanitize(feishu_error(token_json), app_secret);
+
+		write_record(state, { ts: rec.ts, status: 'error', error: reason });
+		return json_error(502, reason);
+	}
+
+	/* 授权成功但没有 im:chat:readonly 时，后面列群必然 99991679；提前给出可操作提示。 */
+	const granted = (is_object(token_json) && type(token_json.scope) == 'string') ? token_json.scope : '';
+
+	if (length(granted) > 0 && index(granted, SCOPE) < 0) {
+		const reason = `授权未包含 ${SCOPE}：请在开发者后台「权限管理」开通，并重新授权`;
+
+		write_record(state, { ts: rec.ts, status: 'error', error: reason });
+		return json_error(502, reason);
+	}
+
 	const token = pick_token(token_json);
 
 	if (length(token) == 0) {
@@ -902,9 +1022,19 @@ function action_callback(query) {
 		return json_error(502, reason);
 	}
 
-	/* user_access_token -> 机器人所在的群（仅用一次，不落盘）。 */
+	/* 群列表必须用 tenant_access_token：它返回“机器人所在的群”，也就是真正能发消息的群。
+	   user_access_token 返回的是“用户所在的群”，机器人不在群里时绑定后发送会 230002。 */
+	const bot_token = tenant_access_token(app_id, app_secret);
+
+	if (length(bot_token) == 0) {
+		const reason = '获取应用 tenant_access_token 失败：检查 App ID/App Secret 与应用是否启用';
+
+		write_record(state, { ts: rec.ts, status: 'error', error: reason });
+		return json_error(502, reason);
+	}
+
 	const chats_res = api_call('GET',
-		'/open-apis/im/v1/chats?page_size=50&user_id_type=open_id', token, null);
+		'/open-apis/im/v1/chats?page_size=50&user_id_type=open_id', bot_token, null);
 
 	if (chats_res.http != 200) {
 		const reason = sanitize(length(chats_res.error) > 0

@@ -40,6 +40,9 @@ CGI=/www/cgi-bin/prism-router-feishu
 CFG=/etc/config/prism-router
 MOCK_PORT=19091
 MOCK_BASE="http://127.0.0.1:$MOCK_PORT"
+# v3 token 在另一个 URL 前缀（/oauth），mock 需要第二个 uhttpd 实例。
+MOCK_AUTH_PORT=19092
+AUTH_BASE="http://127.0.0.1:$MOCK_AUTH_PORT"
 MOCK=/tmp/mock
 WORK=/tmp/fs-oauth
 SECRET='SECRET-should-not-leak'
@@ -93,7 +96,29 @@ if (len > 0) {
 let status = 200;
 let out = {};
 
-if (index(uri, "/authen/v1/oidc/access_token") >= 0) {
+if (index(uri, "/oauth/v3/token") >= 0) {
+	note("oidc-requests.jsonl", sprintf("%s|%d|%s", method, len, body));
+	if (flag("fail-oidc")) {
+		status = 500;
+		out = { code: 500, error: "server_error", error_description: "mock upstream down" };
+	} else if (flag("scope-denied")) {
+		status = 400;
+		out = { code: 20027, error: "invalid_scope", error_description: "scope not granted" };
+	} else if (flag("no-scope")) {
+		out = { code: 0, access_token: "u-mock-access-token", token_type: "Bearer",
+			expires_in: 7200, scope: "contact:user.base:readonly" };
+	} else if (index(body, "good") >= 0) {
+		/* v3 响应是顶层 access_token（没有 data 包裹），并回传实际 scope。 */
+		out = { code: 0, access_token: "u-mock-access-token", token_type: "Bearer",
+			expires_in: 7200, scope: "im:chat:readonly" };
+	} else if (false) {
+		out = { code: 0, access_token: "u-mock-access-token", token_type: "Bearer",
+			expires_in: 7200, scope: "contact:user.base:readonly" };
+	} else {
+		status = 400;
+		out = { code: 20003, error: "invalid_grant", error_description: "authorization code is invalid or expired" };
+	}
+} else if (index(uri, "/authen/v1/oidc/access_token") >= 0) {
 	note("oidc-requests.jsonl", sprintf("%s|%d|%s", method, len, body));
 	if (flag("fail-oidc")) {
 		status = 500;
@@ -144,7 +169,8 @@ print(sprintf("%J\n", out));
 UCEOF
 
 # 每条固定路径放一份 CGI（uhttpd 直接按「docroot + URL」找脚本，不做 PATH_INFO 拆分）
-for p in open-apis/authen/v1/oidc/access_token \
+for p in oauth/v3/token \
+         open-apis/authen/v1/oidc/access_token \
          open-apis/im/v1/chats \
          open-apis/auth/v3/tenant_access_token/internal \
          open-apis/im/v1/messages \
@@ -170,6 +196,7 @@ SHIM
 chmod 755 /tmp/shim/curl
 
 /usr/sbin/uhttpd -f -p 127.0.0.1:$MOCK_PORT -h "$MOCK" -x /open-apis >/tmp/mock-uhttpd.log 2>&1 &
+/usr/sbin/uhttpd -f -p 127.0.0.1:$MOCK_AUTH_PORT -h "$MOCK" -x /oauth >/tmp/mock-auth-uhttpd.log 2>&1 &
 wait_http(){ # $1=url
   i=0
   while [ "$i" -lt 60 ]; do
@@ -179,8 +206,9 @@ wait_http(){ # $1=url
   done
   return 1
 }
-wait_http "$MOCK_BASE/open-apis/im/v1/chats" && ok "mock 飞书 API 已监听 $MOCK_BASE（127.0.0.1）" \
-  || { bad "mock 飞书 API 未就绪"; cat /tmp/mock-uhttpd.log; }
+wait_http "$MOCK_BASE/open-apis/im/v1/chats" && wait_http "$AUTH_BASE/oauth/v3/token" \
+  && ok "mock 飞书 API 已监听 $MOCK_BASE / $AUTH_BASE（127.0.0.1）" \
+  || { bad "mock 飞书 API 未就绪"; cat /tmp/mock-uhttpd.log; cat /tmp/mock-auth-uhttpd.log; }
 
 echo "=== 0. 安装单包 ==="
 opkg install "$PRISM_IPK" >/tmp/i.log 2>&1 \
@@ -226,6 +254,7 @@ cgi(){ # $1=QUERY_STRING [$2=METHOD] [$3=HTTP_HOST] [$4=HTTPS]
   : > "$CGI_RAW"; : > "$CGI_H"; : > "$CGI_B"
   env PATH="/tmp/shim:$PATH" REQUEST_METHOD="${2:-GET}" HTTP_HOST="${3:-router.lan:8080}" \
       HTTPS="${4:-}" QUERY_STRING="$1" PRISM_ROUTER_FEISHU_BASE="$MOCK_BASE" \
+      PRISM_ROUTER_FEISHU_AUTH_BASE="$AUTH_BASE" \
       ucode "$CGI" > "$CGI_RAW" 2>/tmp/cgi.err
   CGI_RC=$?
   tr -d '\r' < "$CGI_RAW" > /tmp/cgi.clean
@@ -292,13 +321,21 @@ case "$STATE" in
 esac
 URL=$(jget url)
 case "$URL" in
-  */open-apis/authen/v1/index\?app_id=cli_mockapp*) ok "url 指向飞书授权页且带 app_id" ;;
+  */open-apis/authen/v1/authorize\?client_id=cli_mockapp*) ok "url 指向新版飞书授权页且带 client_id" ;;
   *) bad "url 形状不对：$URL" ;;
 esac
 case "$URL" in
   *"redirect_uri=http%3A%2F%2Frouter.lan%3A8080%2Fcgi-bin%2Fprism-router-feishu%3Faction%3Dcallback"*)
     ok "url 的 redirect_uri 已 urlencode（与开放平台填写的地址一致）" ;;
   *) bad "redirect_uri 未按预期编码：$URL" ;;
+esac
+case "$URL" in
+  *"response_type=code"*) ok "url 带 response_type=code（新版授权页必填）" ;;
+  *) bad "url 缺 response_type=code：$URL" ;;
+esac
+case "$URL" in
+  *"scope=im%3Achat%3Areadonly"*) ok "url 显式申请 im:chat:readonly（否则拉群 20027）" ;;
+  *) bad "url 缺 im:chat:readonly scope：$URL" ;;
 esac
 case "$URL" in
   *"state=$STATE") ok "url 的 state 与返回一致" ;;
@@ -358,14 +395,14 @@ has "授权成功，请回到棱镜路由设置页选择要绑定的群" "$CGI_B
 hasnt "<script" "$CGI_B" "HTML 无脚本"
 hasnt "src=" "$CGI_B" "HTML 无外部资源（src=）"
 hasnt "href=" "$CGI_B" "HTML 无外部链接（href=）"
-grep -q "Bearer $USER_TOKEN" /tmp/mock/chats-requests.jsonl 2>/dev/null \
-  && ok "群列表请求带 Authorization: Bearer <user_access_token>" \
-  || bad "群列表请求缺少 Bearer 头：$(head -1 /tmp/mock/chats-requests.jsonl 2>/dev/null)"
+grep -q "Bearer $TENANT_TOKEN" /tmp/mock/chats-requests.jsonl 2>/dev/null \
+  && ok "群列表请求带 Authorization: Bearer <tenant_access_token>（列机器人所在的群）" \
+  || bad "群列表请求缺少 tenant Bearer：$(head -1 /tmp/mock/chats-requests.jsonl 2>/dev/null)"
 grep -q "page_size=50" /tmp/mock/chats-requests.jsonl 2>/dev/null \
   && ok "群列表请求 page_size=50" || bad "群列表请求缺少 page_size=50"
 grep -q "user_id_type=open_id" /tmp/mock/chats-requests.jsonl 2>/dev/null \
   && ok "群列表请求 user_id_type=open_id" || bad "群列表请求缺少 user_id_type=open_id"
-grep -q 'grant_type.*authorization_code' /tmp/mock/oidc-requests.jsonl 2>/dev/null \
+grep -q '"grant_type":"authorization_code"\|grant_type.*authorization_code' /tmp/mock/oidc-requests.jsonl 2>/dev/null \
   && ok "换 token 请求 grant_type=authorization_code" || bad "换 token 请求缺 grant_type"
 grep -q 'client_id.*cli_mockapp' /tmp/mock/oidc-requests.jsonl 2>/dev/null \
   && ok "换 token 请求带 client_id（app_id）" || bad "换 token 请求缺 client_id"
@@ -397,6 +434,33 @@ has "授权成功" "$CGI_B" "重复 callback 仍返回成功页"
 cgi "action=status&state=$STATE"
 eq "ready" "$(jget status)" "重复 callback 没有把状态改成 error"
 eq 50 "$(jget chats len)" "重复 callback 保留 chats"
+
+echo
+echo "=== 5b. 授权失败提示：20027 / token 缺 scope / 用户拒绝 ==="
+: > /tmp/mock/scope-denied
+cgi "action=start" GET "router.lan:8080"
+STATE=$(jget state)
+cgi "action=callback&code=good&state=$STATE"
+eq 502 "$(ccode)" "scope 未开通 -> 502"
+has "20027" /tmp/cgi.b "错误码 20027 出现在响应里"
+has "im:chat:readonly" /tmp/cgi.b "提示开通 im:chat:readonly"
+rm -f /tmp/mock/scope-denied
+
+: > /tmp/mock/no-scope
+cgi "action=start" GET "router.lan:8080"
+STATE=$(jget state)
+cgi "action=callback&code=good&state=$STATE"
+eq 502 "$(ccode)" "token 返回的 scope 不含 im:chat:readonly -> 502"
+has "授权未包含" /tmp/cgi.b "提示重新授权并开通权限"
+rm -f /tmp/mock/no-scope
+
+cgi "action=start" GET "router.lan:8080"
+STATE=$(jget state)
+cgi "action=callback&error=access_denied&state=$STATE"
+eq 400 "$(ccode)" "用户在授权页拒绝 -> 400"
+has "拒绝" /tmp/cgi.b "拒绝提示可操作"
+cgi "action=status&state=$STATE"
+eq "error" "$(jget status)" "拒绝后状态为 error 而不是 pending"
 
 echo
 echo "=== 6. 错误路径：state 不存在 / 非法 / 过期 / 缺 code ==="
@@ -463,7 +527,7 @@ echo
 echo "=== 8. 经 uhttpd 的真实 HTTP ==="
 cat > /tmp/mockwww/cgi-bin/prism-router-feishu <<WRAP
 #!/bin/sh
-PRISM_ROUTER_FEISHU_BASE='$MOCK_BASE' exec ucode $CGI
+PRISM_ROUTER_FEISHU_BASE='$MOCK_BASE' PRISM_ROUTER_FEISHU_AUTH_BASE='$AUTH_BASE' exec ucode $CGI
 WRAP
 chmod 755 /tmp/mockwww/cgi-bin/prism-router-feishu
 /usr/sbin/uhttpd -f -p 127.0.0.1:18080 -h /tmp/mockwww -x /cgi-bin >/tmp/web-uhttpd.log 2>&1 &

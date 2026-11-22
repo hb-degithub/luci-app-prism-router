@@ -1121,6 +1121,47 @@ return view.extend({
 		return row;
 	},
 
+	/* 绑定前置条件：飞书开放平台的配置项缺一不可，直接显示可复制的回调地址，
+	 * 避免用户只填了 App ID/Secret 却因没配重定向 URL / 没开权限而反复失败。 */
+	feishuPrereqNode: function() {
+		var redirect = '';
+
+		try {
+			redirect = window.location.protocol + '//' + window.location.host +
+				'/cgi-bin/prism-router-feishu?action=callback';
+		}
+		catch (e) { redirect = ''; }
+
+		var savedId = str(rawValue('feishu', 'app_id'));
+
+		var codeStyle = 'display:inline-block;max-width:100%;padding:2px 6px;border-radius:4px;' +
+			'background:rgba(127,127,127,.12);font-size:12px;word-break:break-all;user-select:all';
+
+		return E('div', {
+			'class': 'cbi-value-description',
+			'style': 'margin:0;padding:10px 12px;border:1px solid rgba(127,127,127,.28);' +
+				'border-radius:6px;max-width:100%;min-width:0;line-height:1.65'
+		}, [
+			E('div', {}, E('strong', {}, _('绑定前必须完成（缺一不可）'))),
+			E('ol', { 'style': 'margin:6px 0 0 18px;padding:0' }, [
+				E('li', {}, _('开放平台创建「自建应用」，并开启「机器人」能力。')),
+				E('li', {}, _('「权限管理」添加 im:chat:readonly，然后创建版本并发布（企业自建应用还需管理员审批）。')),
+				E('li', {}, [
+					_('「安全设置 → 重定向 URL」原样添加：'),
+					E('br'),
+					E('code', { 'style': codeStyle }, redirect || _('（无法读取当前地址，请用浏览器访问本页）'))
+				]),
+				E('li', {}, _('在本页填写 App ID / App Secret；点「生成绑定二维码」时会自动保存到本机。')),
+				E('li', {}, _('先在飞书群里添加这个机器人，再生成二维码；群列表只显示机器人已加入的群。'))
+			]),
+			E('div', { 'style': 'margin-top:6px' }, savedId
+				? _('已保存 App ID：') + savedId
+				: _('当前还没有保存 App ID / App Secret。')),
+			E('div', { 'style': 'margin-top:4px;opacity:.8' },
+				_('授权页会申请 im:chat:readonly；若应用未开通该权限，飞书会直接报 20027。群列表用机器人身份获取，不包含机器人未加入的群。'))
+		]);
+	},
+
 	/* 扫码绑定区块：二维码 + 轮询状态 + 群列表 + 已绑定提示。
 	 * 只在 mode=app 时显示（syncFeishuMode 负责）；全部单列布局，390px 不横向溢出。 */
 	feishuScanField: function(writeDisabled) {
@@ -1181,6 +1222,7 @@ return view.extend({
 			'style': 'display:none;margin:0;max-width:100%;min-width:0'
 		}, [
 			this.subhead(_('飞书应用机器人 · 扫码绑定'), false),
+			this.feishuPrereqNode(),
 			E('div', {
 				'style': 'display:grid;grid-template-columns:minmax(0,1fr);gap:10px;' +
 					'max-width:100%;min-width:0;box-sizing:border-box'
