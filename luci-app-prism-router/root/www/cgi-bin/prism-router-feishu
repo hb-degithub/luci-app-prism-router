@@ -41,7 +41,7 @@
 import { readfile, open, lsdir, stat, lstat, mkdir, chmod, rename, unlink, popen } from 'fs';
 import { cursor } from 'uci';
 
-const VERSION       = '1.0.11';
+const VERSION       = '1.0.12';
 const PROD_BASE     = 'https://open.feishu.cn';
 /* 新版授权页与 v3 token 端点都在 accounts.feishu.cn（官方文档 2025 起）。 */
 const AUTH_BASE      = 'https://accounts.feishu.cn';
@@ -850,7 +850,7 @@ const HTML_OK = `<!DOCTYPE html>
 
 // ───────────────────────────── 动作 ─────────────────────────────
 
-function action_start() {
+function action_start(query) {
 	const app_id = uci_value('app_id');
 	const app_secret = uci_value('app_secret');
 	/* mode 只影响 400 的提示文案：webhook 模式下也允许先扫码绑定群（常见顺序是先选群、
@@ -872,8 +872,10 @@ function action_start() {
 
 	const state = new_state();
 
+	const target = (trim(text(query.target, '')) == 'openid') ? 'openid' : 'chats';
+
 	if (match(state, STATE_RE) == null || !write_record(state, {
-		ts: time(), status: 'pending', redirect: redirect_uri()
+		ts: time(), status: 'pending', target: target, redirect: redirect_uri()
 	}))
 		return json_error(500, '写入授权状态失败');
 
@@ -902,7 +904,10 @@ function action_status(query) {
 		return json_error(404, '授权已过期（10 分钟内有效），请重新扫码');
 	}
 
-	const out = { status: text(rec.status, 'pending'), chats: [], error: '' };
+	const out = { status: text(rec.status, 'pending'), chats: [], open_id: '', error: '' };
+
+	if (text(rec.open_id, '') != '')
+		out.open_id = text(rec.open_id, '');
 
 	if (rec.status == 'ready' && is_array(rec.chats))
 		out.chats = rec.chats;
@@ -1022,6 +1027,39 @@ function action_callback(query) {
 		return json_error(502, reason);
 	}
 
+	/* 个人通知：用 user_access_token 调 user_info 拿 open_id，
+	   email 在租户内解析不到时（230001 invalid receive_id）用它最稳。 */
+	if (text(rec.target, '') == 'openid') {
+		const ui_res = api_call('GET', '/open-apis/authen/v1/user_info', token, null);
+
+		if (ui_res.http != 200) {
+			const reason = sanitize(length(ui_res.error) > 0
+				? ui_res.error
+				: `获取用户信息失败（HTTP ${ui_res.http}）`, app_secret);
+
+			write_record(state, { ts: rec.ts, status: 'error', target: 'openid', error: reason });
+			return json_error(502, reason);
+		}
+
+		const ui_json = json_parse(ui_res.body);
+		const data = (is_object(ui_json) && is_object(ui_json.data)) ? ui_json.data : {};
+		const open_id = trim(text(data.open_id ?? ui_json.open_id, ''));
+
+		if (length(open_id) == 0) {
+			const reason = sanitize(upstream_reason(ui_json, '响应缺少 open_id'), app_secret);
+
+			write_record(state, { ts: rec.ts, status: 'error', target: 'openid', error: reason });
+			return json_error(502, reason);
+		}
+
+		if (!write_record(state, {
+			ts: rec.ts, status: 'ready', target: 'openid', open_id: open_id, updated: time()
+		}))
+			return json_error(500, '写入授权结果失败');
+
+		return respond(200, 'text/html; charset=utf-8', HTML_OK);
+	}
+
 	/* 群列表必须用 tenant_access_token：它返回“机器人所在的群”，也就是真正能发消息的群。
 	   user_access_token 返回的是“用户所在的群”，机器人不在群里时绑定后发送会 230002。 */
 	const bot_token = tenant_access_token(app_id, app_secret);
@@ -1075,7 +1113,7 @@ function run_action() {
 	const action = lc(trim(text(query.action, '')));
 
 	if (action == 'start')
-		action_start();
+		action_start(query);
 	else if (action == 'callback')
 		action_callback(query);
 	else if (action == 'status')

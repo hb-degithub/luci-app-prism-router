@@ -2193,7 +2193,11 @@ return view.extend({
 		show('receive_id', user);
 
 		if (this.feishuScanBlock != null)
-			this.feishuScanBlock.style.display = app ? '' : 'none';
+			this.feishuScanBlock.style.display = (app || user) ? '' : 'none';
+
+		if (this.feishuBindBtn != null)
+			this.setFeishuButton(this.feishuBindBtn,
+				user ? _('扫码获取我的 open_id') : _('生成绑定二维码'), this.feishuWriteBlocked());
 
 		if (!app && this.feishuPolling === true) {
 			this.stopFeishuPoll();
@@ -2554,7 +2558,7 @@ return view.extend({
 
 					self.rememberOptions('feishu', { app_id: appId, app_secret: appSecret });
 
-					return self.requestFeishuStart();
+					return self.requestFeishuStart(self.feishuMode() === FEISHU_MODE_USER ? 'openid' : '');
 				})
 				.catch(function(err) {
 					self.setFeishuButton(self.feishuBindBtn, _('生成绑定二维码'), false);
@@ -2563,18 +2567,19 @@ return view.extend({
 				});
 		}
 
-		return this.requestFeishuStart();
+		return this.requestFeishuStart(this.feishuMode() === FEISHU_MODE_USER ? 'openid' : '');
 	},
 
 	/* 真正调 CGI 的 start：GET + 同源相对路径，不带任何凭证（CGI 从 UCI 读）。 */
-	requestFeishuStart: function() {
+	requestFeishuStart: function(target) {
 		var self = this;
 		var seq = (this.feishuStartSeq || 0) + 1;
+		var q = '?action=start' + (target ? ('&target=' + encodeURIComponent(target)) : '');
 
 		this.feishuStartSeq = seq;
-		this.setFeishuScanStatus(_('正在申请绑定二维码…'), '');
+		this.setFeishuScanStatus(target === 'openid' ? _('正在申请授权二维码…') : _('正在申请绑定二维码…'), '');
 
-		return this.feishuRequest(FEISHU_CGI + '?action=start', { method: 'GET' }).then(function(data) {
+		return this.feishuRequest(FEISHU_CGI + q, { method: 'GET' }).then(function(data) {
 			/* 期间又点了一次「重新生成」：这份响应已经过期，别覆盖新的 state/二维码 */
 			if (self.feishuStartSeq !== seq) return;
 
@@ -2695,12 +2700,26 @@ return view.extend({
 		}
 
 		if (status === 'ready') {
-			/* state 一次性：拿到群列表就停表，避免继续打后端 */
+			/* state 一次性：拿到结果就停表，避免继续打后端 */
 			this.clearFeishuPollTimer();
 			this.feishuPolling = false;
 			this.feishuState = '';
 			this.feishuPollFailures = 0;
 			this.renderFeishuQr('');
+
+			var openId = (data != null && data.open_id != null) ? ('' + data.open_id) : '';
+
+			/* 个人模式：授权后直接拿到 open_id，填进输入框，不需要群 */
+			if (openId !== '') {
+				var input = this.inputs['feishu.receive_id'];
+
+				if (input != null)
+					input.value = openId;
+
+				this.setFeishuScanStatus(_('已获取你的 open_id，并填入接收人：') + openId, '');
+
+				return;
+			}
 
 			var chats = (data != null && Array.isArray(data.chats)) ? data.chats : [];
 

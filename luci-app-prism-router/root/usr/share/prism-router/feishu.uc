@@ -1760,8 +1760,9 @@ code_help = function(code) {
     if (code == 230025) return "消息体超长";
     if (code == 230099) return "卡片内容非法（子码见响应）";
     /* 应用机器人（im/v1/messages）常见错误 */
-    if (code == 230001 || code == 230002) return "机器人不在该群，或群里没有发言权限（先把机器人拉进群）";
-    if (code == 230013) return "机器人没有发消息权限（开放平台检查 im:message:send_as_bot）";
+    if (code == 230001) return "参数错误：receive_id 与类型不匹配，或用户不在租户/可用范围（个人建议用扫码获取 open_id）";
+    if (code == 230002) return "机器人不在该群，或群里没有发言权限（先把机器人拉进群）";
+    if (code == 230013) return "目标用户不在应用可用范围内（开放平台发布版本 → 可用范围加入该账号）";
     if (code == 230027) return "缺少 im:message:send_as_bot 权限（改权限后要发布版本）";
     if (code == 99991672) return "应用未开通发消息权限：开放平台 → 权限管理 → 添加 im:message:send_as_bot（或 im:message），再创建版本并发布";
     if (code == 99991679) return "user_access_token 缺少所需权限：重新授权或开通对应 scope";

@@ -128,6 +128,14 @@ if (index(uri, "/oauth/v3/token") >= 0) {
 	} else {
 		out = { code: 20003, msg: "Authorization code is invalid or expired" };
 	}
+} else if (index(uri, "/authen/v1/user_info") >= 0) {
+	note("userinfo-requests.jsonl", sprintf("%s|%s", method, auth));
+	if (index(auth, "Bearer u-") >= 0)
+		out = { code: 0, data: { open_id: "ou_mock_openid", name: "Mock User" } };
+	else {
+		status = 401;
+		out = { code: 99991663, msg: "invalid access token" };
+	}
 } else if (index(uri, "/im/v1/chats") >= 0) {
 	note("chats-requests.jsonl", sprintf("%s|%s", auth, qs));
 	let items = [];
@@ -170,6 +178,7 @@ UCEOF
 
 # 每条固定路径放一份 CGI（uhttpd 直接按「docroot + URL」找脚本，不做 PATH_INFO 拆分）
 for p in oauth/v3/token \
+         open-apis/authen/v1/user_info \
          open-apis/authen/v1/oidc/access_token \
          open-apis/im/v1/chats \
          open-apis/auth/v3/tenant_access_token/internal \
@@ -461,6 +470,19 @@ eq 400 "$(ccode)" "用户在授权页拒绝 -> 400"
 has "拒绝" /tmp/cgi.b "拒绝提示可操作"
 cgi "action=status&state=$STATE"
 eq "error" "$(jget status)" "拒绝后状态为 error 而不是 pending"
+
+echo
+echo "=== 5c. 个人模式：扫码拿 open_id（不建群）==="
+cgi "action=start&target=openid" GET "router.lan:8080"
+STATE=$(jget state)
+cgi "action=callback&code=good&state=$STATE"
+eq 200 "$(ccode)" "openid 回调 HTTP 200"
+cgi "action=status&state=$STATE"
+eq "ready" "$(jget status)" "openid 状态 ready"
+eq "ou_mock_openid" "$(jget open_id)" "status 返回 open_id"
+grep -q "Bearer u-mock-access-token" /tmp/mock/userinfo-requests.jsonl 2>/dev/null \
+  && ok "user_info 请求带 user_access_token" || bad "user_info 请求缺 Bearer"
+hasnt "$SECRET" "$CGI_B" "openid 响应不含 app_secret"
 
 echo
 echo "=== 6. 错误路径：state 不存在 / 非法 / 过期 / 缺 code ==="

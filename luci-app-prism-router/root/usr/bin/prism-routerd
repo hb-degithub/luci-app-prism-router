@@ -54,7 +54,7 @@
 const fs = require('fs');
 const uloop = require('uloop');
 
-const DAEMON_VERSION = '1.0.11';
+const DAEMON_VERSION = '1.0.12';
 
 const STATE_DIR_DEFAULT = '/tmp/prism-router';
 const DAILY_DIR_DEFAULT = '/etc/prism-router/daily';
