@@ -1126,58 +1126,29 @@ return view.extend({
 	/* 绑定前置条件：飞书开放平台的配置项缺一不可，直接显示可复制的回调地址，
 	 * 避免用户只填了 App ID/Secret 却因没配重定向 URL / 没开权限而反复失败。 */
 	feishuPrereqNode: function() {
-		var redirect = '';
-
-		try {
-			var forced = str(rawValue('feishu', 'redirect_base')).trim();
-
-			redirect = (forced !== '' ? forced.replace(/\/+$/, '')
-				: (window.location.protocol + '//' + window.location.host)) +
-				'/cgi-bin/prism-router-feishu?action=callback';
-		}
-		catch (e) { redirect = ''; }
-
 		var savedId = str(rawValue('feishu', 'app_id'));
-
-		var codeStyle = 'display:inline-block;max-width:100%;padding:2px 6px;border-radius:4px;' +
-			'background:rgba(127,127,127,.12);font-size:12px;word-break:break-all;user-select:all';
 
 		return E('div', {
 			'class': 'cbi-value-description',
 			'style': 'margin:0;padding:10px 12px;border:1px solid rgba(127,127,127,.28);' +
 				'border-radius:6px;max-width:100%;min-width:0;line-height:1.65'
 		}, [
-			E('div', {}, E('strong', {}, _('绑定前必须完成（缺一不可）'))),
+			E('div', {}, E('strong', {}, _('扫码添加机器人前，先在飞书后台完成'))),
 			E('ol', { 'style': 'margin:6px 0 0 18px;padding:0' }, [
-				E('li', {}, _('开放平台创建「自建应用」，并开启「机器人」能力。')),
-				E('li', {}, _('「权限管理」添加 im:chat:readonly，然后创建版本并发布（企业自建应用还需管理员审批）。')),
-				E('li', {}, [
-					_('「安全设置 → 重定向 URL」原样添加（含 ?action=callback）：'),
-					E('br'),
-					E('code', { 'style': codeStyle }, redirect || _('（无法读取当前地址，请用浏览器访问本页）')),
-					redirect ? E('button', {
-						'class': 'cbi-button cbi-button-neutral',
-						'style': 'margin-left:6px',
-						'click': function(ev) {
-							ev.preventDefault();
-							try {
-								if (navigator.clipboard) navigator.clipboard.writeText(redirect);
-							} catch (e) { }
-						}
-					}, _('复制')) : '',
-					E('br'),
-					E('span', { style: 'opacity:.8' }, _('若飞书报 20029：这里显示的值必须与后台一条不差（协议、域名、端口、查询串）。'))
-				]),
-				E('li', {}, _('在本页填写 App ID / App Secret；点「生成绑定二维码」时会自动保存到本机。')),
-				E('li', {}, _('先在飞书群里添加这个机器人，再生成二维码；群列表只显示机器人已加入的群。'))
+				E('li', {}, _('开放平台创建「自建应用」，开启「机器人」能力。')),
+				E('li', {}, _('权限管理添加 im:message:send_as_bot（群通知再加 im:chat:readonly），创建版本并发布。')),
+				E('li', {}, _('管理员审批，并把你自己加入应用的可用范围。')),
+				E('li', {}, _('填写下方 App ID / App Secret 并保存。')),
+				E('li', {}, _('点「生成机器人二维码」，手机飞书扫码打开机器人并添加到群；回来点「列出机器人所在的群」选择。'))
 			]),
 			E('div', { 'style': 'margin-top:6px' }, savedId
 				? _('已保存 App ID：') + savedId
 				: _('当前还没有保存 App ID / App Secret。')),
 			E('div', { 'style': 'margin-top:4px;opacity:.8' },
-				_('授权页会申请 im:chat:readonly；若应用未开通该权限，飞书会直接报 20027。群列表用机器人身份获取，不包含机器人未加入的群。'))
+				_('二维码是飞书官方 Applink（applink.feishu.cn/client/bot/open），不需要配置重定向 URL。'))
 		]);
 	},
+
 
 	/* 扫码绑定区块：二维码 + 轮询状态 + 群列表 + 已绑定提示。
 	 * 只在 mode=app 时显示（syncFeishuMode 负责）；全部单列布局，390px 不横向溢出。 */
@@ -2216,11 +2187,10 @@ return view.extend({
 		show('receive_id', user);
 
 		if (this.feishuScanBlock != null)
-			this.feishuScanBlock.style.display = (app || user) ? '' : 'none';
+			this.feishuScanBlock.style.display = app ? '' : 'none';
 
 		if (this.feishuBindBtn != null)
-			this.setFeishuButton(this.feishuBindBtn,
-				user ? _('扫码获取我的 open_id') : _('生成绑定二维码'), this.feishuWriteBlocked());
+			this.setFeishuButton(this.feishuBindBtn, _('生成机器人二维码'), this.feishuWriteBlocked());
 
 		if (!app && this.feishuPolling === true) {
 			this.stopFeishuPoll();
@@ -2581,7 +2551,7 @@ return view.extend({
 
 					self.rememberOptions('feishu', { app_id: appId, app_secret: appSecret });
 
-					return self.requestFeishuStart(self.feishuMode() === FEISHU_MODE_USER ? 'openid' : '');
+					return Promise.resolve(self.showBotQr(appId));
 				})
 				.catch(function(err) {
 					self.setFeishuButton(self.feishuBindBtn, _('生成绑定二维码'), false);
@@ -2590,10 +2560,20 @@ return view.extend({
 				});
 		}
 
-		return this.requestFeishuStart(this.feishuMode() === FEISHU_MODE_USER ? 'openid' : '');
+		return Promise.resolve(this.showBotQr(appId));
 	},
 
 	/* 真正调 CGI 的 start：GET + 同源相对路径，不带任何凭证（CGI 从 UCI 读）。 */
+	/* 飞书官方 Applink：扫码直接打开机器人，可一键添加到群，不需要 redirect_uri。 */
+	showBotQr: function(appId) {
+		var url = 'https://applink.feishu.cn/client/bot/open?appId=' + encodeURIComponent(appId);
+
+		this.clearFeishuChats();
+		this.renderFeishuQr(url);
+		this.setFeishuScanStatus(_('扫码打开机器人，把它添加到目标群；加好后点「列出机器人所在的群」选择。'), '');
+		this.setFeishuButton(this.feishuBindBtn, _('重新生成二维码'), false);
+	},
+
 	requestFeishuStart: function(target) {
 		var self = this;
 		var seq = (this.feishuStartSeq || 0) + 1;

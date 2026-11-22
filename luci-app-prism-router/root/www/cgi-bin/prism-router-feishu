@@ -41,7 +41,7 @@
 import { readfile, open, lsdir, stat, lstat, mkdir, chmod, rename, unlink, popen } from 'fs';
 import { cursor } from 'uci';
 
-const VERSION       = '1.0.15';
+const VERSION       = '1.0.16';
 const PROD_BASE     = 'https://open.feishu.cn';
 /* 新版授权页与 v3 token 端点都在 accounts.feishu.cn（官方文档 2025 起）。 */
 const AUTH_BASE      = 'https://accounts.feishu.cn';
