@@ -2003,7 +2003,8 @@ deliver_app = function(cfg, req, force_token) {
         return { ok: false, retryable: true, code: -5, http: 0, msg: "tenant_access_token 获取失败", bytes: 0, route: "app" };
     let content;
     if (req.msg_type == "interactive")
-        content = (cfg.card_wrapper == "bare") ? req.card : { type: "card", data: req.card };
+        /* 卡片 2.0 必须原样作为 content 发送；再套 {type,data} 会 230099/11310 */
+        content = req.card;
     else
         content = req.content;
     let body = sprintf('%J', {
