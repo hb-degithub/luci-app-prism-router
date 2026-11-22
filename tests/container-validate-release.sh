@@ -4,7 +4,9 @@
 #      dist 里出现 *.legacy.ipk 直接失败（旧包不允许发布）。
 #   2. 校验 SHA256SUMS；并做“篡改 / 缺文件”负例，证明哈希不符或缺失会被拒绝。
 #   3. control 元数据：Package/Version/Architecture/Priority/Section/Depends；
-#      Depends 与两个 Makefile 逐项一致；Priority 必须是合法值。
+#      Depends 与两个 Makefile 逐项一致；Priority 必须是合法值；
+#      Architecture 必须与包名一致，且 1.0.23 起必须是 x86_64（随包 musl .so）。
+#   3b. 随包 pylib（官方 lark-oapi 裁剪树）：MANIFEST 校验和/体积/静态 import 图。
 #   4. control 归档权限（目录 755、control/conffiles 644、postinst/prerm 755）；
 #      data 归档权限（目录 755、普通文件 644、可执行文件 755、owner 0/0）。
 #   5. payload 与源码：门禁进入 23.05 / 24.10 容器，逐文件比对安装内容与仓库源码；
@@ -49,12 +51,18 @@ mapfile -t MODERN < <(find "$DIST" -maxdepth 1 -type f -name '*.ipk' ! -name '*.
 IPK_NAME="${MODERN[0]}"
 # 版本从实际产物名解析（不再写死 1.0.0），并要求与 Makefile 单一来源一致。
 case "$IPK_NAME" in
-  luci-app-prism-router_*-[0-9]*_all.ipk) ;;
+  luci-app-prism-router_*-[0-9]*_all.ipk|luci-app-prism-router_*-[0-9]*_x86_64.ipk) ;;
   *) fail "modern 包名不符：$IPK_NAME" ;;
 esac
-VER=$(printf '%s' "$IPK_NAME" | sed -n 's/^luci-app-prism-router_\(.*\)-[0-9][0-9]*_all\.ipk$/\1/p')
-REL=$(printf '%s' "$IPK_NAME" | sed -n 's/^luci-app-prism-router_.*-\([0-9][0-9]*\)_all\.ipk$/\1/p')
-[ -n "$VER" ] && [ -n "$REL" ] || fail "无法从包名解析版本：$IPK_NAME"
+VER=$(printf '%s' "$IPK_NAME" | sed -n 's/^luci-app-prism-router_\(.*\)-[0-9][0-9]*_\(all\|x86_64\)\.ipk$/\1/p')
+REL=$(printf '%s' "$IPK_NAME" | sed -n 's/^luci-app-prism-router_.*-\([0-9][0-9]*\)_\(all\|x86_64\)\.ipk$/\1/p')
+ARCH=$(printf '%s' "$IPK_NAME" | sed -n 's/^luci-app-prism-router_.*-[0-9][0-9]*_\(all\|x86_64\)\.ipk$/\1/p')
+[ -n "$VER" ] && [ -n "$REL" ] && [ -n "$ARCH" ] || fail "无法从包名解析版本/架构：$IPK_NAME"
+# 随包的 pycryptodome / websockets / charset_normalizer 是 musl x86_64 的 .so；
+# 打成 all 会装到别的架构上直接 ImportError，这里硬性拦住。
+[ "$ARCH" = "x86_64" ] || fail "Architecture 必须是 x86_64（随包 .so 为 musllinux_x86_64），实际 $ARCH"
+MAKE_ARCH=$(sed -n 's/^LUCI_PKGARCH:=//p' "$ROOT/luci-app-prism-router/Makefile" | head -1)
+[ "$ARCH" = "$MAKE_ARCH" ] || fail "包名架构 $ARCH 与 Makefile LUCI_PKGARCH $MAKE_ARCH 不一致"
 MAKE_VER=$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-prism-router/Makefile" | head -1)
 [ "$VER" = "$MAKE_VER" ] || fail "包名版本 $VER 与 Makefile PKG_VERSION $MAKE_VER 不一致"
 IPK="$DIST/$IPK_NAME"
@@ -119,6 +127,8 @@ is_exec_name() {
   case "$1" in
     ./usr/bin/prism-routerd|./etc/init.d/prism-routerd|\
     ./usr/share/prism-router/feishu-test.sh|\
+    ./usr/share/prism-router/feishu-ws.py|\
+    ./etc/init.d/prism-router-feishu-ws|\
     ./www/cgi-bin/prism-router-ingest|./www/cgi-bin/prism-router-stations|\
     ./www/cgi-bin/prism-router-metrics|./www/cgi-bin/prism-router-feishu|\
     ./www/cgi-bin/prism-router-control|\
@@ -203,6 +213,8 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
       return p == "./usr/bin/prism-routerd" ||
              p == "./etc/init.d/prism-routerd" ||
              p == "./usr/share/prism-router/feishu-test.sh" ||
+             p == "./usr/share/prism-router/feishu-ws.py" ||
+             p == "./etc/init.d/prism-router-feishu-ws" ||
              p == "./www/cgi-bin/prism-router-ingest" ||
              p == "./www/cgi-bin/prism-router-stations" ||
              p == "./www/cgi-bin/prism-router-metrics" ||
@@ -234,7 +246,7 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
   [ -f "$ctl/control" ] || fail "$pkg 缺 control"
   grep -qx "Package: $pkg" "$ctl/control" || fail "$pkg Package 字段不符"
   grep -qx "Version: $VER-$REL" "$ctl/control" || fail "$pkg Version 字段不符（期望 $VER-$REL）"
-  grep -qx "Architecture: all" "$ctl/control" || fail "$pkg Architecture 字段不符"
+  grep -qx "Architecture: $ARCH" "$ctl/control" || fail "$pkg Architecture 字段不符（期望 $ARCH）"
   grep -qx "Section: $section" "$ctl/control" || fail "$pkg Section 字段不符"
   local priority
   priority=$(sed -n 's/^Priority: //p' "$ctl/control" | head -1)
@@ -257,12 +269,58 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
   case "$pkg" in
     luci-app-prism-router)
       for dep in luci-base rpcd-mod-ucode ucode ucode-mod-fs ucode-mod-uci \
-                 ucode-mod-uloop curl openssl-util uhttpd; do
+                 ucode-mod-uloop curl openssl-util uhttpd \
+                 python3-light python3-logging python3-openssl python3-asyncio \
+                 python3-ctypes; do
         printf '%s\n' "$ctl_deps" | grep -qx "$dep" || fail "luci-app-prism-router 缺 $dep"
       done
       ;;
   esac
   pass "$pkg 关键运行时依赖齐全"
+
+  # ---- 随包 pylib（官方 lark-oapi 裁剪树）----
+  local pylib_dir="$data/usr/lib/prism-router/pylib"
+  [ -f "$pylib_dir/MANIFEST.json" ] || fail "$pkg 缺 pylib/MANIFEST.json"
+  grep -qxF "./usr/lib/prism-router/pylib/MANIFEST.json" "$data_list" \
+    || fail "$pkg data.tar.gz 里没有 pylib/MANIFEST.json"
+  local pylib_files pylib_bytes
+  pylib_files=$(find "$pylib_dir" -type f | wc -l)
+  pylib_bytes=$(find "$pylib_dir" -type f -printf '%s\n' | awk '{s+=$1} END{print s+0}')
+  [ "$pylib_files" -ge 500 ] || fail "$pkg pylib 文件数异常（$pylib_files）"
+  [ "$pylib_bytes" -lt $((25 * 1024 * 1024)) ] \
+    || fail "$pkg pylib 解压后 $pylib_bytes 字节，超过 25MB 目标"
+  # 运行必需的入口必须真的在包里
+  for need in lark_oapi/__init__.py lark_oapi/ws/client.py \
+              lark_oapi/event/dispatcher_handler.py \
+              lark_oapi/api/im/v1/processor.py Crypto/Cipher/AES.py \
+              websockets/__init__.py requests/__init__.py; do
+    [ -f "$pylib_dir/$need" ] || fail "$pkg pylib 缺 $need"
+  done
+  # 绝不能把未分发的产品线/构建垃圾带进来
+  for bad in lark_oapi/client.py lark_oapi/api/contact lark_oapi/core/http/transport.py; do
+    [ -e "$pylib_dir/$bad" ] && fail "$pkg pylib 残留了不该分发的 $bad"
+  done
+  if find "$pylib_dir" \( -name '__pycache__' -o -name '*.pyc' -o -name '*.dist-info' \) -print -quit | grep -q .; then
+    fail "$pkg pylib 含 __pycache__/*.pyc/dist-info"
+  fi
+  # MANIFEST 的 sha256/体积/静态 import 图（宿主 python3 即可，无需 musl）
+  if command -v python3 >/dev/null 2>&1; then
+    python3 "$ROOT/tools/pylib_tool.py" verify --pylib "$pylib_dir" --static-imports \
+      > "$WORK/pylib-verify-$pkg.json" 2>&1 \
+      || { cat "$WORK/pylib-verify-$pkg.json" >&2; fail "$pkg pylib 校验失败"; }
+    pass "$pkg pylib MANIFEST/sha256/静态 import 图通过（$pylib_files 文件，$pylib_bytes 字节）"
+  else
+    echo "  SKIP  pylib 深度校验（无 python3）"
+  fi
+
+  # 长连接服务脚本与 init
+  for entry in "./usr/share/prism-router/feishu-ws.py|luci-app-prism-router/root/usr/share/prism-router/feishu-ws.py" \
+               "./etc/init.d/prism-router-feishu-ws|luci-app-prism-router/root/etc/init.d/prism-router-feishu-ws"; do
+    local t="${entry%%|*}" ssrc="${entry#*|}"
+    grep -qxF "$t" "$data_list" || fail "$pkg payload 缺 $t"
+    cmp -s "$data/${t#./}" "$ROOT/$ssrc" || fail "$pkg payload $t 与源码不一致"
+  done
+  pass "$pkg 长连接服务脚本与 init 已进包且与源码一致"
 
   # conffile
   [ "$(cat "$ctl/conffiles" 2>/dev/null)" = "/etc/config/prism-router" ] || fail "$pkg conffiles 不符"
@@ -308,7 +366,10 @@ check_pkg() { # $1=ipk $2=pkg $3=section $4=makefile $5=depvar
     rel="${f#"$ROOT/luci-app-prism-router/root/"}"
     grep -qxF "./$rel" "$data_list" || fail "payload 缺 root/ 文件 $rel"
     payload_matches "$data/$rel" "$f" "./$rel" || fail "payload root/ 文件 $rel 与源码不一致（版本/内容漂移）"
-  done < <(find "$ROOT/luci-app-prism-router/root" -type f | LC_ALL=C sort)
+  # __pycache__/*.pyc 是本地调试（py_compile / SourceFileLoader）留下的构建垃圾，
+  # 从来不会进包；跳过它们，但其它任何 root/ 文件都必须逐字节进包。
+  done < <(find "$ROOT/luci-app-prism-router/root" -type f \
+    ! -path '*/__pycache__/*' ! -name '*.pyc' | LC_ALL=C sort)
   pass "$pkg payload 与源码一致（含条件文件）"
   pass "$pkg 版本常量与包名一致（daemon/rpcd/metrics/feishu = $VER）"
 }

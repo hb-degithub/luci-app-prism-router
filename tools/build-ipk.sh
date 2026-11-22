@@ -2,15 +2,20 @@
 # 不依赖 OpenWrt SDK 手搓 .ipk（纯脚本包，无编译产物）
 #
 # 产物（单个插件包 + SHA256SUMS）：
-#   dist/luci-app-prism-router_1.0.4-1_all.ipk
+#   dist/luci-app-prism-router_<VER>-<REL>_<ARCH>.ipk
 #   dist/SHA256SUMS
+#
+# 架构：1.0.23 起随包分发官方 lark-oapi 的 musl x86_64 原生扩展
+# （pycryptodome / websockets / charset_normalizer 的 .so 都是
+#  cp39-abi3-musllinux / cp311-musllinux），因此 Architecture 固定为 x86_64，
+# 不再是 all。可用 PRISM_ARCH 覆盖（仅用于负例/实验）。
 #
 # 24.10 / 23.05 的 .ipk 外层都是 tar.gz（见 docs/IPK-FORMAT.md）。
 # 极旧版本（21.02 及更早）才需要 ar 容器；默认不再生成，只有显式
 # `--legacy` 才会额外产出 *.legacy.ipk，并打印“不可发布”警告。
 #
 # 用法：
-#   tools/build-ipk.sh                 # 重建 dist/，1 个插件包 + SHA256SUMS（默认 1.0.4）
+#   tools/build-ipk.sh                 # 重建 dist/，1 个插件包 + SHA256SUMS
 #   tools/build-ipk.sh --legacy        # 额外产 ar 包（仅排查极旧版本，不要发布）
 #   tools/build-ipk.sh --out DIR       # 输出到指定目录（供测试用临时目录）
 #   tools/build-ipk.sh --help
@@ -23,7 +28,9 @@ OUT="$ROOT/dist"; LEGACY=0
 # 版本可用环境变量覆盖（CI 按 Release tag 注入）；源码默认 1.0.22，
 # 与 Makefile / Android 默认版本保持一致。包名、opkg Version 与包内版本常量
 # 全部由同一个 VER 派生，避免出现“新 UI 却打包成旧版本”的漂移。
-VER="${PRISM_VER:-1.0.22}"; REL="${PRISM_REL:-1}"
+VER="${PRISM_VER:-1.0.24}"; REL="${PRISM_REL:-1}"
+# 随包 SDK 的 .so 是 musl x86_64；Architecture 必须与之一致，不能是 all。
+ARCH="${PRISM_ARCH:-x86_64}"
 
 usage() {
   sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
@@ -47,6 +54,10 @@ case "$VER" in
 esac
 case "$REL" in
   ''|*[!0-9]*) echo "build-ipk: 非法 release [$REL]" >&2; exit 2 ;;
+esac
+case "$ARCH" in
+  all) echo "build-ipk: 拒绝 Architecture=all：随包的 pycryptodome/websockets .so 是 musl x86_64" >&2; exit 2 ;;
+  ''|*[!a-z0-9_]*) echo "build-ipk: 非法架构 [$ARCH]" >&2; exit 2 ;;
 esac
 
 [ -n "$OUT" ] || { echo "build-ipk: 输出目录为空" >&2; exit 2; }
@@ -78,6 +89,8 @@ pack() { # $1=dir $2=basename（不带扩展名）
   # / 独立面板的 init 与只读 CGI（静态页面仍是 644）
   chmod 755 "$d/data/usr/bin/prism-routerd" "$d/data/etc/init.d/prism-routerd" \
     "$d/data/usr/share/prism-router/feishu-test.sh" \
+    "$d/data/usr/share/prism-router/feishu-ws.py" \
+    "$d/data/etc/init.d/prism-router-feishu-ws" \
     "$d/data/www/cgi-bin/prism-router-ingest" \
     "$d/data/www/cgi-bin/prism-router-stations" \
     "$d/data/www/cgi-bin/prism-router-metrics" \
@@ -114,11 +127,12 @@ pack() { # $1=dir $2=basename（不带扩展名）
   echo "  ✓ dist/${base}.ipk         $(stat -c%s "$OUT/${base}.ipk") B (tar.gz, 23.05/24.10)"
 }
 
-ctl() { # $1=dir  $2=pkgname  $3=section  $4=depends  $5=desc
+ctl() { # $1=dir  $2=pkgname  $3=section  $4=depends  $5=desc  $6=arch
   # Priority 必须是 Debian/OpenWrt 的合法值；不能把占位符/密码类字符串写进 control。
   # Depends 必须与两个 Makefile 保持一致（release gate 会逐项比对）。
-  printf 'Package: %s\nVersion: %s-%s\nArchitecture: all\nMaintainer: prism-router\nSection: %s\nPriority: standard\nDepends: %s\nDescription: %s\n' \
-    "$2" "$VER" "$REL" "$3" "$4" "$5" > "$1/control/control"
+  # Architecture 必须与包名、以及随包 .so 的 musl 架构一致。
+  printf 'Package: %s\nVersion: %s-%s\nArchitecture: %s\nMaintainer: prism-router\nSection: %s\nPriority: standard\nDepends: %s\nDescription: %s\n' \
+    "$2" "$VER" "$REL" "$6" "$3" "$4" "$5" > "$1/control/control"
   chmod 644 "$1/control/control"
 }
 hook() { printf '%s\n' "$@" > "$W/_h"; chmod 644 "$W/_h"; }
@@ -143,7 +157,8 @@ mkdir -p "$D/data/usr/bin" "$D/data/usr/share/prism-router" \
   "$D/data/etc/init.d" "$D/data/etc/config" "$D/data/etc/prism-router/daily" \
   "$D/data/www/cgi-bin" "$D/data/www/prism-router-panel/cgi-bin" \
   "$D/data/www/luci-static/resources/view/prism-router" \
-  "$D/data/www/luci-static/resources/prism-router" "$D/control"
+  "$D/data/www/luci-static/resources/prism-router" \
+  "$D/data/usr/lib/prism-router" "$D/control"
 chmod 755 "$D" "$D/control" "$D/data" \
   "$D/data/usr" "$D/data/usr/bin" "$D/data/usr/share" "$D/data/usr/share/prism-router" \
   "$D/data/usr/share/rpcd" "$D/data/usr/share/rpcd/ucode" "$D/data/usr/share/rpcd/acl.d" \
@@ -154,7 +169,8 @@ chmod 755 "$D" "$D/control" "$D/data" \
   "$D/data/www/prism-router-panel" "$D/data/www/prism-router-panel/cgi-bin" \
   "$D/data/www/luci-static" "$D/data/www/luci-static/resources" \
   "$D/data/www/luci-static/resources/view" "$D/data/www/luci-static/resources/view/prism-router" \
-  "$D/data/www/luci-static/resources/prism-router"
+  "$D/data/www/luci-static/resources/prism-router" \
+  "$D/data/usr/lib/prism-router"
 
 # 守护进程 / init / 配置
 versioned "$ROOT/luci-app-prism-router/root/usr/bin/prism-routerd" "$W/prism-routerd" DAEMON_VERSION
@@ -171,6 +187,39 @@ done
 [ -f "$ROOT/luci-app-prism-router/root/usr/share/prism-router/feishu-test.sh" ] && \
   install -m 755 "$ROOT/luci-app-prism-router/root/usr/share/prism-router/feishu-test.sh" \
     "$D/data/usr/share/prism-router/feishu-test.sh"
+
+# 官方 lark-oapi 长连接服务 + 随包 SDK（musl x86_64）
+# 先校验 vendor 树没漂移（MANIFEST.json 的 totals.sha256 / 体积 / 静态 import 图），
+# 再整树拷进 data/usr/lib/prism-router/pylib。SDK 不写系统 site-packages。
+PYLIB_SRC="$ROOT/luci-app-prism-router/pylib"
+[ -d "$PYLIB_SRC" ] || { echo "build-ipk: 缺少 $PYLIB_SRC（先跑 tools/vendor-pylib.sh）" >&2; exit 1; }
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$ROOT/tools/pylib_tool.py" verify --pylib "$PYLIB_SRC" --static-imports \
+    >/tmp/prism-pylib-verify.json 2>/tmp/prism-pylib-verify.err \
+    || { echo "build-ipk: pylib 校验失败（$PYLIB_SRC）" >&2
+         grep -v '^ *$' /tmp/prism-pylib-verify.err | tail -20 >&2
+         python3 - /tmp/prism-pylib-verify.json <<'PYV' >&2 || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit(0)
+for name, item in sorted(d.get("checks", {}).items()):
+    if not item.get("ok"):
+        print("  失败项 %s: %s" % (name, item.get("detail")))
+PYV
+         exit 1; }
+  PYLIB_BYTES=$(du -sb "$PYLIB_SRC" | cut -f1)
+  echo "  ✓ pylib 校验通过（$(du -sh "$PYLIB_SRC" | cut -f1)，$PYLIB_BYTES 字节）"
+else
+  echo "build-ipk: 警告：没有 python3，跳过 pylib 清单校验" >&2
+fi
+install -d -m 755 "$D/data/usr/lib/prism-router/pylib"
+cp -a "$PYLIB_SRC/." "$D/data/usr/lib/prism-router/pylib/"
+install -m 755 "$ROOT/luci-app-prism-router/root/usr/share/prism-router/feishu-ws.py" \
+  "$D/data/usr/share/prism-router/feishu-ws.py"
+install -m 755 "$ROOT/luci-app-prism-router/root/etc/init.d/prism-router-feishu-ws" \
+  "$D/data/etc/init.d/prism-router-feishu-ws"
 
 # rpcd 插件 / ACL / 菜单
 versioned "$ROOT/luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc" "$W/prism-router.uc" VERSION
@@ -222,8 +271,9 @@ for f in "$ROOT"/luci-app-prism-router/htdocs/luci-static/resources/prism-router
 done
 
 ctl "$D" luci-app-prism-router luci \
-  "luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util, uhttpd" \
-  "PRISM Router single-package plugin: usage accounting daemon, LuCI pages, diagnostics and optional standalone panel."
+  "luci-base, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-uloop, curl, openssl-util, uhttpd, python3-light, python3-asyncio, python3-codecs, python3-ctypes, python3-decimal, python3-email, python3-logging, python3-openssl, python3-urllib, python3-uuid, python3-xml" \
+  "PRISM Router single-package plugin: usage accounting daemon, LuCI pages, Feishu long-connection service (bundled lark-oapi), diagnostics and optional standalone panel." \
+  "$ARCH"
 printf '/etc/config/prism-router\n' > "$D/control/conffiles"; chmod 644 "$D/control/conffiles"
 # postinst 的迁移判定要用到包内 conffile 的 sha256（构建时算好写进脚本）：
 # 用来区分“本次安装刚从包里解出来的默认配置”和“用户已有的配置”。
@@ -265,6 +315,12 @@ if [ -f /etc/config/traffic-stats ] && ! pkg_was_installed && conf_is_pkg_defaul
 	fi
 fi
 
+# 升级/重装时补建新字段（只加缺省值，不改用户已有值）。
+if ! uci -q get prism-router.feishu.ws_enabled >/dev/null 2>&1; then
+	uci -q set prism-router.feishu.ws_enabled='0'
+	uci -q commit prism-router
+fi
+
 # 旧数据只补缺：升级时绝不用历史 traffic-stats 覆盖较新的 daily/nodes/stations。
 if [ -d /etc/traffic-stats ]; then
 	mkdir -p /etc/prism-router
@@ -282,6 +338,14 @@ if [ "$(uci -q get prism-router.panel.enabled)" = "1" ]; then
 else
 	/etc/init.d/prism-router-panel disable >/dev/null 2>&1
 fi
+# 飞书长连接默认关闭：只跟随 ws_enabled，绝不强制启动。
+if [ "$(uci -q get prism-router.feishu.ws_enabled)" = "1" ]; then
+	/etc/init.d/prism-router-feishu-ws enable >/dev/null 2>&1
+	/etc/init.d/prism-router-feishu-ws restart >/dev/null 2>&1
+else
+	/etc/init.d/prism-router-feishu-ws stop >/dev/null 2>&1
+	/etc/init.d/prism-router-feishu-ws disable >/dev/null 2>&1
+fi
 rm -f /tmp/luci-indexcache* 2>/dev/null
 /etc/init.d/rpcd reload >/dev/null 2>&1
 exit 0
@@ -289,13 +353,15 @@ POSTINST
 sed -i "s/@PKG_CONF_SHA@/$CNF_SHA/" "$W/_h"
 install -m 755 "$W/_h" "$D/control/postinst"
 hook '#!/bin/sh' '[ -n "${IPKG_INSTROOT:-}" ] && exit 0' \
+  '/etc/init.d/prism-router-feishu-ws stop >/dev/null 2>&1' \
+  '/etc/init.d/prism-router-feishu-ws disable >/dev/null 2>&1' \
   '/etc/init.d/prism-router-panel stop >/dev/null 2>&1' \
   '/etc/init.d/prism-router-panel disable >/dev/null 2>&1' \
   '/etc/init.d/prism-routerd stop >/dev/null 2>&1' \
   '/etc/init.d/prism-routerd disable >/dev/null 2>&1' \
   'exit 0'
 install -m 755 "$W/_h" "$D/control/prerm"
-pack "$D" "luci-app-prism-router_${VER}-${REL}_all"
+pack "$D" "luci-app-prism-router_${VER}-${REL}_${ARCH}"
 
 # ================= 发布校验和 =================
 # 只覆盖本次实际生成的 *.ipk（默认 2 个 modern；--legacy 时含 4 个）。

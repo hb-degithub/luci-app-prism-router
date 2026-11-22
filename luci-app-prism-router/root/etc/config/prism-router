@@ -157,6 +157,22 @@ config panel 'panel'
 config feishu 'feishu'
 	# 总开关：设 0 可临时静音（未配置 webhook/app 时无论如何都不会发送）
 	option enabled '1'
+	# ── 长连接（官方 lark-oapi WebSocket，接收入群/消息事件）───────────────
+	# 默认关闭。打开后 procd 会常驻 /usr/share/prism-router/feishu-ws.py，
+	# 用官方 SDK 连飞书长连接，把「机器人被加进哪些群」「谁在群里说过话」
+	# 记录到 /etc/prism-router/feishu-ws.json（0600），设置页可一键把发现的
+	# chat_id / receive_id 填进下面的字段（不会自动改已保存的值）。
+	#
+	# 前置条件（缺一不启动，原因由 ubus prism-router.feishu_ws_status 返回）：
+	#   1) app_id / app_secret 已填；
+	#   2) 飞书开放平台「事件与回调 → 加密策略」里开启**长连接**并在
+	#      「事件订阅」中添加 im.chat.member.bot.added_v1、im.message.receive_v1；
+	#   3) 已安装 python3 运行时（随包 Depends 自动装）。
+	# 打开方式：
+	#   uci set prism-router.feishu.ws_enabled='1'
+	#   uci commit prism-router
+	#   /etc/init.d/prism-router-feishu-ws enable && restart
+	option ws_enabled '0'
 	# ── 发送路线（默认关闭应用机器人，不影响已有的 webhook 自定义机器人）──────
 	# webhook = 群自定义机器人（默认）：纯出站 HTTPS，不需要回调、不需要审核。
 	# app     = 自建应用机器人：支持在设置页「扫码绑定群」选择目标群，发消息走

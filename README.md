@@ -64,13 +64,18 @@
 
 ### 路由器（OpenWrt 23.05+ / iStoreOS）
 
-从 [Releases](https://github.com/hb-degithub/luci-app-prism-router/releases) 下载 `luci-app-prism-router_*_all.ipk`：
+从 [Releases](https://github.com/hb-degithub/luci-app-prism-router/releases) 下载对应架构的
+`luci-app-prism-router_*_x86_64.ipk`（1.0.23 起随包分发 pycryptodome 等 musl x86_64
+原生扩展，架构不再是 `all`）：
 
 ```sh
-opkg install luci-app-prism-router_1.0.9-1_all.ipk
+opkg install luci-app-prism-router_1.0.23-1_x86_64.ipk
 /etc/init.d/prism-routerd enable
 /etc/init.d/prism-routerd restart
 ```
+
+可选：飞书官方 SDK 长连接（接收入群/消息事件，默认关闭）见
+[docs/FEISHU-WS.md](docs/FEISHU-WS.md)。
 
 安装后在 LuCI「服务 → 棱镜路由」打开。数据写入 `/tmp/prism-router/state.json`，每日汇总在 `/etc/prism-router/daily/`。
 

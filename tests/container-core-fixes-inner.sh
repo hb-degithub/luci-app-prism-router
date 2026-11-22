@@ -48,7 +48,7 @@ ROOT=/tmp/cf
 mkdir -p "$ROOT"
 
 echo "=== 0. 安装两个包 ==="
-opkg install "$PRISM_IPK" >/tmp/i1.log 2>&1 \
+opkg_install_ipk "$PRISM_IPK" >/tmp/i1.log 2>&1 \
   && ok "安装 prism-router" || { bad "安装 prism-router"; tail -5 /tmp/i1.log; }
 true >/tmp/i2.log 2>&1 \
   && ok "安装 luci-app-prism-router" || { bad "安装 luci-app"; tail -5 /tmp/i2.log; }

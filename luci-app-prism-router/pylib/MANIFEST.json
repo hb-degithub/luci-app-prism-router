@@ -1,0 +1,447 @@
+{
+  "generated_at": "2026-11-22T23:05:17+0800",
+  "generated_by": "tools/pylib_tool.py",
+  "imports": {
+    "hard_external": {},
+    "lazy_missing": {
+      "Crypto:Crypto.Cipher._mode_ccm": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_cfb": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_ctr": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_eax": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_ecb": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_gcm": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_gcm_siv": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_kw": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_kwp": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_ocb": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_ofb": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_openpgp": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_siv": [
+        "Crypto.Cipher"
+      ],
+      "Crypto:Crypto.Cipher._mode_xts": [
+        "Crypto.Cipher"
+      ]
+    },
+    "missing": {},
+    "optional_external": {
+      "backports": [
+        "backports"
+      ],
+      "brotli": [
+        "brotli"
+      ],
+      "brotlicffi": [
+        "brotlicffi"
+      ],
+      "cffi": [
+        "cffi"
+      ],
+      "chardet": [
+        "chardet"
+      ],
+      "compression": [
+        "compression"
+      ],
+      "cryptography": [
+        "cryptography"
+      ],
+      "h2": [
+        "h2.config",
+        "h2.connection",
+        "h2.events"
+      ],
+      "js": [
+        "js"
+      ],
+      "pyodide": [
+        "pyodide.ffi"
+      ],
+      "python_socks": [
+        "python_socks",
+        "python_socks.async_.asyncio"
+      ],
+      "simplejson": [
+        "simplejson"
+      ],
+      "socks": [
+        "socks"
+      ]
+    },
+    "reachable_modules": 174,
+    "roots": [
+      "lark_oapi",
+      "lark_oapi.ws",
+      "lark_oapi.event.dispatcher_handler",
+      "lark_oapi.api.im.v1.processor",
+      "Crypto.Cipher.AES",
+      "requests",
+      "urllib3",
+      "certifi",
+      "idna",
+      "charset_normalizer",
+      "websockets",
+      "websockets.asyncio.client"
+    ]
+  },
+  "limits": {
+    "Crypto_bytes": 4194304,
+    "lark_oapi_bytes": 4194304,
+    "total_bytes": 26214400
+  },
+  "manifest_version": 3,
+  "native_extensions": [
+    "Crypto/Cipher/_raw_aes.abi3.so",
+    "Crypto/Cipher/_raw_aesni.abi3.so",
+    "Crypto/Cipher/_raw_cbc.abi3.so",
+    "Crypto/Util/_base64.abi3.so",
+    "Crypto/Util/_cpuid_c.abi3.so",
+    "Crypto/Util/_strxor.abi3.so",
+    "charset_normalizer/cd.cpython-311-x86_64-linux-musl.so",
+    "charset_normalizer/md.cpython-311-x86_64-linux-musl.so",
+    "websockets/speedups.cpython-311-x86_64-linux-musl.so"
+  ],
+  "not_vendored": {
+    "anyio": "httpx \u7684\u4f9d\u8d56\uff0c\u540c\u4e0a",
+    "h11": "httpx \u7684\u4f9d\u8d56\uff0c\u540c\u4e0a",
+    "httpcore": "httpx \u7684\u4f9d\u8d56\uff0c\u540c\u4e0a",
+    "httpx": "\u53ea\u6709 lark_oapi.core.http.transport / channel / scene \u4f7f\u7528\uff1btransport \u7684\u5bfc\u5165\u5df2\u88c1",
+    "pip": "\u5b89\u88c5\u5668\uff0c\u4e0d\u968f\u5305",
+    "protobuf": "lark_oapi/ws/pb/google/protobuf \u5df2\u5185\u7f6e\u4e00\u4efd",
+    "requests_toolbelt": "\u53ea\u6709 api/*/resource \u7684 MultipartEncoder \u7528\uff1bresource \u76ee\u5f55\u672a\u5206\u53d1",
+    "sniffio": "anyio \u7684\u4f9d\u8d56\uff0c\u540c\u4e0a",
+    "typing_extensions": "\u4ec5 anyio \u9700\u8981\uff1blark_oapi \u672c\u4f53\u4e0d import"
+  },
+  "packages": {
+    "Crypto": {
+      "bytes": 495889,
+      "dist": "pycryptodome",
+      "files": 27,
+      "source_files": 306,
+      "version": "4.6.0",
+      "wheel": "pycryptodome-4.6.0-cp39-abi3-musllinux_1_2_x86_64.whl",
+      "wheel_tags": [
+        "cp39-abi3-musllinux_1_2_x86_64"
+      ]
+    },
+    "certifi": {
+      "bytes": 227377,
+      "dist": "certifi",
+      "files": 5,
+      "source_files": 8,
+      "version": "2026.11.20",
+      "wheel": "certifi-2026.11.20-py3-none-any.whl",
+      "wheel_tags": [
+        "py3-none-any"
+      ]
+    },
+    "charset_normalizer": {
+      "bytes": 736346,
+      "dist": "charset-normalizer",
+      "files": 15,
+      "source_files": 16,
+      "version": "3.5.2",
+      "wheel": "charset_normalizer-3.5.2-cp311-cp311-musllinux_1_2_x86_64.whl",
+      "wheel_tags": [
+        "cp311-cp311-musllinux_1_2_x86_64"
+      ]
+    },
+    "idna": {
+      "bytes": 332039,
+      "dist": "idna",
+      "files": 11,
+      "source_files": 12,
+      "version": "3.20",
+      "wheel": "idna-3.20-py3-none-any.whl",
+      "wheel_tags": [
+        "py3-none-any"
+      ]
+    },
+    "lark_oapi": {
+      "bytes": 1436234,
+      "dist": "lark-oapi",
+      "files": 427,
+      "source_files": 10729,
+      "version": "1.8.0",
+      "wheel": "lark_oapi-1.8.0-py3-none-any.whl",
+      "wheel_tags": [
+        "py3-none-any"
+      ]
+    },
+    "requests": {
+      "bytes": 217284,
+      "dist": "requests",
+      "files": 20,
+      "source_files": 22,
+      "version": "2.34.2",
+      "wheel": "requests-2.34.2-py3-none-any.whl",
+      "wheel_tags": [
+        "py3-none-any"
+      ]
+    },
+    "urllib3": {
+      "bytes": 438441,
+      "dist": "urllib3",
+      "files": 38,
+      "source_files": 39,
+      "version": "2.8.0",
+      "wheel": "urllib3-2.8.0-py3-none-any.whl",
+      "wheel_tags": [
+        "py3-none-any"
+      ]
+    },
+    "websockets": {
+      "bytes": 638626,
+      "dist": "websockets",
+      "files": 49,
+      "source_files": 51,
+      "version": "15.0.1",
+      "wheel": "websockets-15.0.1-cp311-cp311-musllinux_1_2_x86_64.whl",
+      "wheel_tags": [
+        "cp311-cp311-musllinux_1_2_x86_64"
+      ]
+    }
+  },
+  "patches": [
+    {
+      "action": "replace",
+      "path": "lark_oapi/__init__.py",
+      "reason": "\u53bb\u6389 from .api import * / .client / .card / .scene\uff0810534 \u4e2a\u6a21\u5757\u3001166MB RSS\uff09",
+      "sha256": "d0d788961c701379a365bf0994498ad004a0e7e187b27897cdafad67cfe6d436",
+      "upstream_sha256": "3d2bf4cb46572c1c28b834ea3512fef9112133f70b56c6073ca644e145da5754"
+    },
+    {
+      "action": "replace",
+      "path": "lark_oapi/api/__init__.py",
+      "reason": "api/ \u53ea\u5206\u53d1 im \u4ea7\u54c1\u7ebf\uff08\u4e24\u4e2a\u4e8b\u4ef6\u5904\u7406\u5668\u90fd\u5728 im.v1\uff09",
+      "sha256": "e0cf8f39c3cf993896d4ab20407f6f6f27b1cbb46627598799a1461e0ac9a3c6",
+      "upstream_sha256": "620a2524b429b18ecc5f5201a625d26791b9de716ef424c066f0e02ba91c0d3d"
+    },
+    {
+      "action": "replace",
+      "path": "lark_oapi/api/im/__init__.py",
+      "reason": "im \u53ea\u5206\u53d1 v1\uff08\u672c\u63d2\u4ef6\u53ea\u6ce8\u518c v1 \u4e8b\u4ef6\uff1bv2 \u65e0\u5bf9\u5e94\u4e8b\u4ef6\uff09",
+      "sha256": "f21fe4f0b94dc58f97d690a530cd07aea2f5925f1be45453c51367a9cadbdc24",
+      "upstream_sha256": "ad20b50151c02e5992340d113be3e6d18e561f4fd29c477d0564b241ff190223"
+    },
+    {
+      "action": "replace",
+      "path": "lark_oapi/core/http/__init__.py",
+      "reason": "\u53ea\u5bfc\u51fa HttpHandler\uff1atransport \u786c import httpx + requests_toolbelt\uff0c\u4e14\u53ea\u6709\u88ab\u88c1\u6389\u7684 Client \u4f7f\u7528",
+      "sha256": "3e18fe60c601a393f20930d454e2e77bf931b3ab3f69f59d077f9670d35c616d",
+      "upstream_sha256": "a489beff611e66844fd0417aa26719d3eb62697ce48517f7ec485874e61fd25d"
+    },
+    {
+      "action": "patch",
+      "dropped_count": 23,
+      "dropped_imports": [
+        "from lark_oapi.api.acs.v1.processor import *",
+        "from lark_oapi.api.application.v6.processor import *",
+        "from lark_oapi.api.approval.v4.processor import *",
+        "from lark_oapi.api.auth.v4.processor import *",
+        "from lark_oapi.api.calendar.v4.processor import *",
+        "from lark_oapi.api.compensation.v1.processor import *",
+        "from lark_oapi.api.contact.v3.processor import *",
+        "from lark_oapi.api.corehr.v1.processor import *",
+        "from lark_oapi.api.corehr.v2.processor import *",
+        "from lark_oapi.api.drive.v1.processor import *",
+        "from lark_oapi.api.elearning.v2.processor import *",
+        "from lark_oapi.api.helpdesk.v1.processor import *",
+        "from lark_oapi.api.hire.v1.processor import *",
+        "from lark_oapi.api.mail.v1.processor import *",
+        "from lark_oapi.api.meeting_room.v1.processor import *",
+        "from lark_oapi.api.minutes.v1.processor import *",
+        "from lark_oapi.api.moments.v1.processor import *",
+        "from lark_oapi.api.payroll.v1.processor import *",
+        "from lark_oapi.api.performance.v2.processor import *",
+        "from lark_oapi.api.security_and_compliance.v2.processor import *",
+        "from lark_oapi.api.task.v1.processor import *",
+        "from lark_oapi.api.task.v2.processor import *",
+        "from lark_oapi.api.vc.v1.processor import *"
+      ],
+      "path": "lark_oapi/event/dispatcher_handler.py",
+      "reason": "\u5220\u9664 23 \u4e2a\u5df2\u88c1\u4ea7\u54c1\u7ebf\u7684 processor \u5bfc\u5165\uff1b\u7528 from __future__ import annotations \u8ba9\u672a\u5b9a\u4e49\u7c7b\u578b\u7684\u6ce8\u89e3\u60f0\u6027\u6c42\u503c\uff08\u5426\u5219 class \u5b9a\u4e49\u65f6 NameError\uff09",
+      "sha256": "43e53066f9a0e841ac763f6702cf881ce52423535f7ea614de1319be1e9959ec",
+      "upstream_sha256": "98695075d462f9725e80545463503846905792a944494d343c3687ae2e6e0dca"
+    }
+  ],
+  "pruned": {
+    "Crypto": {
+      "keep": [
+        "Cipher",
+        "Util",
+        "Random"
+      ],
+      "why": "lark AESCipher \u53ea\u7528 AES-CBC\uff1bPublicKey/Hash/SelfTest \u7b49\u7ea6 10MB \u4e0d\u53c2\u4e0e"
+    },
+    "lark_oapi": {
+      "keep": "core/event/ws/api-im",
+      "why": "ws \u957f\u8fde\u63a5\u53ea\u7528 core/event/ws + api/im \u7684\u4e8b\u4ef6\u6a21\u578b\uff1b\u5168\u91cf api \u4f1a import 10534 \u4e2a\u6a21\u5757\uff08\u771f\u673a 166MB RSS / 4.9s\uff09"
+    },
+    "removed_entries": {
+      "Crypto": [
+        "Crypto/Hash/",
+        "Crypto/IO/",
+        "Crypto/Math/",
+        "Crypto/Protocol/",
+        "Crypto/PublicKey/",
+        "Crypto/SelfTest/",
+        "Crypto/Signature/",
+        "Crypto/Cipher/AEGIS.py",
+        "Crypto/Cipher/ARC2.py",
+        "Crypto/Cipher/ARC4.py",
+        "Crypto/Cipher/Blowfish.py",
+        "Crypto/Cipher/CAST.py",
+        "Crypto/Cipher/ChaCha20.py",
+        "Crypto/Cipher/ChaCha20_Poly1305.py",
+        "Crypto/Cipher/DES.py",
+        "Crypto/Cipher/DES3.py",
+        "Crypto/Cipher/PKCS1_OAEP.py",
+        "Crypto/Cipher/PKCS1_v1_5.py",
+        "Crypto/Cipher/Salsa20.py",
+        "Crypto/Cipher/_ARC4.abi3.so",
+        "Crypto/Cipher/_EKSBlowfish.py",
+        "Crypto/Cipher/_Salsa20.abi3.so",
+        "Crypto/Cipher/_Salsa20_avx2_bmi2.abi3.so",
+        "Crypto/Cipher/_chacha20.abi3.so",
+        "Crypto/Cipher/_chacha20_avx2_bmi2.abi3.so",
+        "Crypto/Cipher/_mode_ccm.py",
+        "Crypto/Cipher/_mode_cfb.py",
+        "Crypto/Cipher/_mode_ctr.py",
+        "Crypto/Cipher/_mode_eax.py",
+        "Crypto/Cipher/_mode_ecb.py",
+        "Crypto/Cipher/_mode_gcm.py",
+        "Crypto/Cipher/_mode_gcm_siv.py",
+        "Crypto/Cipher/_mode_kw.py",
+        "Crypto/Cipher/_mode_kwp.py",
+        "Crypto/Cipher/_mode_ocb.py",
+        "Crypto/Cipher/_mode_ofb.py",
+        "Crypto/Cipher/_mode_openpgp.py",
+        "Crypto/Cipher/_mode_siv.py",
+        "Crypto/Cipher/_mode_xts.py",
+        "Crypto/Cipher/_pkcs1_decode.abi3.so",
+        "Crypto/Cipher/_pkcs1_oaep_decode.py",
+        "Crypto/Cipher/_raw_aegis.abi3.so",
+        "Crypto/Cipher/_raw_aegis_aesni.abi3.so",
+        "Crypto/Cipher/_raw_arc2.abi3.so",
+        "Crypto/Cipher/_raw_blowfish.abi3.so",
+        "Crypto/Cipher/_raw_cast.abi3.so",
+        "Crypto/Cipher/_raw_cfb.abi3.so",
+        "Crypto/Cipher/_raw_ctr.abi3.so",
+        "Crypto/Cipher/_raw_des.abi3.so",
+        "Crypto/Cipher/_raw_des3.abi3.so",
+        "Crypto/Cipher/_raw_ecb.abi3.so",
+        "Crypto/Cipher/_raw_eksblowfish.abi3.so",
+        "Crypto/Cipher/_raw_ocb.abi3.so",
+        "Crypto/Cipher/_raw_ofb.abi3.so",
+        "Crypto/Cipher/_raw_xts.abi3.so",
+        "Crypto/Cipher/oaep.py"
+      ],
+      "__all__": [
+        "certifi/tests",
+        "websockets/speedups.c",
+        "websockets/speedups.pyi"
+      ],
+      "lark_oapi": [
+        "lark_oapi/client.py",
+        "lark_oapi/adapter/",
+        "lark_oapi/card/",
+        "lark_oapi/channel/",
+        "lark_oapi/scene/",
+        "lark_oapi/api/acs/",
+        "lark_oapi/api/admin/",
+        "lark_oapi/api/aily/",
+        "lark_oapi/api/apaas/",
+        "lark_oapi/api/application/",
+        "lark_oapi/api/approval/",
+        "lark_oapi/api/attendance/",
+        "lark_oapi/api/auth/",
+        "lark_oapi/api/authen/",
+        "lark_oapi/api/baike/",
+        "lark_oapi/api/base/",
+        "lark_oapi/api/bitable/",
+        "lark_oapi/api/block/",
+        "lark_oapi/api/board/",
+        "lark_oapi/api/bot/",
+        "lark_oapi/api/calendar/",
+        "lark_oapi/api/cardkit/",
+        "lark_oapi/api/compensation/",
+        "lark_oapi/api/contact/",
+        "lark_oapi/api/corehr/",
+        "lark_oapi/api/directory/",
+        "lark_oapi/api/docs/",
+        "lark_oapi/api/document_ai/",
+        "lark_oapi/api/docx/",
+        "lark_oapi/api/drive/",
+        "lark_oapi/api/ehr/",
+        "lark_oapi/api/elearning/",
+        "lark_oapi/api/event/",
+        "lark_oapi/api/gray_test_open_sg/",
+        "lark_oapi/api/helpdesk/",
+        "lark_oapi/api/hire/",
+        "lark_oapi/api/human_authentication/",
+        "lark_oapi/api/lingo/",
+        "lark_oapi/api/mail/",
+        "lark_oapi/api/mdm/",
+        "lark_oapi/api/meeting_room/",
+        "lark_oapi/api/minutes/",
+        "lark_oapi/api/moments/",
+        "lark_oapi/api/okr/",
+        "lark_oapi/api/optical_char_recognition/",
+        "lark_oapi/api/passport/",
+        "lark_oapi/api/payroll/",
+        "lark_oapi/api/performance/",
+        "lark_oapi/api/personal_settings/",
+        "lark_oapi/api/report/",
+        "lark_oapi/api/search/",
+        "lark_oapi/api/security_and_compliance/",
+        "lark_oapi/api/sheets/",
+        "lark_oapi/api/spark/",
+        "lark_oapi/api/speech_to_text/",
+        "lark_oapi/api/task/",
+        "lark_oapi/api/tenant/",
+        "lark_oapi/api/translation/",
+        "lark_oapi/api/trust_party/",
+        "lark_oapi/api/unified_kms/",
+        "... \u5171 71 \u9879"
+      ]
+    }
+  },
+  "pythonpath": "/usr/lib/prism-router/pylib",
+  "source": "pip download: lark-oapi==1.8.0, websockets==15.0.1, requests==2.34.2, urllib3==2.8.0, certifi==2026.11.20, idna==3.20, charset-normalizer==3.5.2, pycryptodome==4.6.0",
+  "target": {
+    "abi_tag": "cp311-musl-x86_64",
+    "arch": "x86_64",
+    "libc": "musl",
+    "python": "3.11"
+  },
+  "totals": {
+    "bytes": 4558815,
+    "files": 602,
+    "sha256": "d7d9037bf98b3d6d19911f611cbe11193398d0321de184a32ec6c353972b7075"
+  }
+}

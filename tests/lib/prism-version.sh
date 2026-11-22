@@ -15,7 +15,10 @@ prism_pick_ipk() { # $1=dist 目录
   done
   [ -n "$PRISM_IPK" ] || { echo "ERROR: $dist 中缺少插件 ipk；先运行 tools/build-ipk.sh 或本脚本加 --build" >&2; return 1; }
   PRISM_IPK_NAME=$(basename "$PRISM_IPK")
-  PRISM_VER=$(printf '%s' "$PRISM_IPK_NAME" | sed -n 's/^luci-app-prism-router_\(.*\)-[0-9][0-9]*_all\.ipk$/\1/p')
+  PRISM_VER=$(printf '%s' "$PRISM_IPK_NAME" | sed -n 's/^luci-app-prism-router_\(.*\)-[0-9][0-9]*_\(all\|x86_64\)\.ipk$/\1/p')
   [ -n "$PRISM_VER" ] || { echo "ERROR: 无法从 $PRISM_IPK_NAME 解析版本" >&2; return 1; }
-  export PRISM_IPK PRISM_IPK_NAME PRISM_VER
+  # 架构也从包名派生：1.0.23 起随包分发 pycryptodome 的 musl x86_64 .so，改为 x86_64。
+  PRISM_ARCH=$(printf '%s' "$PRISM_IPK_NAME" | sed -n 's/^luci-app-prism-router_.*-[0-9][0-9]*_\(all\|x86_64\)\.ipk$/\1/p')
+  [ -n "$PRISM_ARCH" ] || { echo "ERROR: 无法从 $PRISM_IPK_NAME 解析架构" >&2; return 1; }
+  export PRISM_IPK PRISM_IPK_NAME PRISM_VER PRISM_ARCH
 }

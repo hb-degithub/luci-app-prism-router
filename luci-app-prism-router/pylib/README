@@ -1,0 +1,12 @@
+prism-router · 随包分发的 lark-oapi 长连接子集
+===============================================
+
+本目录由 tools/pylib_tool.py 生成，请勿手改。上游版本、逐文件 sha256、
+裁剪/补丁清单、体积上限、静态 import 图都在 MANIFEST.json。
+
+  * 安装位置：/usr/lib/prism-router/pylib（不写系统 site-packages）
+  * 使用方：/usr/share/prism-router/feishu-ws.py（PYTHONPATH 指向本目录）
+  * 目标平台：musl x86_64 + CPython 3.11（pycryptodome/websockets 的原生扩展绑定）
+  * 重新生成：tools/vendor-pylib.sh（在路由器上 pip download + 裁剪 + 真 import 自检）
+  * 离线校验：python3 tools/pylib_tool.py verify --pylib <本目录> --static-imports
+  * 说明/已知限制：仓库 docs/FEISHU-WS.md（「随包 SDK」一节）

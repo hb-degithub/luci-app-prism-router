@@ -91,7 +91,7 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 echo "=== 1. 安装单包 ==="
-opkg install "$PRISM_IPK" >/tmp/i1.log 2>&1 \
+opkg_install_ipk "$PRISM_IPK" >/tmp/i1.log 2>&1 \
   && ok "安装 luci-app-prism-router（家长控制 CGI 同包）" \
   || { bad "安装失败"; tail -8 /tmp/i1.log; }
 

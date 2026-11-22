@@ -1,0 +1,84 @@
+#!/bin/sh /etc/rc.common
+# prism-router · 飞书官方 SDK 长连接（lark-oapi WebSocket）
+#
+# 默认关闭。只有同时满足以下条件才会启动：
+#   * uci prism-router.feishu.ws_enabled = 1
+#   * app_id、app_secret 都非空
+#   * /usr/bin/python3 与 /usr/share/prism-router/feishu-ws.py 存在
+# 任一不满足只写一条 logger 消息并正常退出（不算启动失败），
+# 具体原因由 ubus 方法 prism-router.feishu_ws_status 一并返回给 UI。
+#
+# 运行：/usr/bin/python3 -u /usr/share/prism-router/feishu-ws.py
+#   PYTHONPATH=/usr/lib/prism-router/pylib  —— 随包分发的官方 SDK（不写系统 site-packages）
+#   PYTHONDONTWRITEBYTECODE=1               —— 不往 flash 写 .pyc
+# app_secret 只在 Python 进程内通过 `uci -q get` 读取，不经过本脚本的 argv/env。
+
+START=95
+STOP=10
+USE_PROCD=1
+
+PROG=/usr/bin/python3
+SCRIPT=/usr/share/prism-router/feishu-ws.py
+PYLIB=/usr/lib/prism-router/pylib
+LOG_TAG=prism-router-feishu-ws
+
+start_service() {
+	local enabled app_id app_secret
+
+	config_load prism-router
+	config_get_bool enabled feishu ws_enabled 0
+	config_get app_id feishu app_id ''
+	config_get app_secret feishu app_secret ''
+
+	if [ "$enabled" != "1" ]; then
+		logger -t "$LOG_TAG" "ws_enabled=0，不启动长连接（默认关闭）"
+		return 0
+	fi
+
+	if [ -z "$app_id" ] || [ -z "$app_secret" ]; then
+		logger -t "$LOG_TAG" "缺少 feishu.app_id / feishu.app_secret，不启动长连接"
+		unset app_secret
+		return 0
+	fi
+	unset app_secret
+
+	if [ ! -x "$PROG" ]; then
+		logger -t "$LOG_TAG" "未安装 python3（$PROG），不启动长连接"
+		return 0
+	fi
+	if [ ! -f "$SCRIPT" ]; then
+		logger -t "$LOG_TAG" "缺少 $SCRIPT，不启动长连接"
+		return 0
+	fi
+	if [ ! -d "$PYLIB" ]; then
+		logger -t "$LOG_TAG" "缺少随包 SDK 目录 $PYLIB，不启动长连接"
+		return 0
+	fi
+
+	# 清掉上一次可能残留的运行时文件，避免 rpcd 把死进程当 running。
+	rm -f /tmp/prism-router/feishu-ws.pid /tmp/prism-router/feishu-ws.status.json
+
+	procd_open_instance feishu-ws
+	procd_set_param command "$PROG" -u "$SCRIPT"
+	procd_set_param env \
+		PYTHONPATH="$PYLIB" \
+		PYTHONDONTWRITEBYTECODE=1 \
+		PYTHONUNBUFFERED=1 \
+		PYTHONIOENCODING=utf-8
+	# 崩溃/被 OOM 杀掉后由 procd 拉起；正常 SIGTERM 退出不会被反复重启。
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	# 配置文件变更后重启（uci commit 后 reload_config 会触发）
+	procd_set_param file /etc/config/prism-router
+	procd_close_instance
+}
+
+stop_service() {
+	# 先让 Python 收到 SIGTERM（procd 默认），再清掉运行时文件。
+	rm -f /tmp/prism-router/feishu-ws.pid /tmp/prism-router/feishu-ws.status.json
+}
+
+service_triggers() {
+	procd_add_reload_trigger "prism-router"
+}

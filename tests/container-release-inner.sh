@@ -3,20 +3,24 @@
 # 不访问网络；安装、重装、卸载全部发生在一次性容器里。
 #
 # 检查项：
-#   1. 严格依赖安装（无 --force-depends，不需要图表库占位包）
+#   1. 严格依赖安装（非 python3 依赖必须由镜像提供；python3-* 用“已安装”桩，见 lib 注释）
 #   2. 包内每个文件落位、属主 root:root、权限 644/755；关键目录 755
 #   3. payload 与 /src/repo 源码逐文件一致（含 PWA / CGI / 条件 node-auth.uc）
 #   4. conffile 声明、修改 conffile 后同版本强制重装仍保留用户配置
 #   5. 卸载完整清单：opkg files 列出的文件全部消失，仅 conffile 按规则保留
 #   6. legacy（ar 容器）负例：必须被 opkg 以 Malformed package file 拒绝
+# 依赖校验 + 仅为离线镜像缺失的 python3-* 登记“已安装”桩（见 lib 注释）
+. /src/tests/lib/opkg-install-inner.sh
+
 mkdir -p /var/lock /var/run /tmp 2>/dev/null
 
 PASS=0; FAIL=0
 ok(){ echo "  PASS  $1"; PASS=$((PASS+1)); }
 bad(){ echo "  FAIL  $1"; FAIL=$((FAIL+1)); }
 # 版本由外层门禁从实际产物名解析后传入；单独运行 inner 时退回源码默认值。
-PRISM_VER="${PRISM_VER:-1.0.22}"
-PRISM_IPK_NAME="${PRISM_IPK_NAME:-luci-app-prism-router_${PRISM_VER}-1_all.ipk}"
+PRISM_VER="${PRISM_VER:-1.0.24}"
+PRISM_ARCH="${PRISM_ARCH:-x86_64}"
+PRISM_IPK_NAME="${PRISM_IPK_NAME:-luci-app-prism-router_${PRISM_VER}-1_${PRISM_ARCH}.ipk}"
 IPK="/src/dist/$PRISM_IPK_NAME"
 [ -f "$IPK" ] || { echo "FAIL: 缺少 $IPK" >&2; exit 1; }
 perm(){ ls -ld "$1" 2>/dev/null | awk '{print $1,$3":"$4}'; }
@@ -57,8 +61,8 @@ B_ETC=$(perm /etc); B_USR=$(perm /usr); B_WWW=$(perm /www); B_CGI=$(perm /www/cg
 echo "  /etc=$B_ETC  /usr=$B_USR  /www=$B_WWW  /www/cgi-bin=${B_CGI:-无}"
 
 # 前端已统一使用内置 SVG，无需 luci-lib-chartjs；严格按声明依赖安装。
-echo "=== 1. 严格依赖安装（无 --force-depends）==="
-opkg install "$IPK" >/tmp/rel-i1.log 2>&1 \
+echo "=== 1. 严格依赖安装（python3-* 由桩满足，其余由镜像提供）==="
+opkg_install_ipk "$IPK" >/tmp/rel-i1.log 2>&1 \
   && ok "单包插件安装成功（daemon + LuCI + CGI 同包）" || { bad "单包安装失败"; tail -8 /tmp/rel-i1.log; }
 
 echo "=== 2. 系统目录权限未被改动 ==="
@@ -69,6 +73,7 @@ echo "=== 2. 系统目录权限未被改动 ==="
 
 echo "=== 3. 包内文件权限 / 属主 / 语法 ==="
 for d in /etc/prism-router /etc/prism-router/daily /usr/share/prism-router \
+         /usr/lib/prism-router /usr/lib/prism-router/pylib \
          /www/luci-static/resources/view/prism-router /www/luci-static/resources/prism-router \
          /usr/share/rpcd/ucode /usr/share/rpcd/acl.d /usr/share/luci/menu.d; do
   check "$d" "root:root drwxr-xr-x"
@@ -79,6 +84,11 @@ for pair in \
   "/etc/config/prism-router:root:root -rw-r--r--" \
   "/usr/share/prism-router/feishu.uc:root:root -rw-r--r--" \
   "/usr/share/prism-router/feishu-test.sh:root:root -rwxr-xr-x" \
+  "/usr/share/prism-router/feishu-ws.py:root:root -rwxr-xr-x" \
+  "/etc/init.d/prism-router-feishu-ws:root:root -rwxr-xr-x" \
+  "/usr/lib/prism-router/pylib/MANIFEST.json:root:root -rw-r--r--" \
+  "/usr/lib/prism-router/pylib/lark_oapi/api/im/v1/processor.py:root:root -rw-r--r--" \
+  "/usr/lib/prism-router/pylib/Crypto/Cipher/_raw_aes.abi3.so:root:root -rw-r--r--" \
   "/usr/share/prism-router/retention.uc:root:root -rw-r--r--" \
   "/usr/share/prism-router/push.uc:root:root -rw-r--r--" \
   "/usr/share/prism-router/stations.uc:root:root -rw-r--r--" \
@@ -134,6 +144,43 @@ for j in /usr/share/rpcd/acl.d/luci-app-prism-router.json /usr/share/luci/menu.d
     && ok "JSON 合法 $j" || bad "JSON 非法 $j"
 done
 
+for opt in ws_enabled; do
+  grep -q "option $opt " /etc/config/prism-router \
+    && ok "默认配置含 feishu.$opt" || bad "默认配置缺少 feishu.$opt"
+done
+grep -qE "option[[:space:]]+ws_enabled[[:space:]]+'0'" /etc/config/prism-router \
+  && ok "长连接默认关闭（ws_enabled=0）" || bad "ws_enabled 默认值不是 0"
+
+# 随包 SDK：文件数/体积极限 + 原生扩展存在（容器里没有 python3，只做结构校验）
+PYLIB=/usr/lib/prism-router/pylib
+if [ -d "$PYLIB/lark_oapi" ] && [ -d "$PYLIB/Crypto" ]; then
+  ok "随包 pylib 已安装（$PYLIB）"
+else
+  bad "随包 pylib 缺失"
+fi
+pylib_files=$(find "$PYLIB" -type f 2>/dev/null | wc -l)
+pylib_kb=$(du -sk "$PYLIB" 2>/dev/null | awk '{print $1}')
+[ "$pylib_files" -ge 500 ] && ok "pylib 文件数 $pylib_files" || bad "pylib 文件数异常（$pylib_files）"
+[ "${pylib_kb:-0}" -lt 25600 ] && ok "pylib 占用 ${pylib_kb}KB (<25MB)" || bad "pylib 超过 25MB（${pylib_kb}KB）"
+so_count=$(find "$PYLIB" -name '*.so' | wc -l)
+[ "$so_count" -ge 3 ] && ok "pylib 含 $so_count 个 musl 原生扩展" || bad "pylib 原生扩展缺失（$so_count）"
+
+# 长连接 rpcd 方法：没起服务时应返回 ok=true/ running=false，且绝不出现 secret
+if PRISM_ROUTER_METHOD=feishu_ws_status ucode /usr/share/rpcd/ucode/prism-router.uc >/tmp/ws-status.json 2>/tmp/ws-status.err; then
+  if ucode -e "let d=json(require('fs').readfile('/tmp/ws-status.json')); exit((d.ok==true && d.running==false && type(d.chats)=='array' && type(d.users)=='array' && type(d.log_tail)=='array') ? 0 : 1)"; then
+    ok "feishu_ws_status 返回结构正确（未运行）"
+  else
+    bad "feishu_ws_status 返回结构异常"; cat /tmp/ws-status.json
+  fi
+  if grep -qi 'app_secret\|"secret"\|Bearer ' /tmp/ws-status.json; then
+    bad "feishu_ws_status 泄露了 secret"
+  else
+    ok "feishu_ws_status 未泄露 secret"
+  fi
+else
+  bad "feishu_ws_status 调用失败"; tail -5 /tmp/ws-status.err
+fi
+
 echo "=== 4. payload 与仓库源码逐文件一致 ==="
 while IFS='|' read -r dst src; do
   [ -n "$dst" ] || continue
@@ -144,6 +191,8 @@ done <<'PAYLOAD'
 /etc/config/prism-router|luci-app-prism-router/root/etc/config/prism-router
 /usr/share/prism-router/feishu.uc|luci-app-prism-router/root/usr/share/prism-router/feishu.uc
 /usr/share/prism-router/feishu-test.sh|luci-app-prism-router/root/usr/share/prism-router/feishu-test.sh
+/usr/share/prism-router/feishu-ws.py|luci-app-prism-router/root/usr/share/prism-router/feishu-ws.py
+/etc/init.d/prism-router-feishu-ws|luci-app-prism-router/root/etc/init.d/prism-router-feishu-ws
 /usr/share/prism-router/retention.uc|luci-app-prism-router/root/usr/share/prism-router/retention.uc
 /usr/share/prism-router/push.uc|luci-app-prism-router/root/usr/share/prism-router/push.uc
 /usr/share/prism-router/stations.uc|luci-app-prism-router/root/usr/share/prism-router/stations.uc
@@ -237,7 +286,7 @@ check_current_kept(){ # $1=场景名
 
 # 4b-1 升级/重装：当前配置 + 旧配置同时存在，当前配置必须逐项保留
 write_current; write_legacy
-opkg install --force-reinstall "$IPK" >/tmp/rel-4b-upgrade.log 2>&1 \
+opkg_install_ipk --force-reinstall "$IPK" >/tmp/rel-4b-upgrade.log 2>&1 \
 	&& ok "4b-1 同版本重装（当前+旧配置并存）成功" || { bad "4b-1 重装失败"; tail -8 /tmp/rel-4b-upgrade.log; }
 check_current_kept "4b-1 重装"
 
@@ -245,7 +294,7 @@ check_current_kept "4b-1 重装"
 opkg remove luci-app-prism-router >/tmp/rel-4b-rm1.log 2>&1 \
 	&& ok "4b-2 卸载成功" || { bad "4b-2 卸载失败"; tail -5 /tmp/rel-4b-rm1.log; }
 rm -f "$CUR_CONF"; write_current; write_legacy
-opkg install "$IPK" >/tmp/rel-4b-fresh-current.log 2>&1 \
+opkg_install_ipk "$IPK" >/tmp/rel-4b-fresh-current.log 2>&1 \
 	&& ok "4b-2 重新安装（已有当前配置+旧配置）成功" || { bad "4b-2 重新安装失败"; tail -8 /tmp/rel-4b-fresh-current.log; }
 check_current_kept "4b-2 首次安装"
 
@@ -253,7 +302,7 @@ check_current_kept "4b-2 首次安装"
 opkg remove luci-app-prism-router >/tmp/rel-4b-rm2.log 2>&1 \
 	&& ok "4b-3 卸载成功" || { bad "4b-3 卸载失败"; tail -5 /tmp/rel-4b-rm2.log; }
 rm -f "$CUR_CONF"; write_legacy
-opkg install "$IPK" >/tmp/rel-4b-fresh-legacy.log 2>&1 \
+opkg_install_ipk "$IPK" >/tmp/rel-4b-fresh-legacy.log 2>&1 \
 	&& ok "4b-3 重新安装（只有旧配置）成功" || { bad "4b-3 重新安装失败"; tail -8 /tmp/rel-4b-fresh-legacy.log; }
 [ "$(cfg_get prism-router.settings.custom_marker)" = "legacy-must-not-win" ] \
 	&& ok "4b-3 旧配置已迁移到 prism-router" || bad "4b-3 旧配置未迁移"
@@ -269,7 +318,7 @@ opkg install "$IPK" >/tmp/rel-4b-fresh-legacy.log 2>&1 \
 opkg remove luci-app-prism-router >/tmp/rel-4b-rm3.log 2>&1 \
 	&& ok "4b-4 卸载成功" || { bad "4b-4 卸载失败"; tail -5 /tmp/rel-4b-rm3.log; }
 rm -f "$CUR_CONF" "$LEGACY_CONF"
-opkg install "$IPK" >/tmp/rel-4b-fresh-none.log 2>&1 \
+opkg_install_ipk "$IPK" >/tmp/rel-4b-fresh-none.log 2>&1 \
 	&& ok "4b-4 重新安装（无旧配置）成功" || { bad "4b-4 重新安装失败"; tail -8 /tmp/rel-4b-fresh-none.log; }
 cmp -s "$CUR_CONF" /src/repo/luci-app-prism-router/root/etc/config/prism-router \
 	&& ok "4b-4 无旧配置时使用包内 conffile" || bad "4b-4 无旧配置时 conffile 与包内默认值不一致"
@@ -280,13 +329,13 @@ grep -qx '/etc/config/prism-router' /usr/lib/opkg/info/luci-app-prism-router.con
 
 printf "\n\toption gate_marker '1'\n" >> /etc/config/prism-router
 rm -f /usr/share/rpcd/ucode/prism-router.uc
-opkg install --force-reinstall "$IPK" >/tmp/re-luci.log 2>&1 \
+opkg_install_ipk --force-reinstall "$IPK" >/tmp/re-luci.log 2>&1 \
   && ok "同版本强制重装成功（恢复 rpcd 插件）" || { bad "强制重装失败"; tail -8 /tmp/re-luci.log; }
 same_file_var /usr/share/rpcd/ucode/prism-router.uc \
   /src/repo/luci-app-prism-router/root/usr/share/rpcd/ucode/prism-router.uc VERSION
 
 rm -f /usr/bin/prism-routerd
-opkg install --force-reinstall "$IPK" >/tmp/re-daemon.log 2>&1 \
+opkg_install_ipk --force-reinstall "$IPK" >/tmp/re-daemon.log 2>&1 \
   && ok "同版本强制重装成功（恢复 daemon）" || { bad "强制重装失败"; tail -8 /tmp/re-daemon.log; }
 [ -f /usr/bin/prism-routerd ] && ok "重装恢复 /usr/bin/prism-routerd" || bad "重装未恢复 /usr/bin/prism-routerd"
 if grep -q "gate_marker" /etc/config/prism-router; then

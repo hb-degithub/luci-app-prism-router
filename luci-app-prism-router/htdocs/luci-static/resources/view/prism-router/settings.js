@@ -80,6 +80,12 @@ var callFeishuChats = rpc.declare({
 	expect: {}
 });
 
+var callFeishuWsStatus = rpc.declare({
+	object: 'prism-router',
+	method: 'feishu_ws_status',
+	expect: {}
+});
+
 var callRestart = rpc.declare({
 	object: 'prism-router',
 	method: 'restart',
@@ -998,6 +1004,11 @@ return view.extend({
 			fields.push(self.field(def[0], def[1], def[2], def[3], def[4], def[5]));
 		});
 
+		fields.push(this.field('feishu', 'ws_enabled', _('启用长连接（接收入群/消息事件）'),
+			_('用飞书官方 SDK 常驻接收事件；机器人进群或给它发消息后，这里会出现群/用户，可一键填入。默认关闭。'),
+			'bool', null));
+		fields.push(this.feishuWsStatusField());
+
 		/* ---- 机器人二维码（扫码加群）---- */
 		fields.push(this.feishuScanField(writeDisabled));
 
@@ -1094,10 +1105,120 @@ return view.extend({
 		/* report_weekday 只在 weekly / both 时显示（radio 的 change 也会再调一次） */
 		this.updateConditionalFields();
 
+		/* 首次渲染查一次长连接状态（用户点「刷新状态」再查，不做高频轮询） */
+		this.refreshFeishuWs();
+
 		/* beforeunload / visibilitychange 只绑一次，切标签或离开页面时清掉轮询定时器 */
 		this.bindFeishuLifecycle();
 
 		return section;
+	},
+
+	feishuWsStatusField: function() {
+		this.feishuWsStatusNode = E('div', { style: 'white-space:pre-wrap;line-height:1.6' }, _('长连接状态：未查询'));
+		this.feishuWsList = E('div', { style: 'margin-top:6px' }, '');
+
+		return E('div', {
+			'class': 'cbi-value-description',
+			'style': 'margin:4px 0 0 0;padding:8px 10px;border:1px solid rgba(127,127,127,.28);border-radius:6px'
+		}, [
+			this.feishuWsStatusNode,
+			E('button', {
+				'class': 'cbi-button cbi-button-neutral',
+				'style': 'margin-top:6px',
+				'click': ui.createHandlerFn(this, this.refreshFeishuWs)
+			}, _('刷新状态')),
+			this.feishuWsList
+		]);
+	},
+
+	refreshFeishuWs: function() {
+		var self = this;
+		var node = this.feishuWsStatusNode;
+
+		if (node == null) return Promise.resolve();
+
+		node.textContent = _('长连接状态：查询中…');
+
+		return callFeishuWsStatus().then(function(st) {
+			if (st == null || st.ok !== true) {
+				node.textContent = _('长连接状态：查询失败');
+
+				return;
+			}
+
+			var lines = [];
+
+			lines.push(_('开关：') + (st.ws_enabled ? _('已启用') : _('未启用')) +
+				' · ' + _('服务：') + (st.running
+					? (st.connected ? _('已连接') : _('运行中，正在重连'))
+					: _('未运行')));
+
+			if (st.reasons != null && st.reasons.length)
+				lines.push(st.reasons[0]);
+			if (st.last_error)
+				lines.push(_('错误：') + st.last_error);
+			if (st.last_event_ts)
+				lines.push(_('最近事件：') + new Date(st.last_event_ts * 1000).toLocaleString());
+			if (st.heartbeat_age != null && st.heartbeat_age >= 0)
+				lines.push(_('心跳：') + st.heartbeat_age + 's');
+
+			lines.push(_('已发现群：') + ((st.chats || []).length) + ' · ' +
+				_('用户：') + ((st.users || []).length));
+
+			node.textContent = lines.join('\n');
+			self.renderFeishuWsLists(st);
+		}).catch(function(e) {
+			node.textContent = _('长连接状态：查询失败（') + ((e != null && e.message) ? e.message : e) + '）';
+		});
+	},
+
+	renderFeishuWsLists: function(st) {
+		var self = this;
+		var box = this.feishuWsList;
+
+		if (box == null) return;
+
+		clearNode(box);
+
+		(st.chats || []).forEach(function(c) {
+			box.appendChild(E('div', { style: 'padding:3px 0' }, [
+				E('code', {}, c.chat_id),
+				E('span', { style: 'margin-left:6px' }, c.name || ''),
+				E('button', {
+					'class': 'cbi-button cbi-button-neutral',
+					'style': 'margin-left:8px',
+					'click': function(ev) {
+						ev.preventDefault();
+
+						var n = self.inputs['feishu.chat_id'];
+
+						if (n != null) n.value = c.chat_id;
+					}
+				}, _('使用该群'))
+			]));
+		});
+
+		(st.users || []).forEach(function(u) {
+			var id = u.open_id || u.user_id || '';
+
+			if (!id) return;
+
+			box.appendChild(E('div', { style: 'padding:3px 0' }, [
+				E('code', {}, id),
+				E('button', {
+					'class': 'cbi-button cbi-button-neutral',
+					'style': 'margin-left:8px',
+					'click': function(ev) {
+						ev.preventDefault();
+
+						var n = self.inputs['feishu.receive_id'];
+
+						if (n != null) n.value = id;
+					}
+				}, _('使用该用户'))
+			]));
+		});
 	},
 
 	/* 发送方式切换：webhook（自定义机器人，保持原样）/ app（自建应用机器人，扫码绑定）。 */
@@ -1510,6 +1631,7 @@ return view.extend({
 		feishu.enabled = this.inputChecked('feishu', 'enabled') ? '1' : '0';
 		/* 发送方式：webhook = 群自定义机器人，app = 自建应用机器人（扫码绑定群）。
 		   后端 UCI_FIELDS 白名单里暂时没有 mode 时会静默忽略这个键，不影响其它字段落盘。 */
+		feishu.ws_enabled = this.inputChecked('feishu', 'ws_enabled') ? '1' : '0';
 		feishu.webhook = this.inputValue('feishu', 'webhook').trim();
 		feishu.secret = this.inputValue('feishu', 'secret');
 		feishu.mode = this.radioValue('feishu', 'mode', FEISHU_MODE_WEBHOOK);

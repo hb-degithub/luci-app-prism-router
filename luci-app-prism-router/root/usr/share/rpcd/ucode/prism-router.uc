@@ -56,7 +56,7 @@ const STATIONS_DIR = '/etc/prism-router/stations';
 /* 设备别名/分组/首次出现（prism-routerd 与 rpcd 共用的唯一权威文件，SPEC §10.1） */
 const DEVICES_FILE = env_or('PRISM_ROUTER_DEVICES_FILE', '/etc/prism-router/devices.json');
 const INIT_SCRIPT  = '/etc/init.d/prism-routerd';
-const VERSION      = '1.0.22';
+const VERSION      = '1.0.24';
 
 /* 别名/分组单字段字节上限（与守护进程 DEVICE_META_TEXT_MAX 一致） */
 const DEVICE_TEXT_MAX = 128;
@@ -143,6 +143,8 @@ const UCI_FIELDS = {
 	             'log_days', 'log_max_kb', 'spool_max_kb', 'dry_run' ],
 	feishu:   [ 'enabled', 'mode', 'webhook', 'secret', 'daily_time', 'report_chat_enabled',
 	             'app_id', 'app_secret', 'chat_id', 'receive_id', 'receive_id_type', 'card_wrapper',
+	             /* 长连接（官方 lark-oapi WebSocket，feishu-ws.py 消费；默认 0 关闭） */
+	             'ws_enabled',
 	             /* 内容 / 时间 / 条件可配（feishu.uc 1.1.0） */
 	             'report_items', 'report_mode', 'report_time', 'report_weekday',
 	             'alert_app_daily_limit', 'alert_spike_ratio', 'alert_offline_min',
@@ -1073,6 +1075,218 @@ function test_feishu() {
 		ok: rc == 0,
 		code: (rc == 0) ? 0 : -1,
 		msg: length(lines) ? join('\n', lines) : '未返回内容'
+	};
+}
+
+// ------------------------------------------------- 飞书长连接（feishu-ws.py）
+/* 只读、脱敏的运行摘要，供设置页显示「服务是否在跑 / 最近事件 / 发现的群与用户」。
+ *
+ * 数据来源（服务侧写入，见 /usr/share/prism-router/feishu-ws.py）：
+ *   /etc/prism-router/feishu-ws.json         发现的群/用户（0600，原子写，事件驱动）
+ *   /tmp/prism-router/feishu-ws.status.json  实时状态（tmpfs，每 15s 心跳）
+ *   /tmp/prism-router/feishu-ws.pid          PID
+ *   /tmp/prism-router/feishu-ws.log          日志（512KB 上限）
+ *
+ * 安全：本方法**不读取** app_secret（只判断是否为空），也绝不把 secret/token
+ * 写进返回值；日志尾部再做一次 token 打码。群名/ID 本身是用户可见信息。
+ */
+const WS_STATE_FILE = '/etc/prism-router/feishu-ws.json';
+const WS_STATUS_FILE = '/tmp/prism-router/feishu-ws.status.json';
+const WS_PID_FILE = '/tmp/prism-router/feishu-ws.pid';
+const WS_LOG_FILE = '/tmp/prism-router/feishu-ws.log';
+const WS_INIT_SCRIPT = '/etc/init.d/prism-router-feishu-ws';
+/* 状态文件超过这个秒数没更新就不再认为「在跑」（服务每 15s 心跳一次）。 */
+const WS_STATUS_FRESH = 180;
+const WS_LOG_TAIL_LINES = 40;
+const WS_MAX_CHATS = 50;
+const WS_MAX_USERS = 20;
+
+function ws_bool(value) {
+	const v = lc(trim(text(value, '')));
+
+	return (v == '1' || v == 'true' || v == 'yes' || v == 'on' || v == 'enabled');
+}
+
+function ws_pid() {
+	try {
+		if (!access(WS_PID_FILE))
+			return 0;
+		const raw = trim(text(readfile(WS_PID_FILE) ?? '', ''));
+
+		return match(raw, /^[0-9]+$/) ? int(raw) : 0;
+	}
+	catch (e) {
+		return 0;
+	}
+}
+
+function ws_pid_alive(pid) {
+	if (pid <= 0)
+		return false;
+
+	try {
+		/* fs.access() 存在返回 true、不存在返回 null；统一成布尔值。 */
+		return access(sprintf('/proc/%d', pid)) == true;
+	}
+	catch (e) {
+		return false;
+	}
+}
+
+/* 日志行脱敏：把形如 app_secret=xxx / Authorization: Bearer xxx 的 token 打码。
+ * 服务本身不打印 secret，这里是纵深防御（日志文件可能被别的进程追加）。 */
+function ws_mask_line(line) {
+	const out = [];
+
+	for (let token in split(text(line, ''), ' ')) {
+		const low = lc(token);
+		const q = index(token, '?');
+
+		/* SDK 的连接串会把 access_key/ticket 放在 query 里，整段砍掉只留 ?*** */
+		if (match(low, /^(wss?|https?):\/\//) && q >= 0)
+			push(out, substr(token, 0, q) + '?***');
+		else if (match(low, /(secret|token|password|passwd|authorization|bearer|cookie|access[_-]?key|ticket|sign|appsecret)[=:]/))
+			push(out, '***');
+		else
+			push(out, substr(token, 0, 200));
+	}
+
+	return join(' ', out);
+}
+
+/* 只保留最后 WS_LOG_TAIL_LINES 行，避免把 512KB 日志整段塞进 ubus 消息。 */
+function ws_log_tail() {
+	let raw = '';
+	let tail = [];
+
+	try {
+		if (!access(WS_LOG_FILE))
+			return tail;
+
+		raw = text(readfile(WS_LOG_FILE) ?? '', '');
+
+		if (!length(raw))
+			return tail;
+	}
+	catch (e) {
+		return tail;
+	}
+
+	/* 环形缓冲：只留最后 N 行，不会因日志很大而撑爆内存。 */
+	for (let line in split(raw, '\n')) {
+		const l = trim(line);
+
+		if (!length(l))
+			continue;
+
+		push(tail, l);
+
+		if (length(tail) > WS_LOG_TAIL_LINES)
+			shift(tail);
+	}
+
+	for (let i = 0; i < length(tail); i++)
+		tail[i] = ws_mask_line(tail[i]);
+
+	return tail;
+}
+
+function feishu_ws_status() {
+	const ws_enabled = ws_bool(uci_get('feishu', 'ws_enabled', '0'));
+	const app_id = trim(text(uci_get('feishu', 'app_id', ''), ''));
+	/* secret 只在本地判空，绝不进入返回值 / 日志。 */
+	const has_secret = length(trim(text(uci_get('feishu', 'app_secret', ''), ''))) > 0;
+	const state = read_json(WS_STATE_FILE) ?? {};
+	const status = read_json(WS_STATUS_FILE) ?? {};
+	const pid = ws_pid();
+	const now = time();
+	const updated = integer(status?.updated_at, 0);
+
+	/* 「在跑」= PID 文件里的进程还活着 + 状态文件里的 pid 对得上 + 心跳没过期。
+	 * 只靠 pgrep 会把 pid 复用也算进去；只靠状态文件又会把 kill -9 当活。 */
+	const running = !!(ws_pid_alive(pid)
+		&& integer(status?.pid, 0) == pid
+		&& updated > 0
+		&& (now - updated) <= WS_STATUS_FRESH);
+
+	const chats = [];
+	for (let item in (type(state?.chats) == 'array' ? state.chats : [])) {
+		if (type(item) != 'object')
+			continue;
+
+		const id = trim(text(item?.chat_id, ''));
+
+		if (!length(id))
+			continue;
+
+		push(chats, {
+			chat_id: substr(id, 0, 128),
+			name: substr(trim(text(item?.name, '')), 0, 64),
+			last_seen: integer(item?.last_seen, 0)
+		});
+
+		if (length(chats) >= WS_MAX_CHATS)
+			break;
+	}
+
+	const users = [];
+	for (let item in (type(state?.users) == 'array' ? state.users : [])) {
+		if (type(item) != 'object')
+			continue;
+
+		const open_id = trim(text(item?.open_id, ''));
+		const user_id = trim(text(item?.user_id, ''));
+
+		if (!length(open_id) && !length(user_id))
+			continue;
+
+		push(users, {
+			open_id: substr(open_id, 0, 128),
+			user_id: substr(user_id, 0, 128),
+			name: substr(trim(text(item?.name, '')), 0, 64),
+			last_seen: integer(item?.last_seen, 0)
+		});
+
+		if (length(users) >= WS_MAX_USERS)
+			break;
+	}
+
+	/* 不启动的具体原因，按「用户下一步要做什么」排序。 */
+	const reasons = [];
+
+	if (!ws_enabled)
+		push(reasons, 'ws_enabled=0：长连接默认关闭，勾选「启用长连接」并保存后才会启动');
+	else if (!length(app_id) || !has_secret)
+		push(reasons, '缺少 feishu.app_id / feishu.app_secret');
+	if (!access(WS_INIT_SCRIPT))
+		push(reasons, '缺少 /etc/init.d/prism-router-feishu-ws（请重装插件）');
+	if (!access('/usr/bin/python3'))
+		push(reasons, '未安装 python3（opkg install python3-light python3-openssl python3-asyncio python3-ctypes python3-logging）');
+	if (!access('/usr/lib/prism-router/pylib/lark_oapi'))
+		push(reasons, '缺少随包分发的 lark-oapi（/usr/lib/prism-router/pylib）');
+
+	return {
+		ok: true,
+		ws_enabled: ws_enabled,
+		has_credentials: length(app_id) > 0 && has_secret,
+		running: running,
+		connected: !!(running && status?.connected == true),
+		pid: running ? pid : 0,
+		last_event_ts: integer(status?.last_event_ts, integer(state?.last_event_ts, 0)),
+		last_event_type: substr(text(status?.last_event_type, text(state?.last_event_type, '')), 0, 64),
+		events_seen: integer(status?.events_seen, integer(state?.events_seen, 0)),
+		heartbeat_age: updated > 0 ? (now - updated) : -1,
+		last_error: substr(text(status?.last_error, ''), 0, 200),
+		chats: chats,
+		users: users,
+		log_tail: ws_log_tail(),
+		reasons: reasons,
+		paths: {
+			state: WS_STATE_FILE,
+			status: WS_STATUS_FILE,
+			log: WS_LOG_FILE,
+			init: WS_INIT_SCRIPT
+		}
 	};
 }
 
@@ -2611,6 +2825,21 @@ const methods = {
 			}
 			catch (e) {
 				return { ok: false, code: -1, msg: `${e}` };
+			}
+		}
+	},
+
+	/* 飞书长连接运行摘要（只读、脱敏）：设置页据此显示运行状态并回填 chat_id /
+	 * receive_id。返回 {ok, ws_enabled, running, connected, last_event_ts,
+	 * chats:[{chat_id,name}], users:[{open_id,user_id,name}], log_tail, reasons, ...}。
+	 * 不返回 app_secret；读权限由 ACL（luci-app-prism-router / -admin）控制。 */
+	feishu_ws_status: {
+		call: function(request) {
+			try {
+				return feishu_ws_status();
+			}
+			catch (e) {
+				return { ok: false, error: `${e}` };
 			}
 		}
 	},
