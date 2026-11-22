@@ -254,6 +254,7 @@ config feishu 'feishu'
 # 守护进程不再按 settings.history_days 做「只留 N 个文件」的计数裁剪；删掉整段
 # 则回到旧行为（老配置升级后完全不受影响）。
 config retention 'retention'
+	option run_time '03:30'
 	# 总开关：0 = 什么都不删、不截断（回到旧行为）
 	option enabled '1'
 	# /etc/prism-router/daily/*.json：按文件名里的日期保留（一天一个文件）

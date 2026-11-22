@@ -23,7 +23,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-prism-router
-PKG_VERSION:=1.0.30
+PKG_VERSION:=1.0.31
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-2.0-only
@@ -178,6 +178,11 @@ define Package/luci-app-prism-router/postinst
 		/etc/init.d/prism-router-feishu-ws stop >/dev/null 2>&1
 		/etc/init.d/prism-router-feishu-ws disable >/dev/null 2>&1
 	fi
+	# 自动维护清理任务：按 retention.run_time 写入一条 cron（去重）
+	RT="$$(uci -q get prism-router.retention.run_time)"; RT="$${RT:-03:30}"
+	case "$$RT" in [0-2][0-9]:[0-5][0-9]) ;; *) RT=03:30 ;; esac
+	RH="$${RT%:*}"; RM="$${RT#*:}"
+	( crontab -l 2>/dev/null | grep -v 'prism-router/retention.uc' ; echo "$$RM $$RH * * * ucode /usr/share/prism-router/retention.uc >/dev/null 2>&1" ) | crontab -
 	# 新 rpcd ucode 需要 restart 才会注册（reload 不重载脚本）
 	/etc/init.d/rpcd restart >/dev/null 2>&1
 }

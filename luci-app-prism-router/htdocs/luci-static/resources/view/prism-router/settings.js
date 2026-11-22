@@ -1416,7 +1416,8 @@ return view.extend({
 	renderRetentionSection: function() {
 		var self = this;
 		var defs = [
-			[ 'retention', 'enabled', _('启用清理任务'), _('关闭后 retention.uc 什么都不删、不截断（等于回到旧行为）。定时触发仍需自己加 cron。'), 'bool', null ],
+			[ 'retention', 'run_time', _('每天清理时间'), _('24 小时制 HH:MM，例如 03:30。插件安装/升级时会按此时间自动写入 cron。'), 'text', { placeholder: '03:30' } ],
+			[ 'retention', 'enabled', _('启用清理任务'), _('关闭后 retention.uc 什么都不删、不截断（等于回到旧行为）；定时任务仍保留，只是空跑。'), 'bool', null ],
 			[ 'retention', 'daily_days', _('每日汇总保留（天）'), _('/etc/prism-router/daily/*.json；0–36500，0 = 关闭该目录的按天清理。默认 400。'), 'number', { min: 0, max: 36500 } ],
 			[ 'retention', 'nodes_days', _('子节点快照保留（天）'), _('/etc/prism-router/nodes/*.json / *.jsonl；0–36500，0 = 关闭。默认 30。'), 'number', { min: 0, max: 36500 } ],
 			[ 'retention', 'stations_days', _('AP 站点快照保留（天）'), _('/etc/prism-router/stations/*.json；0–36500，0 = 关闭。默认 7。'), 'number', { min: 0, max: 36500 } ],
@@ -1452,7 +1453,7 @@ return view.extend({
 			E('div', { 'class': 'cbi-value-description' },
 				_('清理范围是硬编码白名单（daily / nodes / stations / 日志 / 飞书队列），本段只改天数和大小，没有路径项。')),
 			E('div', { 'class': 'cbi-value-description' },
-				_('定时触发由你自己的 cron 负责（本页不改 crontab），例如：30 3 * * * /usr/bin/ucode /usr/share/prism-router/retention.uc >/dev/null 2>&1')),
+				_('插件会按「每天清理时间」自动写入 cron；也可手动执行：ucode /usr/share/prism-router/retention.uc --dry-run')),
 			E('div', { 'class': 'cbi-value-description' },
 				_('注意：上面的「立即预览」读取的是已保存的 UCI 配置，改了输入请先保存。'))
 		];
@@ -1722,6 +1723,7 @@ return view.extend({
 	collectRetentionValues: function() {
 		var retention = {};
 
+		retention.run_time = this.inputValue('retention', 'run_time').trim() || '03:30';
 		retention.enabled = this.inputChecked('retention', 'enabled') ? '1' : '0';
 
 		for (var i = 0; i < RETENTION_KEYS.length; i++) {
