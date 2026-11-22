@@ -985,8 +985,6 @@ return view.extend({
 
 		var channelFields = [
 			[ 'feishu', 'enabled', _('启用飞书报表'), _('开启后按下面的「时间」推送日报/周报；测试发送不受这里影响。'), 'bool', null ],
-			[ 'feishu', 'webhook', _('Webhook 地址'), _('群自定义机器人的地址，https://open.feishu.cn/open-apis/bot/v2/hook/…'), 'text', { wide: true } ],
-			[ 'feishu', 'secret', _('签名校验 secret'), _('机器人开启「签名校验」时填写；留空则不加签。'), 'password', { placeholder: _('留空则不签名') } ],
 			[ 'feishu', 'app_id', _('App ID（扫码加群的自建应用）'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。填了 App ID/Secret 就优先走应用 API，不再用 webhook。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
 			[ 'feishu', 'app_secret', _('App Secret'), _('与 App ID 配套；仅保存在本机 /etc/config/prism-router。'), 'password', null ],
 			[ 'feishu', 'chat_id', _('群 chat_id'), _('点下方「列出机器人所在的群」自动获取；形如 oc_xxxxx。'), 'text', { wide: true, placeholder: 'oc_xxxxx' } ],
@@ -1104,9 +1102,10 @@ return view.extend({
 
 	/* 发送方式切换：webhook（自定义机器人，保持原样）/ app（自建应用机器人，扫码绑定）。 */
 	feishuModeField: function() {
-		var choices = [ [ FEISHU_MODE_WEBHOOK, _('群自定义机器人（webhook）') ],
-		                [ FEISHU_MODE_APP, _('应用机器人 · 群（扫码绑定）') ],
-		                [ FEISHU_MODE_USER, _('应用机器人 · 个人（无需群）') ] ];
+		/* 只保留“应用凭证”一种接入方式：要么绑定群，要么直接发个人；
+		   不再提供 webhook（群自定义机器人）。 */
+		var choices = [ [ FEISHU_MODE_APP, _('绑定群（扫码）') ],
+		                [ FEISHU_MODE_USER, _('发给个人（无需群）') ] ];
 
 		/* mode 未设置时后端沿用旧行为：app_id/app_secret/chat_id 齐全走应用。
 		   这里把 app 放到首位，让界面选中项与真实发送路线一致，避免误导。 */
@@ -1116,7 +1115,7 @@ return view.extend({
 			choices = [ choices[1], choices[0] ];
 
 		var row = this.radioField('feishu', 'mode', _('发送方式'),
-			_('群自定义机器人 = 复制群里的 webhook（只能发到该群）；应用机器人 · 群 = 自建应用扫码绑定群，用 chat_id；应用机器人 · 个人 = 自建应用直接发给你本人，用 open_id，不需要建群。'),
+			_('两种都只需要飞书自建应用的 App ID / App Secret。绑定群 = 扫码把机器人所在的群选出来；发给个人 = 直接填你的飞书邮箱，不需要建群。'),
 			choices);
 
 		row.setAttribute('id', 'ts-feishu-mode-row');
@@ -1526,9 +1525,9 @@ return view.extend({
 		feishu.enabled = this.inputChecked('feishu', 'enabled') ? '1' : '0';
 		/* 发送方式：webhook = 群自定义机器人，app = 自建应用机器人（扫码绑定群）。
 		   后端 UCI_FIELDS 白名单里暂时没有 mode 时会静默忽略这个键，不影响其它字段落盘。 */
-		feishu.mode = this.radioValue('feishu', 'mode', FEISHU_MODE_WEBHOOK);
-		feishu.webhook = this.inputValue('feishu', 'webhook');
-		feishu.secret = this.inputValue('feishu', 'secret');
+		feishu.mode = this.radioValue('feishu', 'mode', FEISHU_MODE_APP);
+		if (feishu.mode === FEISHU_MODE_WEBHOOK)
+			feishu.mode = FEISHU_MODE_APP;
 		feishu.app_id = this.inputValue('feishu', 'app_id');
 		feishu.app_secret = this.inputValue('feishu', 'app_secret');
 		feishu.chat_id = this.inputValue('feishu', 'chat_id');
@@ -1677,11 +1676,8 @@ return view.extend({
 				return gbFields[i][1] + ' ' + _('必须是 0–1048576 之间的数字（GB，留空 = 不限制）');
 		}
 
-		if (feishu.webhook.length > 0 && !/^https?:\/\/[^\s]+$/.test(feishu.webhook))
-			return _('飞书 webhook 必须是 http(s) 地址');
-
-		if (feishu.mode !== FEISHU_MODE_WEBHOOK && feishu.mode !== FEISHU_MODE_APP && feishu.mode !== FEISHU_MODE_USER)
-			return _('飞书发送方式只能是 webhook / app / user');
+		if (feishu.mode !== FEISHU_MODE_APP && feishu.mode !== FEISHU_MODE_USER)
+			return _('飞书发送方式只能是绑定群或发给个人（都使用应用凭证）');
 
 		/* 应用机器人没有 App ID/Secret 连 token 都换不到：保存前就拦住并说清楚，别等到发送时静默失败 */
 		if ((feishu.mode === FEISHU_MODE_APP || feishu.mode === FEISHU_MODE_USER) &&
@@ -2158,9 +2154,10 @@ return view.extend({
 	// ------------------------------------------------------ 应用机器人 · 扫码绑定
 
 	feishuMode: function() {
-		var mode = this.radioValue('feishu', 'mode', FEISHU_MODE_WEBHOOK);
+		var mode = this.radioValue('feishu', 'mode', FEISHU_MODE_APP);
 
-		return (mode === FEISHU_MODE_APP) ? FEISHU_MODE_APP : FEISHU_MODE_WEBHOOK;
+		/* 旧配置可能还是 webhook：一律按“绑定群”处理，不再有 webhook 选项。 */
+		return (mode === FEISHU_MODE_USER) ? FEISHU_MODE_USER : FEISHU_MODE_APP;
 	},
 
 	/* 读不到 UCI 或没有 admin ACL：所有会落盘的飞书按钮都禁用（与其它写按钮同一闸门）。 */
@@ -2173,7 +2170,6 @@ return view.extend({
 		var mode = this.feishuMode();
 		var app = (mode === FEISHU_MODE_APP);
 		var user = (mode === FEISHU_MODE_USER);
-		var webhook = (mode === FEISHU_MODE_WEBHOOK);
 		var self = this;
 
 		/* 只显示当前方式真正需要的字段：webhook/secret 只在 webhook；app 凭据在 app/user；
@@ -2183,8 +2179,6 @@ return view.extend({
 			if (row != null) row.style.display = on ? '' : 'none';
 		}
 
-		show('webhook', webhook);
-		show('secret', webhook);
 		show('app_id', app || user);
 		show('app_secret', app || user);
 		show('chat_id', app);

@@ -56,7 +56,7 @@ const STATIONS_DIR = '/etc/prism-router/stations';
 /* 设备别名/分组/首次出现（prism-routerd 与 rpcd 共用的唯一权威文件，SPEC §10.1） */
 const DEVICES_FILE = env_or('PRISM_ROUTER_DEVICES_FILE', '/etc/prism-router/devices.json');
 const INIT_SCRIPT  = '/etc/init.d/prism-routerd';
-const VERSION      = '1.0.8';
+const VERSION      = '1.0.9';
 
 /* 别名/分组单字段字节上限（与守护进程 DEVICE_META_TEXT_MAX 一致） */
 const DEVICE_TEXT_MAX = 128;

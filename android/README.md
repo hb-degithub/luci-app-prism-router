@@ -27,7 +27,7 @@ echo "sdk.dir=/path/to/android-sdk" > local.properties
 ## 安装
 
 ```sh
-adb install -r artifacts/prism-router-android-1.0.8-debug.apk
+adb install -r artifacts/prism-router-android-1.0.9-debug.apk
 ```
 
 或把 APK 传到手机点击安装（需允许「安装未知来源应用」）。
