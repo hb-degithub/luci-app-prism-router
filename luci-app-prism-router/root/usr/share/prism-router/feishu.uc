@@ -114,7 +114,7 @@ const LOG_MAX       = 524288;                // 512 KB 轮转
 // 卡片可配区块（顺序即渲染顺序）：overview 附带近 24h 折线图
 const ITEMS_ALL      = ["overview", "proxy_direct", "wifi_wired", "system",
                         "top_devices", "top_apps", "nodes"];
-const ITEMS_DEFAULT  = ["overview", "proxy_direct", "wifi_wired", "top_devices", "top_apps"];
+const ITEMS_DEFAULT  = ["overview", "proxy_direct", "wifi_wired", "system", "top_devices", "top_apps"];
 const ITEMS_DISABLE  = ["none", "off", "-", "0", ""];
 const DEFAULT_DAILY_DIR = "/etc/prism-router/daily";
 const SPIKE_MIN_BASE = 1048576;              // 突增基线低于 1 MB/h 时不告警（避免小样本噪声）
@@ -1253,6 +1253,38 @@ collect = function(state, hist, now) {
     ctx.hours = hours;
     ctx.has_hours = used;
 
+    /* 今日性能汇总：从 history.json 的桶里取 system 快照，算均值/峰值 */
+    ctx.system_day = null;
+    {
+        let hd = read_json(BASE + "/history.json");
+        let buckets = (type(hd) == "object" && type(hd.buckets) == "array") ? hd.buckets : [];
+        let cpu = [], mem = [], load = [], disk = [], temp = [];
+
+        for (let b in buckets) {
+            if (type(b) != "object" || type(b.system) != "object")
+                continue;
+            let sys = b.system;
+            if (sys.cpu_pct != null) push(cpu, double(sys.cpu_pct));
+            if (sys.mem_pct != null) push(mem, double(sys.mem_pct));
+            if (sys.load1 != null) push(load, double(sys.load1));
+            if (sys.disk_pct != null) push(disk, double(sys.disk_pct));
+            if (sys.temp_c != null) push(temp, double(sys.temp_c));
+        }
+
+        let avg = function(a) { let s = 0; for (let v in a) s += v; return length(a) ? s / length(a) : null; };
+        let mx = function(a) { let m = null; for (let v in a) if (m == null || v > m) m = v; return m; };
+
+        if (length(cpu) || length(mem) || length(load) || length(disk) || length(temp))
+            ctx.system_day = {
+                samples: length(buckets),
+                cpu_avg: avg(cpu), cpu_max: mx(cpu),
+                mem_avg: avg(mem),
+                load_max: mx(load),
+                disk_max: mx(disk),
+                temp_max: mx(temp)
+            };
+    }
+
     if (state && type(state) == "object") {
         ctx.has_state = true;
         let ts = intv(state.ts);
@@ -1468,8 +1500,6 @@ overview_text = function(ctx) {
         s += sprintf("**在线设备**：%d 台", ctx.online);
     else
         s += "**在线设备**：—（state.json 缺失）";
-    if (ctx.rates.rx > 0 || ctx.rates.tx > 0)
-        s += sprintf("\n**实时速率**：↓%s ↑%s", fmt_rate(ctx.rates.rx), fmt_rate(ctx.rates.tx));
     return s;
 };
 
@@ -1492,7 +1522,23 @@ wifi_wired_text = function(ctx) {
     return s;
 };
 
-system_text = function(sys) {
+system_text = function(sys, day) {
+    if (day != null && type(day) == "object") {
+        let parts = [];
+        if (day.cpu_max != null)
+            parts = [sprintf("CPU 峰值 %.0f%% / 均值 %.0f%%", day.cpu_max, day.cpu_avg == null ? day.cpu_max : day.cpu_avg)];
+        if (day.mem_avg != null)
+            push(parts, sprintf("内存均值 %.0f%%", day.mem_avg));
+        if (day.load_max != null)
+            push(parts, sprintf("负载峰值 %.2f", day.load_max));
+        if (day.disk_max != null)
+            push(parts, sprintf("磁盘 %.0f%%", day.disk_max));
+        if (day.temp_max != null)
+            push(parts, sprintf("温度峰值 %.0f℃", day.temp_max));
+        if (length(parts))
+            return "**系统**（今日）：" + join(" · ", parts);
+    }
+
     if (sys == null || type(sys) != "object")
         return "";
     let parts = [];
@@ -1568,9 +1614,7 @@ table_element = function(ctx, top_n) {
     for (let i = 0; i < length(ctx.devices) && i < top_n; i++) {
         let d = ctx.devices[i];
         push(rows, {
-            host: cut(d.label, 48),
-            direct: fmt_bytes(d.direct),
-            proxy: fmt_bytes(d.proxy),
+            host: cut(d.label, 40),
             total: fmt_bytes(d.total)
         });
     }
@@ -1582,9 +1626,7 @@ table_element = function(ctx, top_n) {
         "header_style": { bold: true, background_style: "grey", text_size: "normal" },
         "columns": [
             { name: "host", display_name: "设备", data_type: "text" },
-            { name: "direct", display_name: "直连", data_type: "text" },
-            { name: "proxy", display_name: "代理", data_type: "text" },
-            { name: "total", display_name: "合计", data_type: "text" }
+            { name: "total", display_name: "今日流量", data_type: "text" }
         ],
         "rows": rows
     };
@@ -1596,7 +1638,6 @@ apps_table_element = function(ctx, top_n) {
         let a = ctx.apps[i];
         push(rows, {
             app: cut(a.host, 40),
-            chain: length(a.chain) ? cut(a.chain, 24) : "-",
             total: fmt_bytes(a.total)
         });
     }
@@ -1608,8 +1649,7 @@ apps_table_element = function(ctx, top_n) {
         "header_style": { bold: true, background_style: "grey", text_size: "normal" },
         "columns": [
             { name: "app", display_name: "应用 / 域名", data_type: "text" },
-            { name: "chain", display_name: "出口", data_type: "text" },
-            { name: "total", display_name: "合计", data_type: "text" }
+            { name: "total", display_name: "今日流量", data_type: "text" }
         ],
         "rows": rows
     };
@@ -1653,7 +1693,7 @@ card_elements = function(ctx, items, top_n, step) {
         } else if (it == "wifi_wired") {
             push(els, { "tag": "markdown", "content": wifi_wired_text(ctx) });
         } else if (it == "system") {
-            let txt = system_text(ctx.system);
+            let txt = system_text(ctx.system, ctx.system_day);
             if (length(txt))
                 push(els, { "tag": "markdown", "content": txt });
         } else if (it == "nodes") {
@@ -1704,8 +1744,7 @@ prepare_daily = function(ctx, cfg) {
     let ts = sprintf("%d", time());
     let sign = length(cfg.secret) ? hmac_sign(ts, cfg.secret) : "";
     let ladder = [
-        { top: 10, step: 1 }, { top: 8, step: 1 }, { top: 5, step: 1 },
-        { top: 5, step: 2 }, { top: 5, step: 4 }, { top: 5, step: 6 },
+        { top: 5, step: 1 }, { top: 5, step: 2 }, { top: 5, step: 4 }, { top: 5, step: 6 },
         { top: 0, step: 1 }, { top: 0, step: 2 }, { top: 0, step: 4 }, { top: 0, step: 6 }
     ];
     let tried = [];
@@ -2861,9 +2900,9 @@ check_card_json = function(raw, items) {
                     return false;
             return true;
         };
-        if (all(["host", "direct", "proxy", "total"], cols) && dev_table == null)
+        if (all(["host", "total"], cols) && dev_table == null)
             dev_table = tb;
-        else if (all(["app", "chain", "total"], cols) && app_table == null)
+        else if (all(["app", "total"], cols) && app_table == null)
             app_table = tb;
     }
 
@@ -2912,9 +2951,9 @@ check_card_json = function(raw, items) {
         }
     };
     if (has_item("top_devices"))
-        check_table(dev_table, "设备", ["host", "direct", "proxy", "total"], 10);
+        check_table(dev_table, "设备", ["host", "total"], 10);
     if (has_item("top_apps"))
-        check_table(app_table, "应用", ["app", "chain", "total"], 10);
+        check_table(app_table, "应用", ["app", "total"], 10);
 
     if (foot != null && type(foot.text) == "object" && foot.text.tag == "plain_text" &&
         foot.text.text_size == "notation")

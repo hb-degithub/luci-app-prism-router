@@ -221,7 +221,7 @@ config feishu 'feishu'
 	#       top_devices、top_apps、nodes（多节点列表）
 	# 关掉全部推送：写 'none'（注意 UCI 里 option 写空串等同「未设置」，会回落到本默认值）。
 	# 整项缺省 = 用本默认值（老配置行为不变）；写进无效名字 = 该名字被忽略。
-	option report_items 'overview,proxy_direct,wifi_wired,top_devices,top_apps'
+	option report_items 'overview,proxy_direct,wifi_wired,system,top_devices,top_apps'
 	# ── 什么时候发（cron 交给用户；用 `feishu.uc scheduled` 才会按这里判定）──────
 	# daily = 每天；weekly = report_weekday 那天；both = 每天（那天算周报标题）
 	option report_mode 'daily'

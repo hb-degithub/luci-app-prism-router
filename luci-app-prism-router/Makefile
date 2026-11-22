@@ -23,7 +23,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-prism-router
-PKG_VERSION:=1.0.29
+PKG_VERSION:=1.0.30
 PKG_RELEASE:=1
 
 PKG_LICENSE:=GPL-2.0-only

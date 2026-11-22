@@ -28,7 +28,7 @@ OUT="$ROOT/dist"; LEGACY=0
 # 版本可用环境变量覆盖（CI 按 Release tag 注入）；源码默认 1.0.22，
 # 与 Makefile / Android 默认版本保持一致。包名、opkg Version 与包内版本常量
 # 全部由同一个 VER 派生，避免出现“新 UI 却打包成旧版本”的漂移。
-VER="${PRISM_VER:-1.0.29}"; REL="${PRISM_REL:-1}"
+VER="${PRISM_VER:-1.0.30}"; REL="${PRISM_REL:-1}"
 # 随包 SDK 的 .so 是 musl x86_64；Architecture 必须与之一致，不能是 all。
 # PRISM_NO_PYLIB=1 生成不带 SDK 的 all 架构包：Webhook / 应用 API 仍可用，
 # 仅长连接不随包，供 ARM 等非 x86_64 设备安装。

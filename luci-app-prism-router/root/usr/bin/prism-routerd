@@ -54,7 +54,7 @@
 const fs = require('fs');
 const uloop = require('uloop');
 
-const DAEMON_VERSION = '1.0.29';
+const DAEMON_VERSION = '1.0.30';
 
 const STATE_DIR_DEFAULT = '/tmp/prism-router';
 const DAILY_DIR_DEFAULT = '/etc/prism-router/daily';
@@ -2041,6 +2041,7 @@ function bucket_ts_of(ts) {
 function bucket_reset(ctx, bts) {
 	ctx.cur_bucket = {
 		ts: bts,
+		system: ctx.system,
 		direct_rx: 0, direct_tx: 0, proxy_rx: 0, proxy_tx: 0,
 		apps: {},
 		devs: {}
@@ -2091,6 +2092,7 @@ function bucket_finalize(b) {
 
 	return {
 		ts: b.ts,
+		system: b.system,
 		direct_rx: b.direct_rx, direct_tx: b.direct_tx,
 		proxy_rx: b.proxy_rx, proxy_tx: b.proxy_tx,
 		top_apps: slice(apps, 0, TOP_PER_BUCKET),

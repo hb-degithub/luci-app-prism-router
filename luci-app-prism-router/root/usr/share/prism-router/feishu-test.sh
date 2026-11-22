@@ -262,7 +262,7 @@ if [ -f "$TMP/card.json" ]; then
     grep -q '"page_size":10' "$TMP/card.json" && ok "table.page_size=10" || bad "page_size 不是 10"
     grep -q '"text_size":"notation"' "$TMP/card.json" && ok "脚注使用 plain_text + notation" || bad "脚注结构不对"
     HOSTS=$(grep -o '"host":"' "$TMP/card.json" | wc -l | tr -d ' \t')
-    [ "$HOSTS" -eq 10 ] && ok "Top 10 设备行（实际 $HOSTS）" || bad "设备行数 $HOSTS，不是 10"
+    [ "$HOSTS" -eq 5 ] && ok "Top 5 设备行（实际 $HOSTS）" || bad "设备行数 $HOSTS，不是 5"
 
     # 默认输出路径 /tmp/card.json（需求要求的路径）
     if run_uc card --base "$BASE" --secret demo >/dev/null 2>&1 && [ -f /tmp/card.json ]; then
