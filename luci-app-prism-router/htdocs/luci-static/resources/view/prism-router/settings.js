@@ -990,7 +990,7 @@ return view.extend({
 			[ 'feishu', 'app_id', _('App ID（扫码加群的自建应用）'), _('飞书开放平台 → 自建应用 → 凭证与基础信息。填了 App ID/Secret 就优先走应用 API，不再用 webhook。'), 'text', { wide: true, placeholder: 'cli_xxxxx' } ],
 			[ 'feishu', 'app_secret', _('App Secret'), _('与 App ID 配套；仅保存在本机 /etc/config/prism-router。'), 'password', null ],
 			[ 'feishu', 'chat_id', _('群 chat_id'), _('点下方「列出机器人所在的群」自动获取；形如 oc_xxxxx。'), 'text', { wide: true, placeholder: 'oc_xxxxx' } ],
-			[ 'feishu', 'receive_id', _('接收人 open_id（个人通知，无需群）'), _('自建应用给个人发消息用，形如 ou_xxxxx；可在开放平台 API 调试台获取，或让管理员提供。'), 'text', { wide: true, placeholder: 'ou_xxxxx' } ],
+			[ 'feishu', 'receive_id', _('接收人（个人通知，无需群）'), _('填你的飞书登录邮箱最省事；也可以填 ou_ 开头的 open_id。应用可用范围必须包含这个账号。'), 'text', { wide: true, placeholder: 'you@company.com 或 ou_xxxxx' } ],
 			[ 'feishu', 'report_chat_enabled', _('群聊报表'), _('关掉后只推送给私聊/其它通道（按后端实现）。'), 'bool', null ]
 		];
 
@@ -1534,8 +1534,10 @@ return view.extend({
 		feishu.chat_id = this.inputValue('feishu', 'chat_id');
 		/* 接收目标统一成 receive_id + receive_id_type：webhook 不用，app 用群，user 用个人。 */
 		if (feishu.mode === FEISHU_MODE_USER) {
-			feishu.receive_id_type = 'open_id';
-			feishu.receive_id = this.inputValue('feishu', 'receive_id');
+			var target = this.inputValue('feishu', 'receive_id').trim();
+			/* 邮箱最直观；ou_ 开头按 open_id。 */
+			feishu.receive_id_type = (target.indexOf('@') > 0) ? 'email' : 'open_id';
+			feishu.receive_id = target;
 		} else {
 			feishu.receive_id_type = 'chat_id';
 			feishu.receive_id = feishu.chat_id;
@@ -1686,8 +1688,14 @@ return view.extend({
 		    (str(feishu.app_id) === '' || str(feishu.app_secret) === ''))
 			return _('应用机器人模式需要填写 App ID 和 App Secret：请补全后保存，或把发送方式切回自定义机器人');
 
-		if (feishu.mode === FEISHU_MODE_USER && !/^ou_[A-Za-z0-9_-]{8,}$/.test(str(feishu.receive_id)))
-			return _('个人通知需要填写接收人 open_id（形如 ou_xxxxx）；可在开放平台 API 调试台获取');
+		if (feishu.mode === FEISHU_MODE_USER) {
+			var rcpt = str(feishu.receive_id).trim();
+			var okEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rcpt);
+			var okOpen = /^ou_[A-Za-z0-9_-]{8,}$/.test(rcpt);
+
+			if (!okEmail && !okOpen)
+				return _('个人通知需要填写飞书登录邮箱，或 ou_ 开头的 open_id');
+		}
 
 		if (feishu.daily_time.length > 0 && normHHMM(feishu.daily_time) == null)
 			return _('旧字段 daily_time 必须是 24 小时制 HH:MM');
